@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.0
+// @version      1.1
 // @description  Wszystkie skrypty w jednym pliku. Moduły włączasz/wyłączasz w menu Tampermonkey/ScriptCat (ikona rozszerzenia). Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -1990,7 +1990,7 @@
     }
 
     const btn = document.createElement('button');
-    btn.textContent = '🎫 Księgowanie w tickecie';
+    btn.textContent = '🎫 Księgowanie w tickecie'; btn.id = 'ksieg-btn';
     btn.style.cssText = `
         position:fixed; top:158px; right:20px; z-index:999999;
         padding:10px 15px; background:#FF2F00; color:white;
@@ -5322,7 +5322,7 @@
     'use strict';
 
     const refundBtn = document.createElement("button");
-    refundBtn.innerText = "🔍 Refund checker";
+    refundBtn.innerText = "🔍 Refund checker"; refundBtn.id = 'refund-btn';
     refundBtn.style.cssText = `
         position: fixed; top: 62px; right: 20px;
         z-index: 999999; padding: 10px 15px;
@@ -7655,7 +7655,7 @@
     }
 
     const btn = document.createElement('button');
-    btn.textContent = '👤 Typ klienta';
+    btn.textContent = '👤 Typ klienta'; btn.id = 'klient-btn';
     btn.style.cssText =
         'position:fixed;top:252px;right:20px;z-index:999999;padding:10px 15px;background:#FF2F00;color:white;border:none;border-radius:8px;cursor:pointer;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.2);';
 
@@ -9575,5 +9575,25 @@
             console.error('[Beliani hub] modul ' + m.id + ':', e);
         }
     });
+
+
+    // ===== Pasek guzikow: uklada guziki modulow w pionie na prawej krawedzi =====
+    function arrangeDock() {
+        const order = ['#ksieg-btn', '#refund-btn', '#oandaKursBtn', '#viesBtn', '#klient-btn', '#sepa-btn', '#ilp-btn'];
+        let y = 70;
+        const gap = 8;
+        order.forEach(function (sel) {
+            const b = document.querySelector(sel);
+            if (!b) return;
+            b.style.position = 'fixed';
+            b.style.right = '12px';
+            b.style.left = 'auto';
+            b.style.bottom = 'auto';
+            b.style.top = y + 'px';
+            b.style.zIndex = '2147483646';
+            y += (b.offsetHeight || 40) + gap;
+        });
+    }
+    if (onProlo()) { [300, 1200, 3000].forEach(function (ms) { setTimeout(arrangeDock, ms); }); }
 
 })();
