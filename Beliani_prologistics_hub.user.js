@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.11
+// @version      1.12
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5375,6 +5375,10 @@
                     border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
                     font-family:monospace;
                 "></div>
+                <div style="margin-top:6px;">
+                    <button id="tm-deact-change" style="padding:5px 9px;border:none;border-radius:6px;background:#b45309;color:#fff;cursor:pointer;font-size:11px;font-weight:bold;">Zmień zaznaczone → Refund Deactivated</button>
+                    <span id="tm-deact-status" style="font-size:11px;color:#666;margin-left:6px;"></span>
+                </div>
             </div>
             <div style="font-weight:bold; color:#16a34a; margin-bottom:4px;">✅ OK:</div>
             <div id="tm-refund-ok" style="
@@ -5644,10 +5648,10 @@
     }
 
     // Zmiana statusu refundu na "Refund Done" przez API strony aukcji.
-    async function setRefundDone(logId) {
+    async function setRefundStatus(logId, newStatus) {
         try {
             const fd = new FormData();
-            fd.append('new_status', 'Refund Done');
+            fd.append('new_status', newStatus);
             fd.append('log_id', logId);
             const resp = await fetch('/api/refunds/updateRefundStatus/', { method: 'POST', body: fd });
             let data = null;
@@ -5725,6 +5729,7 @@
 
             const approvedAmounts = [];
             const approvedLogIds = [];
+            const approvedPairs = [];
             let totalRowsInTable = 0;
 
             // W surowym HTML tabela nie ma jeszcze id="refundTable" (orders.js dodaje je w przegladarce).
@@ -5765,6 +5770,7 @@
 
                             if (amt !== null && amt > 0) {
                                 approvedAmounts.push(amt);
+                                approvedPairs.push({ amount: amt, logId: _lid });
                             }
                         }
                     }
@@ -5781,18 +5787,19 @@
                 };
             }
 
-            const amountCounts = {};
+            const amountGroups = {};
 
-            approvedAmounts.forEach(a => {
-                const key = a.toFixed(2);
-                amountCounts[key] = (amountCounts[key] || 0) + 1;
+            approvedPairs.forEach(pr => {
+                const key = pr.amount.toFixed(2);
+                (amountGroups[key] = amountGroups[key] || []).push(pr.logId);
             });
 
-            const internalDuplicates = Object.entries(amountCounts)
-                .filter(([, count]) => count > 1)
-                .map(([amt, count]) => ({
+            const internalDuplicates = Object.entries(amountGroups)
+                .filter(([, ids]) => ids.length > 1)
+                .map(([amt, ids]) => ({
                     amount: parseFloat(amt),
-                    count
+                    count: ids.length,
+                    logIds: ids.filter(Boolean)
                 }));
 
             const refundAmount = approvedAmounts.reduce((s, a) => s + a, 0);
@@ -5979,8 +5986,12 @@
             dupHtml += '<div style="font-weight:bold; margin-bottom:4px;">Zduplikowane refundy approved:</div>';
             dupHtml += internalDupList
                 .map(d => {
-                    const parts = d.duplicates.map(x => `${formatAmount(x.amount)} ×${x.count}`).join(', ');
-                    return `<div>⚠️ <strong>${d.auftrag}</strong> — ${parts}</div>`;
+                    let h = `<div style="margin-bottom:4px;">⚠️ <strong>${d.auftrag}</strong>:</div>`;
+                    d.duplicates.forEach(x => {
+                        const boxes = (x.logIds || []).map(lid => `<label style="margin-right:10px;white-space:nowrap;"><input type="checkbox" class="tm-deact-cb" data-logid="${lid}"> deaktywuj #${lid}</label>`).join('');
+                        h += `<div style="margin-left:14px;">${formatAmount(x.amount)} ×${x.count} → ${boxes}</div>`;
+                    });
+                    return h;
                 })
                 .join('');
         }
@@ -6039,12 +6050,30 @@
             const logIds = (row.getAttribute('data-logids') || '').split(',').filter(Boolean);
             let allOk = logIds.length > 0;
             let lastState = '', lastErr = '';
-            for (const lid of logIds) { const res = await setRefundDone(lid); if (!res.ok) { allOk = false; lastErr = res.error || 'blad'; } else { lastState = res.state || ''; } }
+            for (const lid of logIds) { const res = await setRefundStatus(lid, 'Refund Done'); if (!res.ok) { allOk = false; lastErr = res.error || 'blad'; } else { lastState = res.state || ''; } }
             const note = row.querySelector('.tm-exec-note');
             if (allOk) { done++; row.style.opacity = '0.55'; if (note) { note.style.color = '#16a34a'; note.textContent = ' ✅ serwer: ' + (lastState || 'Refund Done'); } cb.checked = false; cb.disabled = true; }
             else { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' ❌ ' + (lastErr || 'blad') + ' (zmien przez link)'; } }
         }
         statusSpan.textContent = 'Gotowe: ' + done + ' zmienione' + (err ? ', ' + err + ' blad' : '') + '.';
+    };
+
+    refundPanel.querySelector('#tm-deact-change').onclick = async () => {
+        const dupDivEl = document.getElementById('tm-refund-duplicates');
+        const st = document.getElementById('tm-deact-status');
+        const checked = Array.from(dupDivEl.querySelectorAll('.tm-deact-cb:checked'));
+        if (!checked.length) { st.textContent = 'Zaznacz przynajmniej jeden zwrot do deaktywacji.'; return; }
+        if (!confirm('Zmienic status na "Refund Deactivated" dla ' + checked.length + ' zwrotow?')) return;
+        st.textContent = 'Zmieniam...';
+        let done = 0, err = 0;
+        for (const cb of checked) {
+            const lid = cb.getAttribute('data-logid');
+            const res = await setRefundStatus(lid, 'Refund Deactivated');
+            const lab = cb.closest('label');
+            if (res.ok) { done++; cb.checked = false; cb.disabled = true; if (lab) { lab.style.color = '#16a34a'; lab.insertAdjacentHTML('beforeend', ' ✅'); } }
+            else { err++; if (lab) { lab.style.color = '#dc2626'; lab.insertAdjacentHTML('beforeend', ' ❌ ' + (res.error || 'blad')); } }
+        }
+        st.textContent = 'Gotowe: ' + done + ' deaktywowane' + (err ? ', ' + err + ' blad' : '') + '.';
     };
 
     refundPanel.querySelector('#tm-exec-all').onchange = (e) => {
