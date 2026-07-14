@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.2
+// @version      1.3
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -9590,34 +9590,35 @@
             #beliani-launch-panel{margin-top:8px;width:252px;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);overflow:hidden;}
             #beliani-launcher .bl-row{display:flex;align-items:center;gap:10px;width:100%;padding:11px 14px;border:none;background:#fff;font-size:14px;color:#1a1a1a;cursor:pointer;text-align:left;box-sizing:border-box;}
             #beliani-launcher .bl-row:hover{background:#F6E7E6;}
-            #beliani-launcher .bl-emoji{width:20px;text-align:center;font-size:16px;flex:0 0 20px;}
+            #beliani-launcher .bl-emoji{width:20px;flex:0 0 20px;display:flex;align-items:center;justify-content:center;}
             #beliani-launcher .bl-sep{height:1px;background:#eee;}
             #beliani-launcher .bl-gear{color:#750000;font-weight:bold;}
             #beliani-launcher .bl-set-row{display:block;width:100%;padding:9px 14px 9px 34px;border:none;background:#faf7f6;font-size:13px;color:#333;cursor:pointer;text-align:left;box-sizing:border-box;}
             #beliani-launcher .bl-set-row:hover{background:#F6E7E6;}
         `);
 
+        function svgIco(p){ return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#FF2F00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + p + '</svg>'; }
         const LAUNCH_TOOLS = [
-            { id:'ksieg',    emoji:'🎫', label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
-            { id:'refund',   emoji:'🔍', label:'Refund Checker',          sel:'#refund-btn' },
-            { id:'vies',     emoji:'💱', label:'Kurs walut',              sel:'#oandaKursBtn' },
-            { id:'vies',     emoji:'🏛', label:'VIES / KRS / GUS',        sel:'#viesBtn' },
-            { id:'klient',   emoji:'👤', label:'Zmiana typu klienta',     sel:'#klient-btn' },
-            { id:'sepa',     emoji:'💶', label:'Walidator SEPA',          sel:'#sepa-btn' },
-            { id:'issuelog', emoji:'📋', label:'Issue / PAID',            sel:'#ilp-btn' },
+            { id:'ksieg',    icon:svgIco('<path d="M15 5v2"/><path d="M15 11v2"/><path d="M15 17v2"/><path d="M5 5h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-3a2 2 0 0 0 0 -4v-3a2 2 0 0 1 2 -2"/>'), label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
+            { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
+            { id:'vies',     icon:svgIco('<path d="M17.2 7a6 7 0 1 0 0 10"/><path d="M4 10h9"/><path d="M4 14h9"/>'), label:'Kurs walut', sel:'#oandaKursBtn' },
+            { id:'vies',     icon:svgIco('<path d="M11.46 20.85a12 12 0 0 1 -7.96 -14.85a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3a12 12 0 0 1 -.09 7.06"/><path d="M15 19l2 2l4 -4"/>'), label:'VIES / KRS / GUS', sel:'#viesBtn' },
+            { id:'klient',   icon:svgIco('<circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2"/>'), label:'Zmiana typu klienta', sel:'#klient-btn' },
+            { id:'sepa',     icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M9 13h6"/><path d="M9 17h6"/>'), label:'Walidator SEPA', sel:'#sepa-btn' },
+            { id:'issuelog', icon:svgIco('<rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><path d="M9 12h.01"/><path d="M13 12h2"/><path d="M9 16h.01"/><path d="M13 16h2"/>'), label:'Issue / PAID', sel:'#ilp-btn' },
         ];
 
         function hideBtns(){ LAUNCH_TOOLS.forEach(function(t){ const b = document.querySelector(t.sel); if (b) b.style.display = 'none'; }); }
 
         const wrap = document.createElement('div'); wrap.id = 'beliani-launcher';
         const btn = document.createElement('button'); btn.id = 'beliani-launch-btn';
-        btn.innerHTML = '<span>\u2630</span><span>Narzedzia</span>';
+        btn.innerHTML = '<span>\u2630</span><span>Narzędzia</span>';
         const panel = document.createElement('div'); panel.id = 'beliani-launch-panel'; panel.style.display = 'none';
 
         let html = '';
         LAUNCH_TOOLS.forEach(function(t){
             if (!isOn(t.id)) return;
-            html += '<button class="bl-row" data-sel="' + t.sel + '"><span class="bl-emoji">' + t.emoji + '</span>' + t.label + '</button>';
+            html += '<button class="bl-row" data-sel="' + t.sel + '"><span class="bl-emoji">' + t.icon + '</span>' + t.label + '</button>';
         });
         html += '<div class="bl-sep"></div>';
         html += '<button class="bl-row bl-gear" id="bl-gear"><span class="bl-emoji">\u2699</span>Moduly i ustawienia</button>';
@@ -9634,9 +9635,9 @@
         btn.addEventListener('click', function(){ panel.style.display = (panel.style.display === 'none') ? 'block' : 'none'; });
         panel.querySelectorAll('.bl-row[data-sel]').forEach(function(r){
             r.addEventListener('click', function(){
-                const b = document.querySelector(r.getAttribute('data-sel'));
-                if (b) b.click();
+                const sel = r.getAttribute('data-sel');
                 panel.style.display = 'none';
+                setTimeout(function(){ const b = document.querySelector(sel); if (b) b.click(); }, 0);
             });
         });
         const gear = panel.querySelector('#bl-gear');
