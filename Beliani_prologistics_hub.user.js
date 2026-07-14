@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.1
-// @description  Wszystkie skrypty w jednym pliku. Moduły włączasz/wyłączasz w menu Tampermonkey/ScriptCat (ikona rozszerzenia). Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
+// @version      1.2
+// @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
 // @match        https://prologistics.info/*
@@ -7655,7 +7655,7 @@
     }
 
     const btn = document.createElement('button');
-    btn.textContent = '👤 Typ klienta'; btn.id = 'klient-btn';
+    btn.textContent = '👤 Zmiana typu klienta'; btn.id = 'klient-btn';
     btn.style.cssText =
         'position:fixed;top:252px;right:20px;z-index:999999;padding:10px 15px;background:#FF2F00;color:white;border:none;border-radius:8px;cursor:pointer;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.2);';
 
@@ -9577,23 +9577,86 @@
     });
 
 
-    // ===== Pasek guzikow: uklada guziki modulow w pionie na prawej krawedzi =====
-    function arrangeDock() {
-        const order = ['#ksieg-btn', '#refund-btn', '#oandaKursBtn', '#viesBtn', '#klient-btn', '#sepa-btn', '#ilp-btn'];
-        let y = 70;
-        const gap = 8;
-        order.forEach(function (sel) {
-            const b = document.querySelector(sel);
-            if (!b) return;
-            b.style.position = 'fixed';
-            b.style.right = '12px';
-            b.style.left = 'auto';
-            b.style.bottom = 'auto';
-            b.style.top = y + 'px';
-            b.style.zIndex = '2147483646';
-            y += (b.offsetHeight || 40) + gap;
+    // ===== Launcher: jeden guzik po prawej -> lista narzedzi + ustawienia =====
+    function buildLauncher() {
+        if (!onProlo()) return;
+        if (!document.body) return;
+        if (document.getElementById('beliani-launcher')) return;
+
+        GM_addStyle(`
+            #beliani-launcher{position:fixed;top:70px;right:12px;z-index:2147483647;font-family:Arial,Helvetica,sans-serif;}
+            #beliani-launch-btn{height:44px;padding:0 16px;border:none;border-radius:22px;background:#FF2F00;color:#fff;font-size:15px;font-weight:bold;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.3);white-space:nowrap;display:flex;align-items:center;gap:8px;}
+            #beliani-launch-btn:hover{background:#cc2600;}
+            #beliani-launch-panel{margin-top:8px;width:252px;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);overflow:hidden;}
+            #beliani-launcher .bl-row{display:flex;align-items:center;gap:10px;width:100%;padding:11px 14px;border:none;background:#fff;font-size:14px;color:#1a1a1a;cursor:pointer;text-align:left;box-sizing:border-box;}
+            #beliani-launcher .bl-row:hover{background:#F6E7E6;}
+            #beliani-launcher .bl-emoji{width:20px;text-align:center;font-size:16px;flex:0 0 20px;}
+            #beliani-launcher .bl-sep{height:1px;background:#eee;}
+            #beliani-launcher .bl-gear{color:#750000;font-weight:bold;}
+            #beliani-launcher .bl-set-row{display:block;width:100%;padding:9px 14px 9px 34px;border:none;background:#faf7f6;font-size:13px;color:#333;cursor:pointer;text-align:left;box-sizing:border-box;}
+            #beliani-launcher .bl-set-row:hover{background:#F6E7E6;}
+        `);
+
+        const LAUNCH_TOOLS = [
+            { id:'ksieg',    emoji:'🎫', label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
+            { id:'refund',   emoji:'🔍', label:'Refund Checker',          sel:'#refund-btn' },
+            { id:'vies',     emoji:'💱', label:'Kurs walut',              sel:'#oandaKursBtn' },
+            { id:'vies',     emoji:'🏛', label:'VIES / KRS / GUS',        sel:'#viesBtn' },
+            { id:'klient',   emoji:'👤', label:'Zmiana typu klienta',     sel:'#klient-btn' },
+            { id:'sepa',     emoji:'💶', label:'Walidator SEPA',          sel:'#sepa-btn' },
+            { id:'issuelog', emoji:'📋', label:'Issue / PAID',            sel:'#ilp-btn' },
+        ];
+
+        function hideBtns(){ LAUNCH_TOOLS.forEach(function(t){ const b = document.querySelector(t.sel); if (b) b.style.display = 'none'; }); }
+
+        const wrap = document.createElement('div'); wrap.id = 'beliani-launcher';
+        const btn = document.createElement('button'); btn.id = 'beliani-launch-btn';
+        btn.innerHTML = '<span>\u2630</span><span>Narzedzia</span>';
+        const panel = document.createElement('div'); panel.id = 'beliani-launch-panel'; panel.style.display = 'none';
+
+        let html = '';
+        LAUNCH_TOOLS.forEach(function(t){
+            if (!isOn(t.id)) return;
+            html += '<button class="bl-row" data-sel="' + t.sel + '"><span class="bl-emoji">' + t.emoji + '</span>' + t.label + '</button>';
         });
+        html += '<div class="bl-sep"></div>';
+        html += '<button class="bl-row bl-gear" id="bl-gear"><span class="bl-emoji">\u2699</span>Moduly i ustawienia</button>';
+        html += '<div id="bl-settings" style="display:none">';
+        MODULES.forEach(function(m){
+            html += '<button class="bl-set-row" data-id="' + m.id + '">' + (isOn(m.id) ? '\u2705' : '\u2B1C') + ' ' + m.name + '</button>';
+        });
+        html += '</div>';
+        panel.innerHTML = html;
+
+        wrap.appendChild(btn); wrap.appendChild(panel);
+        document.body.appendChild(wrap);
+
+        btn.addEventListener('click', function(){ panel.style.display = (panel.style.display === 'none') ? 'block' : 'none'; });
+        panel.querySelectorAll('.bl-row[data-sel]').forEach(function(r){
+            r.addEventListener('click', function(){
+                const b = document.querySelector(r.getAttribute('data-sel'));
+                if (b) b.click();
+                panel.style.display = 'none';
+            });
+        });
+        const gear = panel.querySelector('#bl-gear');
+        if (gear) gear.addEventListener('click', function(e){
+            e.stopPropagation();
+            const s = panel.querySelector('#bl-settings');
+            s.style.display = (s.style.display === 'none') ? 'block' : 'none';
+        });
+        panel.querySelectorAll('.bl-set-row').forEach(function(r){
+            r.addEventListener('click', function(){
+                const id = r.getAttribute('data-id');
+                try { GM_setValue(HUB + id, !isOn(id)); } catch(e){}
+                location.reload();
+            });
+        });
+
+        hideBtns();
+        [600, 1500, 3000].forEach(function(ms){ setTimeout(hideBtns, ms); });
     }
-    if (onProlo()) { [300, 1200, 3000].forEach(function (ms) { setTimeout(arrangeDock, ms); }); }
+    buildLauncher();
+    [500, 1500].forEach(function(ms){ setTimeout(buildLauncher, ms); });
 
 })();
