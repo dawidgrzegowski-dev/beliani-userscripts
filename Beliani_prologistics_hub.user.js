@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.3
+// @version      1.5
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5645,7 +5645,14 @@
             const approvedAmounts = [];
             let totalRowsInTable = 0;
 
-            const refundTable = doc.getElementById('refundTable');
+            // W surowym HTML tabela nie ma jeszcze id="refundTable" (orders.js dodaje je w przegladarce).
+            // Szukamy jej po naglowku "Refund amount" (bywa ze spacja na koncu).
+            let refundTable = doc.getElementById('refundTable');
+            if (!refundTable) {
+                const hdr = Array.from(doc.querySelectorAll('td[data-field-name]'))
+                    .find(td => (td.getAttribute('data-field-name') || '').trim() === 'Refund amount');
+                if (hdr) refundTable = hdr.closest('table');
+            }
 
             if (refundTable) {
                 const headerRow = refundTable.querySelector('tr.table-heading-row');
@@ -5654,7 +5661,7 @@
                 let colIdx = -1;
 
                 allHeaderCells.forEach((td, i) => {
-                    if (td.getAttribute('data-field-name') === 'Refund amount') colIdx = i;
+                    if ((td.getAttribute('data-field-name') || '').trim() === 'Refund amount') colIdx = i;
                 });
 
                 if (colIdx >= 0) {
