@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.5
+// @version      1.7
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5381,6 +5381,16 @@
                 border-radius:6px; padding:8px; max-height:120px; overflow-y:auto;
                 margin-bottom:10px; font-family:monospace;
             "></div>
+            <div style="font-weight:bold; color:#a15c00; margin-bottom:4px;">⚠️ Wykonane – zmień status / wyksięguj:</div>
+            <div id="tm-refund-executed" style="
+                font-size:11px; background:#fff7ed; border:1px solid #fed7aa;
+                border-radius:6px; padding:8px; max-height:120px; overflow-y:auto;
+                margin-bottom:10px; font-family:monospace;
+            "></div>
+            <div style="margin:0 0 10px;">
+                <button id="tm-exec-change" style="padding:6px 10px;border:none;border-radius:6px;background:#a15c00;color:#fff;cursor:pointer;font-size:12px;font-weight:bold;">Zmień zaznaczone → Refund Done</button>
+                <span id="tm-exec-status" style="font-size:11px;color:#666;margin-left:8px;"></span>
+            </div>
             <div style="font-weight:bold; color:#dc2626; margin-bottom:4px;">❌ Kwota nie odpowiada:</div>
             <div id="tm-refund-fail" style="
                 font-size:11px; background:#fef2f2; border:1px solid #fecaca;
@@ -5631,6 +5641,43 @@
         return selectEl.value || null;
     }
 
+    // Zmiana statusu refundu na "Refund Done" przez API strony aukcji.
+    async function setRefundDone(logId) {
+        try {
+            const fd = new FormData();
+            fd.append('new_status', 'Refund Done');
+            fd.append('log_id', logId);
+            const resp = await fetch('/api/refunds/updateRefundStatus/', { method: 'POST', body: fd });
+            const data = await resp.json();
+            return !!(data && data.success);
+        } catch (e) { return false; }
+    }
+
+    // Zwrot fizycznie wykonany u dostawcy (automaticRefundsTable): PayPal=DONE,
+    // Saferpay=CAPTURED, Klarna=CANCEL DONE. Kolumny szukamy po nazwie naglowka.
+    function getExecutedRefundAmount(doc) {
+        const SUCCESS = ['captured', 'done', 'cancel done'];
+        let sum = 0, found = false;
+        const tables = doc.querySelectorAll('#automaticRefundsTable, table[data-simple-nav$="automatic booking refunds"]');
+        tables.forEach(function(table){
+            const headerRow = table.querySelector('tr.table-heading-row');
+            if (!headerRow) return;
+            const heads = Array.from(headerRow.querySelectorAll('td')).map(td => td.textContent.trim().toLowerCase());
+            const amountIdx = heads.indexOf('amount');
+            const statusIdx = heads.indexOf('status');
+            if (amountIdx < 0 || statusIdx < 0) return;
+            table.querySelectorAll('tr.table-row').forEach(function(row){
+                const cells = row.querySelectorAll('td');
+                if (cells.length <= Math.max(amountIdx, statusIdx)) return;
+                const status = (cells[statusIdx].textContent || '').trim().toLowerCase();
+                if (SUCCESS.indexOf(status) === -1) return;
+                const amt = parseMoney(cells[amountIdx].textContent);
+                if (amt !== null && amt > 0) { sum += amt; found = true; }
+            });
+        });
+        return found ? sum : null;
+    }
+
     async function checkRefund(auftragNumber) {
         try {
             const resp = await fetch(`/auction.php?number=${auftragNumber}&txnid=3`);
@@ -5643,6 +5690,7 @@
             const openAmount = openData.amount;
 
             const approvedAmounts = [];
+            const approvedLogIds = [];
             let totalRowsInTable = 0;
 
             // W surowym HTML tabela nie ma jeszcze id="refundTable" (orders.js dodaje je w przegladarce).
@@ -5673,6 +5721,8 @@
                         const stateValue = getSelectedStateValue(stateSelect);
 
                         if (stateValue !== 'Refund approved') continue;
+                        const _lid = stateSelect ? stateSelect.getAttribute('data-log-id') : null;
+                        if (_lid) approvedLogIds.push(_lid);
 
                         const cells = row.querySelectorAll('td');
 
@@ -5712,6 +5762,20 @@
                 }));
 
             const refundAmount = approvedAmounts.reduce((s, a) => s + a, 0);
+
+            // Zwrot juz wykonany u dostawcy, mimo statusu "Refund approved"?
+            const executedAmount = getExecutedRefundAmount(doc);
+            if (executedAmount !== null && refundAmount > 0 && Math.abs(executedAmount - refundAmount) < 0.02) {
+                return {
+                    executed: true,
+                    auftragNumber,
+                    refundAmount,
+                    executedAmount,
+                    approvedAmounts,
+                    logIds: approvedLogIds,
+                    error: `Zwrot wykonany u dostawcy: ${executedAmount.toFixed(2)} (= approved ${refundAmount.toFixed(2)}) — status/ksiegowanie do zmiany`
+                };
+            }
 
             // KLUCZOWA ZMIANA:
             // Jeśli openAmount wyszedł jako 0 z fallbacku widocznego HTML,
@@ -5795,6 +5859,7 @@
         const summaryDiv = document.getElementById('tm-refund-summary');
         const dupSection = document.getElementById('tm-refund-duplicates-section');
         const dupDiv = document.getElementById('tm-refund-duplicates');
+        const executedDiv = document.getElementById('tm-refund-executed');
 
         btn.disabled = true;
         btn.textContent = '⏳ Sprawdzam...';
@@ -5809,11 +5874,13 @@
         failDiv.innerHTML = '';
         summaryDiv.innerHTML = '';
         dupDiv.innerHTML = '';
+        executedDiv.innerHTML = '';
         dupSection.style.display = 'none';
 
         const okList = [];
         const failList = [];
         const internalDupList = [];
+        const executedList = [];
 
         // Równolegle, z limitem jednoczesnych żądań (zamiast: po jednym + 500 ms przerwy)
         const CONCURRENCY = 6;
@@ -5843,7 +5910,9 @@
         for (let i = 0; i < unique.length; i++) {
             const result = results[i];
             if (!result) continue;
-            if (result.internalDuplicates && result.internalDuplicates.length > 0) {
+            if (result.executed) {
+                executedList.push({ auftrag: result.auftragNumber, amount: result.executedAmount, logIds: result.logIds || [] });
+            } else if (result.internalDuplicates && result.internalDuplicates.length > 0) {
                 internalDupList.push({
                     auftrag: result.auftragNumber,
                     duplicates: result.internalDuplicates
@@ -5893,7 +5962,16 @@
             ? failList.map(l => `<div style="color:#dc2626">${l}</div>`).join('')
             : '<div style="color:#888">Brak</div>';
 
-        let summary = `✅ OK: <strong>${okList.length}</strong> &nbsp; ❌ Problemy: <strong>${failList.length}</strong>`;
+        executedDiv.innerHTML = executedList.length
+            ? executedList.map(e => {
+                const links = (e.logIds || []).map(id => `<a href="/react/settings_page/import_payments/${id}/" target="_blank">${id}</a>`).join(', ') || '—';
+                return `<div style="display:flex;align-items:flex-start;gap:6px;padding:3px 0;" data-logids="${(e.logIds||[]).join(',')}">`
+                    + `<input type="checkbox" class="tm-exec-cb" style="margin-top:2px;">`
+                    + `<span><strong>${e.auftrag}</strong> — ${e.amount.toFixed(2)} — status: <b>Refund approved</b> — import: ${links}<span class="tm-exec-note" style="color:#16a34a;"></span></span></div>`;
+              }).join('')
+            : '<div style="color:#888">Brak</div>';
+
+        let summary = `✅ OK: <strong>${okList.length}</strong> &nbsp; ⚠️ Wykonane: <strong>${executedList.length}</strong> &nbsp; ❌ Problemy: <strong>${failList.length}</strong>`;
 
         const totalDups = inputDuplicates.length + internalDupList.length;
 
@@ -5910,6 +5988,26 @@
 
         btn.disabled = false;
         btn.textContent = '🔍 Sprawdź wszystkie w tle';
+    };
+
+    refundPanel.querySelector('#tm-exec-change').onclick = async () => {
+        const execDiv = document.getElementById('tm-refund-executed');
+        const statusSpan = document.getElementById('tm-exec-status');
+        const checked = Array.from(execDiv.querySelectorAll('.tm-exec-cb:checked'));
+        if (!checked.length) { statusSpan.textContent = 'Zaznacz przynajmniej jedno.'; return; }
+        if (!confirm('Zmienic status na "Refund Done" dla ' + checked.length + ' zamowien?')) return;
+        statusSpan.textContent = 'Zmieniam...';
+        let done = 0, err = 0;
+        for (const cb of checked) {
+            const row = cb.closest('[data-logids]');
+            const logIds = (row.getAttribute('data-logids') || '').split(',').filter(Boolean);
+            let allOk = logIds.length > 0;
+            for (const lid of logIds) { const ok = await setRefundDone(lid); if (!ok) allOk = false; }
+            const note = row.querySelector('.tm-exec-note');
+            if (allOk) { done++; row.style.opacity = '0.55'; if (note) note.textContent = ' ✅ zmieniono'; cb.checked = false; cb.disabled = true; }
+            else { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' ❌ blad (uprawnienia? zmien przez link)'; } }
+        }
+        statusSpan.textContent = 'Gotowe: ' + done + ' zmienione' + (err ? ', ' + err + ' blad' : '') + '.';
     };
 
     refundBtn.onclick = () => {
