@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.12
+// @version      1.13
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -9298,6 +9298,98 @@
 
     document.body.appendChild(btn);
     document.body.appendChild(panel);
+
+    // ===== SZYBKI TRYB (API): pokaz aktualny typ + zmien na B2B bez iframe =====
+    (function setupFastB2B(){
+        function fastMkt(){ var r = panel.querySelector('input[name="tm-c-marketplace"]:checked'); return r ? r.value : 'allegro_pl'; }
+        function fastRead(orderNumber){
+            var searchUrl = BASE + '/search.php?what=ff_number&ff_number=' + encodeURIComponent(orderNumber);
+            return fetch(searchUrl, { credentials: 'same-origin' })
+                .then(function(r){ return r.text().then(function(html){ return { finalUrl: r.url, html: html }; }); })
+                .then(function(o){
+                    var auctionUrl = null;
+                    if (/auction\.php\?number=/.test(o.finalUrl)) auctionUrl = o.finalUrl;
+                    if (!auctionUrl) { var d = new DOMParser().parseFromString(o.html, 'text/html'); var a = d.querySelector('a[href*="auction.php?number="]'); if (a) auctionUrl = absoluteUrl(a.getAttribute('href')); }
+                    if (!auctionUrl) return { ok:false, error:'nie znaleziono zamowienia' };
+                    return fetch(auctionUrl, { credentials:'same-origin' }).then(function(r){ return r.text(); }).then(function(ah){
+                        var ad = new DOMParser().parseFromString(ah, 'text/html');
+                        var sel = ad.querySelector('select[name="customer_type"]');
+                        var current = (sel && sel.options[sel.selectedIndex]) ? String(sel.options[sel.selectedIndex].value || '').trim() : '';
+                        var m = ah.match(/var __AUCTION = "([^"]+)"/);
+                        return { ok:true, auctionUrl:auctionUrl, current:current, auction: m ? m[1] : '' };
+                    });
+                })
+                .catch(function(e){ return { ok:false, error:e.message }; });
+        }
+        function fastChange(auction, targetType){
+            var body = 'fn=change_customer_type&auction=' + encodeURIComponent(auction) + '&customerType=' + encodeURIComponent(targetType);
+            return fetch(BASE + '/js_backend.php', { method:'POST', credentials:'same-origin', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With':'XMLHttpRequest' }, body: body })
+                .then(function(r){ return r.ok; }).catch(function(){ return false; });
+        }
+
+        var wrap = document.createElement('div');
+        wrap.style.cssText = 'margin-top:10px;padding-top:10px;border-top:2px dashed #FF2F00;';
+        wrap.innerHTML =
+            '<button id="tm-c-fast-btn" style="padding:9px;width:100%;background:#FF2F00;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">\u26A1 SZYBKO (API): pokaz typ + zmien na B2B</button>'
+          + '<div id="tm-c-fast-status" style="font-size:11px;color:#666;margin-top:6px;"></div>'
+          + '<div id="tm-c-fast-list" style="margin-top:6px;font-size:12px;max-height:260px;overflow-y:auto;font-family:monospace;"></div>'
+          + '<button id="tm-c-fast-change" style="display:none;margin-top:8px;padding:8px;width:100%;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Zmien zaznaczone na B2B</button>';
+        panel.appendChild(wrap);
+
+        var fastItems = [];
+        document.getElementById('tm-c-fast-btn').onclick = async function(){
+            var st = document.getElementById('tm-c-fast-status');
+            var listEl = document.getElementById('tm-c-fast-list');
+            var changeBtn = document.getElementById('tm-c-fast-change');
+            var inp = document.getElementById('tm-c-input');
+            var parsed = parseMarketplace(inp ? inp.value : '', fastMkt());
+            if (!parsed.length) { st.textContent = 'Brak rozpoznanych numerow we wklejce.'; return; }
+            st.textContent = 'Sprawdzam ' + parsed.length + '...'; listEl.innerHTML = ''; changeBtn.style.display = 'none'; fastItems = [];
+            for (var i = 0; i < parsed.length; i++) {
+                var it = parsed[i];
+                var res = await fastRead(it.orderNumber);
+                st.textContent = 'Sprawdzam ' + (i+1) + '/' + parsed.length + '...';
+                var idx = fastItems.length;
+                var row = { order: it.orderNumber, target: (it.targetType || 'B2B'), current: res.ok ? res.current : '', auction: res.ok ? res.auction : '', auctionUrl: res.ok ? res.auctionUrl : '', error: res.ok ? '' : res.error };
+                fastItems.push(row);
+                var already = res.ok && String(row.current).toUpperCase() === String(row.target).toUpperCase();
+                var h = '<div style="display:flex;align-items:flex-start;gap:6px;padding:2px 0;" data-idx="' + idx + '">';
+                h += (res.ok && !already) ? '<input type="checkbox" class="tm-c-fast-cb" data-idx="' + idx + '">' : '<span style="width:13px;flex:0 0 13px;"></span>';
+                h += '<span><strong>' + row.order + '</strong> \u2014 ';
+                if (!res.ok) h += '<span style="color:#dc2626;">' + row.error + '</span>';
+                else if (already) h += 'juz ' + row.current + ' \u2713';
+                else h += 'teraz: <b>' + (row.current || '?') + '</b> \u2192 ' + row.target + (row.auctionUrl ? ' <a href="' + row.auctionUrl + '" target="_blank">[strona]</a>' : '');
+                h += '<span class="tm-c-fast-note"></span></span></div>';
+                listEl.insertAdjacentHTML('beforeend', h);
+            }
+            var changeable = fastItems.some(function(r){ return r.error === '' && String(r.current).toUpperCase() !== String(r.target).toUpperCase(); });
+            changeBtn.style.display = changeable ? 'block' : 'none';
+            st.textContent = 'Gotowe.';
+        };
+
+        document.getElementById('tm-c-fast-change').onclick = async function(){
+            var listEl = document.getElementById('tm-c-fast-list');
+            var st = document.getElementById('tm-c-fast-status');
+            var checked = Array.prototype.slice.call(listEl.querySelectorAll('.tm-c-fast-cb:checked'));
+            if (!checked.length) { st.textContent = 'Zaznacz przynajmniej jedno.'; return; }
+            if (!confirm('Zmienic typ na B2B dla ' + checked.length + ' zamowien?')) return;
+            var ok = 0, err = 0;
+            for (var j = 0; j < checked.length; j++) {
+                var cb = checked[j];
+                var idx = parseInt(cb.getAttribute('data-idx'), 10);
+                var row = fastItems[idx];
+                var cont = cb.closest('[data-idx]');
+                var note = cont ? cont.querySelector('.tm-c-fast-note') : null;
+                if (!row || !row.auction) { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' \u274C brak __AUCTION'; } continue; }
+                await fastChange(row.auction, row.target);
+                var v = await fastRead(row.order);
+                var okNow = v.ok && String(v.current).toUpperCase() === String(row.target).toUpperCase();
+                if (okNow) { ok++; cb.checked = false; cb.disabled = true; if (note) { note.style.color = '#16a34a'; note.textContent = ' \u2705 ' + v.current; } }
+                else { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' \u274C nie zmienil (' + (v.ok ? v.current : v.error) + ')'; } }
+            }
+            st.textContent = 'Gotowe: ' + ok + ' zmienione' + (err ? ', ' + err + ' blad' : '') + '.';
+        };
+    })();
 })();
     }
 
