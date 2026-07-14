@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.10
+// @version      1.11
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5382,7 +5382,7 @@
                 border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
                 margin-bottom:10px; font-family:monospace;
             "></div>
-            <div style="font-weight:bold; color:#a15c00; margin-bottom:4px;">⚠️ Wykonane – zmień status / wyksięguj:</div>
+            <div style="font-weight:bold; color:#a15c00; margin-bottom:4px;">⚠️ Zrobione + wyksięgowane (Open=0) – zmień status na Done:</div>
             <div id="tm-refund-executed" style="
                 font-size:11px; background:#fff7ed; border:1px solid #fed7aa;
                 border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
@@ -5662,10 +5662,11 @@
     }
 
     // Zwrot fizycznie wykonany u dostawcy (automaticRefundsTable): PayPal=DONE,
-    // Saferpay=CAPTURED, Klarna=CANCEL DONE. Kolumny szukamy po nazwie naglowka.
-    function getExecutedRefundAmount(doc) {
+    // Saferpay=CAPTURED, Klarna=CANCEL DONE. Zwraca sume i daty (YYYY-MM-DD).
+    function getExecutedRefund(doc) {
         const SUCCESS = ['captured', 'done', 'cancel done'];
         let sum = 0, found = false;
+        const dates = [];
         const tables = doc.querySelectorAll('#automaticRefundsTable, table[data-simple-nav$="automatic booking refunds"]');
         tables.forEach(function(table){
             const headerRow = table.querySelector('tr.table-heading-row');
@@ -5673,6 +5674,8 @@
             const heads = Array.from(headerRow.querySelectorAll('td')).map(td => td.textContent.trim().toLowerCase());
             const amountIdx = heads.indexOf('amount');
             const statusIdx = heads.indexOf('status');
+            let dateIdx = heads.indexOf('date');
+            if (dateIdx < 0) dateIdx = heads.findIndex(h => h.indexOf('date') !== -1);
             if (amountIdx < 0 || statusIdx < 0) return;
             table.querySelectorAll('tr.table-row').forEach(function(row){
                 const cells = row.querySelectorAll('td');
@@ -5681,9 +5684,32 @@
                 if (SUCCESS.indexOf(status) === -1) return;
                 const amt = parseMoney(cells[amountIdx].textContent);
                 if (amt !== null && amt > 0) { sum += amt; found = true; }
+                if (dateIdx >= 0 && cells[dateIdx]) {
+                    const d = (cells[dateIdx].textContent || '').trim().slice(0, 10);
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(d)) dates.push(d);
+                }
             });
         });
-        return found ? sum : null;
+        return found ? { amount: sum, dates: dates } : null;
+    }
+
+    // Czy zwrot jest wyksiegowany: w tabeli 'payments' jest wpis z ujemna kwota i ta sama data (dzien).
+    function paymentsHasRefundBookingOnDate(doc, dayStr) {
+        if (!dayStr) return false;
+        let table = null;
+        const anchor = doc.querySelector('#payments');
+        if (anchor) table = anchor.closest('table');
+        if (!table) table = doc.querySelector('table[data-simple-nav="Payments under billing information"]');
+        if (!table) return false;
+        const rows = table.querySelectorAll('tr');
+        for (let i = 0; i < rows.length; i++) {
+            const cells = rows[i].querySelectorAll('td');
+            if (cells.length < 3) continue;
+            const dateTxt = (cells[0].textContent || '').trim();
+            const amtTxt = (cells[2].textContent || '').trim();
+            if (dateTxt.slice(0, 10) === dayStr && amtTxt.charAt(0) === '-') return true;
+        }
+        return false;
     }
 
     async function checkRefund(auftragNumber) {
@@ -5772,16 +5798,18 @@
             const refundAmount = approvedAmounts.reduce((s, a) => s + a, 0);
 
             // Zwrot juz wykonany u dostawcy, mimo statusu "Refund approved"?
-            const executedAmount = getExecutedRefundAmount(doc);
-            if (executedAmount !== null && refundAmount > 0 && Math.abs(executedAmount - refundAmount) < 0.02) {
+            const exec = getExecutedRefund(doc);
+            const openIsZero = (openAmount !== null && !isNaN(openAmount) && Math.abs(openAmount) < 0.02);
+            const bookedOnRefundDate = exec ? exec.dates.some(d => paymentsHasRefundBookingOnDate(doc, d)) : false;
+            if (exec && refundAmount > 0 && Math.abs(exec.amount - refundAmount) < 0.02 && openIsZero && bookedOnRefundDate) {
                 return {
                     executed: true,
                     auftragNumber,
                     refundAmount,
-                    executedAmount,
+                    executedAmount: exec.amount,
                     approvedAmounts,
                     logIds: approvedLogIds,
-                    error: `Zwrot wykonany u dostawcy: ${executedAmount.toFixed(2)} (= approved ${refundAmount.toFixed(2)}) — status/ksiegowanie do zmiany`
+                    error: `Zwrot wykonany i wyksiegowany (Open=0) — tylko status do zmiany`
                 };
             }
 
