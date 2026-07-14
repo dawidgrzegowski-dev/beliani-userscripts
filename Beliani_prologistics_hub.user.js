@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.7
+// @version      1.8
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5388,6 +5388,7 @@
                 margin-bottom:10px; font-family:monospace;
             "></div>
             <div style="margin:0 0 10px;">
+                <label style="font-size:12px;cursor:pointer;margin-right:10px;"><input type="checkbox" id="tm-exec-all"> zaznacz wszystkie</label>
                 <button id="tm-exec-change" style="padding:6px 10px;border:none;border-radius:6px;background:#a15c00;color:#fff;cursor:pointer;font-size:12px;font-weight:bold;">Zmień zaznaczone → Refund Done</button>
                 <span id="tm-exec-status" style="font-size:11px;color:#666;margin-left:8px;"></span>
             </div>
@@ -6008,6 +6009,11 @@
             else { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' ❌ blad (uprawnienia? zmien przez link)'; } }
         }
         statusSpan.textContent = 'Gotowe: ' + done + ' zmienione' + (err ? ', ' + err + ' blad' : '') + '.';
+    };
+
+    refundPanel.querySelector('#tm-exec-all').onchange = (e) => {
+        const on = e.target.checked;
+        document.getElementById('tm-refund-executed').querySelectorAll('.tm-exec-cb').forEach(cb => { if (!cb.disabled) cb.checked = on; });
     };
 
     refundBtn.onclick = () => {
