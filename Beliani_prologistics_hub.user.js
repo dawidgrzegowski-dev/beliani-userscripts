@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.8
+// @version      1.10
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5339,8 +5339,9 @@
         z-index: 999999; background: white;
         border: 1px solid #ccc; border-radius: 10px;
         box-shadow: 0 4px 16px rgba(0,0,0,0.15);
-        padding: 16px; width: 360px;
+        padding: 16px; width: 480px;
         font-family: sans-serif;
+        max-height: calc(100vh - 128px); overflow-y: auto;
     `;
 
     refundPanel.innerHTML = `
@@ -5371,20 +5372,20 @@
                 <div style="font-weight:bold; color:#f59e0b; margin-bottom:4px;">⚠️ Duplikaty:</div>
                 <div id="tm-refund-duplicates" style="
                     font-size:11px; background:#fffbeb; border:1px solid #fde68a;
-                    border-radius:6px; padding:8px; max-height:120px; overflow-y:auto;
+                    border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
                     font-family:monospace;
                 "></div>
             </div>
             <div style="font-weight:bold; color:#16a34a; margin-bottom:4px;">✅ OK:</div>
             <div id="tm-refund-ok" style="
                 font-size:11px; background:#f0fdf4; border:1px solid #bbf7d0;
-                border-radius:6px; padding:8px; max-height:120px; overflow-y:auto;
+                border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
                 margin-bottom:10px; font-family:monospace;
             "></div>
             <div style="font-weight:bold; color:#a15c00; margin-bottom:4px;">⚠️ Wykonane – zmień status / wyksięguj:</div>
             <div id="tm-refund-executed" style="
                 font-size:11px; background:#fff7ed; border:1px solid #fed7aa;
-                border-radius:6px; padding:8px; max-height:120px; overflow-y:auto;
+                border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
                 margin-bottom:10px; font-family:monospace;
             "></div>
             <div style="margin:0 0 10px;">
@@ -5395,7 +5396,7 @@
             <div style="font-weight:bold; color:#dc2626; margin-bottom:4px;">❌ Kwota nie odpowiada:</div>
             <div id="tm-refund-fail" style="
                 font-size:11px; background:#fef2f2; border:1px solid #fecaca;
-                border-radius:6px; padding:8px; max-height:120px; overflow-y:auto;
+                border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
                 font-family:monospace;
             "></div>
             <div id="tm-refund-summary" style="margin-top:8px; font-size:13px; font-weight:bold;"></div>
@@ -5649,9 +5650,15 @@
             fd.append('new_status', 'Refund Done');
             fd.append('log_id', logId);
             const resp = await fetch('/api/refunds/updateRefundStatus/', { method: 'POST', body: fd });
-            const data = await resp.json();
-            return !!(data && data.success);
-        } catch (e) { return false; }
+            let data = null;
+            try { data = await resp.json(); } catch (e) {}
+            if (!resp.ok) return { ok: false, error: 'HTTP ' + resp.status };
+            if (!data || !data.success) return { ok: false, error: (data && data.message) ? data.message : 'serwer: success=false' };
+            const state = (data.data && data.data.state) ? String(data.data.state) : '';
+            return { ok: true, state: state };
+        } catch (e) {
+            return { ok: false, error: e.message };
+        }
     }
 
     // Zwrot fizycznie wykonany u dostawcy (automaticRefundsTable): PayPal=DONE,
@@ -6003,10 +6010,11 @@
             const row = cb.closest('[data-logids]');
             const logIds = (row.getAttribute('data-logids') || '').split(',').filter(Boolean);
             let allOk = logIds.length > 0;
-            for (const lid of logIds) { const ok = await setRefundDone(lid); if (!ok) allOk = false; }
+            let lastState = '', lastErr = '';
+            for (const lid of logIds) { const res = await setRefundDone(lid); if (!res.ok) { allOk = false; lastErr = res.error || 'blad'; } else { lastState = res.state || ''; } }
             const note = row.querySelector('.tm-exec-note');
-            if (allOk) { done++; row.style.opacity = '0.55'; if (note) note.textContent = ' ✅ zmieniono'; cb.checked = false; cb.disabled = true; }
-            else { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' ❌ blad (uprawnienia? zmien przez link)'; } }
+            if (allOk) { done++; row.style.opacity = '0.55'; if (note) { note.style.color = '#16a34a'; note.textContent = ' ✅ serwer: ' + (lastState || 'Refund Done'); } cb.checked = false; cb.disabled = true; }
+            else { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' ❌ ' + (lastErr || 'blad') + ' (zmien przez link)'; } }
         }
         statusSpan.textContent = 'Gotowe: ' + done + ' zmienione' + (err ? ', ' + err + ' blad' : '') + '.';
     };
