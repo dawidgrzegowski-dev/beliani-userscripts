@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.20
+// @version      1.21
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -16,6 +16,7 @@
 // @connect      wyszukiwarkaregontest.stat.gov.pl
 // @connect      wyszukiwarkaregon.stat.gov.pl
 // @connect      api-krs.ms.gov.pl
+// @connect      raw.githubusercontent.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -10746,11 +10747,39 @@
         btn.innerHTML = '<span>\u2630</span><span>Narzędzia</span>';
         const panel = document.createElement('div'); panel.id = 'beliani-launch-panel'; panel.style.display = 'none';
 
+        function checkUpdate(){
+            var RAW = 'https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js';
+            try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) RAW = GM_info.script.downloadURL; } catch(e){}
+            var current = '?';
+            try { if (typeof GM_info !== 'undefined' && GM_info.script) current = GM_info.script.version || '?'; } catch(e){}
+            function cmp(a,b){ var pa=String(a).split('.').map(Number), pb=String(b).split('.').map(Number); for (var i=0;i<Math.max(pa.length,pb.length);i++){ var x=pa[i]||0, y=pb[i]||0; if (x!==y) return x-y; } return 0; }
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: RAW + '?t=' + Date.now(),
+                    onload: function(resp){
+                        var m = (resp.responseText || '').match(/@version\s+([0-9.]+)/);
+                        var latest = m ? m[1] : null;
+                        if (!latest) { alert('Nie udało się odczytać wersji z GitHub.'); return; }
+                        if (cmp(latest, current) > 0) {
+                            if (confirm('Nowa wersja: ' + latest + ' (masz ' + current + ').\n\nOtworzyć stronę instalacji? W menedżerze potwierdzisz „Update".')) {
+                                window.open(RAW, '_blank');
+                            }
+                        } else {
+                            alert('Masz najnowszą wersję (' + current + ').');
+                        }
+                    },
+                    onerror: function(){ alert('Nie udało się sprawdzić aktualizacji (połączenie / @connect).'); }
+                });
+            } catch(e){ window.open(RAW, '_blank'); }
+        }
+
         let html = '';
         LAUNCH_TOOLS.forEach(function(t){
             if (!isOn(t.id)) return;
             html += '<button class="bl-row" data-sel="' + t.sel + '"><span class="bl-emoji">' + t.icon + '</span>' + t.label + '</button>';
         });
+        html += '<button class="bl-row" id="bl-update"><span class="bl-emoji">\ud83d\udd04</span>Uaktualnij (sprawd\u017a wersj\u0119)</button>';
         html += '<div class="bl-sep"></div>';
         html += '<button class="bl-row bl-gear" id="bl-gear"><span class="bl-emoji">\u2699</span>Moduly i ustawienia</button>';
         html += '<div id="bl-settings" style="display:none">';
@@ -10777,6 +10806,8 @@
             const s = panel.querySelector('#bl-settings');
             s.style.display = (s.style.display === 'none') ? 'block' : 'none';
         });
+        const upd = panel.querySelector('#bl-update');
+        if (upd) upd.addEventListener('click', function(){ panel.style.display = 'none'; checkUpdate(); });
         panel.querySelectorAll('.bl-set-row').forEach(function(r){
             r.addEventListener('click', function(){
                 const id = r.getAttribute('data-id');
