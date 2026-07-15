@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.13
+// @version      1.15
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -4812,6 +4812,21 @@
                 : 'brak Money back i credit note';
             const extra = row.checkedAuctions && row.checkedAuctions > 1 ? ` | auftragi: ${row.checkedAuctions}, tickety: ${row.checkedTickets}` : '';
             tdV.innerHTML = `<span style="color:#d97706">⚠️ Wymagany fallback (${reasonLabel}) — przy księgowaniu: pierwsza pozycja od góry + eskalacja${extra}</span>`;
+            // v1.15: pusty ticket (0 broken items) — doczytaj open amount z Auftragu i oflaguj do recznego sprawdzenia.
+            // Fetch TYLKO dla tego przypadku (problematyczne zamowienia), wiec bez wplywu na szybkosc normalnego ksiegowania.
+            if (row.forceFallbackReason === 'no_money_back_no_credit_note' && row.auctionUrl) {
+                (async () => {
+                    try {
+                        const _ah = await fetch(row.auctionUrl, { credentials: 'same-origin' }).then(r => r.text());
+                        const _ad = new DOMParser().parseFromString(_ah, 'text/html');
+                        const _pay = parsePaymentsTable(_ad);
+                        if (_pay && _pay.openAmount != null && Math.abs(_pay.openAmount) > 0.005) {
+                            const _sp = tdV.querySelector('span');
+                            if (_sp) _sp.innerHTML += ' | <span style="color:#dc2626;font-weight:bold">⚠️ Auftrag open amount: ' + _pay.openAmount + ' ' + (_pay.currency || '') + ' — sprawdź ręcznie</span>';
+                        }
+                    } catch (e) {}
+                })();
+            }
         } else {
             const cn = row.creditNoteCount ? ` | credit note: ${row.creditNoteCount}` : '';
             const extra = row.checkedAuctions && row.checkedAuctions > 1 ? ` | auftragi: ${row.checkedAuctions}, tickety: ${row.checkedTickets}, wybrany: #${row.ticketId}` : '';
@@ -5018,6 +5033,7 @@
     // Każdy worker działa we własnym iframe i pobiera kolejne pozycje z wspólnej kolejki.
     // Pozycje już zaksięgowane są pomijane. UI aktualizuje się na bieżąco.
     panel.querySelector('#tm-t-check-and-book-parallel-btn').onclick = async () => {
+        try { var _d = document.getElementById('tm-t-date'); var _a = document.getElementById('tm-t-account'); if (_d) localStorage.setItem('tm_t_last_date', _d.value); if (_a) localStorage.setItem('tm_t_last_account', _a.value); } catch(e){}
         const raw = document.getElementById('tm-t-input').value;
         const items = parseExcel(raw);
         const bookingDate = document.getElementById('tm-t-date').value.trim();
@@ -5274,7 +5290,7 @@
         if (p.raw && !inp.value.trim()) inp.value = p.raw;
         bar.style.display = 'block';
         bar.innerHTML = `↩️ Poprzednia sesja przerwana: <strong>${done}/${total}</strong> zaksięgowane. ` +
-            `Kliknij <strong>„⚡ Sprawdź i zaksięguj od razu"</strong> — dokończy tylko pozostałe. ` +
+            `Kliknij <strong>„🚀 Sprawdź i zaksięguj RÓWNOLEGLE"</strong> — dokończy równolegle tylko pozostałe. ` +
             `<button id="tm-t-resume-discard" style="margin-left:6px;padding:2px 8px;border:none;border-radius:4px;background:#dc2626;color:#fff;cursor:pointer;font-size:11px;">Odrzuć</button>`;
         updateParsePreview();
         const disc = document.getElementById('tm-t-resume-discard');
@@ -5285,6 +5301,16 @@
         const opening = panel.style.display === 'none';
         panel.style.display = opening ? 'block' : 'none';
         if (opening) {
+            (function(){ try {
+                var _sd = localStorage.getItem('tm_t_last_date');
+                var _sa = localStorage.getItem('tm_t_last_account');
+                var _di = document.getElementById('tm-t-date');
+                var _ai = document.getElementById('tm-t-account');
+                if (_di && _sd) _di.value = _sd;
+                if (_ai && _sa) _ai.value = _sa;
+                if (_di && !_di.__persistBound) { _di.__persistBound = true; _di.addEventListener('change', function(){ try { localStorage.setItem('tm_t_last_date', _di.value); } catch(e){} }); }
+                if (_ai && !_ai.__persistBound) { _ai.__persistBound = true; ['change','input'].forEach(function(ev){ _ai.addEventListener(ev, function(){ try { localStorage.setItem('tm_t_last_account', _ai.value); } catch(e){} }); }); }
+            } catch(e){} })();
             initAccountAutocomplete();
             updateAccountLabel();
             const dateInp = document.getElementById('tm-t-date');
