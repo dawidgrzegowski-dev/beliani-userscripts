@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.16.1
+// @version      1.18
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -9849,6 +9849,877 @@
     }
 
     // ===== Rejestr modułów + przełączniki per osoba =====
+    function init_opsheet() {
+        (function(){
+            if (window.__opStatusLoaded) return;
+            if (!/op_sheet\.php/i.test(location.href)) return;
+            window.__opStatusLoaded = true;
+            const BASE = location.origin;
+
+            function getStatusOptions(){
+                const sel = document.querySelector('select[data-field="status_id"]');
+                if (!sel) return [];
+                return Array.from(sel.options).filter(o => o.value).map(o => ({ value: o.value, label: (o.textContent || '').trim() }));
+            }
+            async function changeStatus(containerId, value){
+                try {
+                    const body = 'fn=change_op_container&field=status_id&container_id=' + encodeURIComponent(containerId) + '&value=' + encodeURIComponent(value);
+                    const resp = await fetch(BASE + '/js_backend.php', { method:'POST', credentials:'same-origin', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With':'XMLHttpRequest' }, body: body });
+                    if (!resp.ok) return { ok:false, error:'HTTP ' + resp.status };
+                    let data = null; try { data = await resp.json(); } catch(e){}
+                    return { ok:true, res: (data && data.res != null) ? data.res : '' };
+                } catch(e){ return { ok:false, error:e.message }; }
+            }
+
+            const btn = document.createElement('button');
+            btn.id = 'op-status-btn';
+            btn.textContent = '\ud83d\udce6 Statusy kontenerow';
+            btn.style.cssText = 'position:fixed;right:12px;top:120px;z-index:999999;padding:9px 14px;background:#FF2F00;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;font-family:sans-serif;font-size:13px;';
+            const panel = document.createElement('div');
+            panel.id = 'op-status-panel';
+            panel.style.cssText = 'display:none;position:fixed;right:12px;top:158px;z-index:999999;background:#fff;border:1px solid #ccc;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.15);padding:16px;width:340px;font-family:sans-serif;color:#332524;';
+            panel.innerHTML =
+                '<div style="font-weight:bold;color:#750000;margin-bottom:8px;">Zmiana statusu zaznaczonych kontenerow</div>'
+              + '<div style="font-size:11px;color:#666;margin-bottom:8px;">Zaznacz wiersze checkboxami na liscie, wybierz status i zmien.</div>'
+              + '<label style="font-size:12px;display:block;margin-bottom:4px;">Nowy status:</label>'
+              + '<select id="op-status-target" style="width:100%;padding:6px;margin-bottom:10px;"></select>'
+              + '<button id="op-status-go" style="width:100%;padding:9px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:13px;">\u26a1 Zmien zaznaczone (API)</button>'
+              + '<div id="op-status-info" style="font-size:11px;color:#666;margin-top:8px;"></div>';
+            document.body.appendChild(btn);
+            document.body.appendChild(panel);
+
+            const tgt = panel.querySelector('#op-status-target');
+            getStatusOptions().forEach(o => { const el = document.createElement('option'); el.value = o.value; el.textContent = o.label; if (/waiting for SM/i.test(o.label)) el.selected = true; tgt.appendChild(el); });
+
+            btn.onclick = () => { panel.style.display = (panel.style.display === 'none' ? 'block' : 'none'); };
+
+            panel.querySelector('#op-status-go').onclick = async () => {
+                const info = panel.querySelector('#op-status-info');
+                const value = tgt.value;
+                const label = tgt.options[tgt.selectedIndex] ? tgt.options[tgt.selectedIndex].textContent : value;
+                const checked = Array.from(document.querySelectorAll('input[name="group[]"]:checked'));
+                const ids = Array.from(new Set(checked.map(cb => cb.getAttribute('data-container-id')).filter(Boolean)));
+                if (!ids.length) { info.textContent = 'Zaznacz kontenery (checkboxy przy wierszach).'; return; }
+                if (!value) { info.textContent = 'Wybierz status.'; return; }
+                if (!confirm('Zmienic status na "' + label + '" dla ' + ids.length + ' kontenerow?')) return;
+                info.textContent = 'Zmieniam...';
+                let ok = 0, err = 0;
+                for (const cid of ids) {
+                    const res = await changeStatus(cid, value);
+                    if (res.ok) { ok++; const rowSel = document.getElementById('status_id[' + cid + ']'); if (rowSel) rowSel.value = value; }
+                    else { err++; }
+                }
+                info.textContent = 'Gotowe: ' + ok + ' zmienione' + (err ? ', ' + err + ' blad' : '') + '.';
+            };
+        })();
+    }
+
+    function init_deposit() {
+(function () {
+    'use strict';
+
+    const today = new Date();
+    const todayDay   = today.getDate();
+    const todayMonth = String(today.getMonth() + 1).padStart(2, '0');
+    const todayYear  = today.getFullYear();
+
+    const btn = document.createElement("button");
+    btn.innerText = "📦 Księgowanie chińskich depozytów";
+    btn.style.cssText = `
+        position:fixed; top:20px; right:20px; z-index:999999;
+        padding:10px 15px; background:#FF2F00; color:white;
+        border:none; border-radius:8px; cursor:pointer;
+        font-size:14px; box-shadow:0 2px 8px rgba(0,0,0,0.2);
+    `;
+
+    const months = ['January','February','March','April','May','June',
+                    'July','August','September','October','November','December'];
+    const monthOptions = months.map((m,i) => {
+        const val = String(i+1).padStart(2,'0');
+        return `<option value="${val}" ${val===todayMonth?'selected':''}>${m}</option>`;
+    }).join('');
+    const dayOptions = Array.from({length:31},(_,i) => {
+        const v=i+1;
+        return `<option value="${v}" ${v===todayDay?'selected':''}>${String(v).padStart(2,'0')}</option>`;
+    }).join('');
+    const yearOptions = Array.from({length:19},(_,i) => {
+        const y=2008+i;
+        return `<option value="${y}" ${y===todayYear?'selected':''}>${y}</option>`;
+    }).join('');
+
+    const panel = document.createElement("div");
+    panel.style.cssText = `
+        display:none; position:fixed; top:65px; right:20px; z-index:999999;
+        background:white; border:1px solid #ccc; border-radius:10px;
+        box-shadow:0 4px 16px rgba(0,0,0,0.15); padding:16px; width:620px;
+        font-family:sans-serif; max-height:90vh; overflow-y:auto;
+    `;
+
+    panel.innerHTML = `
+        <div style="font-weight:bold;margin-bottom:8px;color:#111;font-size:15px;">
+            📦 Auto-księgowanie orderów
+        </div>
+        <div style="font-size:11px;color:#666;margin-bottom:8px;">
+            Format: <code style="background:#f5f5f5;padding:2px 4px;">20730[TAB]Nazwa[TAB]2527.5</code>
+        </div>
+        <textarea id="tm-order-input"
+            placeholder="20730&#9;ZHANGZHOU YOKA&#9;2527.5&#10;20731&#9;ZHANGZHOU YOKA&#9;2851.5"
+            style="width:100%;height:100px;padding:8px;border:1px solid #ccc;
+                   border-radius:6px;font-size:12px;resize:vertical;
+                   box-sizing:border-box;font-family:monospace;"></textarea>
+        <div id="tm-parsed-preview" style="margin-top:4px;font-size:11px;color:#555;min-height:16px;"></div>
+
+        <div style="margin-top:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <label style="font-size:12px;color:#333;">Waluta:</label>
+            <select id="tm-currency" style="padding:4px 6px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
+                <option value="USD" selected>USD $</option>
+                <option value="EUR">EUR €</option>
+                <option value="PLN">PLN</option>
+                <option value="CHF">CHF</option>
+                <option value="GBP">GBP £</option>
+            </select>
+            <label style="font-size:12px;color:#333;">Debit:</label>
+            <input id="tm-debit" value="1270" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
+            <label style="font-size:12px;color:#333;">Credit:</label>
+            <input id="tm-credit" value="1049" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
+        </div>
+
+        <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
+            <label style="font-size:12px;color:#333;white-space:nowrap;">📅 Data:</label>
+            <select id="tm-month" style="padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;flex:1;">
+                ${monthOptions}
+            </select>
+            <select id="tm-day" style="padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;width:58px;">
+                ${dayOptions}
+            </select>
+            <select id="tm-year" style="padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;width:70px;">
+                ${yearOptions}
+            </select>
+        </div>
+
+        <button id="tm-check-btn" style="
+            margin-top:10px;width:100%;padding:9px;background:#FF2F00;color:white;
+            border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">
+            🔍 Sprawdź ordery
+        </button>
+
+        <div id="tm-preview-section" style="display:none;margin-top:12px;">
+            <div style="font-size:12px;font-weight:bold;color:#333;margin-bottom:6px;">
+                Podgląd — kliknij ✏️ aby edytować opis:
+            </div>
+            <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                <thead>
+                    <tr style="background:#f3f4f6;">
+                        <th style="padding:5px 6px;text-align:left;border:1px solid #e5e7eb;white-space:nowrap;">Order</th>
+                        <th style="padding:5px 6px;text-align:left;border:1px solid #e5e7eb;">Kwota</th>
+                        <th style="padding:5px 6px;text-align:left;border:1px solid #e5e7eb;white-space:nowrap;">Debit / Credit</th>
+                        <th style="padding:5px 6px;text-align:left;border:1px solid #e5e7eb;">Opis</th>
+                        <th style="padding:5px 6px;text-align:center;border:1px solid #e5e7eb;">Status</th>
+                    </tr>
+                </thead>
+                <tbody id="tm-preview-body"></tbody>
+            </table>
+
+            <button id="tm-book-btn" style="
+                margin-top:10px;width:100%;padding:10px;background:#16a34a;color:white;
+                border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;">
+                🚀 Zaksięguj wszystkie w tle
+            </button>
+
+            <div id="tm-progress" style="margin-top:10px;display:none;">
+                <div style="font-size:12px;color:#333;margin-bottom:6px;font-weight:bold;">Postęp:</div>
+                <div id="tm-progress-list" style="font-size:11px;max-height:140px;overflow-y:auto;"></div>
+                <div id="tm-summary" style="margin-top:8px;font-size:13px;font-weight:bold;"></div>
+            </div>
+        </div>
+    `;
+
+    const commentPopup = document.createElement('div');
+    commentPopup.style.cssText = `
+        display:none; position:fixed; z-index:9999999;
+        background:white; border:1px solid #FF2F00; border-radius:10px;
+        box-shadow:0 8px 24px rgba(0,0,0,0.18); padding:16px; width:300px;
+        font-family:sans-serif;
+    `;
+    commentPopup.innerHTML = `
+        <div style="font-size:13px;font-weight:bold;color:#111;margin-bottom:8px;">
+            ✏️ Edytuj opis orderu <span id="tm-popup-orderid" style="color:#FF2F00;"></span>
+        </div>
+        <input id="tm-popup-input" type="text" style="
+            width:100%;box-sizing:border-box;padding:7px 9px;
+            font-size:13px;border:1px solid #ccc;border-radius:6px;outline:none;
+        ">
+        <div style="margin-top:10px;display:flex;gap:8px;">
+            <button id="tm-popup-ok" style="
+                flex:1;padding:8px;background:#16a34a;color:white;
+                border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">
+                ✅ Zatwierdź
+            </button>
+            <button id="tm-popup-cancel" style="
+                flex:1;padding:8px;background:#e5e7eb;color:#333;
+                border:none;border-radius:6px;cursor:pointer;font-size:13px;">
+                Anuluj
+            </button>
+        </div>
+    `;
+    document.body.appendChild(commentPopup);
+
+    let popupCallback = null;
+
+    function openCommentPopup(orderId, currentValue, anchorEl, callback) {
+        popupCallback = callback;
+        document.getElementById('tm-popup-orderid').textContent = orderId;
+        const input = document.getElementById('tm-popup-input');
+        input.value = currentValue;
+
+        const rect = anchorEl.getBoundingClientRect();
+        let top  = rect.bottom + 6;
+        let left = rect.left;
+        if (left + 310 > window.innerWidth)  left = window.innerWidth - 316;
+        if (top  + 140 > window.innerHeight) top  = rect.top - 146;
+
+        commentPopup.style.top  = top  + 'px';
+        commentPopup.style.left = left + 'px';
+        commentPopup.style.display = 'block';
+
+        setTimeout(() => { input.focus(); input.select(); }, 30);
+    }
+
+    function closeCommentPopup() {
+        commentPopup.style.display = 'none';
+        popupCallback = null;
+    }
+
+    commentPopup.querySelector('#tm-popup-ok').onclick = () => {
+        const val = document.getElementById('tm-popup-input').value.trim();
+        if (popupCallback) popupCallback(val);
+        closeCommentPopup();
+    };
+
+    commentPopup.querySelector('#tm-popup-cancel').onclick = closeCommentPopup;
+
+    document.getElementById('tm-popup-input').onkeydown = (e) => {
+        if (e.key === 'Enter')  { commentPopup.querySelector('#tm-popup-ok').click(); }
+        if (e.key === 'Escape') { closeCommentPopup(); }
+    };
+
+    document.addEventListener('mousedown', (e) => {
+        if (commentPopup.style.display !== 'none' && !commentPopup.contains(e.target)) {
+            closeCommentPopup();
+        }
+    });
+
+    let previewRows = [];
+    const formDataCache = {};
+
+    function parseOrders(raw) {
+        return raw.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+            const parts  = line.split(/\t+|\s{2,}/);
+            const id     = parts[0]?.trim();
+            const amount = parts[parts.length-1]?.trim().replace(',','.');
+            if (/^\d+$/.test(id) && /^\d+(\.\d+)?$/.test(amount)) return {id, amount};
+            return null;
+        }).filter(Boolean);
+    }
+
+    function updateTextPreview() {
+        const orders = parseOrders(document.getElementById('tm-order-input')?.value||'');
+        const el = document.getElementById('tm-parsed-preview');
+        if (!el) return;
+        el.innerHTML = orders.length
+            ? `<span style="color:#16a34a">✓ ${orders.length} orderów:</span> ` +
+              orders.map(o=>`<strong>${o.id}</strong>→${o.amount}`).join(', ')
+            : '';
+    }
+
+    async function fetchOrderData(orderId) {
+        const resp = await fetch(`/op_order.php?id=${orderId}`);
+        const html = await resp.text();
+        const doc  = new DOMParser().parseFromString(html, 'text/html');
+
+        let depositComment = '';
+        for (const cell of doc.querySelectorAll('.commentText')) {
+            const text     = cell.textContent;
+            const pctMatch = text.match(/(\d+)\s*%/);
+            if (pctMatch && /dep(osit|o)/i.test(text)) {
+                depositComment = `deposit ${pctMatch[1]}%`;
+                break;
+            }
+        }
+
+        const form     = doc.querySelector('form');
+        const formData = new FormData();
+        if (form) {
+            for (const el of form.elements) {
+                if (!el.name) continue;
+                if ((el.type==='checkbox'||el.type==='radio') && el.checked)
+                    formData.append(el.name, el.value);
+                else if (el.type!=='checkbox' && el.type!=='radio')
+                    formData.append(el.name, el.value);
+            }
+        }
+        return { formData, depositComment };
+    }
+
+    function normalizeBookingAmount(value) {
+        const n = parseFloat(String(value || '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, '')
+            .replace(/[€$£]/g, '')
+            .replace(',', '.')
+            .trim());
+        return isNaN(n) ? null : n.toFixed(2);
+    }
+
+    function escapeRegExp(value) {
+        return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function amountAppearsInText(text, amount) {
+        const n = normalizeBookingAmount(amount);
+        if (!n) return false;
+
+        const plain = n.replace('.', '\\.');
+        const comma = n.replace('.', ',').replace(',', '\\,');
+        const noDecimals = n.endsWith('.00') ? n.slice(0, -3) : null;
+
+        const patterns = [
+            new RegExp('(^|[^0-9])' + plain + '([^0-9]|$)'),
+            new RegExp('(^|[^0-9])' + comma + '([^0-9]|$)')
+        ];
+
+        if (noDecimals) {
+            patterns.push(new RegExp('(^|[^0-9])' + escapeRegExp(noDecimals) + '([^0-9]|$)'));
+        }
+
+        return patterns.some(re => re.test(text));
+    }
+
+    function controlValueText(cell) {
+        if (!cell) return '';
+
+        const parts = [];
+
+        cell.querySelectorAll('input, textarea').forEach(el => {
+            if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) return;
+            parts.push(String(el.value || '').trim());
+        });
+
+        cell.querySelectorAll('select').forEach(sel => {
+            const opt = sel.options && sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex] : null;
+            parts.push(String(sel.value || '').trim());
+            if (opt) parts.push(String(opt.textContent || '').trim());
+        });
+
+        const ownText = String(cell.textContent || '').trim();
+        if (ownText) parts.push(ownText);
+
+        return parts.filter(Boolean).join(' ').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function normalizeDateYYYYMMDD(year, month, day) {
+        return String(year || '').trim() + '-' + String(month || '').padStart(2, '0') + '-' + String(parseInt(day, 10)).padStart(2, '0');
+    }
+
+    function cellHasAccount(cellText, account) {
+        const expected = String(account || '').trim();
+        if (!expected) return true;
+        const text = String(cellText || '').trim();
+        return text === expected || text.indexOf(expected + ':') >= 0 || text.indexOf(expected + ' ') >= 0 || text.indexOf(expected) >= 0;
+    }
+
+    function cellHasCurrency(cellText, currency) {
+        const expected = String(currency || '').trim().toUpperCase();
+        const text = String(cellText || '').trim().toUpperCase();
+        if (!expected) return true;
+        if (text.indexOf(expected) >= 0) return true;
+        if (expected === 'USD' && text.indexOf('$') >= 0) return true;
+        if (expected === 'EUR' && text.indexOf('€') >= 0) return true;
+        if (expected === 'GBP' && text.indexOf('£') >= 0) return true;
+        return false;
+    }
+
+    // === NOWE w v6.3 ===
+    // Helper który tylko liczy ile jest wierszy płatności w tabeli Payments
+    // (wierszy z datą YYYY-MM-DD w pierwszej komórce). To kluczowy sygnał:
+    // jeśli po POST liczba nie wzrosła, serwer nic nie zapisał - nawet jeśli
+    // verifyBookedOnOrderPage znalazł dopasowanie do istniejącego wpisu.
+    function countPaymentRows(doc) {
+        const paymentTables = [...doc.querySelectorAll('table')].filter(table => {
+            const headerText = String(table.textContent || '').toLowerCase();
+            return headerText.indexOf('payments') >= 0 &&
+                headerText.indexOf('debit account') >= 0 &&
+                headerText.indexOf('credit account') >= 0;
+        });
+        let count = 0;
+        for (const table of paymentTables) {
+            for (const tr of table.querySelectorAll('tr')) {
+                const cells = [...tr.querySelectorAll('td,th')];
+                if (cells.length < 7) continue;
+                const firstCellText = String(cells[0].textContent || '').trim();
+                if (!/^\d{4}-\d{2}-\d{2}/.test(firstCellText)) continue;
+                count++;
+            }
+        }
+        return count;
+    }
+
+    function verifyBookedOnOrderPage(doc, row, currency, month, day, year) {
+        const expectedAmount = normalizeBookingAmount(row.amount);
+        const expectedCurrency = String(currency || '').trim();
+        const expectedDebit = String(row.debit || '').trim();
+        const expectedCredit = String(row.credit || '').trim();
+        const expectedComment = String(row.comment || '').trim().toLowerCase();
+        const expectedDate = normalizeDateYYYYMMDD(year, month, day);
+
+        const paymentTables = [...doc.querySelectorAll('table')].filter(table => {
+            const headerText = String(table.textContent || '').toLowerCase();
+            return headerText.indexOf('payments') >= 0 &&
+                headerText.indexOf('debit account') >= 0 &&
+                headerText.indexOf('credit account') >= 0;
+        });
+
+        // === ZMIANA w v6.5 ===
+        // Zapisane wiersze płatności w tabeli mają wartości w <input> i <select>
+        // (edycja inline). Musimy więc czytać wartości z tych pól.
+        // "Nowy płatność" form row jest pomijany przez filtr daty w cells[0]
+        // (textContent zaczyna się od "Set payment date" + opcji selectów, a nie od YYYY-MM-DD).
+
+        let inspectedRows = 0;
+
+        for (const table of paymentTables) {
+            const trs = [...table.querySelectorAll('tr')];
+
+            for (const tr of trs) {
+                const cells = [...tr.querySelectorAll('td,th')];
+                if (cells.length < 7) continue;
+
+                const firstCellText = String(cells[0].textContent || '').trim().toLowerCase();
+                if (!/^\d{4}-\d{2}-\d{2}/.test(firstCellText)) continue;
+
+                const dateText = controlValueText(cells[0]);
+                const amountText = controlValueText(cells[1]);
+                const currencyText = controlValueText(cells[2]);
+                const debitText = controlValueText(cells[3]);
+                const creditText = controlValueText(cells[4]);
+                const commentText = controlValueText(cells[6]).toLowerCase();
+
+                inspectedRows++;
+
+                const actualAmount = normalizeBookingAmount(amountText);
+
+                const amountOk = actualAmount === expectedAmount;
+                const currencyOk = cellHasCurrency(currencyText, expectedCurrency);
+                const debitOk = cellHasAccount(debitText, expectedDebit);
+                const creditOk = cellHasAccount(creditText, expectedCredit);
+                const commentOk = !expectedComment || commentText.indexOf(expectedComment) >= 0;
+                const dateOk = !expectedDate || dateText.indexOf(expectedDate) >= 0;
+
+                if (amountOk && currencyOk && debitOk && creditOk && commentOk && dateOk) {
+                    return {
+                        ok: true,
+                        matchedText: 'Potwierdzono w tabeli Payments: ' + expectedDate + ' | ' + expectedAmount + ' | ' + expectedCurrency + ' | ' + expectedDebit + '/' + expectedCredit
+                    };
+                }
+            }
+        }
+
+        // === USUNIĘTO w v6.4 ===
+        // Wcześniejszy fallback szukał wszystkich wartości gdziekolwiek na stronie
+        // (włącznie z wartościami inputów i opcjami selectów). Dawał on false-positive
+        // za każdym razem gdy: kwota = wartość całego orderu, debit/credit są w opcjach
+        // dropdownów, komentarz = istniejący komentarz na stronie, data = dzisiejsza.
+        // Bez tego fallbacku weryfikacja jest ścisła: musi istnieć rzeczywisty wiersz
+        // w tabeli Payments z naszymi wartościami.
+
+        return {
+            ok: false,
+            error: 'nie znaleziono wpisu w tabeli Payments (sprawdzono ' + inspectedRows + ' istniejących wierszy)'
+        };
+    }
+
+    async function fetchOrderDoc(orderId) {
+        const resp = await fetch(`/op_order.php?id=${orderId}`, { method:'GET', cache:'no-store' });
+        const html = await resp.text();
+        return new DOMParser().parseFromString(html, 'text/html');
+    }
+
+    async function postBookOrder(row, currency, month, day, year) {
+        const formData = formDataCache[row.id];
+        if (!formData) return { ok:false, error:'Brak danych — sprawdź ordery ponownie' };
+
+        formData.set('update',            'updatepayments');
+        formData.set('newamount',          row.amount);
+        formData.set('newcurrency',        currency);
+        formData.set('debit_account_new',  row.debit);
+        formData.set('credit_account_new', row.credit);
+        formData.set('newpaycomment',      row.comment||'');
+        formData.set('Date_Month',         month);
+        formData.set('Date_Day',           day);
+        formData.set('Date_Year',          year);
+
+        const resp = await fetch(`/op_order.php?id=${row.id}`, {
+            method:'POST', body:formData, redirect:'follow'
+        });
+
+        return (resp.ok || resp.status === 302 || resp.redirected)
+            ? { ok:true }
+            : { ok:false, error:`HTTP ${resp.status}` };
+    }
+
+    async function bookOrder(row, currency, month, day, year) {
+        let lastError = '';
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                // Pobierz stan PRZED i sprawdź czy już zaksięgowane
+                const beforeDoc = await fetchOrderDoc(row.id);
+                const beforeVerify = verifyBookedOnOrderPage(beforeDoc, row, currency, month, day, year);
+                if (beforeVerify.ok) {
+                    return { ok:true, attempts:attempt - 1, verified:true, alreadyBooked:true };
+                }
+
+                // === NOWE w v6.3 ===
+                // Policz wiersze Payments PRZED POST. Po POST musi wzrosnąć — inaczej
+                // serwer nic nie zapisał (mimo HTTP 200) i verifyBookedOnOrderPage
+                // mogłoby dać false-positive trafiając w istniejący wcześniej wpis.
+                const rowsBefore = countPaymentRows(beforeDoc);
+
+                const postResult = await postBookOrder(row, currency, month, day, year);
+                if (!postResult.ok) {
+                    lastError = 'Próba ' + attempt + ': ' + postResult.error;
+                    await new Promise(r => setTimeout(r, 800));
+                    continue;
+                }
+
+                await new Promise(r => setTimeout(r, 1200));
+
+                const afterDoc = await fetchOrderDoc(row.id);
+                const rowsAfter = countPaymentRows(afterDoc);
+                const verify = verifyBookedOnOrderPage(afterDoc, row, currency, month, day, year);
+
+                // === ZMIANA w v6.5 ===
+                // Sukces gdy liczba wierszy Payments wzrosła — niezależnie od verify.ok.
+                // Jeśli verify.ok i rowsAfter > rowsBefore → idealne dopasowanie
+                // Jeśli !verify.ok i rowsAfter > rowsBefore → POST dodał wiersz, ale weryfikator
+                //   nie potrafi precyzyjnie dopasować (np. inny format wartości). i tak SUKCES,
+                //   bo retry zrobiłby duplikat (to był bug poprzednich wersji).
+                if (rowsAfter > rowsBefore) {
+                    return {
+                        ok: true,
+                        attempts: attempt,
+                        verified: verify.ok,
+                        rowsBefore,
+                        rowsAfter,
+                        verifyNote: verify.ok ? null : ('weryfikator nie potrafił dopasować dodanego wiersza: ' + verify.error)
+                    };
+                }
+
+                // rowsAfter === rowsBefore — POST nie zadziałał (serwer zwrócił OK ale nic nie zapisał)
+                if (verify.ok) {
+                    // Verify trafił w istniejący wcześniej wiersz a żaden nie przybył.
+                    // Klasyczny false positive z poprzednich wersji.
+                    lastError = 'Próba ' + attempt + ': POST zwrócił OK, ale liczba wierszy w tabeli Payments się nie zmieniła (przed: ' + rowsBefore + ', po: ' + rowsAfter + '). Serwer nie zapisał płatności — możliwy brak/wygaszony token sesji, brak wymaganego pola w POST lub niewłaściwe uprawnienia. Sprawdź ręcznie w przeglądarce.';
+                } else {
+                    lastError = 'Próba ' + attempt + ': POST zwrócił OK, ale tabela Payments się nie zmieniła (przed: ' + rowsBefore + ', po: ' + rowsAfter + '). ' + verify.error;
+                }
+            } catch(e) {
+                lastError = 'Próba ' + attempt + ': ' + e.message;
+            }
+
+            await new Promise(r => setTimeout(r, 900));
+        }
+
+        return { ok:false, error:'Po 3 próbach nie udało się potwierdzić księgowania. ' + lastError };
+    }
+
+    function buildInitialTable(rows) {
+        const tbody = document.getElementById('tm-preview-body');
+        tbody.innerHTML = '';
+        rows.forEach((row,i) => tbody.appendChild(createTr(row,i)));
+    }
+
+    function updateRow(i) {
+        const tbody    = document.getElementById('tm-preview-body');
+        const existing = tbody.querySelector(`tr[data-row="${i}"]`);
+        const newTr    = createTr(previewRows[i], i);
+        if (existing) tbody.replaceChild(newTr, existing);
+        else tbody.appendChild(newTr);
+    }
+
+    function createTr(row, i) {
+        const tr = document.createElement('tr');
+        tr.dataset.row   = i;
+        tr.style.background = i%2===0 ? '#fff' : '#f9fafb';
+
+        const tdId = document.createElement('td');
+        tdId.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;font-weight:bold;white-space:nowrap;';
+        const idLink = document.createElement('a');
+        idLink.href = `/op_order.php?id=${row.id}`;
+        idLink.target = '_blank';
+        idLink.textContent = row.id;
+        idLink.style.cssText = 'color:#FF2F00;text-decoration:none;';
+        idLink.onmouseenter = () => idLink.style.textDecoration = 'underline';
+        idLink.onmouseleave = () => idLink.style.textDecoration = 'none';
+        tdId.appendChild(idLink);
+        tr.appendChild(tdId);
+
+        if (row.loading) {
+            ['ładowanie…','ładowanie…','ładowanie…','⏳'].forEach((txt,ci) => {
+                const td = document.createElement('td');
+                td.style.cssText = `padding:4px 6px;border:1px solid #e5e7eb;color:#aaa;font-style:italic;${ci===3?'text-align:center':''}`;
+                td.textContent = ci===0 ? row.amount : txt;
+                tr.appendChild(td);
+            });
+            return tr;
+        }
+
+        tr.appendChild(makeInlineEditTd(row.amount, i, 'amount', '70px'));
+
+        const tdK = document.createElement('td');
+        tdK.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;white-space:nowrap;';
+        tdK.appendChild(makeAccountsWidget(row, i));
+        tr.appendChild(tdK);
+
+        const tdO = document.createElement('td');
+        tdO.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;min-width:150px;';
+
+        const commentWrap = document.createElement('div');
+        commentWrap.style.cssText = 'display:flex;align-items:center;gap:5px;';
+
+        const commentLabel = document.createElement('span');
+        commentLabel.id    = `tm-comment-label-${row.id}`;
+        commentLabel.style.cssText = 'flex:1;color:#374151;font-size:12px;';
+        commentLabel.textContent   = row.comment || '—';
+
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '✏️';
+        editBtn.title       = 'Edytuj opis';
+        editBtn.style.cssText = `
+            background:none;border:none;cursor:pointer;
+            font-size:13px;padding:1px 3px;border-radius:4px;
+            flex-shrink:0;
+        `;
+        editBtn.onmouseenter = () => editBtn.style.background = '#eff6ff';
+        editBtn.onmouseleave = () => editBtn.style.background = 'none';
+
+        editBtn.onclick = (e) => {
+            e.stopPropagation();
+            openCommentPopup(row.id, previewRows[i].comment, editBtn, (newVal) => {
+                previewRows[i].comment = newVal;
+                commentLabel.textContent = newVal || '—';
+                const statusCell = document.getElementById(`tm-status-${row.id}`);
+                if (statusCell) {
+                    statusCell.innerHTML = newVal
+                        ? '<span style="color:#16a34a">✅ OK</span>'
+                        : '<span style="color:#f59e0b">⚠️ brak opisu</span>';
+                }
+            });
+        };
+
+        commentWrap.appendChild(commentLabel);
+        commentWrap.appendChild(editBtn);
+        tdO.appendChild(commentWrap);
+        tr.appendChild(tdO);
+
+        const tdS = document.createElement('td');
+        tdS.id    = `tm-status-${row.id}`;
+        tdS.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;text-align:center;white-space:nowrap;';
+        if (row.error) {
+            tdS.innerHTML = `<span style="color:#dc2626" title="${row.error}">⚠️ błąd</span>`;
+        } else {
+            tdS.innerHTML = row.comment
+                ? '<span style="color:#16a34a">✅ OK</span>'
+                : '<span style="color:#f59e0b">⚠️ brak opisu</span>';
+        }
+        tr.appendChild(tdS);
+
+        return tr;
+    }
+
+    function makeInlineEditTd(value, rowIndex, key, minWidth) {
+        const td = document.createElement('td');
+        td.style.cssText = `padding:4px 6px;border:1px solid #e5e7eb;min-width:${minWidth};`;
+        let cur = value;
+
+        function showSpan() {
+            td.innerHTML = '';
+            const span = document.createElement('span');
+            span.textContent = cur||'—';
+            span.title = 'Kliknij aby edytować';
+            span.style.cssText = 'cursor:pointer;display:block;border-radius:3px;padding:1px 3px;transition:background 0.15s;min-height:18px;';
+            span.onmouseenter = () => span.style.background='#eff6ff';
+            span.onmouseleave = () => span.style.background='';
+            span.onclick = showInput;
+            td.appendChild(span);
+        }
+
+        function showInput() {
+            td.innerHTML = '';
+            const inp = document.createElement('input');
+            inp.value = cur;
+            inp.style.cssText = 'width:100%;box-sizing:border-box;padding:2px 4px;font-size:12px;border:1px solid #FF2F00;border-radius:3px;outline:none;';
+            td.appendChild(inp);
+            inp.focus(); inp.select();
+
+            inp.onblur = () => { cur=inp.value.trim(); previewRows[rowIndex][key]=cur; showSpan(); };
+            inp.onkeydown = (e) => {
+                if (e.key==='Enter')  { inp.blur(); }
+                if (e.key==='Escape') { td.innerHTML=''; showSpan(); }
+            };
+        }
+
+        showSpan();
+        return td;
+    }
+
+    function makeAccountsWidget(row, rowIndex) {
+        const wrap = document.createElement('span');
+        wrap.style.cssText = 'display:flex;gap:3px;align-items:center;';
+        const makeInp = (key) => {
+            const inp = document.createElement('input');
+            inp.value = row[key];
+            inp.style.cssText = 'width:46px;padding:2px 4px;font-size:12px;border:1px solid #ccc;border-radius:3px;text-align:center;';
+            inp.oninput = () => { previewRows[rowIndex][key]=inp.value.trim(); };
+            return inp;
+        };
+        const slash = document.createElement('span');
+        slash.textContent='/'; slash.style.color='#999';
+        wrap.appendChild(makeInp('debit'));
+        wrap.appendChild(slash);
+        wrap.appendChild(makeInp('credit'));
+        return wrap;
+    }
+
+    panel.querySelector('#tm-check-btn').onclick = async () => {
+        const raw    = document.getElementById('tm-order-input').value;
+        const orders = parseOrders(raw);
+        if (!orders.length) {
+            document.getElementById('tm-parsed-preview').innerHTML =
+                '<span style="color:red">⚠️ Brak danych!</span>';
+            return;
+        }
+
+        const debit  = document.getElementById('tm-debit').value;
+        const credit = document.getElementById('tm-credit').value;
+
+        document.getElementById('tm-preview-section').style.display = 'block';
+        document.getElementById('tm-progress').style.display = 'none';
+        document.getElementById('tm-summary').innerHTML = '';
+        document.getElementById('tm-progress-list').innerHTML = '';
+
+        previewRows = orders.map(o => ({
+            id:o.id, amount:o.amount, debit, credit,
+            comment:'', loading:true, error:null,
+        }));
+
+        buildInitialTable(previewRows);
+
+        const checkBtn = document.getElementById('tm-check-btn');
+        checkBtn.disabled = true;
+        checkBtn.textContent = '⏳ Sprawdzam…';
+
+        for (let i=0; i<previewRows.length; i++) {
+            const row = previewRows[i];
+            try {
+                const { formData, depositComment } = await fetchOrderData(row.id);
+                formDataCache[row.id] = formData;
+                row.comment = depositComment;
+                row.loading = false;
+            } catch(e) {
+                row.loading = false;
+                row.error   = e.message;
+            }
+            updateRow(i);
+            await new Promise(r => setTimeout(r, 200));
+        }
+
+        checkBtn.disabled = false;
+        checkBtn.textContent = '🔍 Sprawdź ordery';
+    };
+
+    panel.querySelector('#tm-book-btn').onclick = async () => {
+        if (!previewRows.length) return;
+
+        const currency = document.getElementById('tm-currency').value;
+        const month    = document.getElementById('tm-month').value;
+        const day      = document.getElementById('tm-day').value;
+        const year     = document.getElementById('tm-year').value;
+
+        const progressDiv  = document.getElementById('tm-progress');
+        const progressList = document.getElementById('tm-progress-list');
+        const summary      = document.getElementById('tm-summary');
+        const bookBtn      = document.getElementById('tm-book-btn');
+
+        progressDiv.style.display = 'block';
+        progressList.innerHTML = '';
+        summary.innerHTML = '';
+        bookBtn.disabled  = true;
+        bookBtn.textContent = '⏳ Księguję…';
+
+        let ok=0, fail=0;
+
+        for (const row of previewRows) {
+            const logRow = document.createElement('div');
+            logRow.style.cssText = 'padding:3px 0;border-bottom:1px solid #f0f0f0;';
+            logRow.innerHTML = `⏳ <strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'brak opisu'}</em>…`;
+            progressList.appendChild(logRow);
+            progressList.scrollTop = progressList.scrollHeight;
+
+            const result = await bookOrder(row, currency, month, day, year);
+            const statusCell = document.getElementById(`tm-status-${row.id}`);
+
+            if (result.ok) {
+                ok++;
+                // v6.5: pokaż info o zmianie liczby wierszy + ostrzeżenie jeśli weryfikator nie dopasował
+                const rowsInfo = (result.rowsBefore != null && result.rowsAfter != null)
+                    ? ` | Payments: ${result.rowsBefore} → ${result.rowsAfter}`
+                    : '';
+                const noteInfo = result.verifyNote
+                    ? ` <span style="color:#b45309">(⚠ ${result.verifyNote})</span>`
+                    : '';
+                logRow.innerHTML = `✅ <strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'—'}</em> — zaksięgowano i potwierdzono po ${result.attempts || 1} próbie/próbach${result.alreadyBooked ? ' (wpis był już widoczny)' : rowsInfo}${noteInfo}`;
+                logRow.style.color = '#16a34a';
+                if (statusCell) statusCell.innerHTML = '<span style="color:#16a34a">✅ zaksięgowany</span>';
+            } else {
+                fail++;
+                logRow.innerHTML = `❌ <strong>${row.id}</strong> — BŁĄD: ${result.error}`;
+                logRow.style.color = '#dc2626';
+                if (statusCell) statusCell.innerHTML = `<span style="color:#dc2626">❌ błąd</span>`;
+            }
+
+            await new Promise(r => setTimeout(r, 600));
+        }
+
+        summary.innerHTML = fail===0
+            ? `🎉 Zaksięgowano wszystkie <strong>${ok}</strong> ordery poprawnie!`
+            : `✅ OK: <strong>${ok}</strong> &nbsp; ❌ Błędy: <strong>${fail}</strong>`;
+        summary.style.color = fail===0 ? '#16a34a' : '#b45309';
+
+        bookBtn.disabled = false;
+        bookBtn.textContent = '🚀 Zaksięguj wszystkie w tle';
+    };
+
+    btn.onclick = () => {
+        const opening = panel.style.display === 'none';
+        panel.style.display = opening ? 'block' : 'none';
+        if (opening) {
+            document.getElementById('tm-order-input')
+                ?.addEventListener('input', updateTextPreview);
+        }
+    };
+
+    document.addEventListener('click', (e) => {
+        if (!btn.contains(e.target) && !panel.contains(e.target) && !commentPopup.contains(e.target)) {
+            panel.style.display = 'none';
+        }
+    });
+
+    document.body.appendChild(btn);
+    document.body.appendChild(panel);
+})();
+    }
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
@@ -9857,6 +10728,8 @@
         { id: 'issuelog', name: 'Issue Log - Faktury',       test: onProlo,   init: init_issuelog },
         { id: 'klient',   name: 'Zmiana typu klienta',       test: onProlo,   init: init_klient },
         { id: 'allegro',  name: 'Allegro CZ/HU/SK',          test: onAllegro, init: init_allegro },
+        { id: 'opsheet',  name: 'Statusy kontenerow (op_sheet)', test: onProlo,   init: init_opsheet },
+        { id: 'deposit',  name: 'Ksiegowanie depozytow (op_order)', test: onProlo, init: init_deposit },
     ];
 
     MODULES.forEach(function (m) {
