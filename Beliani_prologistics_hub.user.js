@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.21.2
+// @version      1.22
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22,6 +22,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @run-at       document-idle
 // @updateURL   https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
 // @downloadURL https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
@@ -10750,6 +10751,12 @@
         function checkUpdate(){
             var RAW = 'https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js';
             try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) RAW = GM_info.script.downloadURL; } catch(e){}
+            var copied = false;
+            try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(RAW, 'text'); copied = true; } } catch(e){}
+            if (!copied) { try { navigator.clipboard.writeText(RAW); copied = true; } catch(e){} }
+            var tip = copied
+                ? '\n\n\ud83d\udccb Link RAW skopiowany do schowka.\n\u2022 ScriptCat: Link Import \u2192 wklej (Ctrl+V) \u2192 OK  (albo przy skrypcie: Sprawd\u017a aktualizacje)\n\u2022 Tampermonkey: potwierd\u017a poni\u017cej, aby otworzy\u0107 stron\u0119 instalacji'
+                : '\n\nLink RAW: ' + RAW;
             var current = '?';
             try { if (typeof GM_info !== 'undefined' && GM_info.script) current = GM_info.script.version || '?'; } catch(e){}
             function cmp(a,b){ var pa=String(a).split('.').map(Number), pb=String(b).split('.').map(Number); for (var i=0;i<Math.max(pa.length,pb.length);i++){ var x=pa[i]||0, y=pb[i]||0; if (x!==y) return x-y; } return 0; }
@@ -10760,16 +10767,16 @@
                     onload: function(resp){
                         var m = (resp.responseText || '').match(/@version\s+([0-9.]+)/);
                         var latest = m ? m[1] : null;
-                        if (!latest) { alert('Nie udało się odczytać wersji z GitHub.'); return; }
+                        if (!latest) { alert('Nie uda\u0142o si\u0119 odczyta\u0107 wersji z GitHub.' + tip); return; }
                         if (cmp(latest, current) > 0) {
-                            if (confirm('Nowa wersja: ' + latest + ' (masz ' + current + ').\n\nOtworzyć stronę instalacji? W menedżerze potwierdzisz „Update".')) {
+                            if (confirm('Nowa wersja: ' + latest + ' (masz ' + current + ').' + tip + '\n\nOtworzy\u0107 stron\u0119 instalacji teraz?')) {
                                 window.open(RAW, '_blank');
                             }
                         } else {
-                            alert('Masz najnowszą wersję (' + current + ').');
+                            alert('Masz najnowsz\u0105 wersj\u0119 (' + current + ').' + tip);
                         }
                     },
-                    onerror: function(){ alert('Nie udało się sprawdzić aktualizacji (połączenie / @connect).'); }
+                    onerror: function(){ alert('Nie uda\u0142o si\u0119 sprawdzi\u0107 wersji (po\u0142\u0105czenie).' + tip); }
                 });
             } catch(e){ window.open(RAW, '_blank'); }
         }
