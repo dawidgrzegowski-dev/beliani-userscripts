@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.15
+// @version      1.16
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5788,6 +5788,8 @@
                         if (stateValue !== 'Refund approved') continue;
                         const _lid = stateSelect ? stateSelect.getAttribute('data-log-id') : null;
                         if (_lid) approvedLogIds.push(_lid);
+                        const _bankEl = row.querySelector('a[href*="bank_settings"]');
+                        const _bank = _bankEl ? (_bankEl.textContent || '').trim() : '';
 
                         const cells = row.querySelectorAll('td');
 
@@ -5796,7 +5798,7 @@
 
                             if (amt !== null && amt > 0) {
                                 approvedAmounts.push(amt);
-                                approvedPairs.push({ amount: amt, logId: _lid });
+                                approvedPairs.push({ amount: amt, logId: _lid, bankName: _bank });
                             }
                         }
                     }
@@ -5817,15 +5819,16 @@
 
             approvedPairs.forEach(pr => {
                 const key = pr.amount.toFixed(2);
-                (amountGroups[key] = amountGroups[key] || []).push(pr.logId);
+                (amountGroups[key] = amountGroups[key] || []).push({ logId: pr.logId, bankName: pr.bankName || '' });
             });
 
             const internalDuplicates = Object.entries(amountGroups)
-                .filter(([, ids]) => ids.length > 1)
-                .map(([amt, ids]) => ({
+                .filter(([, arr]) => arr.length > 1)
+                .map(([amt, arr]) => ({
                     amount: parseFloat(amt),
-                    count: ids.length,
-                    logIds: ids.filter(Boolean)
+                    count: arr.length,
+                    logIds: arr.map(x => x.logId).filter(Boolean),
+                    items: arr.filter(x => x.logId)
                 }));
 
             const refundAmount = approvedAmounts.reduce((s, a) => s + a, 0);
@@ -6014,7 +6017,7 @@
                 .map(d => {
                     let h = `<div style="margin-bottom:4px;">⚠️ <strong>${d.auftrag}</strong>:</div>`;
                     d.duplicates.forEach(x => {
-                        const boxes = (x.logIds || []).map(lid => `<label style="margin-right:10px;white-space:nowrap;"><input type="checkbox" class="tm-deact-cb" data-logid="${lid}"> deaktywuj #${lid}</label>`).join('');
+                        const boxes = (x.items || []).map(it => `<label style="margin-right:12px;white-space:nowrap;"><input type="checkbox" class="tm-deact-cb" data-logid="${it.logId}"> deaktywuj #${it.logId}${it.bankName ? ' — <b>' + it.bankName + '</b>' : ''}</label>`).join('');
                         h += `<div style="margin-left:14px;">${formatAmount(x.amount)} ×${x.count} → ${boxes}</div>`;
                     });
                     return h;
