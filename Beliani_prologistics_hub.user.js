@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.23
+// @version      1.24
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -7441,7 +7441,7 @@
     function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
     function toast(m) { if (!toastEl) return; toastEl.textContent = m; toastEl.style.display = 'block'; clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.style.display = 'none', 3200); }
 
-    // ===== Wyszukiwarka issue z filtrami (w tym PAID = "---" puste) =====
+    // ===== Wyszukiwarka issue (PAID: Yes/No/-/---/Abroad + wykluczanie firm) =====
     (function setupIssueSearch(){
         const ORIGIN = location.origin;
         const VIEW = '93';
@@ -7451,12 +7451,12 @@
         async function loadFields(){ try { const d = await api(ORIGIN + '/api/issueFieldTypeValue/getAdditionalFieldsList?view_id=' + VIEW); return d.fields || {}; } catch(e){ return {}; } }
         async function fetchAll(baseParams, statusEl){
             var all = [], page = 1, total = 0;
-            while (page <= 30) {
+            while (page <= 40) {
                 var d = await api(ORIGIN + '/api/issueLog/list/?' + baseParams + '&page=' + page + '&per_page=50');
                 var list = d.issue_list || [];
                 all = all.concat(list);
                 total = parseInt((d.issue_pagination||{}).total || '0', 10) || 0;
-                if (statusEl) statusEl.textContent = 'Pobieram… ' + all.length + '/' + total;
+                if (statusEl) statusEl.textContent = 'Pobieram\u2026 ' + all.length + '/' + total;
                 if (list.length === 0 || all.length >= total) break;
                 page++;
             }
@@ -7468,7 +7468,7 @@
         sbtn.style.cssText = 'position:fixed;right:16px;bottom:198px;z-index:2147483000;background:#750000;color:#fff;border:none;border-radius:24px;padding:12px 16px;font:600 13px system-ui;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)';
         const sp = document.createElement('div');
         sp.id = 'ilp-search-panel';
-        sp.style.cssText = 'display:none;position:fixed;right:16px;bottom:240px;z-index:2147483000;background:#fff;border:1px solid #ccc;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);padding:16px;width:420px;max-height:calc(100vh - 130px);overflow-y:auto;font-family:system-ui;color:#332524;';
+        sp.style.cssText = 'display:none;position:fixed;right:12px;top:70px;z-index:2147483000;background:#fff;border:1px solid #ccc;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);padding:16px;width:430px;max-height:calc(100vh - 90px);overflow-y:auto;font-family:system-ui;color:#332524;';
         sp.innerHTML = '<div style="font-weight:bold;color:#750000;margin-bottom:8px;">Szukaj issue (filtry)</div><div id="ilp-s-filters" style="font-size:12px;">\u0141adowanie p\u00f3l\u2026</div>';
         document.body.appendChild(sbtn);
         document.body.appendChild(sp);
@@ -7489,10 +7489,22 @@
                 var fid = f.id;
                 var opts = '<option value="">(wszystkie)</option>';
                 (f.values||[]).forEach(function(v){ opts += '<option value="' + v.id + '">' + esc(v.value) + '</option>'; });
-                if (fid === PAID_FID) opts += '<option value="__EMPTY__">--- (puste)</option>';
+                if (fid === PAID_FID) opts += '<option value="__EMPTY__">--- (puste)</option><option value="__ABROAD__">Abroad (No + - + ---)</option>';
                 h += '<label style="display:block;margin:6px 0 2px;font-weight:600;">' + esc(f.name) + '</label>';
                 h += '<select class="ilp-s-field" data-fid="' + fid + '" style="width:100%;padding:6px;">' + opts + '</select>';
             });
+            var comp = null;
+            Object.keys(FIELDS).forEach(function(n){ if (FIELDS[n].id === '556' || n === 'Company') comp = FIELDS[n]; });
+            if (comp && comp.values) {
+                var pre = ['dkv','chronopost','postnl','hoyer'];
+                h += '<label style="display:block;margin:12px 0 2px;font-weight:600;">Wyklucz firmy (Company):</label>';
+                h += '<div style="max-height:140px;overflow-y:auto;border:1px solid #eee;border-radius:6px;padding:6px;">';
+                comp.values.forEach(function(v){
+                    var chk = pre.some(function(p){ return (v.value||'').toLowerCase().indexOf(p) !== -1; }) ? ' checked' : '';
+                    h += '<label style="display:block;font-size:12px;"><input type="checkbox" class="ilp-s-excl" data-cid="' + v.id + '"' + chk + '> ' + esc(v.value) + '</label>';
+                });
+                h += '</div>';
+            }
             h += '<button id="ilp-s-go" style="margin-top:12px;width:100%;padding:9px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83d\udd0e Szukaj</button>';
             h += '<div id="ilp-s-status" style="font-size:11px;color:#666;margin-top:8px;"></div>';
             h += '<div id="ilp-s-results" style="margin-top:8px;font-size:12px;"></div>';
@@ -7509,18 +7521,28 @@
             if (comment) parts.push('by_comment=' + encodeURIComponent(comment));
             var solving = (sp.querySelector('#ilp-s-solving').value || '').trim();
             if (solving) parts.push('solving_resp_username[]=' + encodeURIComponent(solving));
-            var paidEmpty = false;
+            var paidMode = '';
             sp.querySelectorAll('.ilp-s-field').forEach(function(sel){
                 var fid = sel.getAttribute('data-fid'); var val = sel.value;
+                if (fid === PAID_FID) { paidMode = val; return; }
                 if (!val) return;
-                if (fid === PAID_FID && val === '__EMPTY__') { paidEmpty = true; return; }
                 parts.push('addition[' + fid + '][]=' + encodeURIComponent(val));
             });
+            var exclSet = {};
+            sp.querySelectorAll('.ilp-s-excl:checked').forEach(function(cb){ exclSet[cb.getAttribute('data-cid')] = 1; });
             status.textContent = 'Szukam\u2026';
             try {
                 var list = await fetchAll(parts.join('&'), status);
-                if (paidEmpty) {
-                    list = list.filter(function(it){ var v = String(it['PAID - Finance'] == null ? '' : it['PAID - Finance']); return v !== PAID.yes && v !== PAID.no && v !== PAID.dash; });
+                if (paidMode) {
+                    list = list.filter(function(it){
+                        var v = String(it['PAID - Finance'] == null ? '' : it['PAID - Finance']);
+                        if (paidMode === '__EMPTY__') return v !== PAID.yes && v !== PAID.no && v !== PAID.dash;
+                        if (paidMode === '__ABROAD__') return v !== PAID.yes;
+                        return v === paidMode;
+                    });
+                }
+                if (Object.keys(exclSet).length) {
+                    list = list.filter(function(it){ return !exclSet[String(it['Company'] == null ? '' : it['Company'])]; });
                 }
                 status.textContent = 'Znaleziono: ' + list.length;
                 if (!list.length) { results.innerHTML = '<div style="color:#888">Brak.</div>'; return; }
@@ -7529,9 +7551,11 @@
                     var id = it.id || it.organization_issue_number;
                     return '<div style="padding:4px 0;border-bottom:1px solid #f0f0f0;"><a href="' + ORIGIN + '/react/logs/issue_logs/' + id + '" target="_blank"><strong>' + id + '</strong></a> \u2014 ' + esc(it.issue || '') + ' <span style="color:#750000;">[PAID: ' + paidLabel(it['PAID - Finance']) + ']</span></div>';
                 }).join('');
+                rh += '<div style="text-align:center;margin-top:10px;"><button id="ilp-s-top" style="padding:5px 12px;border:1px solid #ccc;border-radius:6px;background:#f6e7e6;cursor:pointer;">\u2b06 Do g\u00f3ry</button></div>';
                 results.innerHTML = rh;
-                var cb = results.querySelector('#ilp-s-copy');
-                if (cb) cb.onclick = function(){ var nums = list.map(function(it){ return it.id || it.organization_issue_number; }).join('\n'); try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(nums, 'text'); else navigator.clipboard.writeText(nums); status.textContent = 'Skopiowano ' + list.length + ' numer\u00f3w.'; } catch(e){} };
+                var cb2 = results.querySelector('#ilp-s-copy');
+                if (cb2) cb2.onclick = function(){ var nums = list.map(function(it){ return it.id || it.organization_issue_number; }).join('\n'); try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(nums, 'text'); else navigator.clipboard.writeText(nums); status.textContent = 'Skopiowano ' + list.length + ' numer\u00f3w.'; } catch(e){} };
+                var tb = results.querySelector('#ilp-s-top'); if (tb) tb.onclick = function(){ sp.scrollTop = 0; };
             } catch(e){ status.textContent = 'B\u0142\u0105d: ' + e.message; }
         }
         buildFilters();
