@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.18
+// @version      1.20
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -9849,71 +9849,6 @@
     }
 
     // ===== Rejestr modułów + przełączniki per osoba =====
-    function init_opsheet() {
-        (function(){
-            if (window.__opStatusLoaded) return;
-            if (!/op_sheet\.php/i.test(location.href)) return;
-            window.__opStatusLoaded = true;
-            const BASE = location.origin;
-
-            function getStatusOptions(){
-                const sel = document.querySelector('select[data-field="status_id"]');
-                if (!sel) return [];
-                return Array.from(sel.options).filter(o => o.value).map(o => ({ value: o.value, label: (o.textContent || '').trim() }));
-            }
-            async function changeStatus(containerId, value){
-                try {
-                    const body = 'fn=change_op_container&field=status_id&container_id=' + encodeURIComponent(containerId) + '&value=' + encodeURIComponent(value);
-                    const resp = await fetch(BASE + '/js_backend.php', { method:'POST', credentials:'same-origin', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With':'XMLHttpRequest' }, body: body });
-                    if (!resp.ok) return { ok:false, error:'HTTP ' + resp.status };
-                    let data = null; try { data = await resp.json(); } catch(e){}
-                    return { ok:true, res: (data && data.res != null) ? data.res : '' };
-                } catch(e){ return { ok:false, error:e.message }; }
-            }
-
-            const btn = document.createElement('button');
-            btn.id = 'op-status-btn';
-            btn.textContent = '\ud83d\udce6 Statusy kontenerow';
-            btn.style.cssText = 'position:fixed;right:12px;top:120px;z-index:999999;padding:9px 14px;background:#FF2F00;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;font-family:sans-serif;font-size:13px;';
-            const panel = document.createElement('div');
-            panel.id = 'op-status-panel';
-            panel.style.cssText = 'display:none;position:fixed;right:12px;top:158px;z-index:999999;background:#fff;border:1px solid #ccc;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.15);padding:16px;width:340px;font-family:sans-serif;color:#332524;';
-            panel.innerHTML =
-                '<div style="font-weight:bold;color:#750000;margin-bottom:8px;">Zmiana statusu zaznaczonych kontenerow</div>'
-              + '<div style="font-size:11px;color:#666;margin-bottom:8px;">Zaznacz wiersze checkboxami na liscie, wybierz status i zmien.</div>'
-              + '<label style="font-size:12px;display:block;margin-bottom:4px;">Nowy status:</label>'
-              + '<select id="op-status-target" style="width:100%;padding:6px;margin-bottom:10px;"></select>'
-              + '<button id="op-status-go" style="width:100%;padding:9px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:13px;">\u26a1 Zmien zaznaczone (API)</button>'
-              + '<div id="op-status-info" style="font-size:11px;color:#666;margin-top:8px;"></div>';
-            document.body.appendChild(btn);
-            document.body.appendChild(panel);
-
-            const tgt = panel.querySelector('#op-status-target');
-            getStatusOptions().forEach(o => { const el = document.createElement('option'); el.value = o.value; el.textContent = o.label; if (/waiting for SM/i.test(o.label)) el.selected = true; tgt.appendChild(el); });
-
-            btn.onclick = () => { panel.style.display = (panel.style.display === 'none' ? 'block' : 'none'); };
-
-            panel.querySelector('#op-status-go').onclick = async () => {
-                const info = panel.querySelector('#op-status-info');
-                const value = tgt.value;
-                const label = tgt.options[tgt.selectedIndex] ? tgt.options[tgt.selectedIndex].textContent : value;
-                const checked = Array.from(document.querySelectorAll('input[name="group[]"]:checked'));
-                const ids = Array.from(new Set(checked.map(cb => cb.getAttribute('data-container-id')).filter(Boolean)));
-                if (!ids.length) { info.textContent = 'Zaznacz kontenery (checkboxy przy wierszach).'; return; }
-                if (!value) { info.textContent = 'Wybierz status.'; return; }
-                if (!confirm('Zmienic status na "' + label + '" dla ' + ids.length + ' kontenerow?')) return;
-                info.textContent = 'Zmieniam...';
-                let ok = 0, err = 0;
-                for (const cid of ids) {
-                    const res = await changeStatus(cid, value);
-                    if (res.ok) { ok++; const rowSel = document.getElementById('status_id[' + cid + ']'); if (rowSel) rowSel.value = value; }
-                    else { err++; }
-                }
-                info.textContent = 'Gotowe: ' + ok + ' zmienione' + (err ? ', ' + err + ' blad' : '') + '.';
-            };
-        })();
-    }
-
     function init_deposit() {
 (function () {
     'use strict';
@@ -9925,6 +9860,7 @@
 
     const btn = document.createElement("button");
     btn.innerText = "📦 Księgowanie chińskich depozytów";
+    btn.id = 'deposit-btn';
     btn.style.cssText = `
         position:fixed; top:20px; right:20px; z-index:999999;
         padding:10px 15px; background:#FF2F00; color:white;
@@ -10367,6 +10303,29 @@
             : { ok:false, error:`HTTP ${resp.status}` };
     }
 
+    async function ensureContainerStatus(orderId) {
+        try {
+            const doc = await fetchOrderDoc(orderId);
+            const sel = doc.querySelector('select[data-field="status_id"]') || doc.querySelector('select[id^="status_id["]');
+            if (!sel) return { html: ' <span style="color:#b45309">| status: nie znaleziono pola na op_order</span>' };
+            const cid = sel.getAttribute('data-container-id') || ((sel.id.match(/status_id\[(\d+)\]/) || [])[1]);
+            if (!cid) return { html: ' <span style="color:#b45309">| status: brak container-id</span>' };
+            const opt = Array.from(sel.options).find(function(o){ return /waiting for SM/i.test(o.textContent || ''); });
+            const targetVal = opt ? opt.value : '18';
+            const curVal = String(sel.value || '');
+            const curLabel = ((sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : curVal) || '').trim();
+            if (curVal === String(targetVal)) {
+                return { html: ' <span style="color:#0f766e">| status juz: waiting for SM</span>' };
+            }
+            const body = 'fn=change_op_container&field=status_id&container_id=' + encodeURIComponent(cid) + '&value=' + encodeURIComponent(targetVal);
+            const resp = await fetch('/js_backend.php', { method:'POST', credentials:'same-origin', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With':'XMLHttpRequest' }, body: body });
+            if (!resp.ok) return { html: ' <span style="color:#dc2626">| status: BLAD zmiany (HTTP ' + resp.status + ')</span>' };
+            return { html: ' <span style="color:#16a34a">| status: zmieniono na waiting for SM (bylo: ' + curLabel + ')</span>' };
+        } catch (e) {
+            return { html: ' <span style="color:#dc2626">| status: blad (' + e.message + ')</span>' };
+        }
+    }
+
     async function bookOrder(row, currency, month, day, year) {
         let lastError = '';
 
@@ -10681,6 +10640,8 @@
                 logRow.innerHTML = `✅ <strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'—'}</em> — zaksięgowano i potwierdzono po ${result.attempts || 1} próbie/próbach${result.alreadyBooked ? ' (wpis był już widoczny)' : rowsInfo}${noteInfo}`;
                 logRow.style.color = '#16a34a';
                 if (statusCell) statusCell.innerHTML = '<span style="color:#16a34a">✅ zaksięgowany</span>';
+                const _st = await ensureContainerStatus(row.id);
+                logRow.innerHTML += _st.html;
             } else {
                 fail++;
                 logRow.innerHTML = `❌ <strong>${row.id}</strong> — BŁĄD: ${result.error}`;
@@ -10728,7 +10689,6 @@
         { id: 'issuelog', name: 'Issue Log - Faktury',       test: onProlo,   init: init_issuelog },
         { id: 'klient',   name: 'Zmiana typu klienta',       test: onProlo,   init: init_klient },
         { id: 'allegro',  name: 'Allegro CZ/HU/SK',          test: onAllegro, init: init_allegro },
-        { id: 'opsheet',  name: 'Statusy kontenerow (op_sheet)', test: onProlo,   init: init_opsheet },
         { id: 'deposit',  name: 'Ksiegowanie depozytow (op_order)', test: onProlo, init: init_deposit },
     ];
 
@@ -10776,6 +10736,7 @@
             { id:'klient',   icon:svgIco('<circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2"/>'), label:'Zmiana typu klienta', sel:'#klient-btn' },
             { id:'sepa',     icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M9 13h6"/><path d="M9 17h6"/>'), label:'Walidator SEPA', sel:'#sepa-btn' },
             { id:'issuelog', icon:svgIco('<rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><path d="M9 12h.01"/><path d="M13 12h2"/><path d="M9 16h.01"/><path d="M13 16h2"/>'), label:'Issue / PAID', sel:'#ilp-btn' },
+            { id:'deposit',  icon:svgIco('<path d="M12 3l8 4.5v9l-8 4.5l-8 -4.5v-9z"/><path d="M12 12l8 -4.5"/><path d="M12 12v9"/><path d="M12 12l-8 -4.5"/>'), label:'Księgowanie depozytów', sel:'#deposit-btn' },
         ];
 
         function hideBtns(){ LAUNCH_TOOLS.forEach(function(t){ const b = document.querySelector(t.sel); if (b) b.style.display = 'none'; }); }
