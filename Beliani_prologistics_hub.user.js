@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.34
+// @version      1.35
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10987,9 +10987,12 @@
         }
         async function resolveAccounts(status){
             var depoAcc = {};
-            await runPool(state.depo.orders, async function(o){ var a = await orderToAcc(o); if (a) depoAcc[a] = 1; }, function(d, n){ if (status) status.textContent = 'Konta depo: ' + (n ? Math.round(d/n*100) : 100) + '%'; });
+            var total = state.depo.orders.length + state.order.length, done = 0;
+            function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
+            prog();
+            await runPool(state.depo.orders, async function(o){ var a = await orderToAcc(o); if (a) depoAcc[a] = 1; done++; prog(); }, null);
             var sup = state.order.slice();
-            await runPool(sup, async function(s){ var o = firstOrder(s); if (!o) { state.sup2cid[s] = null; return; } var cid = await orderToCompany(o); state.sup2cid[s] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[s] = 1; }, function(d, n){ if (status) status.textContent = 'Konta balance: ' + (n ? Math.round(d/n*100) : 100) + '%'; });
+            await runPool(sup, async function(s){ var o = firstOrder(s); if (o) { var cid = await orderToCompany(o); state.sup2cid[s] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[s] = 1; } else { state.sup2cid[s] = null; } done++; prog(); }, null);
             state.resolved = true;
         }
         wp.querySelector('#wp-go').onclick = async function(){
@@ -11013,8 +11016,8 @@
             var uniq = [], seen = {};
             state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
             _pen = {};
-            status.textContent = 'Czytam komentarze/penalties\u2026';
-            await runPool(uniq, async function(o){ await orderToCompany(o); }, function(d, n){ if (status) status.textContent = 'Penalties: ' + (n ? Math.round(d/n*100) : 100) + '%'; });
+            var pdone = 0, ptot = uniq.length; function pprog(){ if (status) status.textContent = 'Penalties: ' + (ptot ? Math.round(pdone / ptot * 100) : 100) + '%'; } pprog();
+            await runPool(uniq, async function(o){ await orderToCompany(o); pdone++; pprog(); }, null);
             var added = 0;
             state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ var nums = _pen[r.order]; if (nums && nums.length) { var s = 'penalty no. ' + nums.join(', '); if (r.note.indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
             renderTable();
