@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.36
+// @version      1.38
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10886,19 +10886,24 @@
             txt.split(/\r?\n/).forEach(function(line){
                 if (!line.trim()) return;
                 var c = line.split('\t'); while (c.length < 6) c.push('');
-                rows.push({ supplier: c[0].trim(), container: c[1].trim(), seq: c[2].trim(), order: c[3].trim(), amount: c[4].trim(), note: c[5].trim() });
+                var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
+                rows.push({ supplier: c[0].trim(), container: c[1].trim(), seq: c[2].trim(), order: c[3].trim(), amount: c[4].trim(), note: c[5].trim(), cid: cid });
             });
             return rows;
         }
         function parseDepo(txt){
-            var names = [], orders = [];
+            var names = [], entries = [];
             txt.split(/\r?\n/).forEach(function(line){
                 if (!line.trim()) return;
                 var c = line.split('\t');
-                if (c.length >= 2 && /^\d+$/.test(c[0].trim())) { orders.push(c[0].trim()); names.push(norm(c[1].trim())); }
-                else { names.push(norm((c[0]||line).trim())); }
+                var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
+                var order = null, name = '';
+                if (c.length >= 2 && /^\d+$/.test(c[0].trim())) { order = c[0].trim(); name = c[1].trim(); }
+                else { name = (c[0] || line).trim(); }
+                names.push(norm(name));
+                if (order || cid) entries.push({ order: order, cid: cid });
             });
-            return { names: names, orders: orders };
+            return { names: names, entries: entries };
         }
         function matchName(supNorm, depoNames){
             for (var i = 0; i < depoNames.length; i++){
@@ -10921,21 +10926,27 @@
             while ((m = re.exec(html)) !== null) { if (nums.indexOf(m[1]) === -1) nums.push(m[1]); }
             return nums;
         }
+        async function fetchT(url, ms){
+            var ctl = new AbortController(); var t = setTimeout(function(){ try { ctl.abort(); } catch(e){} }, ms || 20000);
+            try { var r = await fetch(url, { credentials:'same-origin', signal: ctl.signal }); clearTimeout(t); return await r.text(); } catch(e){ clearTimeout(t); return null; }
+        }
         async function orderToCompany(o){
-            if (_cid[o] !== undefined && _pen[o] !== undefined) return _cid[o];
-            var v = (_cid[o] !== undefined) ? _cid[o] : null;
-            try {
-                var h = await fetch('/op_order.php?id=' + encodeURIComponent(o), { credentials:'same-origin' }).then(function(r){ return r.text(); });
-                if (_cid[o] === undefined) { var m = h.match(/op_suppliers\.php\?company_id=(\d+)/); v = m ? m[1] : null; _cid[o] = v; saveCache(); }
-                _pen[o] = parsePenalties(h);
-            } catch(e){ if (_pen[o] === undefined) _pen[o] = []; }
-            return v;
+            if (_cid[o] !== undefined) return _cid[o];
+            var v = null;
+            var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o));
+            if (h) { var m = h.match(/op_suppliers\.php\?company_id=(\d+)/); v = m ? m[1] : null; }
+            _cid[o] = v; saveCache(); return v;
+        }
+        async function fetchPen(o){
+            var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o));
+            return h ? parsePenalties(h) : [];
         }
         async function companyToAcc(c){
             if (!c) return null;
             if (_acc[c] !== undefined) return _acc[c];
             var v = null;
-            try { var h = await fetch('/op_suppliers.php?company_id=' + encodeURIComponent(c), { credentials:'same-origin' }).then(function(r){ return r.text(); }); var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); v = m ? m[1].trim() : null; } catch(e){}
+            var h = await fetchT('/op_suppliers.php?company_id=' + encodeURIComponent(c));
+            if (h) { var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); v = m ? m[1].trim() : null; }
             _acc[c] = v; saveCache(); return v;
         }
         async function fetchPenalties(statusEl){
@@ -10981,19 +10992,20 @@
             html += '</table>'; out.innerHTML = html; state.lastOutput = lines.join('\n');
         }
         async function runPool(items, worker, onProgress){
-            var idx = 0, done = 0, N = items.length, WORKERS = 7;
+            var idx = 0, done = 0, N = items.length, WORKERS = 10;
             async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); done++; if (onProgress) onProgress(done, N); } }
             var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one());
             await Promise.all(pool);
         }
+        async function groupCid(s){ var g = state.groups[s] || []; for (var i = 0; i < g.length; i++){ if (g[i].cid) return g[i].cid; } var o = firstOrder(s); return o ? await orderToCompany(o) : null; }
         async function resolveAccounts(status){
             var depoAcc = {};
-            var total = state.depo.orders.length + state.order.length, done = 0;
+            var total = state.depo.entries.length + state.order.length, done = 0;
             function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
             prog();
-            await runPool(state.depo.orders, async function(o){ var a = await orderToAcc(o); if (a) depoAcc[a] = 1; done++; prog(); }, null);
+            await runPool(state.depo.entries, async function(e){ var cid = e.cid || (e.order ? await orderToCompany(e.order) : null); var a = cid ? await companyToAcc(cid) : null; if (a) depoAcc[a] = 1; done++; prog(); }, null);
             var sup = state.order.slice();
-            await runPool(sup, async function(s){ var o = firstOrder(s); if (o) { var cid = await orderToCompany(o); state.sup2cid[s] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[s] = 1; } else { state.sup2cid[s] = null; } done++; prog(); }, null);
+            await runPool(sup, async function(s){ var cid = await groupCid(s); state.sup2cid[s] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[s] = 1; done++; prog(); }, null);
             state.resolved = true;
         }
         wp.querySelector('#wp-go').onclick = async function(){
@@ -11003,6 +11015,7 @@
             if (!balRows.length) { status.textContent = 'Wklej dane balance.'; return; }
             state.order = []; state.groups = {}; state.matched = {}; state.sup2cid = {}; state.resolved = false;
             balRows.forEach(function(r){ var k = r.supplier; if (!(k in state.groups)) { state.groups[k] = []; state.order.push(k); } state.groups[k].push(r); });
+            state.order.sort(function(a, b){ return String(a).toLowerCase().localeCompare(String(b).toLowerCase()); });
             state.order.forEach(function(sup){ if (matchName(norm(sup), state.depo.names)) state.matched[sup] = 1; });
             renderTable();
             status.textContent = 'Sprawdzam konta\u2026';
@@ -11018,7 +11031,7 @@
             state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
             _pen = {};
             var pdone = 0, ptot = uniq.length; function pprog(){ if (status) status.textContent = 'Penalties: ' + (ptot ? Math.round(pdone / ptot * 100) : 100) + '%'; } pprog();
-            await runPool(uniq, async function(o){ await orderToCompany(o); pdone++; pprog(); }, null);
+            await runPool(uniq, async function(o){ _pen[o] = await fetchPen(o); pdone++; pprog(); }, null);
             var added = 0;
             state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ var nums = _pen[r.order]; if (nums && nums.length) { var s = 'penalty no. ' + nums.join(', '); if (r.note.indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
             renderTable();
