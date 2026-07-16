@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.38
+// @version      1.40
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10862,8 +10862,8 @@
             '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Wprowadzanie (balance) <span style="font-weight:400;font-size:11px;opacity:.6">v' + VER + '</span></div><button id="wp-close" class="chn-btn ghost" style="padding:4px 12px">\u2715</button></div>'
           + '<div style="padding:16px;overflow-y:auto">'
           + '<div style="display:flex;gap:10px;flex-wrap:wrap">'
-          + '<div style="flex:1;min-width:280px"><label style="font-weight:600;font-size:12px">BALANCE (wklej z pliku wyjściowego, Tab):</label><textarea id="wp-balance" style="width:100%;height:150px;font-family:monospace;font-size:11px"></textarea></div>'
-          + '<div style="flex:1;min-width:280px"><label style="font-weight:600;font-size:12px">DEPO (order-id + nazwa):</label><textarea id="wp-depo" style="width:100%;height:150px;font-family:monospace;font-size:11px"></textarea></div>'
+          + '<div style="flex:1;min-width:280px"><label style="font-weight:600;font-size:12px">BALANCE (wklej z systemu — z linkami):</label><div id="wp-balance" contenteditable="true" style="width:100%;height:150px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff"></div></div>'
+          + '<div style="flex:1;min-width:280px"><label style="font-weight:600;font-size:12px">DEPO (wklej z systemu — z linkami):</label><div id="wp-depo" contenteditable="true" style="width:100%;height:150px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff"></div></div>'
           + '</div>'
           + '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
           + '<button id="wp-go" class="chn-btn red">Przetwórz</button>'
@@ -10880,29 +10880,51 @@
 
         function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
         function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+        function linkify(s){ return esc(s).replace(/(https?:\/\/[^\s<>"']+)/g, '<a href="$1" target="_blank" style="color:#750000;text-decoration:underline">$1</a>'); }
         function parseAmount(s){ if (s == null) return 0; var m = String(s).replace(/\s/g,'').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
-        function parseBalance(txt){
-            var rows = [];
-            txt.split(/\r?\n/).forEach(function(line){
-                if (!line.trim()) return;
-                var c = line.split('\t'); while (c.length < 6) c.push('');
-                var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
-                rows.push({ supplier: c[0].trim(), container: c[1].trim(), seq: c[2].trim(), order: c[3].trim(), amount: c[4].trim(), note: c[5].trim(), cid: cid });
-            });
+        function cellsOf(tr){ var tds = tr.querySelectorAll('td, th'); return Array.prototype.map.call(tds, function(td){ var a = td.querySelector('a'); return { t: (td.textContent || '').trim(), u: a ? (a.getAttribute('href') || '') : '' }; }); }
+        function parseBalance(el){
+            var rows = [], trs = el.querySelectorAll('tr');
+            function mk(c){ while (c.length < 6) c.push({ t:'', u:'' }); var supU = c[0].u || '', ordU = c[3].u || ''; var cid = (supU.match(/company_id=(\d+)/) || [])[1] || null; return { supplier: c[0].t, supplierUrl: supU, container: c[1].t, seq: c[2].t, order: c[3].t, orderUrl: ordU, amount: c[4].t, note: c[5].t, cid: cid }; }
+            if (trs.length) {
+                trs.forEach(function(tr){ var c = cellsOf(tr); if (c.length && c.some(function(x){ return x.t; })) rows.push(mk(c)); });
+            } else {
+                (el.innerText || el.textContent || '').split(/\r?\n/).forEach(function(line){
+                    if (!line.trim()) return;
+                    var c = line.split('\t'); while (c.length < 6) c.push('');
+                    var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
+                    rows.push({ supplier: c[0].trim(), supplierUrl: '', container: c[1].trim(), seq: c[2].trim(), order: c[3].trim(), orderUrl: '', amount: c[4].trim(), note: c[5].trim(), cid: cid });
+                });
+            }
             return rows;
         }
-        function parseDepo(txt){
-            var names = [], entries = [];
-            txt.split(/\r?\n/).forEach(function(line){
-                if (!line.trim()) return;
-                var c = line.split('\t');
-                var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
-                var order = null, name = '';
-                if (c.length >= 2 && /^\d+$/.test(c[0].trim())) { order = c[0].trim(); name = c[1].trim(); }
-                else { name = (c[0] || line).trim(); }
-                names.push(norm(name));
-                if (order || cid) entries.push({ order: order, cid: cid });
-            });
+        function parseDepo(el){
+            var names = [], entries = [], trs = el.querySelectorAll('tr');
+            if (trs.length) {
+                trs.forEach(function(tr){
+                    var c = cellsOf(tr); if (!c.length) return;
+                    var supCell = null, ordCell = null;
+                    c.forEach(function(x){ if (/op_suppliers/.test(x.u)) supCell = x; if (/op_order/.test(x.u)) ordCell = x; });
+                    var name = supCell ? supCell.t : (c[0] ? c[0].t : '');
+                    var order = ordCell ? ordCell.t : null;
+                    var url = supCell ? supCell.u : '';
+                    if (!order && c.length >= 2 && /^\d+$/.test(c[0].t)) { order = c[0].t; if (!supCell) name = c[1].t; }
+                    if (!name && !order) return;
+                    names.push(norm(name));
+                    var cid = (url && (url.match(/company_id=(\d+)/) || [])[1]) || null;
+                    if (order || cid) entries.push({ order: order, cid: cid });
+                });
+            } else {
+                (el.innerText || el.textContent || '').split(/\r?\n/).forEach(function(line){
+                    if (!line.trim()) return;
+                    var c = line.split('\t');
+                    var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
+                    var order = null, name = '';
+                    if (c.length >= 2 && /^\d+$/.test(c[0].trim())) { order = c[0].trim(); name = c[1].trim(); } else { name = (c[0] || line).trim(); }
+                    names.push(norm(name));
+                    if (order || cid) entries.push({ order: order, cid: cid });
+                });
+            }
             return { names: names, entries: entries };
         }
         function matchName(supNorm, depoNames){
@@ -10980,8 +11002,10 @@
                 var isDepo = !!state.matched[sup];
                 var bg = isDepo ? 'background:#fff3bf;' : '';
                 g.forEach(function(r){
-                    html += '<tr style="' + bg + '"><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.supplier) + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.container) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.seq) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.order) + '</td><td style="border:1px solid #eee;padding:2px 5px;text-align:right">' + esc(r.amount) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.note) + '</td></tr>';
-                    lines.push([r.supplier, r.container, r.seq, r.order, r.amount, r.note].join('\t'));
+                    html += '<tr style="' + bg + '"><td style="border:1px solid #eee;padding:2px 5px">' + (r.supplierUrl ? '<a href="' + esc(r.supplierUrl) + '" target="_blank" style="color:#750000">' + esc(r.supplier) + '</a>' : esc(r.supplier)) + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.container) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.seq) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.orderUrl ? '<a href="' + esc(r.orderUrl) + '" target="_blank">' + esc(r.order) + '</a>' : esc(r.order)) + '</td><td style="border:1px solid #eee;padding:2px 5px;text-align:right">' + esc(r.amount) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + linkify(r.note) + '</td></tr>';
+                    var sc = r.supplierUrl ? '=HYPERLINK("' + r.supplierUrl + '";"' + (r.supplier||'').replace(/"/g, '""') + '")' : (r.supplier||'');
+                    var oc = r.orderUrl ? '=HYPERLINK("' + r.orderUrl + '";"' + (r.order||'') + '")' : (r.order||'');
+                    lines.push([sc, r.container, r.seq, oc, r.amount, r.note].join('\t'));
                 });
                 if (g.length > 1) {
                     var sum = 0; g.forEach(function(r){ sum += parseAmount(r.amount); }); var sumStr = sum.toFixed(2);
@@ -11010,8 +11034,8 @@
         }
         wp.querySelector('#wp-go').onclick = async function(){
             var status = wp.querySelector('#wp-status');
-            var balRows = parseBalance(wp.querySelector('#wp-balance').value);
-            state.depo = parseDepo(wp.querySelector('#wp-depo').value);
+            var balRows = parseBalance(wp.querySelector('#wp-balance'));
+            state.depo = parseDepo(wp.querySelector('#wp-depo'));
             if (!balRows.length) { status.textContent = 'Wklej dane balance.'; return; }
             state.order = []; state.groups = {}; state.matched = {}; state.sup2cid = {}; state.resolved = false;
             balRows.forEach(function(r){ var k = r.supplier; if (!(k in state.groups)) { state.groups[k] = []; state.order.push(k); } state.groups[k].push(r); });
