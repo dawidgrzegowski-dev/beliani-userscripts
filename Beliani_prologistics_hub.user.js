@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.25
+// @version      1.26
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10823,6 +10823,102 @@
 
     document.body.appendChild(btn);
     document.body.appendChild(panel);
+    // ===== Chinskie: chooser (Ksiegowanie / Wprowadzanie) + Wprowadzanie balance =====
+    (function(){
+        var depBtn0 = document.getElementById('deposit-btn'); if (depBtn0) depBtn0.style.display = 'none';
+        var cbtn = document.createElement('button');
+        cbtn.id = 'chinskie-btn';
+        cbtn.textContent = 'Chińskie';
+        cbtn.style.cssText = 'position:fixed;right:16px;bottom:20px;z-index:2147483000;background:#FF2F00;color:#fff;border:none;border-radius:24px;padding:12px 16px;font:600 13px system-ui;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)';
+        var chooser = document.createElement('div');
+        chooser.id = 'chinskie-chooser';
+        chooser.style.cssText = 'display:none;position:fixed;right:16px;bottom:64px;z-index:2147483001;background:#fff;border:1px solid #ccc;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);padding:12px;width:220px;font-family:system-ui;';
+        chooser.innerHTML = '<div style="font-weight:bold;color:#750000;margin-bottom:8px;">Chińskie</div>'
+            + '<button id="ch-ksieg" style="width:100%;padding:9px;margin-bottom:6px;background:#750000;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83d\udce5 Księgowanie</button>'
+            + '<button id="ch-wprow" style="width:100%;padding:9px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\u270d Wprowadzanie</button>';
+        document.body.appendChild(cbtn);
+        document.body.appendChild(chooser);
+        cbtn.addEventListener('click', function(){ chooser.style.display = (chooser.style.display === 'none') ? 'block' : 'none'; });
+
+        var wp = document.createElement('div');
+        wp.id = 'chinskie-wprow';
+        wp.style.cssText = 'display:none;position:fixed;right:12px;top:60px;z-index:2147483001;background:#fff;border:1px solid #ccc;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);padding:16px;width:min(780px, calc(100vw - 40px));max-height:calc(100vh - 80px);overflow-y:auto;font-family:system-ui;color:#332524;';
+        wp.innerHTML =
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><div style="font-weight:bold;color:#750000;">Wprowadzanie — balance (grupowanie + sumy + depo)</div><button id="wp-close" style="border:none;background:#eee;border-radius:6px;padding:4px 10px;cursor:pointer;">\u2715</button></div>'
+          + '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+          + '<div style="flex:1;min-width:280px;"><label style="font-weight:600;font-size:12px;">BALANCE (wklej z pliku wyjściowego, kolumny Tab):</label><textarea id="wp-balance" style="width:100%;height:150px;font-family:monospace;font-size:11px;box-sizing:border-box;"></textarea></div>'
+          + '<div style="flex:1;min-width:280px;"><label style="font-weight:600;font-size:12px;">DEPO (wklej: nazwy dostawców lub order-id + nazwa):</label><textarea id="wp-depo" style="width:100%;height:150px;font-family:monospace;font-size:11px;box-sizing:border-box;"></textarea></div>'
+          + '</div>'
+          + '<div style="margin-top:10px;"><button id="wp-go" style="padding:9px 16px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">Przetwórz</button> <button id="wp-copy" style="padding:9px 16px;background:#FF2F00;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83d\udccb Kopiuj (do Docs)</button> <span id="wp-status" style="font-size:12px;color:#666;margin-left:8px;"></span></div>'
+          + '<div id="wp-out" style="margin-top:12px;overflow-x:auto;"></div>';
+        document.body.appendChild(wp);
+        wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
+
+        chooser.querySelector('#ch-ksieg').onclick = function(){ chooser.style.display = 'none'; var b = document.getElementById('deposit-btn'); if (b) { b.style.display = ''; setTimeout(function(){ b.click(); b.style.display = 'none'; }, 0); } };
+        chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; wp.style.display = 'block'; };
+
+        function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
+        function parseAmount(s){ if (s == null) return 0; var m = String(s).replace(/\s/g,'').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
+        function parseBalance(txt){
+            var rows = [];
+            txt.split(/\r?\n/).forEach(function(line){
+                if (!line.trim()) return;
+                var c = line.split('\t');
+                while (c.length < 6) c.push('');
+                rows.push({ supplier: c[0].trim(), container: c[1].trim(), seq: c[2].trim(), order: c[3].trim(), amount: c[4].trim(), note: c[5].trim() });
+            });
+            return rows;
+        }
+        function parseDepoSuppliers(txt){
+            var set = {};
+            txt.split(/\r?\n/).forEach(function(line){
+                if (!line.trim()) return;
+                var c = line.split('\t');
+                var name = (c.length >= 2 && /^\d+$/.test(c[0].trim())) ? c[1].trim() : (c[0] || line).trim();
+                if (name) set[norm(name)] = 1;
+            });
+            return set;
+        }
+        var lastOutput = '';
+        wp.querySelector('#wp-go').onclick = function(){
+            var status = wp.querySelector('#wp-status');
+            var out = wp.querySelector('#wp-out');
+            var balRows = parseBalance(wp.querySelector('#wp-balance').value);
+            var depoSet = parseDepoSuppliers(wp.querySelector('#wp-depo').value);
+            if (!balRows.length) { status.textContent = 'Wklej dane balance.'; return; }
+            var order = [], groups = {};
+            balRows.forEach(function(r){ var k = r.supplier; if (!(k in groups)) { groups[k] = []; order.push(k); } groups[k].push(r); });
+            var lines = [];
+            var html = '<table style="border-collapse:collapse;font-size:11px;width:100%;">';
+            order.forEach(function(sup){
+                var g = groups[sup];
+                var isDepo = !!depoSet[norm(sup)];
+                var bg = isDepo ? 'background:#fff3bf;' : '';
+                g.forEach(function(r){
+                    html += '<tr style="' + bg + '"><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.supplier||'') + (isDepo ? ' <b style="color:#a15c00;">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.container||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.seq||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.order||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;text-align:right;">' + (r.amount||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.note||'') + '</td></tr>';
+                    lines.push([r.supplier, r.container, r.seq, r.order, r.amount, r.note].join('\t'));
+                });
+                if (g.length > 1) {
+                    var sum = 0; g.forEach(function(r){ sum += parseAmount(r.amount); });
+                    var sumStr = sum.toFixed(2);
+                    html += '<tr style="font-weight:bold;background:#f0f0f0;"><td style="border:1px solid #ddd;padding:2px 5px;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;padding:2px 5px;text-align:right;">' + sumStr + '</td><td style="border:1px solid #ddd;"></td></tr>';
+                    lines.push(['', '', '', '', sumStr, ''].join('\t'));
+                } else {
+                    html += '<tr><td colspan="6" style="height:6px;"></td></tr>';
+                    lines.push('');
+                }
+            });
+            html += '</table>';
+            out.innerHTML = html;
+            lastOutput = lines.join('\n');
+            var depoCount = order.filter(function(s){ return !!depoSet[norm(s)]; }).length;
+            status.textContent = 'Dostawcy: ' + order.length + ' | z depo (żółte): ' + depoCount;
+        };
+        wp.querySelector('#wp-copy').onclick = function(){
+            if (!lastOutput) { wp.querySelector('#wp-status').textContent = 'Najpierw Przetwórz.'; return; }
+            try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(lastOutput, 'text'); else navigator.clipboard.writeText(lastOutput); wp.querySelector('#wp-status').textContent = 'Skopiowano (wklej do Google Docs).'; } catch(e){}
+        };
+    })();
 })();
     }
 
@@ -10834,7 +10930,7 @@
         { id: 'issuelog', name: 'Issue Log - Faktury',       test: onProlo,   init: init_issuelog },
         { id: 'klient',   name: 'Zmiana typu klienta',       test: onProlo,   init: init_klient },
         { id: 'allegro',  name: 'Allegro CZ/HU/SK',          test: onAllegro, init: init_allegro },
-        { id: 'deposit',  name: 'Ksiegowanie depozytow (op_order)', test: onProlo, init: init_deposit },
+        { id: 'deposit',  name: 'Chinskie', test: onProlo, init: init_deposit },
     ];
 
     MODULES.forEach(function (m) {
@@ -10882,7 +10978,7 @@
             { id:'sepa',     icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M9 13h6"/><path d="M9 17h6"/>'), label:'Walidator SEPA', sel:'#sepa-btn' },
             { id:'issuelog', icon:svgIco('<rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><path d="M9 12h.01"/><path d="M13 12h2"/><path d="M9 16h.01"/><path d="M13 16h2"/>'), label:'Issue / PAID', sel:'#ilp-btn' },
             { id:'issuelog', icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Issue — Szukaj', sel:'#ilp-search-btn' },
-            { id:'deposit',  icon:svgIco('<path d="M12 3l8 4.5v9l-8 4.5l-8 -4.5v-9z"/><path d="M12 12l8 -4.5"/><path d="M12 12v9"/><path d="M12 12l-8 -4.5"/>'), label:'Księgowanie depozytów', sel:'#deposit-btn' },
+            { id:'deposit',  icon:svgIco('<path d="M12 3l8 4.5v9l-8 4.5l-8 -4.5v-9z"/><path d="M12 12l8 -4.5"/><path d="M12 12v9"/><path d="M12 12l-8 -4.5"/>'), label:'Chińskie', sel:'#chinskie-btn' },
         ];
 
         function hideBtns(){ LAUNCH_TOOLS.forEach(function(t){ const b = document.querySelector(t.sel); if (b) b.style.display = 'none'; }); }
