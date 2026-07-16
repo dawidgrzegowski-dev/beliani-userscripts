@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.41
+// @version      1.42
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10867,7 +10867,8 @@
           + '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
           + '<button id="wp-go" class="chn-btn red">Przetwórz</button>'
           + '<button id="wp-pen" class="chn-btn maroon">\ud83e\uddfe Penalties</button>'
-          + '<button id="wp-copy" class="chn-btn ghost">\ud83d\udccb Kopiuj (do Sheets)</button>'
+          + '<button id="wp-copy-bal" class="chn-btn ghost">\ud83d\udccb Kopiuj Balance</button>'
+          + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
           + '<div style="margin-top:14px;font-weight:700;color:#750000">BALANCE</div><div id="wp-out-bal" style="overflow-x:auto"></div>'
           + '<div style="margin-top:16px;font-weight:700;color:#750000">DEPO</div><div id="wp-out-dep" style="overflow-x:auto"></div>'
@@ -10882,6 +10883,15 @@
         function parseAmount(s){ if (s == null) return 0; var m = String(s).replace(/\s/g, '').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
         function aLink(url, txt, col){ return url ? '<a href="' + esc(url) + '" target="_blank"' + (col ? ' style="color:' + col + '"' : '') + '>' + esc(txt) + '</a>' : esc(txt); }
         function cellHL(url, label){ return url ? '=HYPERLINK("' + url + '";"' + String(label || '').replace(/"/g, '""') + '")' : String(label || ''); }
+        function copyHtml(html){
+            var tmp = document.createElement('div'); tmp.setAttribute('contenteditable', 'true'); tmp.style.cssText = 'position:fixed;left:-99999px;top:0';
+            tmp.innerHTML = html; document.body.appendChild(tmp);
+            var text = tmp.textContent || '', ok = false;
+            try { var sel = window.getSelection(), range = document.createRange(); range.selectNodeContents(tmp); sel.removeAllRanges(); sel.addRange(range); ok = document.execCommand('copy'); sel.removeAllRanges(); } catch(e){}
+            document.body.removeChild(tmp);
+            if (!ok) { try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(text, 'text'); else navigator.clipboard.writeText(text); ok = true; } catch(e){} }
+            return ok;
+        }
         function elBg(el){ if (!el) return ''; var b = el.style && el.style.backgroundColor; if (b && b !== 'transparent' && b !== 'rgba(0, 0, 0, 0)') return b; var a = el.getAttribute && el.getAttribute('bgcolor'); return a || ''; }
         function rowBg(tr){ var b = elBg(tr); if (b) return b; var tds = tr.querySelectorAll('td, th'); for (var i = 0; i < tds.length; i++){ var c = elBg(tds[i]); if (c) return c; } return ''; }
         function cellsOf(tr){ var tds = tr.querySelectorAll('td, th'); return Array.prototype.map.call(tds, function(td){ var a = td.querySelector('a'); return { t: (td.textContent || '').trim(), u: a ? (a.getAttribute('href') || '') : '' }; }); }
@@ -11015,6 +11025,7 @@
             var b = renderBal(), d = renderDepo();
             wp.querySelector('#wp-out-bal').innerHTML = b.html;
             wp.querySelector('#wp-out-dep').innerHTML = d.html;
+            state.balHtml = b.html; state.depHtml = d.html;
             state.lastOutput = 'BALANCE\n' + b.lines.join('\n') + '\n\nDEPO\n' + d.lines.join('\n');
         }
         async function resolveAccounts(status){
@@ -11052,9 +11063,15 @@
             renderTables();
             status.textContent = added ? ('Dopisano penalties do ' + added + ' wierszy.') : 'Brak penalties w komentarzach tych order\u00f3w.';
         };
-        wp.querySelector('#wp-copy').onclick = function(){
-            if (!state.lastOutput) { wp.querySelector('#wp-status').textContent = 'Najpierw Przetw\u00f3rz.'; return; }
-            try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(state.lastOutput, 'text'); else navigator.clipboard.writeText(state.lastOutput); wp.querySelector('#wp-status').textContent = 'Skopiowano (wklej do Sheets).'; } catch(e){}
+        wp.querySelector('#wp-copy-bal').onclick = function(){
+            var status = wp.querySelector('#wp-status');
+            if (!state.balHtml) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
+            copyHtml(state.balHtml); status.textContent = 'Skopiowano BALANCE (wklej do Sheets \u2014 z kolorami).';
+        };
+        wp.querySelector('#wp-copy-dep').onclick = function(){
+            var status = wp.querySelector('#wp-status');
+            if (!state.depHtml) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
+            copyHtml(state.depHtml); status.textContent = 'Skopiowano DEPO (wklej do Sheets \u2014 z kolorami).';
         };
     })();
 })();
