@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.30
+// @version      1.31
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10029,6 +10029,7 @@
     }).join('');
 
     const panel = document.createElement("div");
+    panel.id = 'deposit-panel';
     panel.style.cssText = `
         display:none; position:fixed; top:65px; right:20px; z-index:999999;
         background:white; border:1px solid #ccc; border-radius:10px;
@@ -10823,39 +10824,58 @@
 
     document.body.appendChild(btn);
     document.body.appendChild(panel);
-    // ===== Chinskie: chooser (Ksiegowanie / Wprowadzanie) + Wprowadzanie balance =====
+    // ===== Chinskie: chooser + Wprowadzanie (Beliani, scalony Przetworz, penalties po company_id) =====
     (function(){
+        var st = document.createElement('style');
+        st.textContent = '#chinskie-chooser .ch-row{display:flex;align-items:center;gap:10px;width:100%;border:none;background:#fff;color:#332524;padding:10px 12px;border-radius:8px;cursor:pointer;font:600 13px system-ui;text-align:left}'
+            + '#chinskie-chooser .ch-row:hover{background:#F6E7E6;color:#750000}'
+            + '.chn-btn{padding:9px 16px;border:none;border-radius:8px;cursor:pointer;font:700 13px system-ui;color:#fff}'
+            + '.chn-btn.red{background:#FF2F00}.chn-btn.red:hover{background:#cc2600}'
+            + '.chn-btn.maroon{background:#750000}.chn-btn.maroon:hover{background:#5a0000}'
+            + '.chn-btn.ghost{background:#F6E7E6;color:#750000;border:1px solid #FFCCB7}.chn-btn.ghost:hover{background:#FFCCB7}'
+            + '#chinskie-wprow textarea{border:1px solid #FFCCB7;border-radius:6px;box-sizing:border-box}#chinskie-wprow label{color:#750000}';
+        document.head.appendChild(st);
+
         var depBtn0 = document.getElementById('deposit-btn'); if (depBtn0) depBtn0.style.display = 'none';
+        function hideDeposit(){ var p = document.getElementById('deposit-panel'); if (p) p.style.display = 'none'; }
+
         var cbtn = document.createElement('button');
         cbtn.id = 'chinskie-btn';
         cbtn.textContent = 'Chińskie';
         cbtn.style.cssText = 'position:fixed;right:16px;bottom:20px;z-index:2147483000;background:#FF2F00;color:#fff;border:none;border-radius:24px;padding:12px 16px;font:600 13px system-ui;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)';
         var chooser = document.createElement('div');
         chooser.id = 'chinskie-chooser';
-        chooser.style.cssText = 'display:none;position:fixed;right:16px;bottom:64px;z-index:2147483001;background:#fff;border:1px solid #ccc;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);padding:12px;width:220px;font-family:system-ui;';
-        chooser.innerHTML = '<div style="font-weight:bold;color:#750000;margin-bottom:8px;">Chińskie</div>'
-            + '<button id="ch-ksieg" style="width:100%;padding:9px;margin-bottom:6px;background:#750000;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83d\udce5 Księgowanie</button>'
-            + '<button id="ch-wprow" style="width:100%;padding:9px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\u270d Wprowadzanie</button>';
+        chooser.style.cssText = 'display:none;position:fixed;right:16px;bottom:64px;z-index:2147483006;background:#fff;border:1px solid #FFCCB7;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.18);padding:8px;width:230px;font-family:system-ui';
+        chooser.innerHTML = '<div style="font-weight:700;color:#750000;padding:6px 10px 8px;font-size:13px">Chińskie</div>'
+            + '<button class="ch-row" id="ch-ksieg">\ud83d\udce5 Księgowanie</button>'
+            + '<button class="ch-row" id="ch-wprow">\u270d Wprowadzanie</button>';
         document.body.appendChild(cbtn);
         document.body.appendChild(chooser);
         cbtn.addEventListener('click', function(){ chooser.style.display = (chooser.style.display === 'none') ? 'block' : 'none'; });
 
         var wp = document.createElement('div');
         wp.id = 'chinskie-wprow';
-        wp.style.cssText = 'display:none;position:fixed;right:12px;top:60px;z-index:2147483001;background:#fff;border:1px solid #ccc;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);padding:16px;width:min(780px, calc(100vw - 40px));max-height:calc(100vh - 80px);overflow-y:auto;font-family:system-ui;color:#332524;';
+        wp.style.cssText = 'position:fixed;left:50%;top:50px;transform:translateX(-50%);z-index:2147483007;background:#fff;border:1px solid #FFCCB7;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.25);padding:0;width:min(820px, calc(100vw - 32px));max-height:calc(100vh - 70px);overflow:hidden;font-family:system-ui;color:#332524;flex-direction:column';
+        wp.style.display = 'none';
         wp.innerHTML =
-            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><div style="font-weight:bold;color:#750000;">Wprowadzanie — balance (grupowanie + sumy + depo)</div><button id="wp-close" style="border:none;background:#eee;border-radius:6px;padding:4px 10px;cursor:pointer;">\u2715</button></div>'
-          + '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
-          + '<div style="flex:1;min-width:280px;"><label style="font-weight:600;font-size:12px;">BALANCE (wklej z pliku wyjściowego, kolumny Tab):</label><textarea id="wp-balance" style="width:100%;height:150px;font-family:monospace;font-size:11px;box-sizing:border-box;"></textarea></div>'
-          + '<div style="flex:1;min-width:280px;"><label style="font-weight:600;font-size:12px;">DEPO (wklej: nazwy dostawców lub order-id + nazwa):</label><textarea id="wp-depo" style="width:100%;height:150px;font-family:monospace;font-size:11px;box-sizing:border-box;"></textarea></div>'
+            '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Wprowadzanie (balance)</div><button id="wp-close" class="chn-btn ghost" style="padding:4px 12px">\u2715</button></div>'
+          + '<div style="padding:16px;overflow-y:auto">'
+          + '<div style="display:flex;gap:10px;flex-wrap:wrap">'
+          + '<div style="flex:1;min-width:280px"><label style="font-weight:600;font-size:12px">BALANCE (wklej z pliku wyjściowego, Tab):</label><textarea id="wp-balance" style="width:100%;height:150px;font-family:monospace;font-size:11px"></textarea></div>'
+          + '<div style="flex:1;min-width:280px"><label style="font-weight:600;font-size:12px">DEPO (order-id + nazwa):</label><textarea id="wp-depo" style="width:100%;height:150px;font-family:monospace;font-size:11px"></textarea></div>'
           + '</div>'
-          + '<div style="margin-top:10px;"><button id="wp-go" style="padding:9px 16px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">Przetwórz</button> <button id="wp-bank" style="padding:9px 16px;background:#1F6FEB;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83c\udfe6 Dopasuj po koncie</button> <button id="wp-pen" style="padding:9px 16px;background:#7c3aed;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83e\uddfe Penalties</button> <button id="wp-copy" style="padding:9px 16px;background:#FF2F00;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83d\udccb Kopiuj (do Docs)</button> <span id="wp-status" style="font-size:12px;color:#666;margin-left:8px;"></span></div>'
-          + '<div id="wp-out" style="margin-top:12px;overflow-x:auto;"></div>';
+          + '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+          + '<button id="wp-go" class="chn-btn red">Przetwórz</button>'
+          + '<button id="wp-pen" class="chn-btn maroon">\ud83e\uddfe Penalties</button>'
+          + '<button id="wp-copy" class="chn-btn ghost">\ud83d\udccb Kopiuj (do Docs)</button>'
+          + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
+          + '<div id="wp-out" style="margin-top:12px;overflow-x:auto"></div>'
+          + '</div>';
         document.body.appendChild(wp);
         wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
 
-        chooser.querySelector('#ch-ksieg').onclick = function(){ chooser.style.display = 'none'; var b = document.getElementById('deposit-btn'); if (b) { b.style.display = ''; setTimeout(function(){ b.click(); b.style.display = 'none'; }, 0); } };
-        chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; wp.style.display = 'block'; };
+        chooser.querySelector('#ch-ksieg').onclick = function(){ chooser.style.display = 'none'; wp.style.display = 'none'; var b = document.getElementById('deposit-btn'); if (b) { b.style.display = ''; setTimeout(function(){ b.click(); b.style.display = 'none'; }, 0); } };
+        chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); wp.style.display = 'flex'; };
 
         function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
         function parseAmount(s){ if (s == null) return 0; var m = String(s).replace(/\s/g,'').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
@@ -10901,90 +10921,95 @@
             try { var h = await fetch('/op_suppliers.php?company_id=' + encodeURIComponent(c), { credentials:'same-origin' }).then(function(r){ return r.text(); }); var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); v = m ? m[1].trim() : null; } catch(e){}
             _acc[c] = v; return v;
         }
-        async function orderToAcc(o){ return await companyToAcc(await orderToCompany(o)); }
         async function fetchPenalties(statusEl){
-            var map = {}, page = 1, guard = 0, seen = {};
+            var byCompany = {}, page = 1, guard = 0, seen = {};
             while (guard++ < 40) {
                 var d;
                 try { d = await fetch('/api/rest/penalty/list?log=1&filter[inactive]=0&filter[applied]=1&page=' + page, { credentials:'same-origin', headers:{ 'X-Requested-With':'XMLHttpRequest', 'accept':'application/json' } }).then(function(r){ return r.json(); }); } catch(e){ break; }
                 var list = (d && d.result) ? d.result : [];
                 if (!list.length) break;
-                var firstId = list[0].id;
-                if (seen[firstId]) break; seen[firstId] = 1;
+                if (seen[list[0].id]) break; seen[list[0].id] = 1;
                 list.forEach(function(p){
-                    var note = (p.penalty_name || '') + ' ' + (p.id || p.penalty_id || '');
-                    [p.source_order_id, p.target_order_id].forEach(function(o){ if (o) { (map[o] = map[o] || []); if (map[o].indexOf(note) === -1) map[o].push(note); } });
+                    var cid = p.op_company_id; if (!cid) return;
+                    var amt = p.amount != null ? parseFloat(p.amount).toFixed(2) : '';
+                    var note = (p.penalty_name || 'penalty') + ' ' + (p.id || '') + (amt ? ' (' + amt + ')' : '');
+                    (byCompany[cid] = byCompany[cid] || []);
+                    if (byCompany[cid].indexOf(note) === -1) byCompany[cid].push(note);
                 });
-                if (statusEl) statusEl.textContent = 'Penalties: strona ' + page + ' (orderów: ' + Object.keys(map).length + ')…';
+                if (statusEl) statusEl.textContent = 'Penalties: strona ' + page + '\u2026';
                 page++;
             }
-            return map;
+            return byCompany;
         }
 
-        var state = { order: [], groups: {}, depo: { names: [], orders: [] }, matched: {}, lastOutput: '' };
+        var state = { order: [], groups: {}, depo: { names: [], orders: [] }, matched: {}, sup2cid: {}, resolved: false, lastOutput: '' };
         function firstOrder(sup){ var g = state.groups[sup] || []; for (var i=0;i<g.length;i++){ if (/^\d+$/.test(g[i].order)) return g[i].order; } return null; }
         function renderTable(){
             var out = wp.querySelector('#wp-out');
-            var lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%;">';
+            var lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             state.order.forEach(function(sup){
                 var g = state.groups[sup];
                 var isDepo = !!state.matched[sup];
                 var bg = isDepo ? 'background:#fff3bf;' : '';
                 g.forEach(function(r){
-                    html += '<tr style="' + bg + '"><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.supplier||'') + (isDepo ? ' <b style="color:#a15c00;">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.container||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.seq||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.order||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;text-align:right;">' + (r.amount||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.note||'') + '</td></tr>';
+                    html += '<tr style="' + bg + '"><td style="border:1px solid #eee;padding:2px 5px">' + (r.supplier||'') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.container||'') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.seq||'') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.order||'') + '</td><td style="border:1px solid #eee;padding:2px 5px;text-align:right">' + (r.amount||'') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.note||'') + '</td></tr>';
                     lines.push([r.supplier, r.container, r.seq, r.order, r.amount, r.note].join('\t'));
                 });
                 if (g.length > 1) {
                     var sum = 0; g.forEach(function(r){ sum += parseAmount(r.amount); }); var sumStr = sum.toFixed(2);
-                    html += '<tr style="font-weight:bold;background:#f0f0f0;"><td style="border:1px solid #ddd;padding:2px 5px;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;padding:2px 5px;text-align:right;">' + sumStr + '</td><td style="border:1px solid #ddd;"></td></tr>';
+                    html += '<tr style="font-weight:bold;background:#F6E7E6"><td style="border:1px solid #eee"></td><td style="border:1px solid #eee"></td><td style="border:1px solid #eee"></td><td style="border:1px solid #eee"></td><td style="border:1px solid #eee;padding:2px 5px;text-align:right">' + sumStr + '</td><td style="border:1px solid #eee"></td></tr>';
                     lines.push(['', '', '', '', sumStr, ''].join('\t'));
-                } else { html += '<tr><td colspan="6" style="height:6px;"></td></tr>'; lines.push(''); }
+                } else { html += '<tr><td colspan="6" style="height:6px"></td></tr>'; lines.push(''); }
             });
             html += '</table>'; out.innerHTML = html; state.lastOutput = lines.join('\n');
         }
-        wp.querySelector('#wp-go').onclick = function(){
+        async function resolveAccounts(status){
+            var depoAcc = {};
+            for (var i = 0; i < state.depo.orders.length; i++){ if (status) status.textContent = 'Konta depo: ' + (i+1) + '/' + state.depo.orders.length; var a = await companyToAcc(await orderToCompany(state.depo.orders[i])); if (a) depoAcc[a] = 1; }
+            var sup = state.order.slice();
+            for (var j = 0; j < sup.length; j++){
+                if (status) status.textContent = 'Konta balance: ' + (j+1) + '/' + sup.length;
+                var o = firstOrder(sup[j]); if (!o) continue;
+                var cid = await orderToCompany(o); state.sup2cid[sup[j]] = cid;
+                var acc = cid ? await companyToAcc(cid) : null;
+                if (acc && depoAcc[acc]) state.matched[sup[j]] = 1;
+            }
+            state.resolved = true;
+        }
+        wp.querySelector('#wp-go').onclick = async function(){
             var status = wp.querySelector('#wp-status');
             var balRows = parseBalance(wp.querySelector('#wp-balance').value);
             state.depo = parseDepo(wp.querySelector('#wp-depo').value);
             if (!balRows.length) { status.textContent = 'Wklej dane balance.'; return; }
-            state.order = []; state.groups = {}; state.matched = {};
+            state.order = []; state.groups = {}; state.matched = {}; state.sup2cid = {}; state.resolved = false;
             balRows.forEach(function(r){ var k = r.supplier; if (!(k in state.groups)) { state.groups[k] = []; state.order.push(k); } state.groups[k].push(r); });
             state.order.forEach(function(sup){ if (matchName(norm(sup), state.depo.names)) state.matched[sup] = 1; });
             renderTable();
-            var c = state.order.filter(function(s){ return !!state.matched[s]; }).length;
-            status.textContent = 'Dostawcy: ' + state.order.length + ' | z depo po nazwie: ' + c + '. „Dopasuj po koncie" sprawdzi też splity.';
-        };
-        wp.querySelector('#wp-bank').onclick = async function(){
-            var status = wp.querySelector('#wp-status');
-            if (!state.order.length) { status.textContent = 'Najpierw Przetwórz.'; return; }
-            var depoAcc = {};
-            for (var i = 0; i < state.depo.orders.length; i++){ status.textContent = 'Konta depo: ' + (i+1) + '/' + state.depo.orders.length; var a = await orderToAcc(state.depo.orders[i]); if (a) depoAcc[a] = 1; }
-            var sup = state.order.slice();
-            for (var j = 0; j < sup.length; j++){
-                status.textContent = 'Konta balance: ' + (j+1) + '/' + sup.length;
-                var o = firstOrder(sup[j]); if (!o) continue;
-                var acc = await orderToAcc(o); if (acc && depoAcc[acc]) state.matched[sup[j]] = 1;
-            }
+            status.textContent = 'Sprawdzam konta\u2026';
+            await resolveAccounts(status);
             renderTable();
             var c = state.order.filter(function(s){ return !!state.matched[s]; }).length;
-            status.textContent = 'Gotowe. Z depo (nazwa + konto): ' + c + ' dostawców na żółto.';
+            status.textContent = 'Gotowe. Dostawcy: ' + state.order.length + ' | do scalenia (\u017c\u00f3\u0142te): ' + c + '.';
         };
         wp.querySelector('#wp-pen').onclick = async function(){
             var status = wp.querySelector('#wp-status');
-            if (!state.order.length) { status.textContent = 'Najpierw Przetwórz.'; return; }
-            status.textContent = 'Pobieram penalties…';
-            var map = await fetchPenalties(status);
+            if (!state.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
+            if (!state.resolved) { status.textContent = 'Sprawdzam konta\u2026'; await resolveAccounts(status); renderTable(); }
+            status.textContent = 'Pobieram penalties\u2026';
+            var byCompany = await fetchPenalties(status);
             var added = 0;
             state.order.forEach(function(sup){
-                state.groups[sup].forEach(function(r){
-                    if (r.order && map[r.order]) { var pen = map[r.order].join(', '); if (r.note.indexOf(pen) === -1) { r.note = (r.note ? r.note + '  ' : '') + pen; added++; } }
-                });
+                var cid = state.sup2cid[sup];
+                if (!cid || !byCompany[cid]) return;
+                var pen = byCompany[cid].join(', ');
+                var r0 = (state.groups[sup] || [])[0];
+                if (r0 && r0.note.indexOf(pen) === -1) { r0.note = (r0.note ? r0.note + '  ' : '') + pen; added++; }
             });
             renderTable();
-            status.textContent = 'Dopisano penalties do ' + added + ' wierszy. (Kopiuj bierze aktualne dane.)';
+            status.textContent = added ? ('Dopisano penalties do ' + added + ' dostawc\u00f3w.') : 'Brak penalties dla tych dostawc\u00f3w (albo inny numer/pole).';
         };
         wp.querySelector('#wp-copy').onclick = function(){
-            if (!state.lastOutput) { wp.querySelector('#wp-status').textContent = 'Najpierw Przetwórz.'; return; }
+            if (!state.lastOutput) { wp.querySelector('#wp-status').textContent = 'Najpierw Przetw\u00f3rz.'; return; }
             try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(state.lastOutput, 'text'); else navigator.clipboard.writeText(state.lastOutput); wp.querySelector('#wp-status').textContent = 'Skopiowano (wklej do Google Docs).'; } catch(e){}
         };
     })();
