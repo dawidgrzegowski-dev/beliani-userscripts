@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.24
+// @version      1.25
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -7441,7 +7441,7 @@
     function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
     function toast(m) { if (!toastEl) return; toastEl.textContent = m; toastEl.style.display = 'block'; clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.style.display = 'none', 3200); }
 
-    // ===== Wyszukiwarka issue (PAID: Yes/No/-/---/Abroad + wykluczanie firm) =====
+    // ===== Wyszukiwarka issue (PAID: Yes/No/-/---/Abroad + wykluczanie firm + do Issue/PAID) =====
     (function setupIssueSearch(){
         const ORIGIN = location.origin;
         const VIEW = '93';
@@ -7498,7 +7498,8 @@
             if (comp && comp.values) {
                 var pre = ['dkv','chronopost','postnl','hoyer'];
                 h += '<label style="display:block;margin:12px 0 2px;font-weight:600;">Wyklucz firmy (Company):</label>';
-                h += '<div style="max-height:140px;overflow-y:auto;border:1px solid #eee;border-radius:6px;padding:6px;">';
+                h += '<input id="ilp-s-excl-search" type="text" placeholder="szukaj firmy\u2026" style="width:100%;padding:5px;box-sizing:border-box;margin-bottom:4px;">';
+                h += '<div id="ilp-s-excl-box" style="max-height:150px;overflow-y:auto;border:1px solid #eee;border-radius:6px;padding:6px;">';
                 comp.values.forEach(function(v){
                     var chk = pre.some(function(p){ return (v.value||'').toLowerCase().indexOf(p) !== -1; }) ? ' checked' : '';
                     h += '<label style="display:block;font-size:12px;"><input type="checkbox" class="ilp-s-excl" data-cid="' + v.id + '"' + chk + '> ' + esc(v.value) + '</label>';
@@ -7510,8 +7511,22 @@
             h += '<div id="ilp-s-results" style="margin-top:8px;font-size:12px;"></div>';
             box.innerHTML = h;
             sp.querySelector('#ilp-s-go').onclick = doSearch;
+            var es = sp.querySelector('#ilp-s-excl-search');
+            if (es) es.addEventListener('input', function(){
+                var q = es.value.toLowerCase();
+                sp.querySelectorAll('#ilp-s-excl-box label').forEach(function(lb){ lb.style.display = lb.textContent.toLowerCase().indexOf(q) !== -1 ? 'block' : 'none'; });
+            });
         }
         function paidLabel(v){ v = String(v == null ? '' : v); if (v === PAID.yes) return 'Yes'; if (v === PAID.no) return 'No'; if (v === PAID.dash) return '-'; return '---'; }
+        function toIssuePaid(nums){
+            var paste = document.getElementById('ilp-paste');
+            var loadBtn = document.getElementById('ilp-load');
+            var ilpPanel = document.getElementById('ilp-panel');
+            var ilpBtn = document.getElementById('ilp-btn');
+            if (ilpPanel) ilpPanel.style.display = 'block'; else if (ilpBtn) ilpBtn.click();
+            if (paste) { paste.value = nums; paste.dispatchEvent(new Event('input', { bubbles:true })); }
+            if (loadBtn) setTimeout(function(){ loadBtn.click(); }, 60);
+        }
         async function doSearch(){
             var status = sp.querySelector('#ilp-s-status');
             var results = sp.querySelector('#ilp-s-results');
@@ -7546,15 +7561,23 @@
                 }
                 status.textContent = 'Znaleziono: ' + list.length;
                 if (!list.length) { results.innerHTML = '<div style="color:#888">Brak.</div>'; return; }
-                var rh = '<div style="margin-bottom:6px;"><button id="ilp-s-copy" style="padding:5px 9px;border:1px solid #ccc;border-radius:6px;background:#f6e7e6;cursor:pointer;">\ud83d\udccb Kopiuj numery</button></div>';
+                var nums = list.map(function(it){ return it.id || it.organization_issue_number; });
+                var links = nums.map(function(id){ return ORIGIN + '/react/logs/issue_logs/' + id; });
+                var rh = '<div style="margin-bottom:6px;display:flex;gap:6px;flex-wrap:wrap;">'
+                    + '<button id="ilp-s-copy" style="padding:5px 9px;border:1px solid #ccc;border-radius:6px;background:#f6e7e6;cursor:pointer;">\ud83d\udccb Numery</button>'
+                    + '<button id="ilp-s-copylinks" style="padding:5px 9px;border:1px solid #ccc;border-radius:6px;background:#f6e7e6;cursor:pointer;">\ud83d\udd17 Linki</button>'
+                    + '<button id="ilp-s-toissue" style="padding:5px 9px;border:none;border-radius:6px;background:#FF2F00;color:#fff;cursor:pointer;font-weight:bold;">\u2192 Wczytaj w Issue/PAID</button>'
+                    + '</div>';
                 rh += list.map(function(it){
                     var id = it.id || it.organization_issue_number;
                     return '<div style="padding:4px 0;border-bottom:1px solid #f0f0f0;"><a href="' + ORIGIN + '/react/logs/issue_logs/' + id + '" target="_blank"><strong>' + id + '</strong></a> \u2014 ' + esc(it.issue || '') + ' <span style="color:#750000;">[PAID: ' + paidLabel(it['PAID - Finance']) + ']</span></div>';
                 }).join('');
                 rh += '<div style="text-align:center;margin-top:10px;"><button id="ilp-s-top" style="padding:5px 12px;border:1px solid #ccc;border-radius:6px;background:#f6e7e6;cursor:pointer;">\u2b06 Do g\u00f3ry</button></div>';
                 results.innerHTML = rh;
-                var cb2 = results.querySelector('#ilp-s-copy');
-                if (cb2) cb2.onclick = function(){ var nums = list.map(function(it){ return it.id || it.organization_issue_number; }).join('\n'); try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(nums, 'text'); else navigator.clipboard.writeText(nums); status.textContent = 'Skopiowano ' + list.length + ' numer\u00f3w.'; } catch(e){} };
+                function copyText(t, msg){ try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); status.textContent = msg; } catch(e){} }
+                var cn = results.querySelector('#ilp-s-copy'); if (cn) cn.onclick = function(){ copyText(nums.join('\n'), 'Skopiowano ' + nums.length + ' numer\u00f3w.'); };
+                var cl = results.querySelector('#ilp-s-copylinks'); if (cl) cl.onclick = function(){ copyText(links.join('\n'), 'Skopiowano ' + links.length + ' link\u00f3w.'); };
+                var ti = results.querySelector('#ilp-s-toissue'); if (ti) ti.onclick = function(){ toIssuePaid(nums.join('\n')); status.textContent = 'Przekazano ' + nums.length + ' do Issue/PAID.'; };
                 var tb = results.querySelector('#ilp-s-top'); if (tb) tb.onclick = function(){ sp.scrollTop = 0; };
             } catch(e){ status.textContent = 'B\u0142\u0105d: ' + e.message; }
         }
