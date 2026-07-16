@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.33
+// @version      1.34
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10878,6 +10878,7 @@
         chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); wp.style.display = 'flex'; };
 
         function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
+        function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
         function parseAmount(s){ if (s == null) return 0; var m = String(s).replace(/\s/g,'').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
         function parseBalance(txt){
             var rows = [];
@@ -10914,18 +10915,10 @@
         function saveCache(){ if (_saveT) return; _saveT = setTimeout(function(){ _saveT = null; try { GM_setValue('chn_order_cid', JSON.stringify(_cid)); GM_setValue('chn_cid_acc', JSON.stringify(_acc)); } catch(e){} }, 800); }
         var _pen = {};
         function parsePenalties(html){
-            var out = [];
-            var re = /class="commentText"[^>]*>([\s\S]{0,600})/gi, m;
-            while ((m = re.exec(html)) !== null) {
-                var txt = m[1].replace(/<[^>]+>/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
-                if (!/open amount/i.test(txt)) continue;
-                var type = ((txt.match(/^([A-Za-z][A-Za-z +\-]*?)\s*:/) || [null, 'penalty'])[1] || 'penalty').trim().toLowerCase();
-                var amt = ((txt.match(/open amount:\s*(-?[\d.,]+\s*[A-Z]{0,3})/i) || [null, ''])[1] || '').trim();
-                var no = (txt.match(/penalty no\.?\s*(\d+)/i) || [null, ''])[1] || '';
-                var note = type + (no ? ' ' + no : '') + (amt ? ' (' + amt + ')' : '');
-                if (note && out.indexOf(note) === -1) out.push(note);
-            }
-            return out;
+            var nums = [];
+            var re = /penalty no\.?\s*(\d+)/gi, m;
+            while ((m = re.exec(html)) !== null) { if (nums.indexOf(m[1]) === -1) nums.push(m[1]); }
+            return nums;
         }
         async function orderToCompany(o){
             if (_cid[o] !== undefined && _pen[o] !== undefined) return _cid[o];
@@ -10975,7 +10968,7 @@
                 var isDepo = !!state.matched[sup];
                 var bg = isDepo ? 'background:#fff3bf;' : '';
                 g.forEach(function(r){
-                    html += '<tr style="' + bg + '"><td style="border:1px solid #eee;padding:2px 5px">' + (r.supplier||'') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.container||'') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.seq||'') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.order||'') + '</td><td style="border:1px solid #eee;padding:2px 5px;text-align:right">' + (r.amount||'') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + (r.note||'') + '</td></tr>';
+                    html += '<tr style="' + bg + '"><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.supplier) + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.container) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.seq) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.order) + '</td><td style="border:1px solid #eee;padding:2px 5px;text-align:right">' + esc(r.amount) + '</td><td style="border:1px solid #eee;padding:2px 5px">' + esc(r.note) + '</td></tr>';
                     lines.push([r.supplier, r.container, r.seq, r.order, r.amount, r.note].join('\t'));
                 });
                 if (g.length > 1) {
@@ -10994,9 +10987,9 @@
         }
         async function resolveAccounts(status){
             var depoAcc = {};
-            await runPool(state.depo.orders, async function(o){ var a = await orderToAcc(o); if (a) depoAcc[a] = 1; }, function(d, n){ if (status) status.textContent = 'Konta depo: ' + d + '/' + n; });
+            await runPool(state.depo.orders, async function(o){ var a = await orderToAcc(o); if (a) depoAcc[a] = 1; }, function(d, n){ if (status) status.textContent = 'Konta depo: ' + (n ? Math.round(d/n*100) : 100) + '%'; });
             var sup = state.order.slice();
-            await runPool(sup, async function(s){ var o = firstOrder(s); if (!o) { state.sup2cid[s] = null; return; } var cid = await orderToCompany(o); state.sup2cid[s] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[s] = 1; }, function(d, n){ if (status) status.textContent = 'Konta balance: ' + d + '/' + n; });
+            await runPool(sup, async function(s){ var o = firstOrder(s); if (!o) { state.sup2cid[s] = null; return; } var cid = await orderToCompany(o); state.sup2cid[s] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[s] = 1; }, function(d, n){ if (status) status.textContent = 'Konta balance: ' + (n ? Math.round(d/n*100) : 100) + '%'; });
             state.resolved = true;
         }
         wp.querySelector('#wp-go').onclick = async function(){
@@ -11021,9 +11014,9 @@
             state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
             _pen = {};
             status.textContent = 'Czytam komentarze/penalties\u2026';
-            await runPool(uniq, async function(o){ await orderToCompany(o); }, function(d, n){ if (status) status.textContent = 'Penalties: ' + d + '/' + n; });
+            await runPool(uniq, async function(o){ await orderToCompany(o); }, function(d, n){ if (status) status.textContent = 'Penalties: ' + (n ? Math.round(d/n*100) : 100) + '%'; });
             var added = 0;
-            state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ var pen = _pen[r.order]; if (pen && pen.length) { var s = pen.join(', '); if (r.note.indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
+            state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ var nums = _pen[r.order]; if (nums && nums.length) { var s = 'penalty no. ' + nums.join(', '); if (r.note.indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
             renderTable();
             status.textContent = added ? ('Dopisano penalties do ' + added + ' wierszy.') : 'Brak penalties w komentarzach tych order\u00f3w.';
         };
