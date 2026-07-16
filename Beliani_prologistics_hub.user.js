@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.43
+// @version      1.44
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10895,6 +10895,7 @@
         function elBg(el){ if (!el) return ''; var b = el.style && el.style.backgroundColor; if (b && b !== 'transparent' && b !== 'rgba(0, 0, 0, 0)') return b; var a = el.getAttribute && el.getAttribute('bgcolor'); return a || ''; }
         function rowBg(tr){ var b = elBg(tr); if (b) return b; var tds = tr.querySelectorAll('td, th'); for (var i = 0; i < tds.length; i++){ var c = elBg(tds[i]); if (c) return c; } return ''; }
         function cellsOf(tr){ var tds = tr.querySelectorAll('td, th'); return Array.prototype.map.call(tds, function(td){ var a = td.querySelector('a'); return { t: (td.textContent || '').trim(), u: a ? (a.getAttribute('href') || '') : '' }; }); }
+        function isHeader(c){ var hasLink = c.some(function(x){ return /op_suppliers|op_order/.test(x.u); }); if (hasLink) return false; var j = c.map(function(x){ return x.t; }).join(' ').toLowerCase(); return /company name|order id|supplier name|order number/.test(j); }
 
         function mkBal(c, bg){
             while (c.length < 6) c.push({ t: '', u: '' });
@@ -10913,7 +10914,7 @@
         function parseBalance(el){
             var rows = [], trs = el.querySelectorAll('tr');
             if (trs.length) {
-                trs.forEach(function(tr){ var c = cellsOf(tr); if (c.length && c.some(function(x){ return x.t; })) rows.push(mkBal(c, rowBg(tr))); });
+                trs.forEach(function(tr){ var c = cellsOf(tr); if (c.length && c.some(function(x){ return x.t; }) && !isHeader(c)) rows.push(mkBal(c, rowBg(tr))); });
             } else {
                 (el.innerText || el.textContent || '').split(/\r?\n/).forEach(function(line){
                     if (!line.trim()) return;
@@ -10927,7 +10928,7 @@
         function parseDepo(el){
             var rows = [], names = [], trs = el.querySelectorAll('tr');
             if (trs.length) {
-                trs.forEach(function(tr){ var c = cellsOf(tr); if (!c.length || !c.some(function(x){ return x.t; })) return; var r = mkDep(c, rowBg(tr)); rows.push(r); names.push(norm(r.supplier)); });
+                trs.forEach(function(tr){ var c = cellsOf(tr); if (!c.length || !c.some(function(x){ return x.t; }) || isHeader(c)) return; var r = mkDep(c, rowBg(tr)); rows.push(r); names.push(norm(r.supplier)); });
             } else {
                 (el.innerText || el.textContent || '').split(/\r?\n/).forEach(function(line){
                     if (!line.trim()) return;
@@ -10988,13 +10989,15 @@
         async function depGroupCid(sup){ var g = state.dep.groups[sup] || []; for (var i = 0; i < g.length; i++){ if (g[i].cid) return g[i].cid; } for (var j = 0; j < g.length; j++){ if (/^\d+$/.test(g[j].order)) return await orderToCompany(g[j].order); } return null; }
 
         function cel(content, bg, right){ return '<td style="border:1px solid #eee;padding:2px 5px' + (right ? ';text-align:right' : '') + (bg ? ';background:' + bg : '') + '">' + content + '</td>'; }
-        function renderBal(){
+        function renderBal(forCopy){
             var g = state.bal, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             g.order.forEach(function(sup){
                 var rows = g.groups[sup], isDepo = !!state.matched[sup];
                 rows.forEach(function(r){
                     var bg = isDepo ? '#fff3bf' : (r.bg || '');
-                    html += '<tr>' + cel(aLink(r.supplierUrl, r.supplier, '#750000') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : ''), bg) + cel(esc(r.container), bg) + cel(esc(r.seq), bg) + cel(aLink(r.orderUrl, r.order), bg) + cel(esc(r.amount), bg, true) + cel(esc(r.note), bg) + '</tr>';
+                    var supC = forCopy ? esc(cellHL(r.supplierUrl, r.supplier)) : (aLink(r.supplierUrl, r.supplier, '#750000') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : ''));
+                    var ordC = forCopy ? esc(cellHL(r.orderUrl, r.order)) : aLink(r.orderUrl, r.order);
+                    html += '<tr>' + cel(supC, bg) + cel(esc(r.container), bg) + cel(esc(r.seq), bg) + cel(ordC, bg) + cel(esc(r.amount), bg, true) + cel(esc(r.note), bg) + '</tr>';
                     lines.push([cellHL(r.supplierUrl, r.supplier), r.container, r.seq, cellHL(r.orderUrl, r.order), r.amount, r.note].join('\t'));
                 });
                 if (rows.length > 1) { var sum = 0; rows.forEach(function(r){ sum += parseAmount(r.amount); }); var s = sum.toFixed(2); html += '<tr style="font-weight:bold">' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel(esc(s), '#fff', true) + cel('', '#fff') + '</tr>'; lines.push(['', '', '', '', s, ''].join('\t')); }
@@ -11002,13 +11005,13 @@
             });
             return { html: html + '</table>', lines: lines };
         }
-        function renderDepo(){
+        function renderDepo(forCopy){
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             var maxc = 1; g.order.forEach(function(sup){ g.groups[sup].forEach(function(r){ if (r.cells && r.cells.length > maxc) maxc = r.cells.length; }); });
             g.order.forEach(function(sup){
                 g.groups[sup].forEach(function(r){
                     var bg = r.bg || '', tds = '', lc = [];
-                    (r.cells || []).forEach(function(x){ var content = x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
+                    (r.cells || []).forEach(function(x){ var content = forCopy ? (x.u ? esc(cellHL(x.u, x.t)) : esc(x.t)) : (x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t)); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
                     html += '<tr>' + tds + '</tr>'; lines.push(lc.join('\t'));
                 });
                 var sep = ''; for (var i = 0; i < maxc; i++) sep += cel('', '#fff'); html += '<tr>' + sep + '</tr>'; lines.push('');
@@ -11016,7 +11019,7 @@
             return { html: html + '</table>', lines: lines };
         }
         function renderTables(){
-            var b = renderBal(), d = renderDepo();
+            var b = renderBal(false), d = renderDepo(false);
             wp.querySelector('#wp-out-bal').innerHTML = b.html;
             wp.querySelector('#wp-out-dep').innerHTML = d.html;
             state.balHtml = b.html; state.depHtml = d.html;
@@ -11059,13 +11062,13 @@
         };
         wp.querySelector('#wp-copy-bal').onclick = function(){
             var status = wp.querySelector('#wp-status');
-            if (!state.balHtml) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
-            copyHtml(state.balHtml); status.textContent = 'Skopiowano BALANCE (wklej do Sheets \u2014 z kolorami).';
+            if (!state.bal.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
+            copyHtml(renderBal(true).html); status.textContent = 'Skopiowano BALANCE (wklej do Sheets \u2014 z kolorami).';
         };
         wp.querySelector('#wp-copy-dep').onclick = function(){
             var status = wp.querySelector('#wp-status');
-            if (!state.depHtml) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
-            copyHtml(state.depHtml); status.textContent = 'Skopiowano DEPO (wklej do Sheets \u2014 z kolorami).';
+            if (!state.dep.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
+            copyHtml(renderDepo(true).html); status.textContent = 'Skopiowano DEPO (wklej do Sheets \u2014 z kolorami).';
         };
     })();
 })();
