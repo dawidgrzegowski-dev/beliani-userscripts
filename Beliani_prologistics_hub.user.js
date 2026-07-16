@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.35
+// @version      1.36
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10826,6 +10826,7 @@
     document.body.appendChild(panel);
     // ===== Chinskie: chooser + Wprowadzanie (Beliani, scalony Przetworz, penalties po company_id) =====
     (function(){
+        var VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
         var st = document.createElement('style');
         st.textContent = '#chinskie-chooser .ch-row{display:flex;align-items:center;gap:10px;width:100%;border:none;background:#fff;color:#332524;padding:10px 12px;border-radius:8px;cursor:pointer;font:600 13px system-ui;text-align:left}'
             + '#chinskie-chooser .ch-row:hover{background:#F6E7E6;color:#750000}'
@@ -10858,7 +10859,7 @@
         wp.style.cssText = 'position:fixed;left:50%;top:50px;transform:translateX(-50%);z-index:2147483007;background:#fff;border:1px solid #FFCCB7;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.25);padding:0;width:min(820px, calc(100vw - 32px));max-height:calc(100vh - 70px);overflow:hidden;font-family:system-ui;color:#332524;flex-direction:column';
         wp.style.display = 'none';
         wp.innerHTML =
-            '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Wprowadzanie (balance)</div><button id="wp-close" class="chn-btn ghost" style="padding:4px 12px">\u2715</button></div>'
+            '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Wprowadzanie (balance) <span style="font-weight:400;font-size:11px;opacity:.6">v' + VER + '</span></div><button id="wp-close" class="chn-btn ghost" style="padding:4px 12px">\u2715</button></div>'
           + '<div style="padding:16px;overflow-y:auto">'
           + '<div style="display:flex;gap:10px;flex-wrap:wrap">'
           + '<div style="flex:1;min-width:280px"><label style="font-weight:600;font-size:12px">BALANCE (wklej z pliku wyjściowego, Tab):</label><textarea id="wp-balance" style="width:100%;height:150px;font-family:monospace;font-size:11px"></textarea></div>'
