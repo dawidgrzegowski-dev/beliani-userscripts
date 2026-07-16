@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.26
+// @version      1.29
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10849,7 +10849,7 @@
           + '<div style="flex:1;min-width:280px;"><label style="font-weight:600;font-size:12px;">BALANCE (wklej z pliku wyjściowego, kolumny Tab):</label><textarea id="wp-balance" style="width:100%;height:150px;font-family:monospace;font-size:11px;box-sizing:border-box;"></textarea></div>'
           + '<div style="flex:1;min-width:280px;"><label style="font-weight:600;font-size:12px;">DEPO (wklej: nazwy dostawców lub order-id + nazwa):</label><textarea id="wp-depo" style="width:100%;height:150px;font-family:monospace;font-size:11px;box-sizing:border-box;"></textarea></div>'
           + '</div>'
-          + '<div style="margin-top:10px;"><button id="wp-go" style="padding:9px 16px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">Przetwórz</button> <button id="wp-copy" style="padding:9px 16px;background:#FF2F00;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83d\udccb Kopiuj (do Docs)</button> <span id="wp-status" style="font-size:12px;color:#666;margin-left:8px;"></span></div>'
+          + '<div style="margin-top:10px;"><button id="wp-go" style="padding:9px 16px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">Przetwórz</button> <button id="wp-bank" style="padding:9px 16px;background:#1F6FEB;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83c\udfe6 Dopasuj po koncie</button> <button id="wp-pen" style="padding:9px 16px;background:#7c3aed;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83e\uddfe Penalties</button> <button id="wp-copy" style="padding:9px 16px;background:#FF2F00;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">\ud83d\udccb Kopiuj (do Docs)</button> <span id="wp-status" style="font-size:12px;color:#666;margin-left:8px;"></span></div>'
           + '<div id="wp-out" style="margin-top:12px;overflow-x:auto;"></div>';
         document.body.appendChild(wp);
         wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
@@ -10863,60 +10863,129 @@
             var rows = [];
             txt.split(/\r?\n/).forEach(function(line){
                 if (!line.trim()) return;
-                var c = line.split('\t');
-                while (c.length < 6) c.push('');
+                var c = line.split('\t'); while (c.length < 6) c.push('');
                 rows.push({ supplier: c[0].trim(), container: c[1].trim(), seq: c[2].trim(), order: c[3].trim(), amount: c[4].trim(), note: c[5].trim() });
             });
             return rows;
         }
-        function parseDepoSuppliers(txt){
-            var set = {};
+        function parseDepo(txt){
+            var names = [], orders = [];
             txt.split(/\r?\n/).forEach(function(line){
                 if (!line.trim()) return;
                 var c = line.split('\t');
-                var name = (c.length >= 2 && /^\d+$/.test(c[0].trim())) ? c[1].trim() : (c[0] || line).trim();
-                if (name) set[norm(name)] = 1;
+                if (c.length >= 2 && /^\d+$/.test(c[0].trim())) { orders.push(c[0].trim()); names.push(norm(c[1].trim())); }
+                else { names.push(norm((c[0]||line).trim())); }
             });
-            return set;
+            return { names: names, orders: orders };
         }
-        var lastOutput = '';
-        wp.querySelector('#wp-go').onclick = function(){
-            var status = wp.querySelector('#wp-status');
+        function matchName(supNorm, depoNames){
+            for (var i = 0; i < depoNames.length; i++){
+                var d = depoNames[i]; if (!d) continue;
+                if (supNorm === d) return true;
+                var sh = supNorm.length <= d.length ? supNorm : d, lo = supNorm.length <= d.length ? d : supNorm;
+                if (sh.length >= 8 && lo.indexOf(sh) === 0) return true;
+            }
+            return false;
+        }
+        var _cid = {}, _acc = {};
+        async function orderToCompany(o){
+            if (_cid[o] !== undefined) return _cid[o];
+            var v = null;
+            try { var h = await fetch('/op_order.php?id=' + encodeURIComponent(o), { credentials:'same-origin' }).then(function(r){ return r.text(); }); var m = h.match(/op_suppliers\.php\?company_id=(\d+)/); v = m ? m[1] : null; } catch(e){}
+            _cid[o] = v; return v;
+        }
+        async function companyToAcc(c){
+            if (!c) return null;
+            if (_acc[c] !== undefined) return _acc[c];
+            var v = null;
+            try { var h = await fetch('/op_suppliers.php?company_id=' + encodeURIComponent(c), { credentials:'same-origin' }).then(function(r){ return r.text(); }); var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); v = m ? m[1].trim() : null; } catch(e){}
+            _acc[c] = v; return v;
+        }
+        async function orderToAcc(o){ return await companyToAcc(await orderToCompany(o)); }
+        async function fetchPenalties(statusEl){
+            var map = {}, page = 1, guard = 0, seen = {};
+            while (guard++ < 40) {
+                var d;
+                try { d = await fetch('/api/rest/penalty/list?log=1&filter[inactive]=0&filter[applied]=1&page=' + page, { credentials:'same-origin', headers:{ 'X-Requested-With':'XMLHttpRequest', 'accept':'application/json' } }).then(function(r){ return r.json(); }); } catch(e){ break; }
+                var list = (d && d.result) ? d.result : [];
+                if (!list.length) break;
+                var firstId = list[0].id;
+                if (seen[firstId]) break; seen[firstId] = 1;
+                list.forEach(function(p){
+                    var note = (p.penalty_name || '') + ' ' + (p.id || p.penalty_id || '');
+                    [p.source_order_id, p.target_order_id].forEach(function(o){ if (o) { (map[o] = map[o] || []); if (map[o].indexOf(note) === -1) map[o].push(note); } });
+                });
+                if (statusEl) statusEl.textContent = 'Penalties: strona ' + page + ' (orderów: ' + Object.keys(map).length + ')…';
+                page++;
+            }
+            return map;
+        }
+
+        var state = { order: [], groups: {}, depo: { names: [], orders: [] }, matched: {}, lastOutput: '' };
+        function firstOrder(sup){ var g = state.groups[sup] || []; for (var i=0;i<g.length;i++){ if (/^\d+$/.test(g[i].order)) return g[i].order; } return null; }
+        function renderTable(){
             var out = wp.querySelector('#wp-out');
-            var balRows = parseBalance(wp.querySelector('#wp-balance').value);
-            var depoSet = parseDepoSuppliers(wp.querySelector('#wp-depo').value);
-            if (!balRows.length) { status.textContent = 'Wklej dane balance.'; return; }
-            var order = [], groups = {};
-            balRows.forEach(function(r){ var k = r.supplier; if (!(k in groups)) { groups[k] = []; order.push(k); } groups[k].push(r); });
-            var lines = [];
-            var html = '<table style="border-collapse:collapse;font-size:11px;width:100%;">';
-            order.forEach(function(sup){
-                var g = groups[sup];
-                var isDepo = !!depoSet[norm(sup)];
+            var lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%;">';
+            state.order.forEach(function(sup){
+                var g = state.groups[sup];
+                var isDepo = !!state.matched[sup];
                 var bg = isDepo ? 'background:#fff3bf;' : '';
                 g.forEach(function(r){
                     html += '<tr style="' + bg + '"><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.supplier||'') + (isDepo ? ' <b style="color:#a15c00;">[DEPO\u21921 przelew]</b>' : '') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.container||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.seq||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.order||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;text-align:right;">' + (r.amount||'') + '</td><td style="border:1px solid #ddd;padding:2px 5px;">' + (r.note||'') + '</td></tr>';
                     lines.push([r.supplier, r.container, r.seq, r.order, r.amount, r.note].join('\t'));
                 });
                 if (g.length > 1) {
-                    var sum = 0; g.forEach(function(r){ sum += parseAmount(r.amount); });
-                    var sumStr = sum.toFixed(2);
+                    var sum = 0; g.forEach(function(r){ sum += parseAmount(r.amount); }); var sumStr = sum.toFixed(2);
                     html += '<tr style="font-weight:bold;background:#f0f0f0;"><td style="border:1px solid #ddd;padding:2px 5px;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;"></td><td style="border:1px solid #ddd;padding:2px 5px;text-align:right;">' + sumStr + '</td><td style="border:1px solid #ddd;"></td></tr>';
                     lines.push(['', '', '', '', sumStr, ''].join('\t'));
-                } else {
-                    html += '<tr><td colspan="6" style="height:6px;"></td></tr>';
-                    lines.push('');
-                }
+                } else { html += '<tr><td colspan="6" style="height:6px;"></td></tr>'; lines.push(''); }
             });
-            html += '</table>';
-            out.innerHTML = html;
-            lastOutput = lines.join('\n');
-            var depoCount = order.filter(function(s){ return !!depoSet[norm(s)]; }).length;
-            status.textContent = 'Dostawcy: ' + order.length + ' | z depo (żółte): ' + depoCount;
+            html += '</table>'; out.innerHTML = html; state.lastOutput = lines.join('\n');
+        }
+        wp.querySelector('#wp-go').onclick = function(){
+            var status = wp.querySelector('#wp-status');
+            var balRows = parseBalance(wp.querySelector('#wp-balance').value);
+            state.depo = parseDepo(wp.querySelector('#wp-depo').value);
+            if (!balRows.length) { status.textContent = 'Wklej dane balance.'; return; }
+            state.order = []; state.groups = {}; state.matched = {};
+            balRows.forEach(function(r){ var k = r.supplier; if (!(k in state.groups)) { state.groups[k] = []; state.order.push(k); } state.groups[k].push(r); });
+            state.order.forEach(function(sup){ if (matchName(norm(sup), state.depo.names)) state.matched[sup] = 1; });
+            renderTable();
+            var c = state.order.filter(function(s){ return !!state.matched[s]; }).length;
+            status.textContent = 'Dostawcy: ' + state.order.length + ' | z depo po nazwie: ' + c + '. „Dopasuj po koncie" sprawdzi też splity.';
+        };
+        wp.querySelector('#wp-bank').onclick = async function(){
+            var status = wp.querySelector('#wp-status');
+            if (!state.order.length) { status.textContent = 'Najpierw Przetwórz.'; return; }
+            var depoAcc = {};
+            for (var i = 0; i < state.depo.orders.length; i++){ status.textContent = 'Konta depo: ' + (i+1) + '/' + state.depo.orders.length; var a = await orderToAcc(state.depo.orders[i]); if (a) depoAcc[a] = 1; }
+            var sup = state.order.slice();
+            for (var j = 0; j < sup.length; j++){
+                status.textContent = 'Konta balance: ' + (j+1) + '/' + sup.length;
+                var o = firstOrder(sup[j]); if (!o) continue;
+                var acc = await orderToAcc(o); if (acc && depoAcc[acc]) state.matched[sup[j]] = 1;
+            }
+            renderTable();
+            var c = state.order.filter(function(s){ return !!state.matched[s]; }).length;
+            status.textContent = 'Gotowe. Z depo (nazwa + konto): ' + c + ' dostawców na żółto.';
+        };
+        wp.querySelector('#wp-pen').onclick = async function(){
+            var status = wp.querySelector('#wp-status');
+            if (!state.order.length) { status.textContent = 'Najpierw Przetwórz.'; return; }
+            status.textContent = 'Pobieram penalties…';
+            var map = await fetchPenalties(status);
+            var added = 0;
+            state.order.forEach(function(sup){
+                state.groups[sup].forEach(function(r){
+                    if (r.order && map[r.order]) { var pen = map[r.order].join(', '); if (r.note.indexOf(pen) === -1) { r.note = (r.note ? r.note + '  ' : '') + pen; added++; } }
+                });
+            });
+            renderTable();
+            status.textContent = 'Dopisano penalties do ' + added + ' wierszy. (Kopiuj bierze aktualne dane.)';
         };
         wp.querySelector('#wp-copy').onclick = function(){
-            if (!lastOutput) { wp.querySelector('#wp-status').textContent = 'Najpierw Przetwórz.'; return; }
-            try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(lastOutput, 'text'); else navigator.clipboard.writeText(lastOutput); wp.querySelector('#wp-status').textContent = 'Skopiowano (wklej do Google Docs).'; } catch(e){}
+            if (!state.lastOutput) { wp.querySelector('#wp-status').textContent = 'Najpierw Przetwórz.'; return; }
+            try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(state.lastOutput, 'text'); else navigator.clipboard.writeText(state.lastOutput); wp.querySelector('#wp-status').textContent = 'Skopiowano (wklej do Google Docs).'; } catch(e){}
         };
     })();
 })();
