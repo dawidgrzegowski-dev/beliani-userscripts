@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.31
+// @version      1.33
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10908,18 +10908,41 @@
             return false;
         }
         var _cid = {}, _acc = {};
+        try { _cid = JSON.parse(GM_getValue('chn_order_cid', '{}')) || {}; } catch(e){ _cid = {}; }
+        try { _acc = JSON.parse(GM_getValue('chn_cid_acc', '{}')) || {}; } catch(e){ _acc = {}; }
+        var _saveT = null;
+        function saveCache(){ if (_saveT) return; _saveT = setTimeout(function(){ _saveT = null; try { GM_setValue('chn_order_cid', JSON.stringify(_cid)); GM_setValue('chn_cid_acc', JSON.stringify(_acc)); } catch(e){} }, 800); }
+        var _pen = {};
+        function parsePenalties(html){
+            var out = [];
+            var re = /class="commentText"[^>]*>([\s\S]{0,600})/gi, m;
+            while ((m = re.exec(html)) !== null) {
+                var txt = m[1].replace(/<[^>]+>/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+                if (!/open amount/i.test(txt)) continue;
+                var type = ((txt.match(/^([A-Za-z][A-Za-z +\-]*?)\s*:/) || [null, 'penalty'])[1] || 'penalty').trim().toLowerCase();
+                var amt = ((txt.match(/open amount:\s*(-?[\d.,]+\s*[A-Z]{0,3})/i) || [null, ''])[1] || '').trim();
+                var no = (txt.match(/penalty no\.?\s*(\d+)/i) || [null, ''])[1] || '';
+                var note = type + (no ? ' ' + no : '') + (amt ? ' (' + amt + ')' : '');
+                if (note && out.indexOf(note) === -1) out.push(note);
+            }
+            return out;
+        }
         async function orderToCompany(o){
-            if (_cid[o] !== undefined) return _cid[o];
-            var v = null;
-            try { var h = await fetch('/op_order.php?id=' + encodeURIComponent(o), { credentials:'same-origin' }).then(function(r){ return r.text(); }); var m = h.match(/op_suppliers\.php\?company_id=(\d+)/); v = m ? m[1] : null; } catch(e){}
-            _cid[o] = v; return v;
+            if (_cid[o] !== undefined && _pen[o] !== undefined) return _cid[o];
+            var v = (_cid[o] !== undefined) ? _cid[o] : null;
+            try {
+                var h = await fetch('/op_order.php?id=' + encodeURIComponent(o), { credentials:'same-origin' }).then(function(r){ return r.text(); });
+                if (_cid[o] === undefined) { var m = h.match(/op_suppliers\.php\?company_id=(\d+)/); v = m ? m[1] : null; _cid[o] = v; saveCache(); }
+                _pen[o] = parsePenalties(h);
+            } catch(e){ if (_pen[o] === undefined) _pen[o] = []; }
+            return v;
         }
         async function companyToAcc(c){
             if (!c) return null;
             if (_acc[c] !== undefined) return _acc[c];
             var v = null;
             try { var h = await fetch('/op_suppliers.php?company_id=' + encodeURIComponent(c), { credentials:'same-origin' }).then(function(r){ return r.text(); }); var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); v = m ? m[1].trim() : null; } catch(e){}
-            _acc[c] = v; return v;
+            _acc[c] = v; saveCache(); return v;
         }
         async function fetchPenalties(statusEl){
             var byCompany = {}, page = 1, guard = 0, seen = {};
@@ -10963,17 +10986,17 @@
             });
             html += '</table>'; out.innerHTML = html; state.lastOutput = lines.join('\n');
         }
+        async function runPool(items, worker, onProgress){
+            var idx = 0, done = 0, N = items.length, WORKERS = 7;
+            async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); done++; if (onProgress) onProgress(done, N); } }
+            var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one());
+            await Promise.all(pool);
+        }
         async function resolveAccounts(status){
             var depoAcc = {};
-            for (var i = 0; i < state.depo.orders.length; i++){ if (status) status.textContent = 'Konta depo: ' + (i+1) + '/' + state.depo.orders.length; var a = await companyToAcc(await orderToCompany(state.depo.orders[i])); if (a) depoAcc[a] = 1; }
+            await runPool(state.depo.orders, async function(o){ var a = await orderToAcc(o); if (a) depoAcc[a] = 1; }, function(d, n){ if (status) status.textContent = 'Konta depo: ' + d + '/' + n; });
             var sup = state.order.slice();
-            for (var j = 0; j < sup.length; j++){
-                if (status) status.textContent = 'Konta balance: ' + (j+1) + '/' + sup.length;
-                var o = firstOrder(sup[j]); if (!o) continue;
-                var cid = await orderToCompany(o); state.sup2cid[sup[j]] = cid;
-                var acc = cid ? await companyToAcc(cid) : null;
-                if (acc && depoAcc[acc]) state.matched[sup[j]] = 1;
-            }
+            await runPool(sup, async function(s){ var o = firstOrder(s); if (!o) { state.sup2cid[s] = null; return; } var cid = await orderToCompany(o); state.sup2cid[s] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[s] = 1; }, function(d, n){ if (status) status.textContent = 'Konta balance: ' + d + '/' + n; });
             state.resolved = true;
         }
         wp.querySelector('#wp-go').onclick = async function(){
@@ -10994,19 +11017,15 @@
         wp.querySelector('#wp-pen').onclick = async function(){
             var status = wp.querySelector('#wp-status');
             if (!state.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
-            if (!state.resolved) { status.textContent = 'Sprawdzam konta\u2026'; await resolveAccounts(status); renderTable(); }
-            status.textContent = 'Pobieram penalties\u2026';
-            var byCompany = await fetchPenalties(status);
+            var uniq = [], seen = {};
+            state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
+            _pen = {};
+            status.textContent = 'Czytam komentarze/penalties\u2026';
+            await runPool(uniq, async function(o){ await orderToCompany(o); }, function(d, n){ if (status) status.textContent = 'Penalties: ' + d + '/' + n; });
             var added = 0;
-            state.order.forEach(function(sup){
-                var cid = state.sup2cid[sup];
-                if (!cid || !byCompany[cid]) return;
-                var pen = byCompany[cid].join(', ');
-                var r0 = (state.groups[sup] || [])[0];
-                if (r0 && r0.note.indexOf(pen) === -1) { r0.note = (r0.note ? r0.note + '  ' : '') + pen; added++; }
-            });
+            state.order.forEach(function(sup){ (state.groups[sup] || []).forEach(function(r){ var pen = _pen[r.order]; if (pen && pen.length) { var s = pen.join(', '); if (r.note.indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
             renderTable();
-            status.textContent = added ? ('Dopisano penalties do ' + added + ' dostawc\u00f3w.') : 'Brak penalties dla tych dostawc\u00f3w (albo inny numer/pole).';
+            status.textContent = added ? ('Dopisano penalties do ' + added + ' wierszy.') : 'Brak penalties w komentarzach tych order\u00f3w.';
         };
         wp.querySelector('#wp-copy').onclick = function(){
             if (!state.lastOutput) { wp.querySelector('#wp-status').textContent = 'Najpierw Przetw\u00f3rz.'; return; }
