@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.42
+// @version      1.43
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10906,13 +10906,9 @@
             var supC = null, ordC = null;
             c.forEach(function(x){ if (/op_suppliers/.test(x.u) && !supC) supC = x; if (/op_order/.test(x.u) && !ordC) ordC = x; });
             var supplier = supC ? supC.t : (c[0] ? c[0].t : '');
-            var supUrl = supC ? supC.u : '';
-            var order = ordC ? ordC.t : (c.length >= 2 && /^\d+$/.test((c[0].t || '')) ? c[0].t : '');
-            var ordUrl = ordC ? ordC.u : '';
-            var amount = '';
-            for (var i = c.length - 1; i >= 0; i--){ var tt = (c[i].t || '').trim(); if (tt && /^-?[\d\s.,]+$/.test(tt) && tt !== order) { amount = tt; break; } }
-            var cid = (supUrl.match(/company_id=(\d+)/) || [])[1] || null;
-            return { supplier: supplier, supplierUrl: supUrl, order: order, orderUrl: ordUrl, amount: amount, cid: cid, bg: bg };
+            var cid = (supC && (supC.u.match(/company_id=(\d+)/) || [])[1]) || null;
+            var order = ordC ? ordC.t : '';
+            return { supplier: supplier, cid: cid, order: order, cells: c, bg: bg };
         }
         function parseBalance(el){
             var rows = [], trs = el.querySelectorAll('tr');
@@ -10939,7 +10935,7 @@
                     var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
                     var order = null, name = '';
                     if (c.length >= 2 && /^\d+$/.test(c[0].trim())) { order = c[0].trim(); name = c[1].trim(); } else { name = (c[0] || line).trim(); }
-                    rows.push({ supplier: name, supplierUrl: '', order: order || '', orderUrl: '', amount: '', cid: cid, bg: '' });
+                    rows.push({ supplier: name, cid: cid, order: order || '', cells: c.map(function(x){ return { t: (x || '').trim(), u: '' }; }), bg: '' });
                     names.push(norm(name));
                 });
             }
@@ -10991,33 +10987,31 @@
         async function groupCid(sup){ var c = balCid(sup); if (c) return c; var g = state.bal.groups[sup] || []; for (var i = 0; i < g.length; i++){ if (/^\d+$/.test(g[i].order)) return await orderToCompany(g[i].order); } return null; }
         async function depGroupCid(sup){ var g = state.dep.groups[sup] || []; for (var i = 0; i < g.length; i++){ if (g[i].cid) return g[i].cid; } for (var j = 0; j < g.length; j++){ if (/^\d+$/.test(g[j].order)) return await orderToCompany(g[j].order); } return null; }
 
-        function td(v){ return '<td style="border:1px solid #eee;padding:2px 5px">' + esc(v) + '</td>'; }
-        function tdR(v){ return '<td style="border:1px solid #eee;padding:2px 5px;text-align:right">' + esc(v) + '</td>'; }
+        function cel(content, bg, right){ return '<td style="border:1px solid #eee;padding:2px 5px' + (right ? ';text-align:right' : '') + (bg ? ';background:' + bg : '') + '">' + content + '</td>'; }
         function renderBal(){
             var g = state.bal, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             g.order.forEach(function(sup){
                 var rows = g.groups[sup], isDepo = !!state.matched[sup];
                 rows.forEach(function(r){
-                    var bg = isDepo ? 'background:#fff3bf;' : (r.bg ? 'background:' + r.bg + ';' : '');
-                    html += '<tr style="' + bg + '"><td style="border:1px solid #eee;padding:2px 5px">' + aLink(r.supplierUrl, r.supplier, '#750000') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : '') + '</td>' + td(r.container) + td(r.seq) + '<td style="border:1px solid #eee;padding:2px 5px">' + aLink(r.orderUrl, r.order) + '</td>' + tdR(r.amount) + td(r.note) + '</tr>';
+                    var bg = isDepo ? '#fff3bf' : (r.bg || '');
+                    html += '<tr>' + cel(aLink(r.supplierUrl, r.supplier, '#750000') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : ''), bg) + cel(esc(r.container), bg) + cel(esc(r.seq), bg) + cel(aLink(r.orderUrl, r.order), bg) + cel(esc(r.amount), bg, true) + cel(esc(r.note), bg) + '</tr>';
                     lines.push([cellHL(r.supplierUrl, r.supplier), r.container, r.seq, cellHL(r.orderUrl, r.order), r.amount, r.note].join('\t'));
                 });
-                if (rows.length > 1) { var sum = 0; rows.forEach(function(r){ sum += parseAmount(r.amount); }); var s = sum.toFixed(2); html += '<tr style="font-weight:bold;background:#F6E7E6"><td style="border:1px solid #eee"></td><td style="border:1px solid #eee"></td><td style="border:1px solid #eee"></td><td style="border:1px solid #eee"></td>' + tdR(s) + '<td style="border:1px solid #eee"></td></tr>'; lines.push(['', '', '', '', s, ''].join('\t')); }
-                else { html += '<tr><td colspan="6" style="height:6px"></td></tr>'; lines.push(''); }
+                if (rows.length > 1) { var sum = 0; rows.forEach(function(r){ sum += parseAmount(r.amount); }); var s = sum.toFixed(2); html += '<tr style="font-weight:bold">' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel(esc(s), '#fff', true) + cel('', '#fff') + '</tr>'; lines.push(['', '', '', '', s, ''].join('\t')); }
+                else { html += '<tr>' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + '</tr>'; lines.push(''); }
             });
             return { html: html + '</table>', lines: lines };
         }
         function renderDepo(){
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
+            var maxc = 1; g.order.forEach(function(sup){ g.groups[sup].forEach(function(r){ if (r.cells && r.cells.length > maxc) maxc = r.cells.length; }); });
             g.order.forEach(function(sup){
-                var rows = g.groups[sup];
-                rows.forEach(function(r){
-                    var bg = r.bg ? 'background:' + r.bg + ';' : '';
-                    html += '<tr style="' + bg + '"><td style="border:1px solid #eee;padding:2px 5px">' + aLink(r.supplierUrl, r.supplier, '#750000') + '</td><td style="border:1px solid #eee;padding:2px 5px">' + aLink(r.orderUrl, r.order) + '</td>' + tdR(r.amount) + '</tr>';
-                    lines.push([cellHL(r.supplierUrl, r.supplier), cellHL(r.orderUrl, r.order), r.amount].join('\t'));
+                g.groups[sup].forEach(function(r){
+                    var bg = r.bg || '', tds = '', lc = [];
+                    (r.cells || []).forEach(function(x){ var content = x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
+                    html += '<tr>' + tds + '</tr>'; lines.push(lc.join('\t'));
                 });
-                if (rows.length > 1) { var sum = 0; rows.forEach(function(r){ sum += parseAmount(r.amount); }); var s = sum.toFixed(2); html += '<tr style="font-weight:bold;background:#F6E7E6"><td style="border:1px solid #eee"></td><td style="border:1px solid #eee"></td>' + tdR(s) + '</tr>'; lines.push(['', '', s].join('\t')); }
-                else { html += '<tr><td colspan="3" style="height:6px"></td></tr>'; lines.push(''); }
+                var sep = ''; for (var i = 0; i < maxc; i++) sep += cel('', '#fff'); html += '<tr>' + sep + '</tr>'; lines.push('');
             });
             return { html: html + '</table>', lines: lines };
         }
