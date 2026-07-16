@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.29
+// @version      1.30
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -6432,7 +6432,7 @@
         s.textContent = `
         #sepa-btn{position:fixed;right:16px;bottom:90px;z-index:2147483000;background:#FF2F00;color:#fff;border:none;border-radius:24px;padding:12px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)}
         #sepa-btn:hover{background:#cc2600}
-        #sepa-overlay{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:2147483001;display:none;align-items:flex-start;justify-content:center}
+        #sepa-overlay{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:2147483040;display:none;align-items:flex-start;justify-content:center}
         #sepa-panel{background:#fff;margin:24px;width:min(1200px,96vw);max-height:92vh;border-radius:12px;display:flex;flex-direction:column;overflow:hidden;font:13px system-ui,sans-serif;color:#111}
         #sepa-panel h2{margin:0;font-size:15px}
         .sepa-head{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid #e5e7eb;background:#f8fafc}
@@ -6457,7 +6457,7 @@
         td.st .w{color:#b45309;display:block}
         td.st .ok{color:#15803d}
         .sepa-num{width:150px}
-        #sepa-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#111;color:#fff;padding:10px 16px;border-radius:8px;z-index:2147483002;font:13px system-ui;display:none}
+        #sepa-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#111;color:#fff;padding:10px 16px;border-radius:8px;z-index:2147483041;font:13px system-ui;display:none}
         `;
         document.head.appendChild(s);
     }
@@ -6649,7 +6649,7 @@
 
     addRow._n = 0;
 
-    function openPanel() { panel.style.display = 'flex'; }
+    function openPanel() { try { document.body.appendChild(panel); } catch (e) {} panel.style.display = 'flex'; }
     function toast(msg) {
         if (!toastEl) return;
         toastEl.textContent = msg; toastEl.style.display = 'block';
