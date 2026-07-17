@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.48
+// @version      1.49
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11092,10 +11092,12 @@
             var pool = spans.length ? spans : [html];
             for (var i = pool.length - 1; i >= 0; i--){
                 var t = pool[i];
-                var pm = t.match(/deposit[^%\d]*?(\d+(?:[.,]\d+)?)\s*%/i);
+                if (!/deposit/i.test(t)) continue;
+                var pm = t.match(/(\d+(?:[.,]\d+)?)\s*%/);
                 if (!pm) continue;
                 var pct = parseFloat(String(pm[1]).replace(',', '.'));
-                var after = t.slice(t.indexOf(pm[0]) + pm[0].length);
+                var di = t.toLowerCase().indexOf('deposit');
+                var after = t.slice(di + 7).replace(/\d+(?:[.,]\d+)?\s*%/g, ' ');
                 var amount = parseMoney(after);
                 if (isFinite(amount)) return { pct: pct, amount: amount };
             }
