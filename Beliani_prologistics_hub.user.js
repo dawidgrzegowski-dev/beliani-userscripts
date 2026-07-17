@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.55
+// @version      1.56
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10967,7 +10967,7 @@
             return false;
         }
 
-        var _cid = {}, _acc = {};
+        var _cid = {}, _acc = {}, _info = {}, _sup = {};
         try { _cid = JSON.parse(GM_getValue('chn_order_cid', '{}')) || {}; } catch(e){ _cid = {}; }
         try { _acc = JSON.parse(GM_getValue('chn_cid_acc', '{}')) || {}; } catch(e){ _acc = {}; }
         var _saveT = null;
@@ -10982,12 +10982,28 @@
             if (h) { var m = h.match(/op_suppliers\.php\?company_id=(\d+)/); v = m ? m[1] : null; }
             _cid[o] = v; saveCache(); return v;
         }
+        async function fetchCompany(c){
+            if (_sup[c] !== undefined) return _sup[c];
+            var acc = null, info = '';
+            var h = await fetchT('/op_suppliers.php?company_id=' + encodeURIComponent(c));
+            if (h) {
+                var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); acc = m ? m[1].trim() : null;
+                var mi = h.match(/name="document_information"[^>]*>([\s\S]*?)<\/textarea>/i); info = mi ? mi[1].trim() : '';
+            }
+            _sup[c] = { acc: acc, info: info }; return _sup[c];
+        }
         async function companyToAcc(c){
             if (!c) return null;
             if (_acc[c] !== undefined) return _acc[c];
-            var v = null, h = await fetchT('/op_suppliers.php?company_id=' + encodeURIComponent(c));
-            if (h) { var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); v = m ? m[1].trim() : null; }
-            _acc[c] = v; saveCache(); return v;
+            var r = await fetchCompany(c);
+            _acc[c] = r.acc; _info[c] = r.info; saveCache(); return r.acc;
+        }
+        async function companyToInfo(c){
+            if (!c) return '';
+            if (_info[c] !== undefined) return _info[c];
+            var r = await fetchCompany(c);
+            if (_acc[c] === undefined) { _acc[c] = r.acc; saveCache(); }
+            _info[c] = r.info; return r.info;
         }
         var PENALTY_DAYS = 7;
         function parsePenalties(html, maxAgeDays){
@@ -11045,6 +11061,10 @@
         function pcHasChoice(r){ return !!(r && r.pi && r.pi.comAmount != null && r.pi.piAmount != null && Math.abs(r.pi.comAmount - r.pi.piAmount) > 0.01); }
         function pcGroupSum(sup){ var s2 = 0, any = false; (state.dep.groups[sup] || []).forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
         function pcAcc(sup){ var cid = (state.depCid || {})[sup]; return cid ? (_acc[cid] || null) : null; }
+        function pcInfo(sup){ var cid = (state.depCid || {})[sup]; return cid ? (_info[cid] || '') : ''; }
+        function pcHasInfo(sup){ var t = pcInfo(sup); return !!(t && t.replace(/\s|&nbsp;/gi, '').length); }
+        function pcDecodeInfo(t){ return String(t || '').replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#0?39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim(); }
+        function pcAttr(t){ return String(t || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
         function pcRefreshSums(){
             state.dep.order.forEach(function(sup, gi){
                 var s2 = pcGroupSum(sup);
@@ -11079,6 +11099,7 @@
                     + '<span style="font-weight:400;opacity:.6">(' + _n + ' poz.)</span>'
                     + '<span style="font-weight:400;margin-left:12px">Konto: <b>' + esc(acc || '—') + '</b></span>'
                     + '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (sum != null ? esc(sum.toFixed(2)) : '—') + '</b></span>'
+                    + (pcHasInfo(sup) ? '<span class="pc-infobadge" title="' + pcAttr(pcDecodeInfo(pcInfo(sup))) + '" style="margin-left:12px;background:#c00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">! Info box</span>' : '')
                     + '</td></tr>';
                 g.groups[sup].forEach(function(r){
                     var bg = r.bg || '', tds = '', lc = [];
@@ -11115,7 +11136,7 @@
             var depoAcc = {}, total = state.dep.order.length + state.bal.order.length, done = 0;
             function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
             prog();
-            await runPool(state.dep.order, async function(sup){ var cid = await depGroupCid(sup); state.depCid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc) depoAcc[acc] = 1; done++; prog(); });
+            await runPool(state.dep.order, async function(sup){ var cid = await depGroupCid(sup); state.depCid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (cid) await companyToInfo(cid); if (acc) depoAcc[acc] = 1; done++; prog(); });
             await runPool(state.bal.order, async function(sup){ var cid = await groupCid(sup); state.sup2cid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[sup] = 1; done++; prog(); });
             state.resolved = true;
         }
