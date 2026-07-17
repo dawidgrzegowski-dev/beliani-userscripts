@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.63
+// @version      1.64
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11128,7 +11128,7 @@
                         var a = pcDepAmt(r), aTxt = (a != null && isFinite(a)) ? a.toFixed(2) : '';
                         var eTxt = (ri === rows.length - 1 && rows.length > 1) ? sum.toFixed(2) : '';
                         var A = cellHL(r.orderUrl, r.order), B = cellHL(r.supplierUrl, r.supplier);
-                        html += '<tr>' + cel(esc(A), bgc) + cel(esc(B), bgc) + cel('', bgc) + cel(esc(aTxt), bgc, true) + cel(esc(eTxt), bgc, true) + '</tr>';
+                        html += '<tr>' + cel(esc(A), bgc) + cel(esc(B), bgc) + cel('', bgc) + cel(esc(aTxt), bgc, true) + cel(eTxt ? '<b>' + esc(eTxt) + '</b>' : '', bgc, true) + '</tr>';
                         lines.push([A, B, '', aTxt, eTxt].join('\t'));
                     });
                     html += '<tr>' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + '</tr>';
@@ -11214,7 +11214,7 @@
             var orders = [], pcts = [], conts = [], pens = [];
             function addOrder(o){ o = String(o || '').trim(); if (o && orders.indexOf(o) === -1) orders.push(o); }
             (G.dep || []).forEach(function(r){ addOrder(r.order); var pp = (r.pi && r.pi.comPct != null) ? Math.round(r.pi.comPct) : null; if (pp != null && pcts.indexOf(pp) === -1) pcts.push(pp); });
-            (G.bal || []).forEach(function(r){ addOrder(r.order); var c = String(r.container || '').trim(); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); pcParsePenalties(r.note).forEach(function(v){ if (pens.indexOf(v) === -1) pens.push(v); }); });
+            (G.bal || []).forEach(function(r){ addOrder(r.order); String(r.container || '').split(/[\s,;]+/).forEach(function(tok){ var c = tok.replace(/[()]/g, '').trim(); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); }); pcParsePenalties(r.note).forEach(function(v){ if (pens.indexOf(v) === -1) pens.push(v); }); });
             if (!orders.length) return '';
             orders.sort(function(a, b){ var na = parseInt(a, 10), nb = parseInt(b, 10); if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb; return String(a).localeCompare(String(b)); });
             var cfgs = [
@@ -11260,7 +11260,7 @@
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
             var accBase = G.cid ? (_acc[G.cid] || '') : ''; var accShown = (state.pcAccEdit && state.pcAccEdit[G.key] != null) ? state.pcAccEdit[G.key] : accBase;
             var h = '<tr class="pc-suphdr"><td colspan="7" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
-                + (gcol ? '<span style="display:inline-block;width:12px;height:12px;border:1px solid #888;vertical-align:middle;margin-right:6px;background:' + gcol + '" title="Kolor łączonego (w kopiowaniu Depo/Balance)"></span>' : '')
+                + ''
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
                 + '<span style="font-weight:400;margin-left:12px">Konto: <span class="pc-acc" data-key="' + esc(G.key) + '" title="Kliknij, aby edytowac konto" style="cursor:text;font-weight:700;border-bottom:1px dashed #999">' + esc(accShown || '—') + '</span></span>'
