@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.60
+// @version      1.63
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11034,7 +11034,7 @@
         async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return h ? parsePenalties(h, PENALTY_DAYS) : []; }
         async function runPool(items, worker, workers){ var idx = 0, N = items.length, WORKERS = workers || 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
 
-        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {} };
+        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {}, pcAccEdit: {} };
         function groupRows(rows){
             var order = [], groups = {};
             rows.forEach(function(r){ var k = r.supplier; if (!(k in groups)) { groups[k] = []; order.push(k); } groups[k].push(r); });
@@ -11047,24 +11047,49 @@
 
         function cel(content, bg, right){ return '<td style="border:1px solid #eee;padding:2px 5px' + (right ? ';text-align:right' : '') + (bg ? ';background:' + bg : '') + '">' + content + '</td>'; }
         function renderBal(forCopy){
-            var g = state.bal, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
+            var g = state.bal, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">', CMb = pcCombinedColorMap();
             g.order.forEach(function(sup){
                 var rows = g.groups[sup], isDepo = !!state.matched[sup];
                 rows.forEach(function(r){
-                    var bg = isDepo ? '#fff3bf' : (r.bg || '');
+                    var bg = isDepo ? (CMb[pcKeyOf(state.sup2cid, sup)] || PC_COMBINED_BG) : (r.bg || '');
                     var supC = forCopy ? esc(cellHL(r.supplierUrl, r.supplier)) : (aLink(r.supplierUrl, r.supplier, '#750000') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : ''));
                     var ordC = forCopy ? esc(cellHL(r.orderUrl, r.order)) : aLink(r.orderUrl, r.order);
-                    html += '<tr>' + cel(supC, bg) + cel(esc(r.container), bg) + cel(esc(r.seq), bg) + cel(ordC, bg) + cel(esc(r.amount), bg, true) + cel(esc(r.note), bg) + '</tr>';
-                    lines.push([cellHL(r.supplierUrl, r.supplier), r.container, r.seq, cellHL(r.orderUrl, r.order), r.amount, r.note].join('\t'));
+                    html += '<tr>' + cel(supC, bg) + cel(esc(r.container), bg) + cel(esc(r.seq), bg) + cel(ordC, bg) + cel(esc(pcBalAmtVal(r) != null ? pcBalAmtVal(r).toFixed(2) : (r.amount || '')), bg, true) + cel(esc(r.note), bg) + '</tr>';
+                    lines.push([cellHL(r.supplierUrl, r.supplier), r.container, r.seq, cellHL(r.orderUrl, r.order), (pcBalAmtVal(r) != null ? pcBalAmtVal(r).toFixed(2) : (r.amount || '')), r.note].join('\t'));
                 });
-                if (rows.length > 1) { var sum = 0; rows.forEach(function(r){ sum += parseAmount(r.amount); }); var s = sum.toFixed(2); html += '<tr style="font-weight:bold">' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel(esc(s), '#fff', true) + cel('', '#fff') + '</tr>'; lines.push(['', '', '', '', s, ''].join('\t')); }
+                if (rows.length > 1) { var sum = 0; rows.forEach(function(r){ sum += (pcBalAmtVal(r) || 0); }); var s = sum.toFixed(2); html += '<tr style="font-weight:bold">' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel(esc(s), '#fff', true) + cel('', '#fff') + '</tr>'; lines.push(['', '', '', '', s, ''].join('\t')); }
                 else { html += '<tr>' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + '</tr>'; lines.push(''); }
             });
             return { html: html + '</table>', lines: lines };
         }
         // ===== depo: kwoty / wybor kwoty / suma / konto =====
+        var PC_COMBINED_BG = '#FFF2CC';
+        function pcKeyOf(cidMap, sup){ var cid = (cidMap || {})[sup]; var acc = cid ? _acc[cid] : null; return acc ? ('acc:' + normAcc(acc)) : ('name:' + norm(sup)); }
+        function pcCombinedKeys(){ var MG = pcMergedGroups(), set = {}; MG.combined.forEach(function(G){ set[G.key] = 1; }); return set; }
+        var PC_PALETTE = ['#FFF2CC', '#00ff00', '#00ffff', '#ffff00', '#ff00ff', '#34a853', '#ffe599', '#93c47d', '#3d85c6', '#c27ba0'];
+        function pcCombinedColorMap(){ var MG = pcMergedGroups(), map = {}; MG.combined.forEach(function(G, i){ map[G.key] = PC_PALETTE[i % PC_PALETTE.length]; }); return map; }
+        function pcBalAmtVal(r){ if (r && r._editAmt != null && isFinite(r._editAmt)) return r._editAmt; if (!r || r.amount == null || r.amount === '') return null; var a = parseAmount(r.amount); return isFinite(a) ? a : null; }
+        function pcBeginEdit(el){
+            var rid = el.getAttribute('data-row'), typ = el.getAttribute('data-type'), r = state._rowMap ? state._rowMap[rid] : null;
+            if (!r) return; var td = el.closest ? el.closest('td') : null; if (!td) return;
+            var cur = (r._editAmt != null && isFinite(r._editAmt)) ? r._editAmt : (typ === 'd' ? pcDepAmt(r) : pcBalAmtVal(r));
+            var inp = document.createElement('input'); inp.type = 'text'; inp.value = (cur == null ? '' : String(cur)); inp.style.cssText = 'width:88px;font-size:11px;padding:1px 3px';
+            td.innerHTML = ''; td.appendChild(inp); inp.focus(); inp.select();
+            function done(){ var v = inp.value.trim(); if (v === '') { delete r._editAmt; } else { var n = parseAmount(v); if (isFinite(n)) r._editAmt = n; } td.innerHTML = (typ === 'd' ? pcAmtCellHtml(r, rid) : pcBalCellHtml(r, rid)); pcRefreshSums(); }
+            inp.onblur = done;
+            inp.onkeydown = function(e){ if (e.key === 'Enter'){ e.preventDefault(); inp.blur(); } else if (e.key === 'Escape'){ td.innerHTML = (typ === 'd' ? pcAmtCellHtml(r, rid) : pcBalCellHtml(r, rid)); } };
+        }
+        function pcBeginEditAcc(el){
+            var key = el.getAttribute('data-key'), cur = el.textContent === '—' ? '' : el.textContent, holder = el.parentNode;
+            var inp = document.createElement('input'); inp.type = 'text'; inp.value = cur; inp.style.cssText = 'width:160px;font-size:11px;padding:1px 3px';
+            holder.replaceChild(inp, el); inp.focus(); inp.select();
+            function done(){ var v = inp.value.trim(); if (!state.pcAccEdit) state.pcAccEdit = {}; state.pcAccEdit[key] = v; var sp = document.createElement('span'); sp.className = 'pc-acc'; sp.setAttribute('data-key', key); sp.title = 'Kliknij, aby edytować konto'; sp.style.cssText = 'cursor:text;font-weight:700;border-bottom:1px dashed #999'; sp.textContent = v || '—'; if (inp.parentNode) inp.parentNode.replaceChild(sp, inp); }
+            inp.onblur = done; inp.onkeydown = function(e){ if (e.key === 'Enter'){ e.preventDefault(); inp.blur(); } };
+        }
         function pcDepAmt(r){
-            if (!r || !r.pi) return null;
+            if (!r) return null;
+            if (r._editAmt != null && isFinite(r._editAmt)) return r._editAmt;
+            if (!r.pi) return null;
             var c = r.pi.comAmount, pa = r.pi.piAmount;
             if (state.pcAmt && state.pcAmt[r.order] === 'pi' && pa != null) return pa;
             return (c != null ? c : (pa != null ? pa : null));
@@ -11079,11 +11104,12 @@
         function pcRefreshSums(){
             var gDepo = 0, gBal = 0;
             (state._groups || []).forEach(function(g){
-                var s2 = pcSumRows(g.dep);
-                if (s2 != null) gDepo += s2;
-                if (g.balSum != null) gBal += g.balSum;
-                var el = wp.querySelector('#wp-out-merged .pc-sum[data-sup="' + g.gi + '"]'); if (el) el.textContent = (s2 != null ? s2.toFixed(2) : '—');
-                var elt = wp.querySelector('#wp-out-merged .pc-sum-total[data-sup="' + g.gi + '"]'); if (elt) elt.textContent = ((s2 || 0) + (g.balSum || 0)).toFixed(2);
+                var ds = pcSumRows(g.dep), bs = pcBalSum(g.bal);
+                if (ds != null) gDepo += ds;
+                if (bs != null) gBal += bs;
+                var e1 = wp.querySelector('#wp-out-merged .pc-sum[data-sup="' + g.gi + '"]'); if (e1) e1.textContent = (ds != null ? ds.toFixed(2) : '—');
+                var e2 = wp.querySelector('#wp-out-merged .pc-balsum[data-sup="' + g.gi + '"]'); if (e2) e2.textContent = (bs != null ? bs.toFixed(2) : '—');
+                var e3 = wp.querySelector('#wp-out-merged .pc-sum-total[data-sup="' + g.gi + '"]'); if (e3) e3.textContent = ((ds || 0) + (bs || 0)).toFixed(2);
             });
             var gd = wp.querySelector('#pc-grand-depo'); if (gd) gd.textContent = gDepo.toFixed(2);
             var gb = wp.querySelector('#pc-grand-bal'); if (gb) gb.textContent = gBal.toFixed(2);
@@ -11093,14 +11119,16 @@
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             if (forCopy){
                 // Format do Sheets: A=nr(link) B=dostawca(link) C=puste D=kwota depo E=suma grupy (ostatni wiersz, gdy >1). Białe tło.
+                var CKd = pcCombinedColorMap();
                 g.order.forEach(function(sup){
                     var rows = g.groups[sup] || [], sum = 0, cnt = 0;
+                    var bgc = CKd[pcKeyOf(state.depCid, sup)] || '#fff';
                     rows.forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { sum += a; cnt++; } });
                     rows.forEach(function(r, ri){
                         var a = pcDepAmt(r), aTxt = (a != null && isFinite(a)) ? a.toFixed(2) : '';
                         var eTxt = (ri === rows.length - 1 && rows.length > 1) ? sum.toFixed(2) : '';
                         var A = cellHL(r.orderUrl, r.order), B = cellHL(r.supplierUrl, r.supplier);
-                        html += '<tr>' + cel(esc(A), '#fff') + cel(esc(B), '#fff') + cel('', '#fff') + cel(esc(aTxt), '#fff', true) + cel(esc(eTxt), '#fff', true) + '</tr>';
+                        html += '<tr>' + cel(esc(A), bgc) + cel(esc(B), bgc) + cel('', bgc) + cel(esc(aTxt), bgc, true) + cel(esc(eTxt), bgc, true) + '</tr>';
                         lines.push([A, B, '', aTxt, eTxt].join('\t'));
                     });
                     html += '<tr>' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + '</tr>';
@@ -11142,10 +11170,15 @@
             });
             return { html: html + '</table>', lines: lines };
         }
-        function pcCopyText(t){ try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(t, 'text'); return true; } } catch(e){} try { navigator.clipboard.writeText(t); return true; } catch(e){} return false; }
+        function pcCopyText(t){
+            var s2 = String(t == null ? '' : t), ok = false;
+            try { var ta = document.createElement('textarea'); ta.value = s2; ta.style.cssText = 'position:fixed;left:-99999px;top:0'; document.body.appendChild(ta); ta.focus(); ta.select(); ok = document.execCommand('copy'); document.body.removeChild(ta); } catch(e){}
+            if (!ok) { try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(s2, 'text'); ok = true; } else { navigator.clipboard.writeText(s2); ok = true; } } catch(e){} }
+            return ok;
+        }
         // ===== scalona tabela: laczenie depo+balance per dostawca (konto), sekcje LACZONE/DEPO/BALANCE =====
         function pcSumRows(rows){ var s2 = 0, any = false; (rows || []).forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
-        function pcBalSum(rows){ var s2 = 0, any = false; (rows || []).forEach(function(r){ if (r.amount == null || r.amount === '') return; var a = parseAmount(r.amount); if (isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
+        function pcBalSum(rows){ var s2 = 0, any = false; (rows || []).forEach(function(r){ var a = pcBalAmtVal(r); if (a != null && isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
         function pcMergedGroups(){
             var byKey = {}, keys = [];
             function keyOf(cidMap, sup){ var cid = (cidMap || {})[sup]; var acc = cid ? _acc[cid] : null; return { k: acc ? ('acc:' + normAcc(acc)) : ('name:' + norm(sup)), cid: cid || null }; }
@@ -11158,6 +11191,25 @@
             combined.sort(bySup); depoOnly.sort(bySup); balOnly.sort(bySup);
             return { combined: combined, depoOnly: depoOnly, balOnly: balOnly };
         }
+        var PC_TITLE_MAX = 140;
+        function pcFormatOrders(orders, om){
+            var useRange = (om === 'range' || om === 'rangenospace'), sep = (om === 'nospace' || om === 'rangenospace') ? ',' : ', ';
+            if (!useRange) return orders.join(sep);
+            var out = [], i = 0, n = orders.length;
+            while (i < n){
+                var j = i;
+                while (j + 1 < n && /^\d+$/.test(orders[j]) && /^\d+$/.test(orders[j + 1]) && (parseInt(orders[j + 1], 10) === parseInt(orders[j], 10) + 1)) j++;
+                if (j - i + 1 >= 3){ out.push(orders[i] + '-' + orders[j]); i = j + 1; } else { out.push(orders[i]); i++; }
+            }
+            return out.join(sep);
+        }
+        function pcBuildTitle(orders, pcts, conts, pens, cfg){
+            var parts = ['Order ' + pcFormatOrders(orders, cfg.om)];
+            if (cfg.dep && pcts.length) parts.push('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(', '));
+            if (cfg.cont && conts.length) parts.push(conts.join(', '));
+            if (cfg.pen && pens.length) parts.push(pens.join(', '));
+            return parts.join(', ');
+        }
         function pcTitleFor(G){
             var orders = [], pcts = [], conts = [], pens = [];
             function addOrder(o){ o = String(o || '').trim(); if (o && orders.indexOf(o) === -1) orders.push(o); }
@@ -11165,14 +11217,20 @@
             (G.bal || []).forEach(function(r){ addOrder(r.order); var c = String(r.container || '').trim(); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); pcParsePenalties(r.note).forEach(function(v){ if (pens.indexOf(v) === -1) pens.push(v); }); });
             if (!orders.length) return '';
             orders.sort(function(a, b){ var na = parseInt(a, 10), nb = parseInt(b, 10); if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb; return String(a).localeCompare(String(b)); });
-            var parts = ['Order ' + orders.join(', ')];
-            parts.push(pcts.length ? ('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(', ')) : 'Deposit');
-            if (conts.length) parts.push(conts.join(', '));
-            if (pens.length) parts.push(pens.join(', '));
-            return parts.join(', ');
+            var cfgs = [
+                { om: 'full', dep: true, cont: true, pen: true },
+                { om: 'range', dep: true, cont: true, pen: true },
+                { om: 'rangenospace', dep: true, cont: true, pen: true },
+                { om: 'rangenospace', dep: true, cont: false, pen: true },
+                { om: 'rangenospace', dep: true, cont: false, pen: false },
+                { om: 'rangenospace', dep: false, cont: false, pen: false }
+            ];
+            var title = '';
+            for (var ci = 0; ci < cfgs.length; ci++){ title = pcBuildTitle(orders, pcts, conts, pens, cfgs[ci]); if (title.length <= PC_TITLE_MAX) return title; }
+            return title;
         }
         function pcTransferTitles(){
-            var MG = pcMergedGroups(), all = MG.combined.concat(MG.depoOnly), out = [];
+            var MG = pcMergedGroups(), all = MG.combined.concat(MG.depoOnly).concat(MG.balOnly), out = [];
             all.forEach(function(G){ var t = pcTitleFor(G); if (t) out.push({ sup: G.sup, title: t }); });
             out.sort(function(a, b){ return String(a.sup).toLowerCase().localeCompare(String(b.sup).toLowerCase()); });
             return out;
@@ -11180,38 +11238,42 @@
         function pcInfoG(G){ return G && G.cid ? (_info[G.cid] || '') : ''; }
         function pcHasInfoG(G){ var t = pcInfoG(G); return !!(t && t.replace(/\s|&nbsp;/gi, '').length); }
         function pcChkHtml(r, gi){ return /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz do payment confirmation / komentarza"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : ''; }
-        function pcAmtCellHtml(r){
-            if (pcHasChoice(r)){
+        function pcAmtValSpan(rid, typ, txt, edited){ return '<span class="pc-amt-val" data-row="' + rid + '" data-type="' + typ + '" title="Kliknij, aby edytowac kwote" style="cursor:text;border-bottom:1px dashed #bbb;font-weight:600' + (edited ? ';color:#0a58ca' : '') + '">' + (txt || '—') + '</span>' + (edited ? ' <span class="pc-amt-reset" data-row="' + rid + '" data-type="' + typ + '" title="Cofnij edycje" style="cursor:pointer;color:#c00;font-size:10px">✕</span>' : ''); }
+        function pcAmtCellHtml(r, rid){
+            var a = pcDepAmt(r), edited = (r._editAmt != null && isFinite(r._editAmt));
+            var val = pcAmtValSpan(rid, 'd', (a != null && isFinite(a)) ? a.toFixed(2) : '', edited);
+            if (!edited && pcHasChoice(r)){
                 var chosenPi = !!(state.pcAmt && state.pcAmt[r.order] === 'pi');
-                return '<span style="white-space:nowrap">'
-                    + '<label style="cursor:pointer" title="Kwota z komentarza / systemu"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
+                return val + '<br><span style="white-space:nowrap;font-size:10px">'
+                    + '<label style="cursor:pointer" title="Kwota z systemu"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
                     + ' <label style="cursor:pointer;color:#c47f00" title="Kwota z P/I"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="pi"' + (chosenPi ? ' checked' : '') + '> P/I ' + esc(r.pi.piAmount.toFixed(2)) + '</label>'
                     + '</span>';
             }
-            var a = pcDepAmt(r);
-            return (a != null && isFinite(a)) ? '<span style="font-weight:600">' + esc(a.toFixed(2)) + '</span>' : '';
+            return val;
         }
+        function pcBalCellHtml(r, rid){ var a = pcBalAmtVal(r), edited = (r._editAmt != null && isFinite(r._editAmt)); return pcAmtValSpan(rid, 'b', (a != null && isFinite(a)) ? a.toFixed(2) : '', edited); }
         function pcPiCellHtml(r){ if (!r.pi) return ''; if (r.pi.warn) return '<span style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; if (r.pi.ok) return '<span style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; return '<span style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; }
-        function pcRowDepo(r, gi){ var bg = r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, bg) + cel('', bg) + cel(pcAmtCellHtml(r), bg, true) + cel(pcPiCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
-        function pcRowBal(r, gi){ var bg = r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(esc(r.amount || ''), bg, true) + cel('', bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
-        function pcGroupHeader(G, gi){
+        function pcRowDepo(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcRowBal(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel('', bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcGroupHeader(G, gi, gcol){
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
-            var acc = G.cid ? (_acc[G.cid] || '—') : '—';
+            var accBase = G.cid ? (_acc[G.cid] || '') : ''; var accShown = (state.pcAccEdit && state.pcAccEdit[G.key] != null) ? state.pcAccEdit[G.key] : accBase;
             var h = '<tr class="pc-suphdr"><td colspan="7" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
+                + (gcol ? '<span style="display:inline-block;width:12px;height:12px;border:1px solid #888;vertical-align:middle;margin-right:6px;background:' + gcol + '" title="Kolor łączonego (w kopiowaniu Depo/Balance)"></span>' : '')
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
-                + '<span style="font-weight:400;margin-left:12px">Konto: <b>' + esc(acc) + '</b></span>'
+                + '<span style="font-weight:400;margin-left:12px">Konto: <span class="pc-acc" data-key="' + esc(G.key) + '" title="Kliknij, aby edytowac konto" style="cursor:text;font-weight:700;border-bottom:1px dashed #999">' + esc(accShown || '—') + '</span></span>'
                 + (hasDep ? '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (depSum != null ? esc(depSum.toFixed(2)) : '—') + '</b></span>' : '')
-                + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b>' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
+                + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b class="pc-balsum" data-sup="' + gi + '">' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
                 + (pcHasInfoG(G) ? '<span class="pc-infobadge" title="' + pcAttr(pcDecodeInfo(pcInfoG(G))) + '" style="margin-left:12px;background:#c00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">! Info box</span>' : '');
-            if (hasDep){ var t = pcTitleFor(G); if (t) h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button></div>'; }
+            var t = pcTitleFor(G); if (t){ var _ov = t.length > PC_TITLE_MAX; h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button> <span style="font-size:10px;color:' + (_ov ? '#c00;font-weight:700' : '#888') + '">(' + t.length + '/' + PC_TITLE_MAX + ')</span></div>'; }
             return h + '</td></tr>';
         }
         function renderMerged(){
             var el = wp.querySelector('#wp-out-merged'); if (!el) return;
-            var MG = pcMergedGroups(); state._groups = [];
+            var MG = pcMergedGroups(); state._groups = []; state._rowMap = {}; var CM = pcCombinedColorMap();
             var gi = 0, html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
             function section(title, groups){
@@ -11219,17 +11281,18 @@
                 html += '<tr><td colspan="7" style="background:#750000;color:#fff;font-weight:700;padding:5px 8px">' + esc(title) + ' <span style="font-weight:400;opacity:.7">(' + groups.length + ')</span></td></tr>';
                 html += colhead();
                 groups.forEach(function(G){
-                    state._groups.push({ gi: gi, dep: G.dep, balSum: pcBalSum(G.bal) });
-                    html += pcGroupHeader(G, gi);
-                    G.dep.forEach(function(r){ html += pcRowDepo(r, gi); });
-                    G.bal.forEach(function(r){ html += pcRowBal(r, gi); });
+                    state._groups.push({ gi: gi, dep: G.dep, bal: G.bal });
+                    var gcol = CM[G.key] || '';
+                    html += pcGroupHeader(G, gi, gcol);
+                    G.dep.forEach(function(r, ri){ var rid = 'g' + gi + 'd' + ri; state._rowMap[rid] = r; html += pcRowDepo(r, gi, rid, gcol); });
+                    G.bal.forEach(function(r, ri){ var rid = 'g' + gi + 'b' + ri; state._rowMap[rid] = r; html += pcRowBal(r, gi, rid, gcol); });
                     gi++;
                 });
             }
             section('ŁĄCZONE (depo + balance)', MG.combined);
             section('DEPO', MG.depoOnly);
             section('BALANCE', MG.balOnly);
-            if (gi){ var gDepo = 0, gBal = 0; state._groups.forEach(function(g){ var d = pcSumRows(g.dep); if (d != null) gDepo += d; if (g.balSum != null) gBal += g.balSum; }); html += '<tr><td colspan="7" style="background:#332524;color:#fff;font-weight:700;padding:5px 8px">RAZEM &nbsp; Depo: <b id="pc-grand-depo">' + gDepo.toFixed(2) + '</b> &nbsp;·&nbsp; Balance: <b id="pc-grand-bal">' + gBal.toFixed(2) + '</b> &nbsp;·&nbsp; Łącznie: <b id="pc-grand-total">' + (gDepo + gBal).toFixed(2) + '</b></td></tr>'; }
+            if (gi){ var gDepo = 0, gBal = 0; state._groups.forEach(function(g){ var d = pcSumRows(g.dep); if (d != null) gDepo += d; var bb = pcBalSum(g.bal); if (bb != null) gBal += bb; }); html += '<tr><td colspan="7" style="background:#332524;color:#fff;font-weight:700;padding:5px 8px">RAZEM &nbsp; Depo: <b id="pc-grand-depo">' + gDepo.toFixed(2) + '</b> &nbsp;·&nbsp; Balance: <b id="pc-grand-bal">' + gBal.toFixed(2) + '</b> &nbsp;·&nbsp; Łącznie: <b id="pc-grand-total">' + (gDepo + gBal).toFixed(2) + '</b></td></tr>'; }
             if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
             el.innerHTML = html + '</table>';
         }
@@ -11428,7 +11491,7 @@
             var dep = parseDepo(wp.querySelector('#wp-depo'));
             if (!balRows.length && !dep.rows.length) { status.textContent = 'Wklej dane.'; return; }
             state.bal = groupRows(balRows); state.dep = groupRows(dep.rows); state.depoNames = dep.names;
-            state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {};
+            state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {}; state.pcAccEdit = {};
             state.bal.order.forEach(function(sup){ if (matchName(norm(sup), state.depoNames)) state.matched[sup] = 1; });
             renderTables();
             status.textContent = 'Sprawdzam konta\u2026';
@@ -11478,9 +11541,9 @@
         }
         async function pcPostComment(orderId, text){
             try {
-                var res = await fetch('/api/comments/save/', { method:'POST', credentials:'same-origin',
-                    headers:{ 'content-type':'application/x-www-form-urlencoded' },
-                    body: 'page_id=' + encodeURIComponent(orderId) + '&comment_type=op_order&comment=' + encodeURIComponent(text) });
+                var res = await fetch('/js_backend.php', { method:'POST', credentials:'same-origin',
+                    headers:{ 'content-type':'application/x-www-form-urlencoded; charset=UTF-8', 'x-requested-with':'XMLHttpRequest' },
+                    body: 'fn=addComment&text=' + encodeURIComponent(text) + '&obj=op_order&obj_id=' + encodeURIComponent(orderId) });
                 return { ok: !!(res && res.ok) };
             } catch (e){ return { ok:false, error:e.message }; }
         }
@@ -11494,6 +11557,14 @@
             } else if (t.classList.contains('pc-amt')){
                 var o = t.getAttribute('data-order'); if (o){ if (!state.pcAmt) state.pcAmt = {}; state.pcAmt[o] = t.value; pcRefreshSums(); }
             }
+        });
+        wp.addEventListener('click', function(e){
+            var t = e.target; if (!t || !t.classList) return;
+            if (t.classList.contains('pc-amt-val')){ pcBeginEdit(t); }
+            else if (t.classList.contains('pc-amt-reset')){ var r = state._rowMap ? state._rowMap[t.getAttribute('data-row')] : null; if (r){ delete r._editAmt; var td = t.closest ? t.closest('td') : null; if (td) td.innerHTML = (t.getAttribute('data-type') === 'd' ? pcAmtCellHtml(r, t.getAttribute('data-row')) : pcBalCellHtml(r, t.getAttribute('data-row'))); pcRefreshSums(); } }
+            else if (t.classList.contains('pc-acc')){ pcBeginEditAcc(t); }
+            else if (t.classList.contains('pc-title-copy')){ var tr = t.closest ? t.closest('tr') : null, sp = tr ? tr.querySelector('.pc-title-txt') : null; if (sp){ var ok = pcCopyText(sp.textContent || ''); var st = wp.querySelector('#wp-status'); if (st) st.textContent = ok ? 'Skopiowano tytuł przelewu.' : 'Nie udało się skopiować.'; } }
+            else if (t.id === 'wp-copy-titles'){ var ts = pcTransferTitles(); var ok2 = pcCopyText(ts.map(function(x){ return x.title; }).join('\n')); var st2 = wp.querySelector('#wp-status'); if (st2) st2.textContent = ok2 ? ('Skopiowano ' + ts.length + ' tytułów.') : 'Nie udało się skopiować.'; }
         });
         wp.querySelector('#wp-pc-all').onclick = function(){
             var boxes = wp.querySelectorAll('#wp-out-merged .pc-chk');
