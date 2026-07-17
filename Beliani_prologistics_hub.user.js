@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.45
+// @version      1.47
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10881,6 +10881,20 @@
         function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
         function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
         function parseAmount(s){ if (s == null) return 0; var m = String(s).replace(/\s/g, '').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
+        function parseMoney(raw){
+            if (raw == null) return NaN;
+            var s = String(raw).replace(/[^0-9.,\s-]/g, ' ');
+            var m = s.match(/-?\d{1,3}(?:[ .,]\d{3})+(?:[.,]\d{1,2})?|-?\d+[.,]\d{1,2}|-?\d+/);
+            if (!m) return NaN;
+            var t = m[0].replace(/\s+/g, ' ').trim();
+            var hasDot = t.indexOf('.') !== -1, hasComma = t.indexOf(',') !== -1, dec = null;
+            if (hasDot && hasComma) { dec = t.lastIndexOf('.') > t.lastIndexOf(',') ? '.' : ','; }
+            else if (hasComma) { if ((t.match(/,/g) || []).length === 1 && /,\d{1,2}$/.test(t)) dec = ','; }
+            else if (hasDot) { if ((t.match(/\./g) || []).length === 1 && /\.\d{1,2}$/.test(t)) dec = '.'; }
+            var out = '';
+            for (var i = 0; i < t.length; i++){ var ch = t.charAt(i); if (ch >= '0' && ch <= '9') out += ch; else if (ch === '-' && i === 0) out += '-'; else if ((ch === '.' || ch === ',') && ch === dec) out += '.'; }
+            var v = parseFloat(out); return isFinite(v) ? v : NaN;
+        }
         function aLink(url, txt, col){ return url ? '<a href="' + esc(url) + '" target="_blank"' + (col ? ' style="color:' + col + '"' : '') + '>' + esc(txt) + '</a>' : esc(txt); }
         function cellHL(url, label){ return url ? '=HYPERLINK("' + url + '";"' + String(label || '').replace(/"/g, '""') + '")' : String(label || ''); }
         function copyHtml(html){
@@ -10969,15 +10983,25 @@
             if (h) { var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); v = m ? m[1].trim() : null; }
             _acc[c] = v; saveCache(); return v;
         }
-        function parsePenalties(html){
-            var nums = [], re = /penalty no\.?\s*(\d+)/gi, m;
-            while ((m = re.exec(html)) !== null) { if (nums.indexOf(m[1]) === -1) nums.push(m[1]); }
+        var PENALTY_DAYS = 7;
+        function parsePenalties(html, maxAgeDays){
+            var days = maxAgeDays || PENALTY_DAYS, cutoff = Date.now() - days * 86400000, nums = [], sawRows = false;
+            var rowRe = /<tr[^>]*(?:class="[^"]*comment-row[^"]*"|data-role="article-comment")[^>]*>([\s\S]*?)<\/tr>/gi, rm;
+            while ((rm = rowRe.exec(html)) !== null) {
+                sawRows = true; var row = rm[1];
+                var dm = row.match(/(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
+                var ts = dm ? Date.parse(dm[1] + 'T' + dm[2]) : NaN;
+                if (isNaN(ts) || ts < cutoff) continue;
+                var pre = /penalty no\.?\s*(\d+)/gi, pm;
+                while ((pm = pre.exec(row)) !== null) { if (nums.indexOf(pm[1]) === -1) nums.push(pm[1]); }
+            }
+            if (!sawRows) { var pr2 = /penalty no\.?\s*(\d+)/gi, m2; while ((m2 = pr2.exec(html)) !== null) { if (nums.indexOf(m2[1]) === -1) nums.push(m2[1]); } }
             return nums;
         }
-        async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return h ? parsePenalties(h) : []; }
+        async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return h ? parsePenalties(h, PENALTY_DAYS) : []; }
         async function runPool(items, worker, workers){ var idx = 0, N = items.length, WORKERS = workers || 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
 
-        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, resolved: false, lastOutput: '' };
+        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '' };
         function groupRows(rows){
             var order = [], groups = {};
             rows.forEach(function(r){ var k = r.supplier; if (!(k in groups)) { groups[k] = []; order.push(k); } groups[k].push(r); });
@@ -11030,15 +11054,31 @@
             var depoAcc = {}, total = state.dep.order.length + state.bal.order.length, done = 0;
             function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
             prog();
-            await runPool(state.dep.order, async function(sup){ var cid = await depGroupCid(sup); var acc = cid ? await companyToAcc(cid) : null; if (acc) depoAcc[acc] = 1; done++; prog(); });
+            await runPool(state.dep.order, async function(sup){ var cid = await depGroupCid(sup); state.depCid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc) depoAcc[acc] = 1; done++; prog(); });
             await runPool(state.bal.order, async function(sup){ var cid = await groupCid(sup); state.sup2cid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[sup] = 1; done++; prog(); });
             state.resolved = true;
+        }
+        function mergeSide(side, cidMap, matchedIn){
+            var byAcc = {}, order = [], groups = {}, matchedOut = {};
+            side.order.forEach(function(sup){
+                var cid = cidMap[sup], acc = cid ? _acc[cid] : null, na = acc ? normAcc(acc) : '';
+                var key = na ? (byAcc[na] || (byAcc[na] = sup)) : sup;
+                if (!(key in groups)) { groups[key] = []; order.push(key); }
+                groups[key] = groups[key].concat(side.groups[sup]);
+                if (matchedIn && matchedIn[sup]) matchedOut[key] = 1;
+            });
+            order.sort(function(a, b){ return String(a).toLowerCase().localeCompare(String(b).toLowerCase()); });
+            return { order: order, groups: groups, matched: matchedOut };
+        }
+        function mergeByAccount(){
+            var b = mergeSide(state.bal, state.sup2cid, state.matched); state.bal = { order: b.order, groups: b.groups }; state.matched = b.matched;
+            var d = mergeSide(state.dep, state.depCid || {}, null); state.dep = { order: d.order, groups: d.groups };
         }
         async function runPenalties(status){
             var uniq = [], seen = {}, pen = {};
             state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
             if (!uniq.length) return 0;
-            var pdone = 0, ptot = uniq.length; function pprog(){ if (status) status.textContent = 'Penalties: ' + (ptot ? Math.round(pdone / ptot * 100) : 100) + '%'; } pprog();
+            var pdone = 0, ptot = uniq.length; function pprog(){ if (status) status.textContent = 'Sprawdzam penalties: ' + (ptot ? Math.round(pdone / ptot * 100) : 100) + '%'; } pprog();
             await runPool(uniq, async function(o){ pen[o] = await fetchPen(o); pdone++; pprog(); }, 6);
             var added = 0;
             state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ var nums = pen[r.order]; if (nums && nums.length) { var s = 'penalty no. ' + nums.join(', '); if ((r.note || '').indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
@@ -11046,10 +11086,19 @@
         }
         function normAcc(s){ return String(s == null ? '' : s).replace(/\D+/g, ''); }
         function extractDepoComment(html){
-            var re = /deposit\s*(\d+(?:[.,]\d+)?)\s*%\s*([\d][\d.,\s]*?)\s*USD/gi, m, last = null;
-            while ((m = re.exec(html)) !== null) { last = m; }
-            if (!last) return null;
-            return { pct: parseFloat(String(last[1]).replace(',', '.')), amount: parseAmount(last[2]) };
+            var spans = [], sre = /class="commentText"[^>]*>([\s\S]*?)<\/span>/gi, sm;
+            while ((sm = sre.exec(html)) !== null) spans.push(sm[1].replace(/<[^>]+>/g, ' '));
+            var pool = spans.length ? spans : [html];
+            for (var i = pool.length - 1; i >= 0; i--){
+                var t = pool[i];
+                var pm = t.match(/deposit[^%\d]*?(\d+(?:[.,]\d+)?)\s*%/i);
+                if (!pm) continue;
+                var pct = parseFloat(String(pm[1]).replace(',', '.'));
+                var after = t.slice(t.indexOf(pm[0]) + pm[0].length);
+                var amount = parseMoney(after);
+                if (isFinite(amount)) return { pct: pct, amount: amount };
+            }
+            return null;
         }
         function extractBankAcc(html){
             var m = html.match(/Bank account number\s*:?\s*([0-9][0-9\s\-]*)/i);
@@ -11084,7 +11133,7 @@
                 var labels = row.map(function(v){ return String(v == null ? '' : v).trim().toLowerCase(); });
                 if (pct === null && amount === null && labels.some(function(x){ return x === 'deposit' || x === 'deposit:'; })){
                     var nums = [];
-                    row.forEach(function(v){ if (typeof v === 'number' && isFinite(v)) nums.push(v); else if (String(v).match(/^\s*-?[\d.,]+\s*$/)) { var f = parseFloat(String(v).replace(',', '.')); if (isFinite(f)) nums.push(f); } });
+                    row.forEach(function(v){ var n = (typeof v === 'number' && isFinite(v)) ? v : parseMoney(v); if (isFinite(n)) nums.push(n); });
                     if (nums.length){ nums.sort(function(a, b){ return a - b; }); var pr = nums[0], am = nums[nums.length - 1]; pct = pr <= 1 ? pr * 100 : pr; amount = am; }
                 }
                 if (!acc && labels.some(function(x){ return x.indexOf('account no') !== -1; })){
@@ -11113,7 +11162,7 @@
             var uniq = [], seen = {}, res = {};
             state.dep.order.forEach(function(sup){ state.dep.groups[sup].forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
             if (!uniq.length) return { ok: 0, bad: 0 };
-            var done = 0, tot = uniq.length; function prog(){ if (status) status.textContent = 'P/I: ' + (tot ? Math.round(done / tot * 100) : 100) + '%'; } prog();
+            var done = 0, tot = uniq.length; function prog(){ if (status) status.textContent = 'Sprawdzam depo (P/I): ' + (tot ? Math.round(done / tot * 100) : 100) + '%'; } prog();
             await runPool(uniq, async function(o){ res[o] = await checkOnePI(o); done++; prog(); }, 6);
             var okc = 0, badc = 0;
             state.dep.order.forEach(function(sup){ state.dep.groups[sup].forEach(function(r){ var v = res[r.order]; if (v) { r.pi = v; } }); });
@@ -11131,6 +11180,7 @@
             renderTables();
             status.textContent = 'Sprawdzam konta\u2026';
             await resolveAccounts(status);
+            mergeByAccount();
             renderTables();
             var _pen = await runPenalties(status);
             var _pi = await runPICheck(status);
