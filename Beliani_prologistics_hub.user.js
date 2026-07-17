@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.51
+// @version      1.52
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11156,7 +11156,7 @@
             if (accLblRow >= 0){
                 var lrow = aoa[accLblRow] || [];
                 for (var c1 = 0; c1 < lrow.length; c1++){ if (isCleanAcc(lrow[c1])){ var d1 = normAcc(lrow[c1]); if (d1.length > acc.length) acc = d1; } }
-                if (!acc){ for (var c2 = 0; c2 < lrow.length; c2++){ if (isAccLbl(lrow[c2])){ var d2 = normAcc(lrow[c2]); if (d2.length >= 8) acc = d2; break; } } }
+                if (!acc){ for (var c2 = 0; c2 < lrow.length; c2++){ if (isAccLbl(lrow[c2])){ var d2 = normAcc(lrow[c2]); if (d2.length >= 8 && d2.length > acc.length) acc = d2; } } }
                 if (acc.length < 8){ for (var w = Math.max(0, accLblRow - 3); w <= accLblRow + 3 && w < aoa.length; w++){ var wr = aoa[w] || []; for (var wj = 0; wj < wr.length; wj++){ if (isCleanAcc(wr[wj])){ var d3 = normAcc(wr[wj]); if (d3.length > acc.length) acc = d3; } } } }
             }
             return { pct: pct, amount: amount, acc: acc };
