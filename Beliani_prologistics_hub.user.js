@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.59
+// @version      1.60
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11006,19 +11006,30 @@
             _info[c] = r.info; return r.info;
         }
         var PENALTY_DAYS = 7;
+        // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
+        function pcParsePenalties(text){
+            var out = [], re = /(overpayment|underpayment|penalty|discount|other\s*[+-])\s*(?:no\.?\s*)?(\d+)/gi, m;
+            while ((m = re.exec(String(text || ''))) !== null){
+                var ty = m[1].toLowerCase().replace(/\s+/g, '');
+                if (ty === 'other+') ty = 'other +'; else if (ty === 'other-') ty = 'other -';
+                var v = ty + ' ' + m[2];
+                if (out.indexOf(v) === -1) out.push(v);
+            }
+            return out;
+        }
+        function pcArial(html){ return String(html).replace(/<table style="/g, '<table style="font-family:Arial,sans-serif;font-size:10pt;').replace(/<td style="/g, '<td style="font-family:Arial,sans-serif;font-size:10pt;'); }
         function parsePenalties(html, maxAgeDays){
-            var days = maxAgeDays || PENALTY_DAYS, cutoff = Date.now() - days * 86400000, nums = [], sawRows = false;
+            var days = maxAgeDays || PENALTY_DAYS, cutoff = Date.now() - days * 86400000, out = [], sawRows = false;
             var rowRe = /<tr[^>]*(?:class="[^"]*comment-row[^"]*"|data-role="article-comment")[^>]*>([\s\S]*?)<\/tr>/gi, rm;
             while ((rm = rowRe.exec(html)) !== null) {
                 sawRows = true; var row = rm[1];
                 var dm = row.match(/(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
                 var ts = dm ? Date.parse(dm[1] + 'T' + dm[2]) : NaN;
                 if (isNaN(ts) || ts < cutoff) continue;
-                var pre = /penalty no\.?\s*(\d+)/gi, pm;
-                while ((pm = pre.exec(row)) !== null) { if (nums.indexOf(pm[1]) === -1) nums.push(pm[1]); }
+                pcParsePenalties(row.replace(/<[^>]+>/g, ' ')).forEach(function(v){ if (out.indexOf(v) === -1) out.push(v); });
             }
-            if (!sawRows) { var pr2 = /penalty no\.?\s*(\d+)/gi, m2; while ((m2 = pr2.exec(html)) !== null) { if (nums.indexOf(m2[1]) === -1) nums.push(m2[1]); } }
-            return nums;
+            if (!sawRows) { pcParsePenalties(String(html).replace(/<[^>]+>/g, ' ')).forEach(function(v){ if (out.indexOf(v) === -1) out.push(v); }); }
+            return out;
         }
         async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return h ? parsePenalties(h, PENALTY_DAYS) : []; }
         async function runPool(items, worker, workers){ var idx = 0, N = items.length, WORKERS = workers || 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
@@ -11151,13 +11162,13 @@
             var orders = [], pcts = [], conts = [], pens = [];
             function addOrder(o){ o = String(o || '').trim(); if (o && orders.indexOf(o) === -1) orders.push(o); }
             (G.dep || []).forEach(function(r){ addOrder(r.order); var pp = (r.pi && r.pi.comPct != null) ? Math.round(r.pi.comPct) : null; if (pp != null && pcts.indexOf(pp) === -1) pcts.push(pp); });
-            (G.bal || []).forEach(function(r){ addOrder(r.order); var c = String(r.container || '').trim(); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); var pm = String(r.note || '').match(/penalty no\.?\s*([0-9][0-9,\s]*)/i); if (pm) pm[1].split(/[,\s]+/).forEach(function(nn){ nn = nn.trim(); if (nn && pens.indexOf(nn) === -1) pens.push(nn); }); });
+            (G.bal || []).forEach(function(r){ addOrder(r.order); var c = String(r.container || '').trim(); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); pcParsePenalties(r.note).forEach(function(v){ if (pens.indexOf(v) === -1) pens.push(v); }); });
             if (!orders.length) return '';
             orders.sort(function(a, b){ var na = parseInt(a, 10), nb = parseInt(b, 10); if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb; return String(a).localeCompare(String(b)); });
             var parts = ['Order ' + orders.join(', ')];
             parts.push(pcts.length ? ('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(', ')) : 'Deposit');
             if (conts.length) parts.push(conts.join(', '));
-            if (pens.length) parts.push('discount ' + pens.join(', '));
+            if (pens.length) parts.push(pens.join(', '));
             return parts.join(', ');
         }
         function pcTransferTitles(){
@@ -11254,7 +11265,7 @@
             var pdone = 0, ptot = uniq.length; function pprog(){ if (status) status.textContent = 'Sprawdzam penalties: ' + (ptot ? Math.round(pdone / ptot * 100) : 100) + '%'; } pprog();
             await runPool(uniq, async function(o){ pen[o] = await fetchPen(o); pdone++; pprog(); }, 6);
             var added = 0;
-            state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ var nums = pen[r.order]; if (nums && nums.length) { var s = 'penalty no. ' + nums.join(', '); if ((r.note || '').indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
+            state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ var nums = pen[r.order]; if (nums && nums.length) { var s = nums.join('  '); if ((r.note || '').indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
             return added;
         }
         function normAcc(s){ return String(s == null ? '' : s).replace(/\D+/g, ''); }
@@ -11433,12 +11444,12 @@
         wp.querySelector('#wp-copy-bal').onclick = function(){
             var status = wp.querySelector('#wp-status');
             if (!state.bal.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
-            copyHtml(renderBal(true).html); status.textContent = 'Skopiowano BALANCE (wklej do Sheets \u2014 z kolorami).';
+            copyHtml(pcArial(renderBal(true).html)); status.textContent = 'Skopiowano BALANCE (wklej do Sheets \u2014 z kolorami).';
         };
         wp.querySelector('#wp-copy-dep').onclick = function(){
             var status = wp.querySelector('#wp-status');
             if (!state.dep.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
-            copyHtml(renderDepo(true).html); status.textContent = 'Skopiowano DEPO (wklej do Sheets \u2014 z kolorami).';
+            copyHtml(pcArial(renderDepo(true).html)); status.textContent = 'Skopiowano DEPO (wklej do Sheets \u2014 z kolorami).';
         };
 
         // ===== Payment confirmation: osobno plik i osobno komentarz (UI-only, nie dotyka kopiowania do Sheets) =====
