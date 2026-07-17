@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.58
+// @version      1.59
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11066,7 +11066,17 @@
         function pcDecodeInfo(t){ return String(t || '').replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#0?39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim(); }
         function pcAttr(t){ return String(t || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
         function pcRefreshSums(){
-            (state._groups || []).forEach(function(g){ var s2 = pcSumRows(g.dep); var el = wp.querySelector('#wp-out-merged .pc-sum[data-sup="' + g.gi + '"]'); if (el) el.textContent = (s2 != null ? s2.toFixed(2) : '—'); });
+            var gDepo = 0, gBal = 0;
+            (state._groups || []).forEach(function(g){
+                var s2 = pcSumRows(g.dep);
+                if (s2 != null) gDepo += s2;
+                if (g.balSum != null) gBal += g.balSum;
+                var el = wp.querySelector('#wp-out-merged .pc-sum[data-sup="' + g.gi + '"]'); if (el) el.textContent = (s2 != null ? s2.toFixed(2) : '—');
+                var elt = wp.querySelector('#wp-out-merged .pc-sum-total[data-sup="' + g.gi + '"]'); if (elt) elt.textContent = ((s2 || 0) + (g.balSum || 0)).toFixed(2);
+            });
+            var gd = wp.querySelector('#pc-grand-depo'); if (gd) gd.textContent = gDepo.toFixed(2);
+            var gb = wp.querySelector('#pc-grand-bal'); if (gb) gb.textContent = gBal.toFixed(2);
+            var gt = wp.querySelector('#pc-grand-total'); if (gt) gt.textContent = (gDepo + gBal).toFixed(2);
         }
         function renderDepo(forCopy){
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
@@ -11139,9 +11149,11 @@
         }
         function pcTitleFor(G){
             var orders = [], pcts = [], conts = [], pens = [];
-            (G.dep || []).forEach(function(r){ if (r.order && orders.indexOf(r.order) === -1) orders.push(r.order); var pp = (r.pi && r.pi.comPct != null) ? Math.round(r.pi.comPct) : null; if (pp != null && pcts.indexOf(pp) === -1) pcts.push(pp); });
-            (G.bal || []).forEach(function(r){ var c = String(r.container || '').trim(); if (c && conts.indexOf(c) === -1) conts.push(c); var pm = String(r.note || '').match(/penalty no\.?\s*([0-9][0-9,\s]*)/i); if (pm) pm[1].split(/[,\s]+/).forEach(function(nn){ nn = nn.trim(); if (nn && pens.indexOf(nn) === -1) pens.push(nn); }); });
+            function addOrder(o){ o = String(o || '').trim(); if (o && orders.indexOf(o) === -1) orders.push(o); }
+            (G.dep || []).forEach(function(r){ addOrder(r.order); var pp = (r.pi && r.pi.comPct != null) ? Math.round(r.pi.comPct) : null; if (pp != null && pcts.indexOf(pp) === -1) pcts.push(pp); });
+            (G.bal || []).forEach(function(r){ addOrder(r.order); var c = String(r.container || '').trim(); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); var pm = String(r.note || '').match(/penalty no\.?\s*([0-9][0-9,\s]*)/i); if (pm) pm[1].split(/[,\s]+/).forEach(function(nn){ nn = nn.trim(); if (nn && pens.indexOf(nn) === -1) pens.push(nn); }); });
             if (!orders.length) return '';
+            orders.sort(function(a, b){ var na = parseInt(a, 10), nb = parseInt(b, 10); if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb; return String(a).localeCompare(String(b)); });
             var parts = ['Order ' + orders.join(', ')];
             parts.push(pcts.length ? ('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(', ')) : 'Deposit');
             if (conts.length) parts.push(conts.join(', '));
@@ -11181,6 +11193,7 @@
                 + '<span style="font-weight:400;margin-left:12px">Konto: <b>' + esc(acc) + '</b></span>'
                 + (hasDep ? '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (depSum != null ? esc(depSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b>' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
+                + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
                 + (pcHasInfoG(G) ? '<span class="pc-infobadge" title="' + pcAttr(pcDecodeInfo(pcInfoG(G))) + '" style="margin-left:12px;background:#c00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">! Info box</span>' : '');
             if (hasDep){ var t = pcTitleFor(G); if (t) h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button></div>'; }
             return h + '</td></tr>';
@@ -11195,7 +11208,7 @@
                 html += '<tr><td colspan="7" style="background:#750000;color:#fff;font-weight:700;padding:5px 8px">' + esc(title) + ' <span style="font-weight:400;opacity:.7">(' + groups.length + ')</span></td></tr>';
                 html += colhead();
                 groups.forEach(function(G){
-                    state._groups.push({ gi: gi, dep: G.dep });
+                    state._groups.push({ gi: gi, dep: G.dep, balSum: pcBalSum(G.bal) });
                     html += pcGroupHeader(G, gi);
                     G.dep.forEach(function(r){ html += pcRowDepo(r, gi); });
                     G.bal.forEach(function(r){ html += pcRowBal(r, gi); });
@@ -11205,6 +11218,7 @@
             section('ŁĄCZONE (depo + balance)', MG.combined);
             section('DEPO', MG.depoOnly);
             section('BALANCE', MG.balOnly);
+            if (gi){ var gDepo = 0, gBal = 0; state._groups.forEach(function(g){ var d = pcSumRows(g.dep); if (d != null) gDepo += d; if (g.balSum != null) gBal += g.balSum; }); html += '<tr><td colspan="7" style="background:#332524;color:#fff;font-weight:700;padding:5px 8px">RAZEM &nbsp; Depo: <b id="pc-grand-depo">' + gDepo.toFixed(2) + '</b> &nbsp;·&nbsp; Balance: <b id="pc-grand-bal">' + gBal.toFixed(2) + '</b> &nbsp;·&nbsp; Łącznie: <b id="pc-grand-total">' + (gDepo + gBal).toFixed(2) + '</b></td></tr>'; }
             if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
             el.innerHTML = html + '</table>';
         }
@@ -11214,7 +11228,7 @@
             function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
             prog();
             await runPool(state.dep.order, async function(sup){ var cid = await depGroupCid(sup); state.depCid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (cid) await companyToInfo(cid); if (acc) depoAcc[acc] = 1; done++; prog(); });
-            await runPool(state.bal.order, async function(sup){ var cid = await groupCid(sup); state.sup2cid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[sup] = 1; done++; prog(); });
+            await runPool(state.bal.order, async function(sup){ var cid = await groupCid(sup); state.sup2cid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (cid) await companyToInfo(cid); if (acc && depoAcc[acc]) state.matched[sup] = 1; done++; prog(); });
             state.resolved = true;
         }
         function mergeSide(side, cidMap, matchedIn){
