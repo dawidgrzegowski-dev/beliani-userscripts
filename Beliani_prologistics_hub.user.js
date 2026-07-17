@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.50
+// @version      1.51
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11103,9 +11103,10 @@
             }
             return null;
         }
-        function extractBankAcc(html){
-            var m = html.match(/Bank account number\s*:?\s*([A-Za-z0-9][A-Za-z0-9\s\-]*)/i);
-            return m ? normAcc(m[1]) : '';
+        function extractBankAccts(html){
+            var out = [], re = /Bank account number\s*:?\s*([^<]*)/gi, m;
+            while ((m = re.exec(html)) !== null){ m[1].split(/[\/,;]| or /i).forEach(function(part){ var d = normAcc(part); if (d.length >= 8 && d.length <= 24 && out.indexOf(d) === -1) out.push(d); }); }
+            return out;
         }
         function extractLatestPI(html){
             var hi = html.search(/<b>\s*P\/?I\s*:\s*<\/b>/i);
@@ -11125,27 +11126,38 @@
             try { var r = await fetch(url, { credentials: 'same-origin', signal: ctl.signal }); clearTimeout(t); if (!r.ok) return null; return await r.arrayBuffer(); } catch(e){ clearTimeout(t); return null; }
         }
         function getXLSX(){ try { if (typeof XLSX !== 'undefined') return XLSX; } catch(e){} try { if (window.XLSX) return window.XLSX; } catch(e){} try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX) return unsafeWindow.XLSX; } catch(e){} return null; }
+        function isAccLbl(x){ return /(?:a\/?c|acc(?:ount)?)\s*(?:no\b|num)/i.test(String(x == null ? '' : x)); }
+        function isCleanAcc(v){
+            if (v == null) return false;
+            var s = String(v).trim(), dg = normAcc(s);
+            if (dg.length < 8 || dg.length > 24) return false;
+            var letters = (s.replace(/\(?\s*usd\s*\)?|\uff08\s*usd\s*\uff09/ig, '').match(/[A-Za-z]/g) || []).length;
+            return letters <= 4;
+        }
         function scanPIsheet(aoa){
             var pct = null, amount = null, acc = '';
-            for (var i = 0; i < aoa.length; i++){
-                var row = aoa[i] || [];
-                var labels = row.map(function(v){ return String(v == null ? '' : v).trim().toLowerCase(); });
-                if (pct === null && labels.some(function(x){ return x === 'deposit' || x === 'deposit:'; })){
-                    var pctCol = -1;
-                    for (var j = 0; j < row.length; j++){
-                        var v = row[j];
-                        if (typeof v === 'number' && v > 0 && v <= 1) { pct = v * 100; pctCol = j; break; }
-                        if (typeof v === 'string' && v.indexOf('%') !== -1) { var pf = parseFloat(v.replace(',', '.').replace(/[^0-9.]/g, '')); if (isFinite(pf)) { pct = pf; pctCol = j; break; } }
-                    }
-                    if (pctCol >= 0){
-                        for (var k = pctCol + 1; k < row.length; k++){ var n = (typeof row[k] === 'number' && isFinite(row[k])) ? row[k] : parseMoney(row[k]); if (isFinite(n) && n > 1) { amount = n; break; } }
-                    } else {
-                        var mx = null; row.forEach(function(v2){ var n2 = (typeof v2 === 'number') ? v2 : parseMoney(v2); if (isFinite(n2) && n2 > 1 && (mx == null || n2 > mx)) mx = n2; }); amount = mx;
-                    }
-                }
-                if (!acc && labels.some(function(x){ return /(?:a\/?c|acc(?:ount)?)\s*(?:no\b|num)/i.test(x); })){
-                    var bestAcc = ''; for (var mm = 0; mm < row.length; mm++){ var dg = normAcc(row[mm]); if (dg.length >= 8 && dg.length > bestAcc.length) bestAcc = dg; } acc = bestAcc;
-                }
+            var depRow = -1, depLabel = '';
+            for (var i = 0; i < aoa.length && depRow < 0; i++){ var row = aoa[i] || []; for (var j = 0; j < row.length; j++){ var ct = String(row[j] == null ? '' : row[j]).trim(); if (/^deposit\b/i.test(ct) && ct.length < 20){ depRow = i; depLabel = ct; break; } } }
+            if (depRow < 0){
+                var totRow = -1;
+                for (var t = 0; t < aoa.length && totRow < 0; t++){ var rw = aoa[t] || []; for (var tj = 0; tj < rw.length; tj++){ if (/^total\b/i.test(String(rw[tj] == null ? '' : rw[tj]).trim())){ totRow = t; break; } } }
+                if (totRow >= 0){ for (var rr = totRow + 1; rr <= totRow + 2 && rr < aoa.length; rr++){ var r2 = aoa[rr] || []; var hasF = r2.some(function(v){ return typeof v === 'number' && v > 0 && v <= 1; }); var hasA = r2.some(function(v){ return typeof v === 'number' && v > 1; }); if (hasF && hasA){ depRow = rr; depLabel = ''; break; } } }
+            }
+            if (depRow >= 0){
+                var drow = aoa[depRow] || [], pctCol = -1;
+                var lm = depLabel.match(/(\d+(?:[.,]\d+)?)\s*%/);
+                if (lm) pct = parseFloat(String(lm[1]).replace(',', '.'));
+                if (pct === null){ for (var pp = 0; pp < drow.length; pp++){ var pv = drow[pp]; if (typeof pv === 'number' && pv > 0 && pv <= 1){ pct = pv * 100; pctCol = pp; break; } if (typeof pv === 'string' && pv.indexOf('%') !== -1){ var pf = parseFloat(pv.replace(',', '.').replace(/[^0-9.]/g, '')); if (isFinite(pf)){ pct = pf; pctCol = pp; break; } } } }
+                for (var k = 0; k < drow.length; k++){ if (k === pctCol) continue; var kc = drow[k]; if (typeof kc === 'string' && /%|deposit|balance/i.test(kc)) continue; var n = (typeof kc === 'number' && isFinite(kc)) ? kc : parseMoney(kc); if (isFinite(n) && n > 1){ amount = n; break; } }
+            }
+            if (pct === null){ for (var q = 0; q < aoa.length && pct === null; q++){ var qr = aoa[q] || []; for (var qj = 0; qj < qr.length; qj++){ var qm = String(qr[qj] == null ? '' : qr[qj]).match(/(\d+(?:[.,]\d+)?)\s*%\s*deposit/i); if (qm){ pct = parseFloat(String(qm[1]).replace(',', '.')); break; } } } }
+            var accLblRow = -1;
+            for (var a = 0; a < aoa.length && accLblRow < 0; a++){ var ar = aoa[a] || []; for (var aj = 0; aj < ar.length; aj++){ if (isAccLbl(ar[aj])){ accLblRow = a; break; } } }
+            if (accLblRow >= 0){
+                var lrow = aoa[accLblRow] || [];
+                for (var c1 = 0; c1 < lrow.length; c1++){ if (isCleanAcc(lrow[c1])){ var d1 = normAcc(lrow[c1]); if (d1.length > acc.length) acc = d1; } }
+                if (!acc){ for (var c2 = 0; c2 < lrow.length; c2++){ if (isAccLbl(lrow[c2])){ var d2 = normAcc(lrow[c2]); if (d2.length >= 8) acc = d2; break; } } }
+                if (acc.length < 8){ for (var w = Math.max(0, accLblRow - 3); w <= accLblRow + 3 && w < aoa.length; w++){ var wr = aoa[w] || []; for (var wj = 0; wj < wr.length; wj++){ if (isCleanAcc(wr[wj])){ var d3 = normAcc(wr[wj]); if (d3.length > acc.length) acc = d3; } } } }
             }
             return { pct: pct, amount: amount, acc: acc };
         }
@@ -11198,7 +11210,7 @@
         async function checkOnePI(order){
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
             if (!h) return { ok: false, msg: 'nie otwarto ordera' };
-            var com = extractDepoComment(h), bank = extractBankAcc(h), piUrl = extractLatestPI(h);
+            var com = extractDepoComment(h), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
             if (!com) return { ok: false, msg: 'brak komentarza deposit' };
             if (!piUrl) return { ok: false, msg: 'brak P/I' };
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
@@ -11209,7 +11221,7 @@
             var bad = [];
             if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '\u2260' + com.amount.toFixed(2));
             if (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct)) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '\u2260' + Math.round(com.pct));
-            if (!pi.acc || !bank || pi.acc !== bank) bad.push('konto ' + (pi.acc || '?') + '\u2260' + (bank || '?'));
+            if (!pi.acc || banks.indexOf(pi.acc) === -1) bad.push('konto ' + (pi.acc || '?') + '\u2260' + (banks.join('/') || '?'));
             return bad.length ? { ok: false, msg: bad.join('; ') } : { ok: true, msg: 'zgodne (' + Math.round(com.pct) + '% ' + com.amount.toFixed(2) + ')' };
         }
         async function runPICheck(status){
