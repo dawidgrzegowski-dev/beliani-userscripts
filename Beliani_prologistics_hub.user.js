@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.44
+// @version      1.45
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17,6 +17,7 @@
 // @connect      wyszukiwarkaregon.stat.gov.pl
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
+// @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -10866,7 +10867,6 @@
           + '</div>'
           + '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
           + '<button id="wp-go" class="chn-btn red">Przetwórz</button>'
-          + '<button id="wp-pen" class="chn-btn maroon">\ud83e\uddfe Penalties</button>'
           + '<button id="wp-copy-bal" class="chn-btn ghost">\ud83d\udccb Kopiuj Balance</button>'
           + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
@@ -10975,7 +10975,7 @@
             return nums;
         }
         async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return h ? parsePenalties(h) : []; }
-        async function runPool(items, worker){ var idx = 0, N = items.length, WORKERS = 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
+        async function runPool(items, worker, workers){ var idx = 0, N = items.length, WORKERS = workers || 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
 
         var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, resolved: false, lastOutput: '' };
         function groupRows(rows){
@@ -11012,9 +11012,10 @@
                 g.groups[sup].forEach(function(r){
                     var bg = r.bg || '', tds = '', lc = [];
                     (r.cells || []).forEach(function(x){ var content = forCopy ? (x.u ? esc(cellHL(x.u, x.t)) : esc(x.t)) : (x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t)); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
+                    if (!forCopy) { var pv = r.pi ? (r.pi.ok ? '<span style="color:#0a0;font-weight:700">P/I \u2713 ' + esc(r.pi.msg) + '</span>' : '<span style="color:#c00;font-weight:700">P/I \u2717 ' + esc(r.pi.msg) + '</span>') : ''; tds += cel(pv, bg); }
                     html += '<tr>' + tds + '</tr>'; lines.push(lc.join('\t'));
                 });
-                var sep = ''; for (var i = 0; i < maxc; i++) sep += cel('', '#fff'); html += '<tr>' + sep + '</tr>'; lines.push('');
+                var sep = '', sc = maxc + (forCopy ? 0 : 1); for (var i = 0; i < sc; i++) sep += cel('', '#fff'); html += '<tr>' + sep + '</tr>'; lines.push('');
             });
             return { html: html + '</table>', lines: lines };
         }
@@ -11033,11 +11034,97 @@
             await runPool(state.bal.order, async function(sup){ var cid = await groupCid(sup); state.sup2cid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (acc && depoAcc[acc]) state.matched[sup] = 1; done++; prog(); });
             state.resolved = true;
         }
+        async function runPenalties(status){
+            var uniq = [], seen = {}, pen = {};
+            state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
+            if (!uniq.length) return 0;
+            var pdone = 0, ptot = uniq.length; function pprog(){ if (status) status.textContent = 'Penalties: ' + (ptot ? Math.round(pdone / ptot * 100) : 100) + '%'; } pprog();
+            await runPool(uniq, async function(o){ pen[o] = await fetchPen(o); pdone++; pprog(); }, 6);
+            var added = 0;
+            state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ var nums = pen[r.order]; if (nums && nums.length) { var s = 'penalty no. ' + nums.join(', '); if ((r.note || '').indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
+            return added;
+        }
+        function normAcc(s){ return String(s == null ? '' : s).replace(/\D+/g, ''); }
+        function extractDepoComment(html){
+            var re = /deposit\s*(\d+(?:[.,]\d+)?)\s*%\s*([\d][\d.,\s]*?)\s*USD/gi, m, last = null;
+            while ((m = re.exec(html)) !== null) { last = m; }
+            if (!last) return null;
+            return { pct: parseFloat(String(last[1]).replace(',', '.')), amount: parseAmount(last[2]) };
+        }
+        function extractBankAcc(html){
+            var m = html.match(/Bank account number\s*:?\s*([0-9][0-9\s\-]*)/i);
+            return m ? normAcc(m[1]) : '';
+        }
+        function extractLatestPI(html){
+            var hi = html.search(/<b>\s*P\/?I\s*:\s*<\/b>/i);
+            if (hi < 0) return null;
+            var after = html.slice(hi);
+            var addNew = after.search(/load_docs\.php\?[^"']*type=/i);
+            var bound = after.length;
+            if (addNew >= 0) { var rest = after.slice(addNew + 5); var nxt = rest.search(/load_docs\.php\?[^"']*type=/i); if (nxt >= 0) bound = addNew + 5 + nxt; }
+            var sec = after.slice(0, bound);
+            var re = /<a[^>]*href="([^"]*doc\.php\?[^"]*doc_id=\d+)"[^>]*>[^<]*<\/a>\s*<br\s*\/?>\s*\(by[^)]*?on\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\)/gi;
+            var m, best = null, bestD = '';
+            while ((m = re.exec(sec)) !== null) { var d = m[2]; if (d > bestD) { bestD = d; best = m[1]; } }
+            return best ? best.replace(/&amp;/g, '&') : null;
+        }
+        async function fetchBin(url, ms){
+            var ctl = new AbortController(); var t = setTimeout(function(){ try { ctl.abort(); } catch(e){} }, ms || 25000);
+            try { var r = await fetch(url, { credentials: 'same-origin', signal: ctl.signal }); clearTimeout(t); if (!r.ok) return null; return await r.arrayBuffer(); } catch(e){ clearTimeout(t); return null; }
+        }
+        function getXLSX(){ try { if (typeof XLSX !== 'undefined') return XLSX; } catch(e){} try { if (window.XLSX) return window.XLSX; } catch(e){} try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX) return unsafeWindow.XLSX; } catch(e){} return null; }
+        function parsePI(buf){
+            var X = getXLSX(); if (!X) return { err: 'brak SheetJS' };
+            var wb; try { wb = X.read(new Uint8Array(buf), { type: 'array' }); } catch(e){ return { err: 'P/I nieczytelne' }; }
+            var ws = wb.Sheets[wb.SheetNames[0]]; if (!ws) return { err: 'P/I puste' };
+            var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ return { err: 'P/I nieczytelne' }; }
+            var pct = null, amount = null, acc = '';
+            for (var i = 0; i < aoa.length; i++){
+                var row = aoa[i] || [];
+                var labels = row.map(function(v){ return String(v == null ? '' : v).trim().toLowerCase(); });
+                if (pct === null && amount === null && labels.some(function(x){ return x === 'deposit' || x === 'deposit:'; })){
+                    var nums = [];
+                    row.forEach(function(v){ if (typeof v === 'number' && isFinite(v)) nums.push(v); else if (String(v).match(/^\s*-?[\d.,]+\s*$/)) { var f = parseFloat(String(v).replace(',', '.')); if (isFinite(f)) nums.push(f); } });
+                    if (nums.length){ nums.sort(function(a, b){ return a - b; }); var pr = nums[0], am = nums[nums.length - 1]; pct = pr <= 1 ? pr * 100 : pr; amount = am; }
+                }
+                if (!acc && labels.some(function(x){ return x.indexOf('account no') !== -1; })){
+                    for (var j = 0; j < row.length; j++){ var dg = normAcc(row[j]); if (dg.length >= 8) { acc = dg; break; } }
+                }
+            }
+            return { pct: pct, amount: amount, acc: acc };
+        }
+        async function checkOnePI(order){
+            var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
+            if (!h) return { ok: false, msg: 'nie otwarto ordera' };
+            var com = extractDepoComment(h), bank = extractBankAcc(h), piUrl = extractLatestPI(h);
+            if (!com) return { ok: false, msg: 'brak komentarza deposit' };
+            if (!piUrl) return { ok: false, msg: 'brak P/I' };
+            var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
+            if (!buf) return { ok: false, msg: 'nie pobrano P/I' };
+            var pi = parsePI(buf);
+            if (pi.err) return { ok: false, msg: pi.err };
+            var bad = [];
+            if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '\u2260' + com.amount.toFixed(2));
+            if (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct)) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '\u2260' + Math.round(com.pct));
+            if (!pi.acc || !bank || pi.acc !== bank) bad.push('konto ' + (pi.acc || '?') + '\u2260' + (bank || '?'));
+            return bad.length ? { ok: false, msg: bad.join('; ') } : { ok: true, msg: 'zgodne (' + Math.round(com.pct) + '% ' + com.amount.toFixed(2) + ')' };
+        }
+        async function runPICheck(status){
+            var uniq = [], seen = {}, res = {};
+            state.dep.order.forEach(function(sup){ state.dep.groups[sup].forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
+            if (!uniq.length) return { ok: 0, bad: 0 };
+            var done = 0, tot = uniq.length; function prog(){ if (status) status.textContent = 'P/I: ' + (tot ? Math.round(done / tot * 100) : 100) + '%'; } prog();
+            await runPool(uniq, async function(o){ res[o] = await checkOnePI(o); done++; prog(); }, 6);
+            var okc = 0, badc = 0;
+            state.dep.order.forEach(function(sup){ state.dep.groups[sup].forEach(function(r){ var v = res[r.order]; if (v) { r.pi = v; } }); });
+            uniq.forEach(function(o){ if (res[o] && res[o].ok) okc++; else badc++; });
+            return { ok: okc, bad: badc };
+        }
         wp.querySelector('#wp-go').onclick = async function(){
             var status = wp.querySelector('#wp-status');
             var balRows = parseBalance(wp.querySelector('#wp-balance'));
             var dep = parseDepo(wp.querySelector('#wp-depo'));
-            if (!balRows.length) { status.textContent = 'Wklej dane balance.'; return; }
+            if (!balRows.length && !dep.rows.length) { status.textContent = 'Wklej dane.'; return; }
             state.bal = groupRows(balRows); state.dep = groupRows(dep.rows); state.depoNames = dep.names;
             state.matched = {}; state.sup2cid = {}; state.resolved = false;
             state.bal.order.forEach(function(sup){ if (matchName(norm(sup), state.depoNames)) state.matched[sup] = 1; });
@@ -11045,20 +11132,11 @@
             status.textContent = 'Sprawdzam konta\u2026';
             await resolveAccounts(status);
             renderTables();
-            var c = state.bal.order.filter(function(s){ return !!state.matched[s]; }).length;
-            status.textContent = 'Gotowe. Dostawcy: ' + state.bal.order.length + ' | do scalenia (\u017c\u00f3\u0142te): ' + c + '.';
-        };
-        wp.querySelector('#wp-pen').onclick = async function(){
-            var status = wp.querySelector('#wp-status');
-            if (!state.bal.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
-            var uniq = [], seen = {}, pen = {};
-            state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ if (/^\d+$/.test(r.order) && !seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); } }); });
-            var pdone = 0, ptot = uniq.length; function pprog(){ if (status) status.textContent = 'Penalties: ' + (ptot ? Math.round(pdone / ptot * 100) : 100) + '%'; } pprog();
-            await runPool(uniq, async function(o){ pen[o] = await fetchPen(o); pdone++; pprog(); });
-            var added = 0;
-            state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){ var nums = pen[r.order]; if (nums && nums.length) { var s = 'penalty no. ' + nums.join(', '); if ((r.note || '').indexOf(s) === -1) { r.note = (r.note ? r.note + '  ' : '') + s; added++; } } }); });
+            var _pen = await runPenalties(status);
+            var _pi = await runPICheck(status);
             renderTables();
-            status.textContent = added ? ('Dopisano penalties do ' + added + ' wierszy.') : 'Brak penalties w komentarzach tych order\u00f3w.';
+            var c = state.bal.order.filter(function(s){ return !!state.matched[s]; }).length;
+            status.textContent = 'Gotowe. Dostawcy: ' + state.bal.order.length + ' | \u017c\u00f3\u0142te: ' + c + ' | penalties: ' + _pen + ' | P/I \u2713' + _pi.ok + ' \u2717' + _pi.bad + '.';
         };
         wp.querySelector('#wp-copy-bal').onclick = function(){
             var status = wp.querySelector('#wp-status');
