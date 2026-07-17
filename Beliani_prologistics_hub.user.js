@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.49
+// @version      1.50
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11104,7 +11104,7 @@
             return null;
         }
         function extractBankAcc(html){
-            var m = html.match(/Bank account number\s*:?\s*([0-9][0-9\s\-]*)/i);
+            var m = html.match(/Bank account number\s*:?\s*([A-Za-z0-9][A-Za-z0-9\s\-]*)/i);
             return m ? normAcc(m[1]) : '';
         }
         function extractLatestPI(html){
@@ -11143,7 +11143,7 @@
                         var mx = null; row.forEach(function(v2){ var n2 = (typeof v2 === 'number') ? v2 : parseMoney(v2); if (isFinite(n2) && n2 > 1 && (mx == null || n2 > mx)) mx = n2; }); amount = mx;
                     }
                 }
-                if (!acc && labels.some(function(x){ return x.indexOf('account no') !== -1; })){
+                if (!acc && labels.some(function(x){ return /(?:a\/?c|acc(?:ount)?)\s*(?:no\b|num)/i.test(x); })){
                     var bestAcc = ''; for (var mm = 0; mm < row.length; mm++){ var dg = normAcc(row[mm]); if (dg.length >= 8 && dg.length > bestAcc.length) bestAcc = dg; } acc = bestAcc;
                 }
             }
@@ -11169,7 +11169,7 @@
             return null;
         }
         function extractPdfAccount(txt){
-            var best = '', re = /account\s*(?:no|number)[\s:.]*((?:[0-9\-\u2019'()\uff08\uff09]+ ?)+)/gi, m;
+            var best = '', re = /(?:a\/?c|acc(?:ount)?)\s*(?:no\b|num(?:ber)?)[\s:.#]*([A-Za-z]{0,5}(?:[0-9\-\u2019'()\uff08\uff09]+ ?)+)/gi, m;
             while ((m = re.exec(txt)) !== null){ var dg = normAcc(m[1]); if (dg.length >= 8 && dg.length <= 24 && dg.length > best.length) best = dg; }
             return best;
         }
