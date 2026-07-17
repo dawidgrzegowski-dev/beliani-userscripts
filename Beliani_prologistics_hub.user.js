@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.53
+// @version      1.54
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10872,6 +10872,8 @@
           + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
           + '<button id="wp-pc-all" class="chn-btn ghost" title="Zaznacz/odznacz wszystkie w tabeli DEPO">\u2611 Zaznacz wszystkie</button>'
           + '<button id="wp-upload-pc" class="chn-btn maroon" title="Wgraj wybrany plik jako Payment conformation do zaznaczonych zam\u00f3wie\u0144">\u2b06 Wgraj payment confirmation (zaznaczone)</button>'
+          + '<label style="font-size:12px;color:#750000;display:inline-flex;align-items:center;gap:4px" title="Po wgraniu dodaj komentarz do zaznaczonych zamowien"><input type="checkbox" id="wp-pc-comment" checked> komentarz:</label>'
+          + '<input type="text" id="wp-pc-comment-text" value="Please confirm payment." style="width:190px;font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:6px">'
           + '<input type="file" id="wp-pc-file" style="display:none">'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
           + '<div style="margin-top:14px;font-weight:700;color:#750000">BALANCE</div><div id="wp-out-bal" style="overflow-x:auto"></div>'
@@ -11036,12 +11038,13 @@
         function renderDepo(forCopy){
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             var maxc = 1; g.order.forEach(function(sup){ g.groups[sup].forEach(function(r){ if (r.cells && r.cells.length > maxc) maxc = r.cells.length; }); });
-            g.order.forEach(function(sup){
+            g.order.forEach(function(sup, gi){
+                if (!forCopy) { var _cols = maxc + 2, _n = (g.groups[sup] || []).length; html += '<tr class="pc-suphdr"><td colspan="' + _cols + '" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000;font-weight:700"><label style="cursor:pointer"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(sup) + '</label> <span style="font-weight:400;opacity:.6">(' + _n + ' poz.)</span></td></tr>'; }
                 g.groups[sup].forEach(function(r){
                     var bg = r.bg || '', tds = '', lc = [];
                     (r.cells || []).forEach(function(x){ var content = forCopy ? (x.u ? esc(cellHL(x.u, x.t)) : esc(x.t)) : (x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t)); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
                     if (!forCopy) { var pv = ''; if (r.pi) { if (r.pi.warn) pv = '<span style="color:#c47f00;font-weight:700">P/I \u26a0 ' + esc(r.pi.msg) + '</span>'; else if (r.pi.ok) pv = '<span style="color:#0a0;font-weight:700">P/I \u2713 ' + esc(r.pi.msg) + '</span>'; else pv = '<span style="color:#c00;font-weight:700">P/I \u2717 ' + esc(r.pi.msg) + '</span>'; } tds += cel(pv, bg);
-                        var pcC = /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz, aby wgra\u0107 payment confirmation do tego zam\u00f3wienia"><input type="checkbox" class="pc-chk" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : '';
+                        var pcC = /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz, aby wgra\u0107 payment confirmation do tego zam\u00f3wienia"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : '';
                         tds += cel(pcC, bg); }
                     html += '<tr>' + tds + '</tr>'; lines.push(lc.join('\t'));
                 });
@@ -11270,7 +11273,8 @@
             copyHtml(renderDepo(true).html); status.textContent = 'Skopiowano DEPO (wklej do Sheets \u2014 z kolorami).';
         };
 
-        // ===== Payment confirmation upload (UI-only, nie dotyka kopiowania do Sheets) =====
+        // ===== Payment confirmation: upload pliku + opcjonalny komentarz (UI-only, nie dotyka kopiowania do Sheets) =====
+        function pcCountOcc(s, sub){ return (sub && s) ? s.split(sub).length - 1 : 0; }
         function pcSelectedOrders(){
             var out = [];
             wp.querySelectorAll('#wp-out-dep .pc-chk:checked').forEach(function(c){ var o = c.getAttribute('data-order'); if (o && out.indexOf(o) === -1) out.push(o); });
@@ -11280,68 +11284,82 @@
             var st = wp.querySelector('#wp-out-dep .pc-st[data-order="' + order + '"]');
             if (st){ st.textContent = ' ' + txt; st.style.color = color || ''; }
         }
-        async function pcUpload(orderId, file){
+        async function pcUploadFile(orderId, file){
             var fd = new FormData();
             fd.append('newpicfn[1]', file, file.name);
             fd.append('add', 'Add documents');
-            // pola formularza load_docs.php (typ 8 = Payment conformation)
             fd.append('op_order_id', String(orderId));
-            fd.append('type', '8');
-            fd.append('mode', '');
-            fd.append('lang', 'german');
-            fd.append('doc_id', '0');
-            fd.append('send_it', '0');
-            fd.append('sig', '0');
-            fd.append('system', '');
-            fd.append('number', '');
-            fd.append('txnid', '');
-            fd.append('page_name', '');
-            fd.append('company_id', '');
-            fd.append('article_id', '');
-            fd.append('company_task_id', '0');
-            fd.append('route_id', '0');
-            try {
-                var res = await fetch('/load_docs.php', { method: 'POST', body: fd, credentials: 'same-origin' });
-                if (!res || !res.ok) return { ok: false, status: res ? res.status : 0 };
-                // weryfikacja: nazwa pliku pojawia si\u0119 na stronie zam\u00f3wienia
-                try {
-                    var vhtml = await fetchT('/op_order.php?id=' + encodeURIComponent(orderId));
-                    if (vhtml && vhtml.indexOf(file.name) !== -1) return { ok: true, verified: true };
-                } catch (e) {}
-                return { ok: true, verified: false };
-            } catch (e) { return { ok: false, error: e.message }; }
+            fd.append('type', '8');            // 8 = Payment conformation
+            fd.append('mode', ''); fd.append('lang', 'german'); fd.append('doc_id', '0');
+            fd.append('send_it', '0'); fd.append('sig', '0'); fd.append('system', '');
+            fd.append('number', ''); fd.append('txnid', ''); fd.append('page_name', '');
+            fd.append('company_id', ''); fd.append('article_id', ''); fd.append('company_task_id', '0'); fd.append('route_id', '0');
+            try { var res = await fetch('/load_docs.php', { method:'POST', body: fd, credentials:'same-origin' }); return { ok: !!(res && res.ok) }; }
+            catch (e){ return { ok:false, error:e.message }; }
         }
+        async function pcPostComment(orderId, text){
+            try {
+                var res = await fetch('/api/comments/save/', { method:'POST', credentials:'same-origin',
+                    headers:{ 'content-type':'application/x-www-form-urlencoded' },
+                    body: 'page_id=' + encodeURIComponent(orderId) + '&comment_type=op_order&comment=' + encodeURIComponent(text) });
+                return { ok: !!(res && res.ok) };
+            } catch (e){ return { ok:false, error:e.message }; }
+        }
+        // deleguj: klik w checkbox dostawcy zaznacza/odznacza wszystkie pozycje tego dostawcy
+        wp.addEventListener('change', function(e){
+            var t = e.target;
+            if (t && t.classList && t.classList.contains('pc-sup-chk')){
+                var gi = t.getAttribute('data-sup');
+                wp.querySelectorAll('#wp-out-dep .pc-chk[data-sup="' + gi + '"]').forEach(function(b){ b.checked = t.checked; });
+            }
+        });
         wp.querySelector('#wp-pc-all').onclick = function(){
             var boxes = wp.querySelectorAll('#wp-out-dep .pc-chk');
-            if (!boxes.length){ wp.querySelector('#wp-status').textContent = 'Najpierw Przetw\u00f3rz.'; return; }
+            if (!boxes.length){ wp.querySelector('#wp-status').textContent = 'Najpierw Przetwórz.'; return; }
             var anyUnchecked = Array.prototype.some.call(boxes, function(b){ return !b.checked; });
             boxes.forEach(function(b){ b.checked = anyUnchecked; });
+            wp.querySelectorAll('#wp-out-dep .pc-sup-chk').forEach(function(b){ b.checked = anyUnchecked; });
         };
         wp.querySelector('#wp-upload-pc').onclick = function(){
             var status = wp.querySelector('#wp-status');
             var orders = pcSelectedOrders();
-            if (!orders.length){ status.textContent = 'Zaznacz zam\u00f3wienia (ostatnia kolumna w tabeli DEPO), do kt\u00f3rych wgra\u0107 payment confirmation.'; return; }
+            if (!orders.length){ status.textContent = 'Zaznacz zamówienia (ostatnia kolumna w tabeli DEPO), do których wgrać payment confirmation.'; return; }
             var fi = wp.querySelector('#wp-pc-file');
-            fi.value = '';
-            fi._orders = orders;
-            fi.click();
+            fi.value = ''; fi._orders = orders; fi.click();
         };
         wp.querySelector('#wp-pc-file').onchange = async function(){
             var status = wp.querySelector('#wp-status');
             var file = this.files && this.files[0];
             var orders = this._orders || [];
             if (!file || !orders.length) return;
-            var okc = 0, badc = 0, warnc = 0;
-            orders.forEach(function(o){ pcSetMark(o, '\u23f3', '#888'); });
+            var wantComment = !!wp.querySelector('#wp-pc-comment').checked;
+            var commentText = (wp.querySelector('#wp-pc-comment-text').value || '').trim();
+            if (wantComment && !commentText) wantComment = false;
+            var okc = 0, warnc = 0, badc = 0;
+            orders.forEach(function(o){ pcSetMark(o, '⏳', '#888'); });
             for (var i = 0; i < orders.length; i++){
                 var o = orders[i];
-                status.textContent = 'Wgrywam payment confirmation: ' + (i + 1) + '/' + orders.length + ' (' + file.name + ')\u2026';
-                var r = await pcUpload(o, file);
-                if (r.ok && r.verified){ okc++; pcSetMark(o, '\u2713', '#0a0'); }
-                else if (r.ok){ warnc++; pcSetMark(o, '\u2713?', '#c47f00'); }
-                else { badc++; pcSetMark(o, '\u2717', '#c00'); }
+                status.textContent = 'Przetwarzam ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
+                var before = '';
+                try { before = await fetchT('/op_order.php?id=' + encodeURIComponent(o)) || ''; } catch (e){ before = ''; }
+                var up = await pcUploadFile(o, file);
+                var cm = wantComment ? await pcPostComment(o, commentText) : { ok: null };
+                if (!up.ok){ badc++; pcSetMark(o, '✗ błąd wysyłki pliku (sprawdź)', '#c00'); continue; }
+                var after = '';
+                try { after = await fetchT('/op_order.php?id=' + encodeURIComponent(o)) || ''; } catch (e){ after = ''; }
+                var fileOk = pcCountOcc(after, file.name) > pcCountOcc(before, file.name);
+                var commentOk = wantComment ? (pcCountOcc(after, commentText) > pcCountOcc(before, commentText)) : null;
+                if (fileOk && commentOk !== false){
+                    okc++; pcSetMark(o, '✓ Potwierdzenie dołączone' + (commentOk ? ' + komentarz' : ''), '#0a0');
+                } else if (fileOk && commentOk === false){
+                    warnc++; pcSetMark(o, '⚠ Dołączone; komentarz? (sprawdź)', '#c47f00');
+                } else if (!fileOk && commentOk){
+                    warnc++; pcSetMark(o, '⚠ Komentarz ok; plik? (sprawdź)', '#c47f00');
+                } else {
+                    warnc++; pcSetMark(o, '⚠ Wysłane; nie potwierdzono (sprawdź)', '#c47f00');
+                }
             }
-            status.textContent = 'Payment confirmation \u201e' + file.name + '\u201d: \u2713 ' + okc + (warnc ? ', \u2713? ' + warnc + ' (wgrano, nie potwierdzono)' : '') + (badc ? ', \u2717 ' + badc : '') + '.';
+            status.textContent = 'Payment confirmation „' + file.name + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + (wantComment ? ' | komentarz: „' + commentText + '”' : '') + '.';
         };
     })();
 })();
