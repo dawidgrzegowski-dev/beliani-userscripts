@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.54
+// @version      1.55
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10871,8 +10871,8 @@
           + '<button id="wp-copy-bal" class="chn-btn ghost">\ud83d\udccb Kopiuj Balance</button>'
           + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
           + '<button id="wp-pc-all" class="chn-btn ghost" title="Zaznacz/odznacz wszystkie w tabeli DEPO">\u2611 Zaznacz wszystkie</button>'
-          + '<button id="wp-upload-pc" class="chn-btn maroon" title="Wgraj wybrany plik jako Payment conformation do zaznaczonych zam\u00f3wie\u0144">\u2b06 Wgraj payment confirmation (zaznaczone)</button>'
-          + '<label style="font-size:12px;color:#750000;display:inline-flex;align-items:center;gap:4px" title="Po wgraniu dodaj komentarz do zaznaczonych zamowien"><input type="checkbox" id="wp-pc-comment" checked> komentarz:</label>'
+          + '<button id="wp-upload-pc" class="chn-btn maroon" title="Wgraj wybrany plik jako Payment conformation do zaznaczonych zamowien">\u2b06 Wgraj payment confirmation</button>'
+          + '<button id="wp-add-comment" class="chn-btn maroon" title="Dodaj komentarz do zaznaczonych zamowien">\ud83d\udcac Dodaj komentarz</button>'
           + '<input type="text" id="wp-pc-comment-text" value="Please confirm payment." style="width:190px;font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:6px">'
           + '<input type="file" id="wp-pc-file" style="display:none">'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
@@ -10929,7 +10929,7 @@
             var supplier = supC ? supC.t : (c[0] ? c[0].t : '');
             var cid = (supC && (supC.u.match(/company_id=(\d+)/) || [])[1]) || null;
             var order = ordC ? ordC.t : '';
-            return { supplier: supplier, cid: cid, order: order, cells: c, bg: bg };
+            return { supplier: supplier, cid: cid, order: order, cells: c, bg: bg, supplierUrl: supC ? supC.u : '', orderUrl: ordC ? ordC.u : '' };
         }
         function parseBalance(el){
             var rows = [], trs = el.querySelectorAll('tr');
@@ -11007,7 +11007,7 @@
         async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return h ? parsePenalties(h, PENALTY_DAYS) : []; }
         async function runPool(items, worker, workers){ var idx = 0, N = items.length, WORKERS = workers || 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
 
-        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '' };
+        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {} };
         function groupRows(rows){
             var order = [], groups = {};
             rows.forEach(function(r){ var k = r.supplier; if (!(k in groups)) { groups[k] = []; order.push(k); } groups[k].push(r); });
@@ -11035,20 +11035,72 @@
             });
             return { html: html + '</table>', lines: lines };
         }
+        // ===== depo: kwoty / wybor kwoty / suma / konto =====
+        function pcDepAmt(r){
+            if (!r || !r.pi) return null;
+            var c = r.pi.comAmount, pa = r.pi.piAmount;
+            if (state.pcAmt && state.pcAmt[r.order] === 'pi' && pa != null) return pa;
+            return (c != null ? c : (pa != null ? pa : null));
+        }
+        function pcHasChoice(r){ return !!(r && r.pi && r.pi.comAmount != null && r.pi.piAmount != null && Math.abs(r.pi.comAmount - r.pi.piAmount) > 0.01); }
+        function pcGroupSum(sup){ var s2 = 0, any = false; (state.dep.groups[sup] || []).forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
+        function pcAcc(sup){ var cid = (state.depCid || {})[sup]; return cid ? (_acc[cid] || null) : null; }
+        function pcRefreshSums(){
+            state.dep.order.forEach(function(sup, gi){
+                var s2 = pcGroupSum(sup);
+                var el = wp.querySelector('#wp-out-dep .pc-sum[data-sup="' + gi + '"]');
+                if (el) el.textContent = (s2 != null ? s2.toFixed(2) : '—');
+            });
+        }
         function renderDepo(forCopy){
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
+            if (forCopy){
+                // Format do Sheets: A=nr(link) B=dostawca(link) C=puste D=kwota depo E=suma grupy (ostatni wiersz, gdy >1). Białe tło.
+                g.order.forEach(function(sup){
+                    var rows = g.groups[sup] || [], sum = 0, cnt = 0;
+                    rows.forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { sum += a; cnt++; } });
+                    rows.forEach(function(r, ri){
+                        var a = pcDepAmt(r), aTxt = (a != null && isFinite(a)) ? a.toFixed(2) : '';
+                        var eTxt = (ri === rows.length - 1 && rows.length > 1) ? sum.toFixed(2) : '';
+                        var A = cellHL(r.orderUrl, r.order), B = cellHL(r.supplierUrl, r.supplier);
+                        html += '<tr>' + cel(esc(A), '#fff') + cel(esc(B), '#fff') + cel('', '#fff') + cel(esc(aTxt), '#fff', true) + cel(esc(eTxt), '#fff', true) + '</tr>';
+                        lines.push([A, B, '', aTxt, eTxt].join('\t'));
+                    });
+                    html += '<tr>' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + '</tr>';
+                    lines.push('');
+                });
+                return { html: html + '</table>', lines: lines };
+            }
             var maxc = 1; g.order.forEach(function(sup){ g.groups[sup].forEach(function(r){ if (r.cells && r.cells.length > maxc) maxc = r.cells.length; }); });
             g.order.forEach(function(sup, gi){
-                if (!forCopy) { var _cols = maxc + 2, _n = (g.groups[sup] || []).length; html += '<tr class="pc-suphdr"><td colspan="' + _cols + '" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000;font-weight:700"><label style="cursor:pointer"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(sup) + '</label> <span style="font-weight:400;opacity:.6">(' + _n + ' poz.)</span></td></tr>'; }
+                var _cols = maxc + 3, _n = (g.groups[sup] || []).length, acc = pcAcc(sup), sum = pcGroupSum(sup);
+                html += '<tr class="pc-suphdr"><td colspan="' + _cols + '" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000;font-weight:700">'
+                    + '<label style="cursor:pointer"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(sup) + '</label> '
+                    + '<span style="font-weight:400;opacity:.6">(' + _n + ' poz.)</span>'
+                    + '<span style="font-weight:400;margin-left:12px">Konto: <b>' + esc(acc || '—') + '</b></span>'
+                    + '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (sum != null ? esc(sum.toFixed(2)) : '—') + '</b></span>'
+                    + '</td></tr>';
                 g.groups[sup].forEach(function(r){
                     var bg = r.bg || '', tds = '', lc = [];
-                    (r.cells || []).forEach(function(x){ var content = forCopy ? (x.u ? esc(cellHL(x.u, x.t)) : esc(x.t)) : (x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t)); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
-                    if (!forCopy) { var pv = ''; if (r.pi) { if (r.pi.warn) pv = '<span style="color:#c47f00;font-weight:700">P/I \u26a0 ' + esc(r.pi.msg) + '</span>'; else if (r.pi.ok) pv = '<span style="color:#0a0;font-weight:700">P/I \u2713 ' + esc(r.pi.msg) + '</span>'; else pv = '<span style="color:#c00;font-weight:700">P/I \u2717 ' + esc(r.pi.msg) + '</span>'; } tds += cel(pv, bg);
-                        var pcC = /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz, aby wgra\u0107 payment confirmation do tego zam\u00f3wienia"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : '';
-                        tds += cel(pcC, bg); }
+                    (r.cells || []).forEach(function(x){ var content = (x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t)); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
+                    var amtCell = '';
+                    if (pcHasChoice(r)) {
+                        var chosenPi = !!(state.pcAmt && state.pcAmt[r.order] === 'pi');
+                        amtCell = '<span style="white-space:nowrap">'
+                            + '<label style="cursor:pointer" title="Kwota z komentarza / systemu"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
+                            + ' <label style="cursor:pointer;color:#c47f00" title="Kwota z P/I"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="pi"' + (chosenPi ? ' checked' : '') + '> P/I ' + esc(r.pi.piAmount.toFixed(2)) + '</label>'
+                            + '</span>';
+                    } else {
+                        var a = pcDepAmt(r);
+                        amtCell = (a != null && isFinite(a)) ? '<span style="font-weight:600">' + esc(a.toFixed(2)) + '</span>' : '';
+                    }
+                    tds += cel(amtCell, bg, true);
+                    var pv = ''; if (r.pi) { if (r.pi.warn) pv = '<span style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; else if (r.pi.ok) pv = '<span style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; else pv = '<span style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; } tds += cel(pv, bg);
+                    var pcC = /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz, aby wgrać payment confirmation do tego zamówienia"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : '';
+                    tds += cel(pcC, bg);
                     html += '<tr>' + tds + '</tr>'; lines.push(lc.join('\t'));
                 });
-                var sep = '', sc = maxc + (forCopy ? 0 : 2); for (var i = 0; i < sc; i++) sep += cel('', '#fff'); html += '<tr>' + sep + '</tr>'; lines.push('');
+                var sep = '', sc = maxc + 3; for (var i2 = 0; i2 < sc; i2++) sep += cel('', '#fff'); html += '<tr>' + sep + '</tr>'; lines.push('');
             });
             return { html: html + '</table>', lines: lines };
         }
@@ -11219,18 +11271,22 @@
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
             if (!h) return { ok: false, msg: 'nie otwarto ordera' };
             var com = extractDepoComment(h), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
-            if (!com) return { ok: false, msg: 'brak komentarza deposit' };
-            if (!piUrl) return { ok: false, msg: 'brak P/I' };
+            var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null };
+            function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; return o; }
+            if (!com) return ret({ ok: false, msg: 'brak komentarza deposit' });
+            if (!piUrl) return ret({ ok: false, msg: 'brak P/I' });
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
-            if (!buf) return { ok: false, msg: 'nie pobrano P/I' };
+            if (!buf) return ret({ ok: false, msg: 'nie pobrano P/I' });
             var pi = await parsePI(buf);
-            if (pi.manual) return { ok: false, warn: true, msg: pi.err || 'P/I \u2013 sprawd\u017a r\u0119cznie' };
-            if (pi.err) return { ok: false, msg: pi.err };
+            base.piAmount = (pi && pi.amount != null) ? pi.amount : null;
+            base.piAcc = (pi && pi.acc) ? pi.acc : null;
+            if (pi.manual) return ret({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie' });
+            if (pi.err) return ret({ ok: false, msg: pi.err });
             var bad = [];
-            if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '\u2260' + com.amount.toFixed(2));
-            if (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct)) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '\u2260' + Math.round(com.pct));
-            if (!pi.acc || banks.indexOf(pi.acc) === -1) bad.push('konto ' + (pi.acc || '?') + '\u2260' + (banks.join('/') || '?'));
-            return bad.length ? { ok: false, msg: bad.join('; ') } : { ok: true, msg: 'zgodne (' + Math.round(com.pct) + '% ' + com.amount.toFixed(2) + ')' };
+            if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '≠' + com.amount.toFixed(2));
+            if (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct)) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '≠' + Math.round(com.pct));
+            if (!pi.acc || banks.indexOf(pi.acc) === -1) bad.push('konto ' + (pi.acc || '?') + '≠' + (banks.join('/') || '?'));
+            return ret(bad.length ? { ok: false, msg: bad.join('; ') } : { ok: true, msg: 'zgodne (' + Math.round(com.pct) + '% ' + com.amount.toFixed(2) + ')' });
         }
         async function runPICheck(status){
             var uniq = [], seen = {}, res = {};
@@ -11249,7 +11305,7 @@
             var dep = parseDepo(wp.querySelector('#wp-depo'));
             if (!balRows.length && !dep.rows.length) { status.textContent = 'Wklej dane.'; return; }
             state.bal = groupRows(balRows); state.dep = groupRows(dep.rows); state.depoNames = dep.names;
-            state.matched = {}; state.sup2cid = {}; state.resolved = false;
+            state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {};
             state.bal.order.forEach(function(sup){ if (matchName(norm(sup), state.depoNames)) state.matched[sup] = 1; });
             renderTables();
             status.textContent = 'Sprawdzam konta\u2026';
@@ -11273,8 +11329,8 @@
             copyHtml(renderDepo(true).html); status.textContent = 'Skopiowano DEPO (wklej do Sheets \u2014 z kolorami).';
         };
 
-        // ===== Payment confirmation: upload pliku + opcjonalny komentarz (UI-only, nie dotyka kopiowania do Sheets) =====
-        function pcCountOcc(s, sub){ return (sub && s) ? s.split(sub).length - 1 : 0; }
+        // ===== Payment confirmation: osobno plik i osobno komentarz (UI-only, nie dotyka kopiowania do Sheets) =====
+        function pcCountOcc(str, sub){ return (sub && str) ? str.split(sub).length - 1 : 0; }
         function pcSelectedOrders(){
             var out = [];
             wp.querySelectorAll('#wp-out-dep .pc-chk:checked').forEach(function(c){ var o = c.getAttribute('data-order'); if (o && out.indexOf(o) === -1) out.push(o); });
@@ -11305,12 +11361,15 @@
                 return { ok: !!(res && res.ok) };
             } catch (e){ return { ok:false, error:e.message }; }
         }
-        // deleguj: klik w checkbox dostawcy zaznacza/odznacza wszystkie pozycje tego dostawcy
+        async function pcOrderHtml(o){ try { return (await fetchT('/op_order.php?id=' + encodeURIComponent(o))) || ''; } catch (e){ return ''; } }
+        // delegacja zmian: checkbox dostawcy -> zaznacz grupe; radio kwoty -> przelicz sumy
         wp.addEventListener('change', function(e){
-            var t = e.target;
-            if (t && t.classList && t.classList.contains('pc-sup-chk')){
+            var t = e.target; if (!t || !t.classList) return;
+            if (t.classList.contains('pc-sup-chk')){
                 var gi = t.getAttribute('data-sup');
                 wp.querySelectorAll('#wp-out-dep .pc-chk[data-sup="' + gi + '"]').forEach(function(b){ b.checked = t.checked; });
+            } else if (t.classList.contains('pc-amt')){
+                var o = t.getAttribute('data-order'); if (o){ if (!state.pcAmt) state.pcAmt = {}; state.pcAmt[o] = t.value; pcRefreshSums(); }
             }
         });
         wp.querySelector('#wp-pc-all').onclick = function(){
@@ -11320,46 +11379,53 @@
             boxes.forEach(function(b){ b.checked = anyUnchecked; });
             wp.querySelectorAll('#wp-out-dep .pc-sup-chk').forEach(function(b){ b.checked = anyUnchecked; });
         };
+        // --- osobno: wgraj plik payment confirmation ---
         wp.querySelector('#wp-upload-pc').onclick = function(){
             var status = wp.querySelector('#wp-status');
             var orders = pcSelectedOrders();
-            if (!orders.length){ status.textContent = 'Zaznacz zamówienia (ostatnia kolumna w tabeli DEPO), do których wgrać payment confirmation.'; return; }
-            var fi = wp.querySelector('#wp-pc-file');
-            fi.value = ''; fi._orders = orders; fi.click();
+            if (!orders.length){ status.textContent = 'Zaznacz zamówienia (ostatnia kolumna w tabeli DEPO).'; return; }
+            var fi = wp.querySelector('#wp-pc-file'); fi.value = ''; fi._orders = orders; fi.click();
         };
         wp.querySelector('#wp-pc-file').onchange = async function(){
             var status = wp.querySelector('#wp-status');
-            var file = this.files && this.files[0];
-            var orders = this._orders || [];
+            var file = this.files && this.files[0]; var orders = this._orders || [];
             if (!file || !orders.length) return;
-            var wantComment = !!wp.querySelector('#wp-pc-comment').checked;
-            var commentText = (wp.querySelector('#wp-pc-comment-text').value || '').trim();
-            if (wantComment && !commentText) wantComment = false;
             var okc = 0, warnc = 0, badc = 0;
             orders.forEach(function(o){ pcSetMark(o, '⏳', '#888'); });
             for (var i = 0; i < orders.length; i++){
                 var o = orders[i];
-                status.textContent = 'Przetwarzam ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
-                var before = '';
-                try { before = await fetchT('/op_order.php?id=' + encodeURIComponent(o)) || ''; } catch (e){ before = ''; }
+                status.textContent = 'Wgrywam plik ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
+                var before = await pcOrderHtml(o);
                 var up = await pcUploadFile(o, file);
-                var cm = wantComment ? await pcPostComment(o, commentText) : { ok: null };
                 if (!up.ok){ badc++; pcSetMark(o, '✗ błąd wysyłki pliku (sprawdź)', '#c00'); continue; }
-                var after = '';
-                try { after = await fetchT('/op_order.php?id=' + encodeURIComponent(o)) || ''; } catch (e){ after = ''; }
-                var fileOk = pcCountOcc(after, file.name) > pcCountOcc(before, file.name);
-                var commentOk = wantComment ? (pcCountOcc(after, commentText) > pcCountOcc(before, commentText)) : null;
-                if (fileOk && commentOk !== false){
-                    okc++; pcSetMark(o, '✓ Potwierdzenie dołączone' + (commentOk ? ' + komentarz' : ''), '#0a0');
-                } else if (fileOk && commentOk === false){
-                    warnc++; pcSetMark(o, '⚠ Dołączone; komentarz? (sprawdź)', '#c47f00');
-                } else if (!fileOk && commentOk){
-                    warnc++; pcSetMark(o, '⚠ Komentarz ok; plik? (sprawdź)', '#c47f00');
-                } else {
-                    warnc++; pcSetMark(o, '⚠ Wysłane; nie potwierdzono (sprawdź)', '#c47f00');
-                }
+                var after = await pcOrderHtml(o);
+                if (pcCountOcc(after, file.name) > pcCountOcc(before, file.name)){ okc++; pcSetMark(o, '✓ Potwierdzenie dołączone', '#0a0'); }
+                else { warnc++; pcSetMark(o, '⚠ Wgrane; nie potwierdzono (sprawdź)', '#c47f00'); }
             }
-            status.textContent = 'Payment confirmation „' + file.name + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + (wantComment ? ' | komentarz: „' + commentText + '”' : '') + '.';
+            status.textContent = 'Payment confirmation „' + file.name + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + '.';
+        };
+        // --- osobno: dodaj komentarz ---
+        wp.querySelector('#wp-add-comment').onclick = async function(){
+            var status = wp.querySelector('#wp-status');
+            var orders = pcSelectedOrders();
+            if (!orders.length){ status.textContent = 'Zaznacz zamówienia (ostatnia kolumna w tabeli DEPO).'; return; }
+            var text = (wp.querySelector('#wp-pc-comment-text').value || '').trim();
+            if (!text){ status.textContent = 'Wpisz treść komentarza.'; return; }
+            this.disabled = true;
+            var okc = 0, warnc = 0, badc = 0;
+            orders.forEach(function(o){ pcSetMark(o, '⏳', '#888'); });
+            for (var i = 0; i < orders.length; i++){
+                var o = orders[i];
+                status.textContent = 'Dodaję komentarz ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
+                var before = await pcOrderHtml(o);
+                var cm = await pcPostComment(o, text);
+                if (!cm.ok){ badc++; pcSetMark(o, '✗ błąd komentarza (sprawdź)', '#c00'); continue; }
+                var after = await pcOrderHtml(o);
+                if (pcCountOcc(after, text) > pcCountOcc(before, text)){ okc++; pcSetMark(o, '✓ komentarz dodany', '#0a0'); }
+                else { warnc++; pcSetMark(o, '⚠ Wysłany; nie potwierdzono (sprawdź)', '#c47f00'); }
+            }
+            this.disabled = false;
+            status.textContent = 'Komentarz „' + text + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + '.';
         };
     })();
 })();
