@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.56
+// @version      1.58
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10870,14 +10870,14 @@
           + '<button id="wp-go" class="chn-btn red">Przetwórz</button>'
           + '<button id="wp-copy-bal" class="chn-btn ghost">\ud83d\udccb Kopiuj Balance</button>'
           + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
+          + '<button id="wp-copy-titles" class="chn-btn ghost">\ud83d\udccb Kopiuj tytuły</button>'
           + '<button id="wp-pc-all" class="chn-btn ghost" title="Zaznacz/odznacz wszystkie w tabeli DEPO">\u2611 Zaznacz wszystkie</button>'
           + '<button id="wp-upload-pc" class="chn-btn maroon" title="Wgraj wybrany plik jako Payment conformation do zaznaczonych zamowien">\u2b06 Wgraj payment confirmation</button>'
           + '<button id="wp-add-comment" class="chn-btn maroon" title="Dodaj komentarz do zaznaczonych zamowien">\ud83d\udcac Dodaj komentarz</button>'
           + '<input type="text" id="wp-pc-comment-text" value="Please confirm payment." style="width:190px;font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:6px">'
           + '<input type="file" id="wp-pc-file" style="display:none">'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
-          + '<div style="margin-top:14px;font-weight:700;color:#750000">BALANCE</div><div id="wp-out-bal" style="overflow-x:auto"></div>'
-          + '<div style="margin-top:16px;font-weight:700;color:#750000">DEPO</div><div id="wp-out-dep" style="overflow-x:auto"></div>'
+          + '<div id="wp-out-merged" style="overflow-x:auto;margin-top:14px"></div>'
           + '</div>';
         document.body.appendChild(wp);
         wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
@@ -11066,11 +11066,7 @@
         function pcDecodeInfo(t){ return String(t || '').replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#0?39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim(); }
         function pcAttr(t){ return String(t || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
         function pcRefreshSums(){
-            state.dep.order.forEach(function(sup, gi){
-                var s2 = pcGroupSum(sup);
-                var el = wp.querySelector('#wp-out-dep .pc-sum[data-sup="' + gi + '"]');
-                if (el) el.textContent = (s2 != null ? s2.toFixed(2) : '—');
-            });
+            (state._groups || []).forEach(function(g){ var s2 = pcSumRows(g.dep); var el = wp.querySelector('#wp-out-merged .pc-sum[data-sup="' + g.gi + '"]'); if (el) el.textContent = (s2 != null ? s2.toFixed(2) : '—'); });
         }
         function renderDepo(forCopy){
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
@@ -11125,13 +11121,94 @@
             });
             return { html: html + '</table>', lines: lines };
         }
-        function renderTables(){
-            var b = renderBal(false), d = renderDepo(false);
-            wp.querySelector('#wp-out-bal').innerHTML = b.html;
-            wp.querySelector('#wp-out-dep').innerHTML = d.html;
-            state.balHtml = b.html; state.depHtml = d.html;
-            state.lastOutput = 'BALANCE\n' + b.lines.join('\n') + '\n\nDEPO\n' + d.lines.join('\n');
+        function pcCopyText(t){ try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(t, 'text'); return true; } } catch(e){} try { navigator.clipboard.writeText(t); return true; } catch(e){} return false; }
+        // ===== scalona tabela: laczenie depo+balance per dostawca (konto), sekcje LACZONE/DEPO/BALANCE =====
+        function pcSumRows(rows){ var s2 = 0, any = false; (rows || []).forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
+        function pcBalSum(rows){ var s2 = 0, any = false; (rows || []).forEach(function(r){ if (r.amount == null || r.amount === '') return; var a = parseAmount(r.amount); if (isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
+        function pcMergedGroups(){
+            var byKey = {}, keys = [];
+            function keyOf(cidMap, sup){ var cid = (cidMap || {})[sup]; var acc = cid ? _acc[cid] : null; return { k: acc ? ('acc:' + normAcc(acc)) : ('name:' + norm(sup)), cid: cid || null }; }
+            function ensure(k, sup, cid){ if (!byKey[k]) { byKey[k] = { key: k, sup: sup, cid: cid || null, dep: [], bal: [] }; keys.push(k); } if (!byKey[k].cid && cid) byKey[k].cid = cid; return byKey[k]; }
+            state.dep.order.forEach(function(sup){ var ko = keyOf(state.depCid, sup); var G = ensure(ko.k, sup, ko.cid); G.dep = G.dep.concat(state.dep.groups[sup] || []); });
+            state.bal.order.forEach(function(sup){ var ko = keyOf(state.sup2cid, sup); var G = ensure(ko.k, sup, ko.cid); G.bal = G.bal.concat(state.bal.groups[sup] || []); });
+            var combined = [], depoOnly = [], balOnly = [];
+            keys.forEach(function(k){ var G = byKey[k]; if (G.dep.length && G.bal.length) combined.push(G); else if (G.dep.length) depoOnly.push(G); else balOnly.push(G); });
+            function bySup(a, b){ return String(a.sup).toLowerCase().localeCompare(String(b.sup).toLowerCase()); }
+            combined.sort(bySup); depoOnly.sort(bySup); balOnly.sort(bySup);
+            return { combined: combined, depoOnly: depoOnly, balOnly: balOnly };
         }
+        function pcTitleFor(G){
+            var orders = [], pcts = [], conts = [], pens = [];
+            (G.dep || []).forEach(function(r){ if (r.order && orders.indexOf(r.order) === -1) orders.push(r.order); var pp = (r.pi && r.pi.comPct != null) ? Math.round(r.pi.comPct) : null; if (pp != null && pcts.indexOf(pp) === -1) pcts.push(pp); });
+            (G.bal || []).forEach(function(r){ var c = String(r.container || '').trim(); if (c && conts.indexOf(c) === -1) conts.push(c); var pm = String(r.note || '').match(/penalty no\.?\s*([0-9][0-9,\s]*)/i); if (pm) pm[1].split(/[,\s]+/).forEach(function(nn){ nn = nn.trim(); if (nn && pens.indexOf(nn) === -1) pens.push(nn); }); });
+            if (!orders.length) return '';
+            var parts = ['Order ' + orders.join(', ')];
+            parts.push(pcts.length ? ('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(', ')) : 'Deposit');
+            if (conts.length) parts.push(conts.join(', '));
+            if (pens.length) parts.push('discount ' + pens.join(', '));
+            return parts.join(', ');
+        }
+        function pcTransferTitles(){
+            var MG = pcMergedGroups(), all = MG.combined.concat(MG.depoOnly), out = [];
+            all.forEach(function(G){ var t = pcTitleFor(G); if (t) out.push({ sup: G.sup, title: t }); });
+            out.sort(function(a, b){ return String(a.sup).toLowerCase().localeCompare(String(b.sup).toLowerCase()); });
+            return out;
+        }
+        function pcInfoG(G){ return G && G.cid ? (_info[G.cid] || '') : ''; }
+        function pcHasInfoG(G){ var t = pcInfoG(G); return !!(t && t.replace(/\s|&nbsp;/gi, '').length); }
+        function pcChkHtml(r, gi){ return /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz do payment confirmation / komentarza"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : ''; }
+        function pcAmtCellHtml(r){
+            if (pcHasChoice(r)){
+                var chosenPi = !!(state.pcAmt && state.pcAmt[r.order] === 'pi');
+                return '<span style="white-space:nowrap">'
+                    + '<label style="cursor:pointer" title="Kwota z komentarza / systemu"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
+                    + ' <label style="cursor:pointer;color:#c47f00" title="Kwota z P/I"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="pi"' + (chosenPi ? ' checked' : '') + '> P/I ' + esc(r.pi.piAmount.toFixed(2)) + '</label>'
+                    + '</span>';
+            }
+            var a = pcDepAmt(r);
+            return (a != null && isFinite(a)) ? '<span style="font-weight:600">' + esc(a.toFixed(2)) + '</span>' : '';
+        }
+        function pcPiCellHtml(r){ if (!r.pi) return ''; if (r.pi.warn) return '<span style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; if (r.pi.ok) return '<span style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; return '<span style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; }
+        function pcRowDepo(r, gi){ var bg = r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, bg) + cel('', bg) + cel(pcAmtCellHtml(r), bg, true) + cel(pcPiCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcRowBal(r, gi){ var bg = r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(esc(r.amount || ''), bg, true) + cel('', bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcGroupHeader(G, gi){
+            var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
+            var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
+            var acc = G.cid ? (_acc[G.cid] || '—') : '—';
+            var h = '<tr class="pc-suphdr"><td colspan="7" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
+                + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
+                + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
+                + '<span style="font-weight:400;margin-left:12px">Konto: <b>' + esc(acc) + '</b></span>'
+                + (hasDep ? '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (depSum != null ? esc(depSum.toFixed(2)) : '—') + '</b></span>' : '')
+                + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b>' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
+                + (pcHasInfoG(G) ? '<span class="pc-infobadge" title="' + pcAttr(pcDecodeInfo(pcInfoG(G))) + '" style="margin-left:12px;background:#c00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">! Info box</span>' : '');
+            if (hasDep){ var t = pcTitleFor(G); if (t) h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button></div>'; }
+            return h + '</td></tr>';
+        }
+        function renderMerged(){
+            var el = wp.querySelector('#wp-out-merged'); if (!el) return;
+            var MG = pcMergedGroups(); state._groups = [];
+            var gi = 0, html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
+            function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
+            function section(title, groups){
+                if (!groups.length) return;
+                html += '<tr><td colspan="7" style="background:#750000;color:#fff;font-weight:700;padding:5px 8px">' + esc(title) + ' <span style="font-weight:400;opacity:.7">(' + groups.length + ')</span></td></tr>';
+                html += colhead();
+                groups.forEach(function(G){
+                    state._groups.push({ gi: gi, dep: G.dep });
+                    html += pcGroupHeader(G, gi);
+                    G.dep.forEach(function(r){ html += pcRowDepo(r, gi); });
+                    G.bal.forEach(function(r){ html += pcRowBal(r, gi); });
+                    gi++;
+                });
+            }
+            section('ŁĄCZONE (depo + balance)', MG.combined);
+            section('DEPO', MG.depoOnly);
+            section('BALANCE', MG.balOnly);
+            if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
+            el.innerHTML = html + '</table>';
+        }
+        function renderTables(){ renderMerged(); }
         async function resolveAccounts(status){
             var depoAcc = {}, total = state.dep.order.length + state.bal.order.length, done = 0;
             function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
@@ -11354,11 +11431,11 @@
         function pcCountOcc(str, sub){ return (sub && str) ? str.split(sub).length - 1 : 0; }
         function pcSelectedOrders(){
             var out = [];
-            wp.querySelectorAll('#wp-out-dep .pc-chk:checked').forEach(function(c){ var o = c.getAttribute('data-order'); if (o && out.indexOf(o) === -1) out.push(o); });
+            wp.querySelectorAll('#wp-out-merged .pc-chk:checked').forEach(function(c){ var o = c.getAttribute('data-order'); if (o && out.indexOf(o) === -1) out.push(o); });
             return out;
         }
         function pcSetMark(order, txt, color){
-            var st = wp.querySelector('#wp-out-dep .pc-st[data-order="' + order + '"]');
+            var st = wp.querySelector('#wp-out-merged .pc-st[data-order="' + order + '"]');
             if (st){ st.textContent = ' ' + txt; st.style.color = color || ''; }
         }
         async function pcUploadFile(orderId, file){
@@ -11388,17 +11465,17 @@
             var t = e.target; if (!t || !t.classList) return;
             if (t.classList.contains('pc-sup-chk')){
                 var gi = t.getAttribute('data-sup');
-                wp.querySelectorAll('#wp-out-dep .pc-chk[data-sup="' + gi + '"]').forEach(function(b){ b.checked = t.checked; });
+                wp.querySelectorAll('#wp-out-merged .pc-chk[data-sup="' + gi + '"]').forEach(function(b){ b.checked = t.checked; });
             } else if (t.classList.contains('pc-amt')){
                 var o = t.getAttribute('data-order'); if (o){ if (!state.pcAmt) state.pcAmt = {}; state.pcAmt[o] = t.value; pcRefreshSums(); }
             }
         });
         wp.querySelector('#wp-pc-all').onclick = function(){
-            var boxes = wp.querySelectorAll('#wp-out-dep .pc-chk');
+            var boxes = wp.querySelectorAll('#wp-out-merged .pc-chk');
             if (!boxes.length){ wp.querySelector('#wp-status').textContent = 'Najpierw Przetwórz.'; return; }
             var anyUnchecked = Array.prototype.some.call(boxes, function(b){ return !b.checked; });
             boxes.forEach(function(b){ b.checked = anyUnchecked; });
-            wp.querySelectorAll('#wp-out-dep .pc-sup-chk').forEach(function(b){ b.checked = anyUnchecked; });
+            wp.querySelectorAll('#wp-out-merged .pc-sup-chk').forEach(function(b){ b.checked = anyUnchecked; });
         };
         // --- osobno: wgraj plik payment confirmation ---
         wp.querySelector('#wp-upload-pc').onclick = function(){
