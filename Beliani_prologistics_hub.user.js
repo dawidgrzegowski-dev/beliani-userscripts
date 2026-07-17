@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.47
+// @version      1.48
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18,6 +18,7 @@
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -11036,7 +11037,7 @@
                 g.groups[sup].forEach(function(r){
                     var bg = r.bg || '', tds = '', lc = [];
                     (r.cells || []).forEach(function(x){ var content = forCopy ? (x.u ? esc(cellHL(x.u, x.t)) : esc(x.t)) : (x.u ? aLink(x.u, x.t, /op_suppliers/.test(x.u) ? '#750000' : '') : esc(x.t)); tds += cel(content, bg); lc.push(x.u ? cellHL(x.u, x.t) : x.t); });
-                    if (!forCopy) { var pv = r.pi ? (r.pi.ok ? '<span style="color:#0a0;font-weight:700">P/I \u2713 ' + esc(r.pi.msg) + '</span>' : '<span style="color:#c00;font-weight:700">P/I \u2717 ' + esc(r.pi.msg) + '</span>') : ''; tds += cel(pv, bg); }
+                    if (!forCopy) { var pv = ''; if (r.pi) { if (r.pi.warn) pv = '<span style="color:#c47f00;font-weight:700">P/I \u26a0 ' + esc(r.pi.msg) + '</span>'; else if (r.pi.ok) pv = '<span style="color:#0a0;font-weight:700">P/I \u2713 ' + esc(r.pi.msg) + '</span>'; else pv = '<span style="color:#c00;font-weight:700">P/I \u2717 ' + esc(r.pi.msg) + '</span>'; } tds += cel(pv, bg); }
                     html += '<tr>' + tds + '</tr>'; lines.push(lc.join('\t'));
                 });
                 var sep = '', sc = maxc + (forCopy ? 0 : 1); for (var i = 0; i < sc; i++) sep += cel('', '#fff'); html += '<tr>' + sep + '</tr>'; lines.push('');
@@ -11122,25 +11123,75 @@
             try { var r = await fetch(url, { credentials: 'same-origin', signal: ctl.signal }); clearTimeout(t); if (!r.ok) return null; return await r.arrayBuffer(); } catch(e){ clearTimeout(t); return null; }
         }
         function getXLSX(){ try { if (typeof XLSX !== 'undefined') return XLSX; } catch(e){} try { if (window.XLSX) return window.XLSX; } catch(e){} try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX) return unsafeWindow.XLSX; } catch(e){} return null; }
-        function parsePI(buf){
-            var X = getXLSX(); if (!X) return { err: 'brak SheetJS' };
-            var wb; try { wb = X.read(new Uint8Array(buf), { type: 'array' }); } catch(e){ return { err: 'P/I nieczytelne' }; }
-            var ws = wb.Sheets[wb.SheetNames[0]]; if (!ws) return { err: 'P/I puste' };
-            var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ return { err: 'P/I nieczytelne' }; }
+        function scanPIsheet(aoa){
             var pct = null, amount = null, acc = '';
             for (var i = 0; i < aoa.length; i++){
                 var row = aoa[i] || [];
                 var labels = row.map(function(v){ return String(v == null ? '' : v).trim().toLowerCase(); });
-                if (pct === null && amount === null && labels.some(function(x){ return x === 'deposit' || x === 'deposit:'; })){
-                    var nums = [];
-                    row.forEach(function(v){ var n = (typeof v === 'number' && isFinite(v)) ? v : parseMoney(v); if (isFinite(n)) nums.push(n); });
-                    if (nums.length){ nums.sort(function(a, b){ return a - b; }); var pr = nums[0], am = nums[nums.length - 1]; pct = pr <= 1 ? pr * 100 : pr; amount = am; }
+                if (pct === null && labels.some(function(x){ return x === 'deposit' || x === 'deposit:'; })){
+                    var pctCol = -1;
+                    for (var j = 0; j < row.length; j++){
+                        var v = row[j];
+                        if (typeof v === 'number' && v > 0 && v <= 1) { pct = v * 100; pctCol = j; break; }
+                        if (typeof v === 'string' && v.indexOf('%') !== -1) { var pf = parseFloat(v.replace(',', '.').replace(/[^0-9.]/g, '')); if (isFinite(pf)) { pct = pf; pctCol = j; break; } }
+                    }
+                    if (pctCol >= 0){
+                        for (var k = pctCol + 1; k < row.length; k++){ var n = (typeof row[k] === 'number' && isFinite(row[k])) ? row[k] : parseMoney(row[k]); if (isFinite(n) && n > 1) { amount = n; break; } }
+                    } else {
+                        var mx = null; row.forEach(function(v2){ var n2 = (typeof v2 === 'number') ? v2 : parseMoney(v2); if (isFinite(n2) && n2 > 1 && (mx == null || n2 > mx)) mx = n2; }); amount = mx;
+                    }
                 }
                 if (!acc && labels.some(function(x){ return x.indexOf('account no') !== -1; })){
-                    for (var j = 0; j < row.length; j++){ var dg = normAcc(row[j]); if (dg.length >= 8) { acc = dg; break; } }
+                    var bestAcc = ''; for (var mm = 0; mm < row.length; mm++){ var dg = normAcc(row[mm]); if (dg.length >= 8 && dg.length > bestAcc.length) bestAcc = dg; } acc = bestAcc;
                 }
             }
             return { pct: pct, amount: amount, acc: acc };
+        }
+        function parsePIxlsx(u8){
+            var X = getXLSX(); if (!X) return { err: 'brak SheetJS' };
+            var wb; try { wb = X.read(u8, { type: 'array' }); } catch(e){ return { err: 'P/I nieczytelne' }; }
+            var best = null;
+            for (var si = 0; si < wb.SheetNames.length; si++){
+                var ws = wb.Sheets[wb.SheetNames[si]]; if (!ws) continue;
+                var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ continue; }
+                var r = scanPIsheet(aoa);
+                if (r.pct != null || r.acc) { if (!best) best = r; if (r.pct != null && r.amount != null && r.acc) { best = r; break; } }
+            }
+            return best || { pct: null, amount: null, acc: '' };
+        }
+        function extractPdfDeposit(txt){
+            var m = txt.match(/(\d+(?:[.,]\d+)?)\s*%\s*deposit\b[^0-9$\u20ac]*[$\u20ac]\s*([\d.,\u2019' ]+)/i);
+            if (m) return { pct: parseFloat(String(m[1]).replace(',', '.')), amount: parseMoney(m[2]) };
+            var di = txt.toLowerCase().indexOf('deposit');
+            if (di >= 0){ var win = txt.slice(Math.max(0, di - 40), di + 60); var pm = win.match(/(\d+(?:[.,]\d+)?)\s*%/); var am = win.match(/[$\u20ac]\s*([\d.,\u2019' ]+)/); if (pm && am) return { pct: parseFloat(String(pm[1]).replace(',', '.')), amount: parseMoney(am[1]) }; }
+            return null;
+        }
+        function extractPdfAccount(txt){
+            var best = '', re = /account\s*(?:no|number)[\s:.]*((?:[0-9\-\u2019'()\uff08\uff09]+ ?)+)/gi, m;
+            while ((m = re.exec(txt)) !== null){ var dg = normAcc(m[1]); if (dg.length >= 8 && dg.length <= 24 && dg.length > best.length) best = dg; }
+            return best;
+        }
+        function getPdfjs(){
+            var lib = null;
+            try { if (typeof pdfjsLib !== 'undefined') lib = pdfjsLib; } catch(e){}
+            if (!lib) { try { lib = window.pdfjsLib; } catch(e){} }
+            if (!lib) { try { if (typeof unsafeWindow !== 'undefined') lib = unsafeWindow.pdfjsLib; } catch(e){} }
+            if (lib && lib.GlobalWorkerOptions) { try { if (!lib.GlobalWorkerOptions.workerSrc) lib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch(e){} }
+            return Promise.resolve(lib);
+        }
+        async function parsePIpdf(u8){
+            var lib = await getPdfjs();
+            if (!lib) return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie (brak pdf.js)' };
+            var txt = '';
+            try { var doc = await lib.getDocument({ data: u8 }).promise; for (var pg = 1; pg <= doc.numPages; pg++){ var page = await doc.getPage(pg); var tc = await page.getTextContent(); txt += tc.items.map(function(it){ return it.str; }).join(' ') + '\n'; } } catch(e){ return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie' }; }
+            var dep = extractPdfDeposit(txt), acc = extractPdfAccount(txt);
+            return { pct: dep ? dep.pct : null, amount: dep ? dep.amount : null, acc: acc };
+        }
+        async function parsePI(buf){
+            var u8 = new Uint8Array(buf);
+            var sig = String.fromCharCode(u8[0] || 0, u8[1] || 0, u8[2] || 0, u8[3] || 0);
+            if (sig === '%PDF') return await parsePIpdf(u8);
+            return parsePIxlsx(u8);
         }
         async function checkOnePI(order){
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
@@ -11150,7 +11201,8 @@
             if (!piUrl) return { ok: false, msg: 'brak P/I' };
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
             if (!buf) return { ok: false, msg: 'nie pobrano P/I' };
-            var pi = parsePI(buf);
+            var pi = await parsePI(buf);
+            if (pi.manual) return { ok: false, warn: true, msg: pi.err || 'P/I \u2013 sprawd\u017a r\u0119cznie' };
             if (pi.err) return { ok: false, msg: pi.err };
             var bad = [];
             if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '\u2260' + com.amount.toFixed(2));
