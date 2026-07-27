@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.78
+// @version      1.79
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10043,8 +10043,22 @@
         <div style="font-weight:bold;margin-bottom:8px;color:#111;font-size:15px;">
             📦 Auto-księgowanie orderów
         </div>
-        <div style="font-size:11px;color:#666;margin-bottom:8px;">
+        <div style="display:flex;gap:16px;align-items:center;margin-bottom:8px;font-size:12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:5px 8px;">
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap;" title="Wklejka: order [TAB] nazwa [TAB] kwota. Opis brany z komentarzy orderu (deposit XX%), po zaksięgowaniu status kontenera zmienia się na waiting for SM.">
+                <input type="radio" name="tm-mode" value="depo" checked> <strong>Depozyty</strong>
+            </label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap;" title="Wklejka: tabela balance z arkusza. Opis = numer kontenera, penalty rozbijane na dwa wpisy, status kontenera BEZ zmian.">
+                <input type="radio" name="tm-mode" value="bal"> <strong>Balance</strong>
+            </label>
+        </div>
+        <div id="tm-fmt-depo" style="font-size:11px;color:#666;margin-bottom:8px;">
             Format: <code style="background:#f5f5f5;padding:2px 4px;">20730[TAB]Nazwa[TAB]2527.5</code>
+        </div>
+        <div id="tm-fmt-bal" style="display:none;font-size:11px;color:#666;margin-bottom:8px;">
+            Wklej tabelę balance prosto z arkusza — 6 kolumn:
+            <code style="background:#f5f5f5;padding:2px 4px;">dostawca ⇥ kontener ⇥ 1/sub/- ⇥ order ⇥ kwota ⇥ notatka</code><br>
+            Wiersze puste pomijane, wiersze z sumą grupy sprawdzane. Kwota wpisu = ta z notatki,
+            różnica względem kolumny „kwota" musi być wytłumaczona penalty.
         </div>
         <textarea id="tm-order-input"
             placeholder="20730&#9;ZHANGZHOU YOKA&#9;2527.5&#10;20731&#9;ZHANGZHOU YOKA&#9;2851.5"
@@ -10052,6 +10066,7 @@
                    border-radius:6px;font-size:12px;resize:vertical;
                    box-sizing:border-box;font-family:monospace;"></textarea>
         <div id="tm-parsed-preview" style="margin-top:4px;font-size:11px;color:#555;min-height:16px;"></div>
+        <div id="tm-bal-msgs" style="margin-top:4px;font-size:11px;"></div>
 
         <div style="margin-top:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
             <label style="font-size:12px;color:#333;">Waluta:</label>
@@ -10066,6 +10081,10 @@
             <input id="tm-debit" value="1270" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
             <label style="font-size:12px;color:#333;">Credit:</label>
             <input id="tm-credit" value="1049" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
+            <span id="tm-pen-wrap" style="display:none;gap:6px;align-items:center;" title="Druga noga penalty: 1270 / to konto, kwota z plusem. Pierwsza noga to ta sama kwota z minusem na Debit/Credit powyżej.">
+                <label style="font-size:12px;color:#333;">Penalty:</label>
+                <input id="tm-pen-credit" value="8100" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
+            </span>
         </div>
 
         <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
@@ -10218,14 +10237,242 @@
         }).filter(Boolean);
     }
 
+    // ================= TRYB BALANCE =================
+    // Wklejka z arkusza, 6 kolumn rozdzielonych tabulatorem:
+    //   0 dostawca | 1 kontener | 2 „1"/„2"/„sub"/„-" | 3 order | 4 kwota | 5 notatka
+    // Kolumna 4 to tyle, ile faktycznie wychodzi z banku za ten order — wiersze sum w arkuszu
+    // sumuja wlasnie ja, wiec sluzy nam za kontrole parsowania.
+    // Kwota z notatki to pelny balance, jeszcze przed potraceniem penalty. Ksiegujemy pelny
+    // balance, a roznice prostujemy dwoma wpisami (minus na 1049, plus na 8100) — inaczej
+    // na koncie bankowym zostaloby o penalty za malo, a na 1270 za malo wartosci towaru.
+    function balMode() {
+        const r = panel.querySelector('input[name="tm-mode"]:checked');
+        return (r && r.value === 'bal') ? 'bal' : 'depo';
+    }
+    function bal2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100; }
+    function balFix(n) { return bal2(n).toFixed(2); }
+    // Kwota zawsze OD POCZATKU pola. W notatce („43562.84 USD penalty no. 1068") dalej stoja
+    // numery roszczen — szukanie „gdziekolwiek" braloby czasem wlasnie je.
+    function balNum(raw) {
+        const s = String(raw == null ? '' : raw).replace(/ /g, ' ').trim().replace(/^[€$£]\s*/, '');
+        const m = s.match(/^-?\d{1,3}(?:[ '’]\d{3})+(?:[.,]\d{1,2})?|^-?\d+(?:[.,]\d{1,2})?/);
+        if (!m) return null;
+        const n = parseFloat(m[0].replace(/[ '’]/g, '').replace(',', '.'));
+        return isNaN(n) ? null : n;
+    }
+    // „penalty no. 814, 1021" -> ['penalty 814','penalty 1021']; „OVERPAYMENT 451" -> ['overpayment 451']
+    function balClaims(text) {
+        const out = [], re = /(overpayment|underpayment|penalty|discount|other\s*[+-])\s*(?:nos?\.?\s*)?(\d+(?:\s*[,+/&]\s*\d+)*)/gi;
+        let m;
+        while ((m = re.exec(String(text || ''))) !== null) {
+            let ty = m[1].toLowerCase().replace(/\s+/g, '');
+            if (ty === 'other+') ty = 'other +'; else if (ty === 'other-') ty = 'other -';
+            m[2].split(/[,+/&]/).forEach(function (n) {
+                const v = ty + ' ' + n.trim();
+                if (n.trim() && out.indexOf(v) < 0) out.push(v);
+            });
+        }
+        return out;
+    }
+    // Ten sam typ w jeden opis: ['penalty 814','penalty 1021'] -> „penalty 814,1021".
+    function balClaimLabel(claims) {
+        const order = [], byType = {};
+        (claims || []).forEach(function (c) {
+            const m = String(c).match(/^(.*?)\s*(\d+)$/);
+            const ty = m ? m[1].trim() : String(c).trim(), no = m ? m[2] : null;
+            if (!byType[ty]) { byType[ty] = []; order.push(ty); }
+            if (no != null && byType[ty].indexOf(no) < 0) byType[ty].push(no);
+        });
+        return order.map(function (ty) {
+            const nos = byType[ty].slice().sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+            return nos.length ? (ty + ' ' + nos.join(',')) : ty;
+        }).join(' + ');
+    }
+    function balShort(line) {
+        const s = String(line || '').replace(/\t/g, ' | ').trim();
+        return s.length > 90 ? s.slice(0, 90) + '…' : s;
+    }
+
+    // Zwraca { entries, groups, errors, warns }. Przy jakimkolwiek bledzie NIE ksiegujemy nic —
+    // lepiej zeby czlowiek poprawil wklejke, niz zeby poszedl w system wpis, ktorego nie umiemy
+    // wytlumaczyc.
+    function parseBalancePaste(raw, debit, credit, penCredit) {
+        const lines = String(raw || '').replace(/\r/g, '').split('\n');
+        const entries = [], errors = [], warns = [], groups = [], byOrder = {};
+        let cur = null, lostSum = 0;
+
+        function closeGroup(declared) {
+            if (cur && cur.rows) groups.push({ name: cur.name, sum: bal2(cur.sum), rows: cur.rows, declared: declared });
+            else if (declared != null) lostSum++;
+            cur = null;
+        }
+        function addPaid(name, amt) {
+            if (!cur) cur = { name: name, sum: 0, rows: 0 };
+            if (!cur.name && name) cur.name = name;
+            cur.sum += amt; cur.rows++;
+        }
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i], no = i + 1;
+            const c = line.split('\t'); while (c.length < 6) c.push('');
+            const f = c.map(function (x) { return String(x == null ? '' : x).replace(/ /g, ' ').trim(); });
+
+            if (!f.join('')) { closeGroup(null); continue; }                    // pusty wiersz = koniec grupy
+            if (!f[0] && !f[1] && !f[2] && !f[3]) {                             // wiersz sumy grupy
+                closeGroup(balNum(f[4]));
+                continue;
+            }
+
+            const order = f[3];
+            if (!/^\d+$/.test(order)) { errors.push('wiersz ' + no + ': w 4. kolumnie nie ma numeru orderu — ' + balShort(line)); continue; }
+            const paid = balNum(f[4]);
+            if (paid == null) { errors.push('wiersz ' + no + ': w 5. kolumnie nie ma kwoty — ' + balShort(line)); continue; }
+
+            const note = f[5];
+            const full = balNum(note);
+            const gross = (full == null) ? paid : full;
+            const claims = balClaims(note);
+            const label = balClaimLabel(claims);
+            const contRaw = f[1];
+            const cont = contRaw.replace(/[()]/g, '').replace(/\s+/g, ' ').trim();
+            const hasCont = !!cont && cont !== '-' && cont !== '—';
+            // Sub-order: kolumna „sub" albo kontener w nawiasie. Kontener nalezy wtedy do orderu
+            // nadrzednego, wiec na stronie tego orderu moze go w ogole nie byc — nie sprawdzamy.
+            const isSub = /^sub$/i.test(f[2]) || /^\(.*\)$/.test(contRaw.trim());
+            const diff = bal2(gross - paid);
+            const base = { id: order, debit: debit, credit: credit, comment: '', loading: false, error: null, line: no, supplier: f[0], noStatus: true, sub: isSub, cont: hasCont ? cont : '' };
+
+            addPaid(f[0], paid);
+            if (!byOrder[order]) byOrder[order] = [];
+            if (byOrder[order].indexOf(no) < 0) byOrder[order].push(no);
+
+            if (!diff) {
+                const desc = hasCont ? cont : label;
+                if (!desc) { errors.push('wiersz ' + no + ': nie ma czego wpisać w opis — brak numeru kontenera i brak numeru penalty/overpayment — ' + balShort(line)); continue; }
+                if (hasCont && label) warns.push('wiersz ' + no + ': w opisie idzie numer kontenera (' + cont + '), a notatka wspomina też „' + label + '" bez różnicy kwot — sprawdź, czy tak ma być.');
+                entries.push(Object.assign({}, base, { amount: balFix(paid), comment: desc, kind: hasCont ? 'kontener' : (claims[0] || '').split(' ')[0] }));
+                continue;
+            }
+
+            // Roznica miedzy notatka a kwota musi byc nazwana. Bez numeru roszczenia nie zgadujemy.
+            if (!claims.length) {
+                errors.push('wiersz ' + no + ': kwota z notatki (' + balFix(gross) + ') różni się od kwoty (' + balFix(paid) + ') o ' + balFix(diff) + ', a notatka nie podaje numeru penalty — nie księguję. ' + balShort(line));
+                continue;
+            }
+            if (!hasCont) warns.push('wiersz ' + no + ': brak numeru kontenera — w opisie pierwszego wpisu pójdzie „' + label + '".');
+            entries.push(Object.assign({}, base, { amount: balFix(gross), comment: hasCont ? cont : label, kind: 'kontener' }));
+            entries.push(Object.assign({}, base, { amount: balFix(-diff), comment: label, kind: 'penalty −' }));
+            entries.push(Object.assign({}, base, { amount: balFix(diff), credit: penCredit, comment: label, kind: 'penalty +' }));
+        }
+        closeGroup(null);
+
+        groups.forEach(function (g) {
+            if (g.declared == null) return;
+            if (Math.abs(bal2(g.sum - g.declared)) >= 0.005) {
+                errors.push('suma grupy „' + (g.name || '?') + '" się nie zgadza: w arkuszu ' + balFix(g.declared) + ', z wierszy wychodzi ' + balFix(g.sum) + ' — sprawdź wklejkę.');
+            }
+        });
+        if (lostSum) warns.push('w wklejce jest ' + lostSum + ' wiersz(y) z sumą grupy, nad którymi nie ma żadnych wierszy — ta suma nie została z niczym porównana.');
+
+        // Ten sam order w dwoch roznych wierszach arkusza to prawie zawsze pomylka przy wklejaniu.
+        // Wpisy z jednego wiersza (pelna kwota + dwie nogi penalty) sa oczywiscie w porzadku.
+        Object.keys(byOrder).forEach(function (id) {
+            if (byOrder[id].length > 1) warns.push('order ' + id + ' występuje w ' + byOrder[id].length + ' wierszach (' + byOrder[id].join(', ') + ') — sprawdź, czy to celowe.');
+        });
+
+        entries.forEach(function (e, i) { e.uid = 'b' + i; });
+
+        // Suma tego, co faktycznie wyjdzie z konta bankowego (credit) i co wpadnie na konto penalty.
+        let bank = 0, pen = 0;
+        entries.forEach(function (e) {
+            const v = parseFloat(e.amount);
+            if (e.kind === 'penalty +') pen += v; else bank += v;
+        });
+
+        return { entries: entries, groups: groups, errors: errors, warns: warns, bank: bal2(bank), pen: bal2(pen) };
+    }
+
+    // Wartosci kont z pol panelu — podglad musi liczyc dokladnie to, co pojdzie w POST.
+    function balAccounts() {
+        return {
+            debit:  (document.getElementById('tm-debit')?.value  || '').trim(),
+            credit: (document.getElementById('tm-credit')?.value || '').trim(),
+            pen:    (document.getElementById('tm-pen-credit')?.value || '').trim()
+        };
+    }
+    function balParseCurrent() {
+        const a = balAccounts();
+        return parseBalancePaste(document.getElementById('tm-order-input')?.value || '', a.debit, a.credit, a.pen);
+    }
+    function balEsc(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    // Bledy i uwagi pod polem wklejki. Blad = nie ksiegujemy nic, uwaga = ksiegujemy, ale pokaz.
+    function balMsgHtml(r) {
+        let html = '';
+        if (r.errors.length) {
+            html += '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:6px 8px;color:#991b1b;margin-bottom:4px;">' +
+                '<strong>Nie księguję — popraw wklejkę (' + r.errors.length + '):</strong><ul style="margin:4px 0 0 16px;padding:0;">' +
+                r.errors.map(function (e) { return '<li>' + balEsc(e) + '</li>'; }).join('') + '</ul></div>';
+        }
+        if (r.warns.length) {
+            html += '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:6px 8px;color:#92400e;">' +
+                '<strong>Do sprawdzenia (' + r.warns.length + '):</strong><ul style="margin:4px 0 0 16px;padding:0;">' +
+                r.warns.map(function (w) { return '<li>' + balEsc(w) + '</li>'; }).join('') + '</ul></div>';
+        }
+        return html;
+    }
+
     function updateTextPreview() {
-        const orders = parseOrders(document.getElementById('tm-order-input')?.value||'');
         const el = document.getElementById('tm-parsed-preview');
         if (!el) return;
+        const raw = document.getElementById('tm-order-input')?.value || '';
+        if (balMode() === 'bal') {
+            const box = document.getElementById('tm-bal-msgs');
+            if (!raw.trim()) { el.innerHTML = ''; if (box) box.innerHTML = ''; return; }
+            const r = balParseCurrent();
+            const a = balAccounts();
+            const orders = {}; r.entries.forEach(function (e) { orders[e.id] = 1; });
+            const checked = r.groups.filter(function (g) { return g.declared != null; }).length;
+            const bits = ['<span style="color:' + (r.errors.length ? '#dc2626' : '#16a34a') + '">' +
+                (r.errors.length ? '⚠️' : '✓') + ' ' + Object.keys(orders).length + ' orderów, ' + r.entries.length + ' wpisów</span>'];
+            if (r.entries.length) bits.push('<span style="color:#374151" title="Tyle netto schodzi z konta ' + balEsc(a.credit) + ' — musi się zgadzać z przelewem.">' +
+                a.credit + ': <strong>' + balFix(r.bank) + '</strong></span>');
+            if (r.pen) bits.push('<span style="color:#374151" title="Suma penalty przeksięgowana na konto ' + balEsc(a.pen) + '.">' + a.pen + ': <strong>' + balFix(r.pen) + '</strong></span>');
+            if (checked) bits.push('<span style="color:#6b7280">sumy grup sprawdzone: ' + checked + '</span>');
+            if (r.warns.length) bits.push('<span style="color:#b45309">uwagi: ' + r.warns.length + '</span>');
+            if (r.errors.length) bits.push('<span style="color:#dc2626">błędy: ' + r.errors.length + '</span>');
+            el.innerHTML = bits.join(' | ');
+            if (box) box.innerHTML = balMsgHtml(r);
+            return;
+        }
+        const orders = parseOrders(raw);
         el.innerHTML = orders.length
             ? `<span style="color:#16a34a">✓ ${orders.length} orderów:</span> ` +
               orders.map(o=>`<strong>${o.id}</strong>→${o.amount}`).join(', ')
             : '';
+    }
+
+    // Przelaczenie trybu zmienia znaczenie wklejki, wiec kasujemy poprzedni podglad —
+    // wiersze policzone w drugim trybie nie moga zostac na ekranie ani w pamieci.
+    function applyMode() {
+        const bal = balMode() === 'bal';
+        const set = (id, disp) => { const e = panel.querySelector('#' + id); if (e) e.style.display = disp; };
+        set('tm-fmt-depo', bal ? 'none' : 'block');
+        set('tm-fmt-bal',  bal ? 'block' : 'none');
+        set('tm-pen-wrap', bal ? 'inline-flex' : 'none');
+        set('tm-preview-section', 'none');
+        const ta = panel.querySelector('#tm-order-input');
+        if (ta) ta.placeholder = bal
+            ? 'Fuzhou Zhonglei…\tSELU4488110\t1\t20360\t15675.70\t15675.70 USD'
+            : '20730\tZHANGZHOU YOKA\t2527.5\n20731\tZHANGZHOU YOKA\t2851.5';
+        panel.style.width = bal ? '760px' : '620px';
+        const btn2 = panel.querySelector('#tm-book-btn');
+        if (btn2) { btn2.disabled = false; btn2.textContent = '🚀 Zaksięguj wszystkie w tle'; }
+        previewRows = [];
+        const box = document.getElementById('tm-bal-msgs');
+        if (box) box.innerHTML = '';
+        updateTextPreview();
     }
 
     async function fetchOrderData(orderId) {
@@ -10454,7 +10701,7 @@
     function refreshDupStatuses() {
         previewRows.forEach(row => {
             if (row.loading) return;
-            const cell = document.getElementById('tm-status-' + row.id + '-' + (row.dupIndex || 1));
+            const cell = document.getElementById(statusCellId(row));
             if (cell) cell.innerHTML = statusCellHtml(row);
         });
     }
@@ -10699,6 +10946,13 @@
         idLink.onmouseenter = () => idLink.style.textDecoration = 'underline';
         idLink.onmouseleave = () => idLink.style.textDecoration = 'none';
         tdId.appendChild(idLink);
+        if (row.kind) {
+            const kindTag = document.createElement('div');
+            kindTag.style.cssText = 'font-size:10px;font-weight:normal;color:#6b7280;';
+            kindTag.textContent = row.kind;
+            if (row.supplier) kindTag.title = row.supplier + (row.line ? ' — wiersz ' + row.line : '');
+            tdId.appendChild(kindTag);
+        }
         tr.appendChild(tdId);
 
         if (row.loading) {
@@ -10725,7 +10979,7 @@
         commentWrap.style.cssText = 'display:flex;align-items:center;gap:5px;';
 
         const commentLabel = document.createElement('span');
-        commentLabel.id    = `tm-comment-label-${row.id}-${row.dupIndex || 1}`;
+        commentLabel.id    = `tm-comment-label-${row.uid || (row.id + '-' + (row.dupIndex || 1))}`;
         commentLabel.style.cssText = 'flex:1;color:#374151;font-size:12px;';
         commentLabel.textContent   = row.comment || '—';
 
@@ -10764,8 +11018,10 @@
         return tr;
     }
 
+    // uid rozroznia wpisy tego samego orderu w trybie balance (pelna kwota + dwie nogi penalty).
+    // Bez niego wszystkie trzy trafialyby w ten sam element (dupIndex = 1 przy roznych kwotach).
     function statusCellId(row) {
-        return 'tm-status-' + row.id + '-' + (row.dupIndex || 1);
+        return 'tm-status-' + (row.uid || (row.id + '-' + (row.dupIndex || 1)));
     }
 
     // Status = stan opisu + ostrzezenie o duplikacie (kwota/data juz w Payments).
@@ -10777,7 +11033,10 @@
         const multi = (row.dupTotal || 1) > 1
             ? `<div style="color:#6b7280;font-size:10px;">wpis ${row.dupIndex}/${row.dupTotal} tej kwoty</div>`
             : '';
-        return base + multi + dupStatusHtml(row);
+        const warn = row.warn
+            ? `<div style="color:#b45309;font-size:10px;margin-top:2px;" title="${String(row.warn).replace(/"/g, '&quot;')}">⚠️ sprawdź kontener</div>`
+            : '';
+        return base + multi + warn + dupStatusHtml(row);
     }
 
     function makeInlineEditTd(value, rowIndex, key, minWidth) {
@@ -10836,25 +11095,45 @@
 
     panel.querySelector('#tm-check-btn').onclick = async () => {
         const raw    = document.getElementById('tm-order-input').value;
-        const orders = parseOrders(raw);
-        if (!orders.length) {
-            document.getElementById('tm-parsed-preview').innerHTML =
-                '<span style="color:red">⚠️ Brak danych!</span>';
-            return;
-        }
-
         const debit  = document.getElementById('tm-debit').value;
         const credit = document.getElementById('tm-credit').value;
+        const isBal  = balMode() === 'bal';
+        let rows;
+
+        if (isBal) {
+            // W trybie balance opis liczymy z wklejki, nie ze strony orderu, a kazdy blad
+            // parsowania blokuje calosc — jeden zly wiersz nie moze przepuscic reszty.
+            const r = balParseCurrent();
+            updateTextPreview();
+            if (r.errors.length || !r.entries.length) {
+                document.getElementById('tm-preview-section').style.display = 'none';
+                previewRows = [];
+                if (!r.errors.length) {
+                    document.getElementById('tm-parsed-preview').innerHTML =
+                        '<span style="color:red">⚠️ Brak danych!</span>';
+                }
+                return;
+            }
+            rows = r.entries.map(e => Object.assign({}, e, { loading: true }));
+        } else {
+            const orders = parseOrders(raw);
+            if (!orders.length) {
+                document.getElementById('tm-parsed-preview').innerHTML =
+                    '<span style="color:red">⚠️ Brak danych!</span>';
+                return;
+            }
+            rows = orders.map(o => ({
+                id:o.id, amount:o.amount, debit, credit,
+                comment:'', loading:true, error:null,
+            }));
+        }
 
         document.getElementById('tm-preview-section').style.display = 'block';
         document.getElementById('tm-progress').style.display = 'none';
         document.getElementById('tm-summary').innerHTML = '';
         document.getElementById('tm-progress-list').innerHTML = '';
 
-        previewRows = orders.map(o => ({
-            id:o.id, amount:o.amount, debit, credit,
-            comment:'', loading:true, error:null,
-        }));
+        previewRows = rows;
         markDuplicateRows(previewRows);
 
         buildInitialTable(previewRows);
@@ -10879,11 +11158,24 @@
                 if (data) {
                     formDataCache[id] = data.formData;
                     paymentsCache[id] = parsePaymentRows(data.doc);
+                    // Pusty formularz = strona nie jest orderem (zly numer, brak uprawnien).
+                    // Bez tego POST poszedlby z pustym body i skonczyl sie mylacym bledem.
+                    let keys = 0;
+                    try { keys = Array.from(data.formData.keys()).length; } catch(e) { keys = 1; }
+                    if (!keys) err = 'strona orderu nie zawiera formularza — sprawdź numer orderu';
                 }
+                const pageText = (data && data.doc && data.doc.body) ? String(data.doc.body.textContent || '') : '';
                 previewRows.forEach((row, i) => {
                     if (row.id !== id) return;
                     row.loading = false;
-                    if (err) row.error = err; else row.comment = data.depositComment;
+                    if (err) { row.error = err; }
+                    else if (!isBal) { row.comment = data.depositComment; }
+                    else if (row.cont && !row.sub && pageText.indexOf(row.cont) < 0) {
+                        // Kontener z arkusza musi byc widoczny na stronie orderu — inaczej wklejka
+                        // najpewniej przesunela sie o wiersz. Sub-ordery pomijamy, bo tam kontener
+                        // nalezy do orderu nadrzednego. To ostrzezenie, nie blokada.
+                        row.warn = 'kontenera ' + row.cont + ' nie ma na stronie orderu ' + row.id + ' — sprawdź, czy wiersze się nie przesunęły';
+                    }
                     updateRow(i);
                 });
             }
@@ -10898,6 +11190,12 @@
     ['tm-month','tm-day','tm-year'].forEach(id => {
         const el = panel.querySelector('#' + id);
         if (el) el.addEventListener('change', () => { try { refreshDupStatuses(); } catch(e) {} });
+    });
+
+    panel.querySelectorAll('input[name="tm-mode"]').forEach(r => r.addEventListener('change', () => { try { applyMode(); } catch(e) {} }));
+    ['tm-debit','tm-credit','tm-pen-credit'].forEach(id => {
+        const el = panel.querySelector('#' + id);
+        if (el) el.addEventListener('input', () => { try { updateTextPreview(); } catch(e) {} });
     });
 
     panel.querySelector('#tm-book-btn').onclick = async () => {
@@ -10947,7 +11245,8 @@
         async function processOne(w, i) {
             const row = previewRows[i];
             const tag = workers > 1 ? `[W${w}] ` : '';
-            const logRow = logLine(`⏳ ${tag}<strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'brak opisu'}</em>…`);
+            const kindTag = row.kind ? ` <span style="color:#6b7280">(${row.kind})</span>` : '';
+            const logRow = logLine(`⏳ ${tag}<strong>${row.id}</strong>${kindTag} — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'brak opisu'}</em>…`);
 
             let result;
             try {
@@ -10967,25 +11266,28 @@
                     ? ` <span style="color:#b45309">(⚠ ${result.verifyNote})</span>`
                     : '';
                 if (result.alreadyBooked) {
-                    logRow.innerHTML = `⛔ ${tag}<strong>${row.id}</strong> — ${row.amount} ${currency} | POMINIĘTO, już zaksięgowane (${result.dupMsg || 'wpis był już widoczny'})`;
+                    logRow.innerHTML = `⛔ ${tag}<strong>${row.id}</strong>${kindTag} — ${row.amount} ${currency} | POMINIĘTO, już zaksięgowane (${result.dupMsg || 'wpis był już widoczny'})`;
                     logRow.style.color = '#b45309';
                     if (statusCell) statusCell.innerHTML = '<span style="color:#b45309">⛔ już zaksięgowany</span>';
                 } else {
-                    logRow.innerHTML = `✅ ${tag}<strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'—'}</em> — zaksięgowano i potwierdzono po ${result.attempts || 1} próbie/próbach${rowsInfo}${noteInfo}`;
+                    logRow.innerHTML = `✅ ${tag}<strong>${row.id}</strong>${kindTag} — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'—'}</em> — zaksięgowano i potwierdzono po ${result.attempts || 1} próbie/próbach${rowsInfo}${noteInfo}`;
                     logRow.style.color = '#16a34a';
                     if (statusCell) statusCell.innerHTML = '<span style="color:#16a34a">✅ zaksięgowany</span>';
                 }
-                // status kontenera ustawiamy tak jak wczesniej — takze gdy wpis juz byl
-                const _st = await ensureContainerStatus(row.id);
-                logRow.innerHTML += _st.html;
+                // status kontenera ustawiamy tak jak wczesniej — takze gdy wpis juz byl.
+                // W trybie balance status ma zostac nietkniety (row.noStatus).
+                if (!row.noStatus) {
+                    const _st = await ensureContainerStatus(row.id);
+                    logRow.innerHTML += _st.html;
+                }
             } else if (result.duplicate) {
                 dupSkipped++;
-                logRow.innerHTML = `🛡 ${tag}<strong>${row.id}</strong> — POMINIĘTO: ${result.error}`;
+                logRow.innerHTML = `🛡 ${tag}<strong>${row.id}</strong>${kindTag} — POMINIĘTO: ${result.error}`;
                 logRow.style.color = '#b45309';
                 if (statusCell) statusCell.innerHTML = '<span style="color:#b45309">🛡 możliwy duplikat</span>';
             } else {
                 fail++;
-                logRow.innerHTML = `❌ ${tag}<strong>${row.id}</strong> — BŁĄD: ${result.error}`;
+                logRow.innerHTML = `❌ ${tag}<strong>${row.id}</strong>${kindTag} — BŁĄD: ${result.error}`;
                 logRow.style.color = '#dc2626';
                 if (statusCell) statusCell.innerHTML = `<span style="color:#dc2626">❌ błąd</span>`;
             }
