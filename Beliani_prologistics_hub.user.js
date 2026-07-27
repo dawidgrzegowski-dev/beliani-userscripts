@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.76
+// @version      1.78
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11497,6 +11497,22 @@
         }
         function pcNum(v, dec){ return (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(dec == null ? 2 : dec); }
         function pcVerdict(o){ if (!o) return 'brak wyniku'; if (o.ok) return '✓ ' + (o.msg || ''); if (o.warn) return '⚠ ' + (o.msg || ''); return '✗ ' + (o.msg || ''); }
+        // Blok bankowy z P/I — do logu, zeby dalo sie zobaczyc co parser wzial i skad.
+        function pcBankLog(b, L, pad){
+            pad = pad || '  ';
+            if (!b) { L.push(pad + 'blok bankowy P/I: brak'); return; }
+            L.push(pad + 'blok bankowy P/I: ' + (b.ok ? 'kompletny' : 'NIEKOMPLETNY') + (b.sheet ? ' [arkusz ' + b.sheet + ']' : '') + (b.alt ? ' [z innego arkusza: ' + b.alt + ']' : ''));
+            L.push(pad + '  beneficjent : ' + pcLogTxt(b.name, 120) + ' | ' + pcLogTxt(b.addr, 200));
+            L.push(pad + '  bank        : ' + pcLogTxt(b.bankName, 120) + ' | ' + pcLogTxt(b.bankAddr, 200));
+            try { var ag = painAgtGeo(b); L.push(pad + '  bank CdtrAgt: miasto ' + (ag.town || '—') + ' | kraj ' + (ag.ctry || '—') + (ag.src ? ' (z ' + ag.src + ')' : '') + (ag.town && ag.ctry ? '' : '  [niepelny adres — do pliku pojdzie sama nazwa banku]')); } catch(e){}
+            L.push(pad + '  konto       : ' + (b.acc || '—') + (b.accFix ? '  [ODTWORZONE — stalo pod inna etykieta]' : '') + ' | SWIFT ' + (b.swift || '—') + (b.swiftBad ? ' [zly format]' : ''));
+            if (b.accBad) L.push(pad + '  UWAGA: pod etykieta konta stalo: „' + pcLogTxt(b.accBad, 120) + '” — odrzucone, to nie jest numer konta');
+            if (b.accNums && b.accNums.length > 1) L.push(pad + '  numery wygladajace na konto w bloku: ' + b.accNums.join(' / '));
+            if (b.rawRows && b.rawRows.length){
+                L.push(pad + '  surowe wiersze bloku bankowego:');
+                b.rawRows.forEach(function(x){ L.push(pad + '    ' + x); });
+            }
+        }
         function pcBuildLog(){
             var L = [], D = state.diag || { bal: {}, dep: {}, raw: {}, log: [] };
             function h(t){ L.push(''); L.push('===== ' + t + ' ====='); }
@@ -11566,6 +11582,7 @@
                 L.push('  ostatni P/I     : ' + (d.piUrl || '—'));
                 if (d.piRaw) L.push('  sekcja P/I (surowa): ' + d.piRaw);
                 if (d.pi) L.push('  odczyt z P/I    : kwota ' + pcNum(d.pi.amount) + ' | % ' + (d.pi.pct == null ? '—' : d.pi.pct) + ' | konto ' + (d.pi.acc || '—') + (d.pi.sheet ? ' | arkusz ' + d.pi.sheet + (d.pi.hidden ? ' [ukryty]' : '') : '') + (d.pi.err ? ' | błąd: ' + d.pi.err : ''));
+                if (d.pi) pcBankLog(d.pi.bank, L, '  ');
                 L.push('  kandydaci (kwoty z komentarzy): ' + ((d.cands && d.cands.length) ? d.cands.map(function(c){ return '#' + c.i + ' ' + (c.contRaw || '—') + ' [' + c.amts.map(function(a){ return a.toFixed(2); }).join(', ') + ']'; }).join(' ; ') : '—'));
                 L.push('  roszczenia (penalty/claim)   : ' + ((d.pens && d.pens.length) ? d.pens.map(function(p){ return '#' + p.i + ' ' + (p.nos.join('+') || 'penalty') + ' ' + (p.amt > 0 ? '+' : '') + p.amt.toFixed(2) + (p.contRaw ? ' @' + p.contRaw : ''); }).join(' ; ') : '—'));
                 L.push('  wszystkie komentarze:');
@@ -11583,6 +11600,7 @@
                 if (d.piRaw) L.push('  sekcja P/I (surowa): ' + d.piRaw);
                 L.push('  wybrany komentarz deposit: ' + (d.com ? ('#' + d.com.idx + ' → kwota ' + pcNum(d.com.amount) + ', % ' + (d.com.pct == null ? '—' : d.com.pct)) : 'BRAK'));
                 if (d.pi) L.push('  odczyt z P/I    : kwota ' + pcNum(d.pi.amount) + ' | % ' + (d.pi.pct == null ? '—' : d.pi.pct) + ' | konto ' + (d.pi.acc || '—') + (d.pi.sheet ? ' | arkusz ' + d.pi.sheet + (d.pi.hidden ? ' [ukryty]' : '') : '') + (d.pi.err ? ' | błąd: ' + d.pi.err : ''));
+                if (d.pi) pcBankLog(d.pi.bank, L, '  ');
                 L.push('  wszystkie komentarze:');
                 (d.cs || []).forEach(function(s){ L.push('    ' + s); });
             }); });
@@ -11814,16 +11832,24 @@
         }
         // Blok bankowy grupy: zbieramy z P/I depo (r.pi.piBank) i z P/I balance (r.bpi.bank).
         // Gdy P/I wskazuja rozne konta - nie zgadujemy, tylko oznaczamy konflikt.
+        // Numer konta ma pierwszenstwo z tej sciezki, ktora ERP juz potwierdzil
+        // (pi.acc — porownane z kontami w systemie przy kontroli P/I). Blok bankowy
+        // z P/I sluzy do nazwy, adresu i BIC; jego slot "konto" bywa przesuniety.
         function painBankOfG(G){
             var list = [], seen = {};
-            function add(b){
+            function add(b, vacc){
                 if (!b || !b.ok) return;
-                var k = painNorm(b.acc) + '|' + painNorm(b.swift);
+                var cur = String(b.acc || ''), ver = normAcc(vacc || ''), o = b;
+                if (ver.length >= 8 && normAcc(cur) !== ver && (!piAccShape(cur) || b.accFix)){
+                    o = {}; for (var kk in b) if (Object.prototype.hasOwnProperty.call(b, kk)) o[kk] = b[kk];
+                    o.acc = ver; o.accWasWrong = cur || '(puste)'; o.accFix = false;
+                }
+                var k = painNorm(o.acc) + '|' + painNorm(o.swift);
                 if (seen[k]) return;
-                seen[k] = 1; list.push(b);
+                seen[k] = 1; list.push(o);
             }
-            (G.dep || []).forEach(function(r){ add(r.pi && r.pi.piBank); });
-            (G.bal || []).forEach(function(r){ add(r.bpi && r.bpi.bank); });
+            (G.dep || []).forEach(function(r){ add(r.pi && r.pi.piBank, r.pi && r.pi.piAcc); });
+            (G.bal || []).forEach(function(r){ add(r.bpi && r.bpi.bank, r.bpi && r.bpi.piAcc); });
             return { bank: list[0] || null, n: list.length, conflict: list.length > 1 };
         }
         // "Zielony" = wszystko sprawdzone. Ostrzezenie (zolte) tez NIE jest zielone.
@@ -11851,7 +11877,7 @@
             var MG = pcMergedGroups(), all = MG.combined.concat(MG.depoOnly).concat(MG.balOnly), out = [];
             all.forEach(function(G, i){
                 var ds = pcSumRows(G.dep), bs = pcBalSum(G.bal);
-                var bk = painBankOfG(G), b = bk.bank || {}, geo = piBankGeo(b), st = painGroupOk(G);
+                var bk = painBankOfG(G), b = bk.bank || {}, geo = piBankGeo(b), ageo = painAgtGeo(b), st = painGroupOk(G);
                 var ed = (state.painEdit && state.painEdit[G.key]) || {};
                 function V(k, d){ return (ed[k] != null && String(ed[k]) !== '') ? ed[k] : d; }
                 var amtBase = (ds || 0) + (bs || 0);
@@ -11866,7 +11892,11 @@
                     town: String(V('town', geo.town || '')),
                     ctry: String(V('ctry', geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2),
                     addr: String(V('addr', b.addr || '')),
-                    bankName: b.bankName || '', bankAddr: b.bankAddr || '',
+                    bankName: String(V('bankName', b.bankName || '')), bankAddr: b.bankAddr || '',
+                    bankTown: String(V('bankTown', ageo.town || '')),
+                    bankCtry: String(V('bankCtry', ageo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2),
+                    bankGeoSrc: ageo.src || '',
+                    accWasWrong: b.accWasWrong || '', accFix: !!b.accFix, accBad: b.accBad || '',
                     geoSrc: geo.src || '', geoWeak: !!(geo.weak && geo.ctry),
                     hasBank: bk.n > 0, conflict: bk.conflict, nBank: bk.n,
                     verified: st.ok, why: st.why,
@@ -11904,6 +11934,13 @@
                 if (!r.verified) warns.push(p + 'nie wszystko sprawdzone — ' + (r.why[0] || '') + (r.why.length > 1 ? (' (+' + (r.why.length - 1) + ')') : ''));
                 if (r.geoWeak) warns.push(p + 'kraj ustalony ' + (r.geoSrc === 'bic' ? 'z BIC banku — bank bywa w innym kraju niż firma, sprawdź' : 'z nazwy firmy — sprawdź') + '.');
                 if (r.conflict) warns.push(p + 'P/I wskazują ' + r.nBank + ' różne konta beneficjenta — użyto pierwszego.');
+                if (cfg.agt !== false){
+                    if (!painTxt(r.bankName, 140, strict)) warns.push(p + 'brak nazwy banku beneficjenta — w pliku pójdzie sam BIC (CdtrAgt/BICFI). Wpisz nazwę, jeśli bank ma widzieć pełne dane.');
+                    else if (!painTxt(r.bankTown, 35, strict)) warns.push(p + 'brak miasta banku beneficjenta — w pliku będzie sama nazwa banku, bez adresu.');
+                    else if (!/^[A-Z]{2}$/.test(String(r.bankCtry || '').toUpperCase())) warns.push(p + 'brak kraju banku beneficjenta — adres banku nie zostanie wpisany do pliku.');
+                }
+                if (r.accWasWrong) warns.push(p + 'w bloku bankowym P/I pod etykietą konta stało „' + String(r.accWasWrong).slice(0, 60) + '” — użyto numeru potwierdzonego przy kontroli P/I (etykiety w pliku są przesunięte).');
+                else if (r.accFix) warns.push(p + 'numer konta odczytany spod innej etykiety w P/I (etykiety przesunięte' + (r.accBad ? ', pod „konto” stało: „' + String(r.accBad).slice(0, 60) + '”' : '') + ') — sprawdź.');
                 if (r.amountEdited) warns.push(p + 'kwota zmieniona ręcznie: ' + r.amountBase.toFixed(2) + ' → ' + r.amount.toFixed(2) + '.');
                 if (/^[A-Z]{2}\d{2}/.test(painNorm(r.acc)) && !painIbanOk(r.acc)) warns.push(p + 'konto wygląda jak IBAN, ale suma kontrolna się nie zgadza — wysyłamy jako „Othr”.');
                 var id = painE2E(r);
@@ -11963,7 +12000,22 @@
                 o('CdtTrfTxInf');
                 o('PmtId'); e('EndToEndId', painE2E(r)); c('PmtId');
                 o('Amt'); e('InstdAmt', painAmt(painCents(r.amount)), ' Ccy="' + PAIN_CCY + '"'); c('Amt');
-                o('CdtrAgt'); o('FinInstnId'); e('BICFI', painNorm(r.bic)); c('FinInstnId'); c('CdtrAgt');
+                o('CdtrAgt'); o('FinInstnId');
+                e('BICFI', painNorm(r.bic));
+                // Zawsze przelew zagraniczny (Chiny/Indie/Singapur/Hongkong): dokladamy nazwe
+                // i adres banku beneficjenta. Kolejnosc dzieci wg FinancialInstitutionIdentification18:
+                // BICFI -> ClrSysMmbId -> LEI -> Nm -> PstlAdr -> Othr. ClrSysMmbId nie uzywamy,
+                // wiec BICFI + Nm + PstlAdr jest dozwolone (SPS 2025, typ platnosci X).
+                if (cfg.agt !== false){
+                    var agtNm = painTxt(r.bankName, 140, strict);
+                    if (agtNm){
+                        e('Nm', agtNm);
+                        var agtTown = painTxt(r.bankTown, 35, strict), agtCtry = String(r.bankCtry || '').toUpperCase();
+                        // PstlAdr tylko z kompletem TwnNm+Ctry — od 14.11.2026 obie sa obowiazkowe.
+                        if (agtTown && /^[A-Z]{2}$/.test(agtCtry)) pstlAdr(agtTown, agtCtry, []);
+                    }
+                }
+                c('FinInstnId'); c('CdtrAgt');
                 o('Cdtr');
                 e('Nm', painTxt(r.name, 140, strict));
                 pstlAdr(painTxt(r.town, 35, strict), r.ctry, painSplitAddr(r.addr, strict));
@@ -11983,7 +12035,7 @@
         }
         function painCfg(){
             if (state._painCfg) return state._painCfg;
-            var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, exec: '' };
+            var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, agt: true, exec: '' };
             try { var raw = GM_getValue(PAIN_CFG_KEY, ''); if (raw) { var o = JSON.parse(raw); for (var k in o) if (o[k] != null) d[k] = o[k]; } } catch(e){}
             if (!/^\d{4}-\d{2}-\d{2}$/.test(d.exec) || d.exec < painDt(new Date())) d.exec = painDt(painNextBizDay(new Date()));
             state._painCfg = d;
@@ -12037,6 +12089,7 @@
                + ['SHAR', 'DEBT', 'CRED', 'SLEV'].map(function(x){ return '<option value="' + x + '"' + (cfg.chrgBr === x ? ' selected' : '') + '>' + x + '</option>'; }).join('')
                + '</select></label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="BtchBookg=true: bank księguje paczkę jedną zbiorczą pozycją na wyciągu."><input type="checkbox" class="pain-cfgb" data-k="batch"' + (cfg.batch === false ? '' : ' checked') + '> księgowanie zbiorcze</label>'
+               + '<label style="font-size:11px;color:#555;cursor:pointer" title="Domyślnie WŁĄCZONE. Te przelewy zawsze idą za granicę (Chiny, Indie, Singapur, Hongkong), więc do CdtrAgt obok BIC-u trafia nazwa banku beneficjenta, a gdy P/I podaje adres banku — też miasto i kraj. Wyłącz tylko, gdyby bank odrzucił plik: zostanie sam BICFI, czyli dokładnie tak jak w 1.77."><input type="checkbox" class="pain-cfgb" data-k="agt"' + (cfg.agt === false ? '' : ' checked') + '> dane banku beneficjenta</label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="Domyślnie WYŁĄCZONE — Swiss Payment Standards 2025 (pkt 3.1) dopuszcza cały Basic Latin, więc „%” i „&” są legalne. Włącz tylko, jeśli bank odrzuci plik z powodu znaków: tekst zostanie ograniczony do zestawu SWIFT (a-z A-Z 0-9 . , : ’ + - / ( ) ?), „%” → „pct”, „&” → „+”."><input type="checkbox" class="pain-cfgb" data-k="strict"' + (cfg.strict ? ' checked' : '') + '> ścisły zestaw znaków</label>'
                + '</div></div>';
 
@@ -12068,7 +12121,14 @@
                    + '<span style="font-size:10px;color:#888">Adres</span> ' + painInp('addr', r.key, r.addr, 330, 'ulica, miasto')
                    + ' <span style="font-size:10px;color:#888">Tytuł</span> ' + painInp('title', r.key, r.title, 430)
                    + ' <span style="font-size:10px;color:' + (tl > PAIN_TITLE_MAX ? '#c00;font-weight:700' : '#888') + '">(' + tl + '/' + PAIN_TITLE_MAX + ')</span>'
-                   + (r.bankName ? ' <span style="font-size:10px;color:#888" title="' + pcAttr(r.bankName + (r.bankAddr ? ' — ' + r.bankAddr : '')) + '">bank: ' + esc(painTxt(r.bankName, 46, false)) + '</span>' : '')
+                   + '</td></tr>';
+                if (cfg.agt !== false) h += '<tr style="background:' + bg + '"><td></td><td colspan="8" style="padding:0 4px 4px 4px" title="' + pcAttr('CdtrAgt — bank beneficjenta w pliku pain.001' + (r.bankAddr ? ('\nadres z P/I: ' + r.bankAddr) : '')) + '">'
+                   + '<span style="font-size:10px;color:#888">Bank benef.</span> ' + painInp('bankName', r.key, r.bankName, 300, 'nazwa banku')
+                   + ' <span style="font-size:10px;color:#888">Miasto banku</span> ' + painInp('bankTown', r.key, r.bankTown, 120)
+                   + ' <span style="font-size:10px;color:#888">Kraj</span> ' + painInp('bankCtry', r.key, r.bankCtry, 34)
+                   + (r.bankCtry && r.bankGeoSrc === 'bic' ? ' <span style="font-size:10px;color:#888">(z BIC)</span>' : '')
+                   + (r.bankName && !r.bankTown ? ' <span style="font-size:10px;color:#c47f00">bez miasta → w pliku sama nazwa banku</span>' : '')
+                   + (!r.bankName ? ' <span style="font-size:10px;color:#c47f00">brak w P/I → w pliku sam BIC</span>' : '')
                    + '</td></tr>';
             });
             h += '<tr style="background:#332524;color:#fff;font-weight:700"><td colspan="2" style="padding:4px 6px">Zaznaczone: ' + sel.length + ' z ' + rows.length + '</td><td style="padding:4px 6px;text-align:right">' + painAmt(cents) + '</td><td colspan="6" style="padding:4px 6px;font-weight:400">' + PAIN_CCY + ' — CtrlSum w pliku</td></tr>';
@@ -12485,7 +12545,10 @@
             if (new RegExp('^' + B + ' BANK (?:ADDRESS|ADDR)$').test(t)) return 'bankAddr';
             if (new RegExp('^(?:' + B + ' )?BANK NAME$').test(t)) return 'bankName';
             if (new RegExp('^(?:' + B + ' )?BANK (?:ADDRESS|ADDR)$').test(t)) return 'bankAddr';
-            if (new RegExp('^' + B + ' (?:ACCOUNT|ACCT|A C|AC) (?:NO|NUMBER|NUM)$').test(t)) return 'acc';
+            // Etykieta konta bez "BENEFICIARY" jest bezpieczna, bo wartosc i tak musi
+            // przejsc test ksztaltu (piAccShape) — adres nigdy nie trafi do konta.
+            if (new RegExp('^(?:' + B + ' )?(?:BANK |USD |US DOLLAR |USD BANK )?(?:ACCOUNT|ACCT|A C|AC)(?: NO| NUMBER| NUM)(?: USD| IN USD)?$').test(t)) return 'acc';
+            if (new RegExp('^(?:' + B + ' )?(?:ACCOUNT|COMPANY) NAME$').test(t)) return 'name';
             if (new RegExp('^(?:' + B + ' )?(?:SWIFT|BIC)(?: (?:NO|NUMBER|CODE))?$').test(t)) return 'swift';
             if (new RegExp('^(?:' + B + ' )?SWIFT BIC(?: CODE)?$').test(t)) return 'swift';
             if (new RegExp('^' + B + ' NAME$').test(t)) return 'name';
@@ -12502,18 +12565,53 @@
             if (ci > 0){ k = piBankKey(s.slice(0, ci)); if (k) return { key: k, val: s.slice(ci + 1).trim() }; }
             return null;
         }
+        // Wartosc musi pasowac do slotu. W P/I dostawcow etykiety bywaja przesuniete
+        // wzgledem wartosci (BAZHOU: pod "ACCOUNT NO." stal adres banku, a numer konta
+        // pod "BANK NAME") — wtedy adres nie moze trafic do konta ani numer do nazwy banku.
+        function piAccShape(v){
+            var s = String(v == null ? '' : v).trim();
+            if (!s || /[,;]/.test(s)) return false;
+            var c = s.replace(/[\s.–—\-\/]+/g, '');
+            if (/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/i.test(c)) return true;
+            var dg = c.replace(/\D+/g, ''), lt = (c.replace(/\(?usd\)?/ig, '').match(/[A-Za-z]/g) || []).length;
+            return dg.length >= 8 && dg.length <= 24 && lt <= 4;
+        }
+        function piBareNum(v){
+            var s = String(v == null ? '' : v).trim();
+            return /^[0-9][0-9\s.–—\-]*$/.test(s) && s.replace(/\D+/g, '').length >= 8;
+        }
         function scanPIbank(aoa){
             var out = { name: '', addr: '', bankName: '', bankAddr: '', acc: '', swift: '', sheet: '' };
+            var nums = [], numSeen = {}, raw = [], lastRaw = -1;
+            // SWIFT sprawdza pozniej format AAAACCXX — tu przyjmujemy co jest, zeby
+            // zle wypelnione pole bylo widoczne jako blad, a nie zniknelo po cichu.
+            function want(key, v){ if (key === 'acc') return piAccShape(v); if (key === 'swift') return true; return !piBareNum(v); }
+            function note(key, val){
+                var d = normAcc(val);
+                if (piBareNum(val) && d.length >= 8 && d.length <= 24 && !numSeen[d]){ numSeen[d] = 1; nums.push(d); }
+                if (key === 'acc' && !out.accBad) out.accBad = String(val).replace(/\s+/g, ' ').trim().slice(0, 90);
+            }
             for (var i = 0; i < aoa.length; i++){
                 var row = aoa[i] || [];
                 for (var j = 0; j < row.length; j++){
                     var hit = piBankCell(row[j]);
-                    if (!hit || out[hit.key]) continue;
-                    var v = hit.val;
-                    if (!v){
-                        for (var c = j + 1; c < row.length; c++){
+                    if (!hit) continue;
+                    // Surowy zrzut wiersza do logu — zeby dalo sie zdiagnozowac uklad pliku.
+                    if (lastRaw !== i && raw.length < 30){
+                        lastRaw = i;
+                        raw.push('w' + (i + 1) + ': ' + row.map(function(x){ return String(x == null ? '' : x).replace(/\s+/g, ' ').trim(); })
+                            .filter(function(x){ return x; }).join(' | ').slice(0, 220));
+                    }
+                    if (out[hit.key]) continue;
+                    var v = '', rej = 0;
+                    if (hit.val && want(hit.key, hit.val)) v = hit.val;
+                    else {
+                        if (hit.val) { note(hit.key, hit.val); rej++; }
+                        for (var c = j + 1; c < row.length && rej < 4 && !v; c++){
                             var cv = String(row[c] == null ? '' : row[c]).trim();
-                            if (cv) { v = cv; break; }
+                            if (!cv) continue;
+                            if (want(hit.key, cv)) { v = cv; break; }
+                            note(hit.key, cv); rej++;
                         }
                     }
                     if (v) out[hit.key] = v.replace(/\s+/g, ' ').trim();
@@ -12522,6 +12620,11 @@
             // SWIFT/BIC: 8 lub 11 znakow, format AAAACCXX[XXX].
             out.swift = String(out.swift || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
             if (!/^[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$/.test(out.swift)) out.swiftBad = out.swift ? true : false;
+            // Ratunek: w slocie konta stalo cos innego, ale w bloku jest dokladnie jeden
+            // numer wygladajacy na konto (stal pod inna etykieta) — bierzemy go i oznaczamy.
+            if (!out.acc && nums.length === 1){ out.acc = nums[0]; out.accFix = true; }
+            out.accNums = nums;
+            out.rawRows = raw;
             out.accRaw = out.acc;
             out.ok = !!(out.name && out.acc && out.swift && !out.swiftBad);
             return out;
@@ -12585,6 +12688,52 @@
             if (!cc) { cc = pbFindCtry(nm); if (cc) src = 'name'; }
             if (!cc && /^[A-Z]{6}/.test(bic)) { cc = bic.substr(4, 2); if (/^[A-Z]{2}$/.test(cc)) src = 'bic'; else cc = ''; }
             return { town: pbTown(addr), ctry: cc, src: src, weak: src !== 'addr' };
+        }
+        // --- miasto i kraj BANKU beneficjenta (CdtrAgt) ---
+        // To inne zadanie niz adres beneficjenta. Adresy bankow maja postac
+        // "ulica, dzielnica, MIASTO, prowincja, kraj", czesto z kropkami zamiast przecinkow
+        // i z nazwa wiezowca w srodku. pbTown (pisany pod adres firmy) daje tu smieci:
+        // "P.R" (Zhonglei), "Jl. Yos Sudarso" (CIMB), "DBS ASIA CENTRAL" (DBS).
+        // Zasada jak wszedzie: albo poprawne miasto, albo puste. Nigdy "prawdopodobne".
+        var PB_BANKJUNK = /\b(?:BANK|BANKING|BRANCH|SUB|CORP|CORPORATION|LTD|LIMITED|INC|PLC|GROUP|FINANCIAL|OFFICE|HEAD|DEPT|DEPARTMENT|ASIA|CENTRAL|MARINA)\b/;
+        var PB_CITYSTATE = { SG: 'SINGAPORE', HK: 'HONG KONG', MO: 'MACAU' };
+        function pbBankTown(addr, ctry){
+            var raw = String(addr == null ? '' : addr);
+            if (!raw) return '';
+            var cc = String(ctry || '').toUpperCase();
+            // Miasta-panstwa: nazwa miasta = nazwa kraju, wiec nie ma czego wyprowadzac.
+            if (PB_CITYSTATE[cc] && new RegExp('\\b' + PB_CITYSTATE[cc].replace(' ', '[^A-Za-z]*') + '\\b', 'i').test(raw)) return PB_CITYSTATE[cc];
+            var segs = raw.split(/[,;\n、]/);
+            // Adres bez przecinkow, za to z kropkami jako separatorem:
+            // "NO.46 JIEYUAN ROAD.HONGQIAO DISTRICT.TIANJIN.CHINA."
+            if (raw.indexOf(',') < 0 && (raw.match(/\./g) || []).length >= 2) segs = raw.split(/[.;\n、]/);
+            for (var i = segs.length - 1; i >= 0; i--){
+                var s = pbStripCtry(segs[i]);
+                s = s.replace(/^(?:NO|NR)\.?\s*\d+[\s,.\-]*/i, '');                  // "No.26 Cirebon" -> "Cirebon"
+                s = s.replace(/^\d{2,6}(?:[-\s]\d{3,4})?\s+(?=[A-Za-z])/, '')        // "26 Cirebon"
+                     .replace(/\s+\d{3,8}$/, '').trim();                             // "FUZHOU 350003"
+                if (!s) continue;
+                var n = pbNorm(s);
+                if (!n || /\d/.test(n)) continue;                                    // z cyframi to nie miasto
+                if (n.replace(/\s+/g, '').length < 3) continue;                      // "P R", inicjaly
+                var m = s.match(/^(.+?)\s+CITY$/i);
+                if (m && m[1] && !PB_NOTOWN.test(pbNorm(m[1])) && !PB_BANKJUNK.test(pbNorm(m[1]))) return m[1].trim();
+                if (PB_PROV.test(n) || PB_NOTOWN.test(n) || PB_BANKJUNK.test(n)) continue;
+                return s;
+            }
+            return '';
+        }
+        // Kraj: z adresu banku, a gdy adres go nie podaje — ze znakow 5-6 BIC-u (kod kraju wg
+        // ISO 9362, zrodlo deterministyczne). Adres i kraj musza opisywac to samo miejsce,
+        // wiec adres ma pierwszenstwo przed BIC-iem.
+        function painAgtGeo(bank){
+            var b = bank || {}, addr = String(b.bankAddr || ''), nm = String(b.bankName || ''), bic = painNorm(b.swift || '');
+            var bicC = '';
+            if (/^[A-Z]{6}/.test(bic)) { var c2 = bic.substr(4, 2); if (/^[A-Z]{2}$/.test(c2)) bicC = c2; }
+            var addrC = pbFindCtry(addr), nmC = '';
+            if (!addrC && !bicC) nmC = pbFindCtry(nm);
+            var cc = addrC || bicC || nmC;
+            return { town: pbBankTown(addr, cc), ctry: cc, src: addrC ? 'addr' : (bicC ? 'bic' : (nmC ? 'name' : '')) };
         }
         function scanPIsheet(aoa){
             var pct = null, amount = null, acc = '';
