@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.68
+// @version      1.70
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11082,6 +11082,7 @@
           + '<button id="wp-add-comment" class="chn-btn maroon" title="Dodaj komentarz do zaznaczonych zamowien">\ud83d\udcac Dodaj komentarz</button>'
           + '<input type="text" id="wp-pc-comment-text" value="Please confirm payment." style="width:190px;font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:6px">'
           + '<input type="file" id="wp-pc-file" style="display:none">'
+          + '<label style="font-size:11px;color:#666;white-space:nowrap;cursor:pointer" title="Sprawdzaj też ostatni P/I dla wierszy BALANCE — tylko numer konta (bez kwoty i %). Wyłącz, żeby Przetwórz działało szybciej."><input type="checkbox" id="wp-bal-pi" checked> P/I dla balance</label>'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
           + '<div id="wp-out-merged" style="overflow-x:auto;margin-top:14px"></div>'
           + '</div>';
@@ -11410,11 +11411,22 @@
             return out.join(sep);
         }
         function pcBuildTitle(orders, pcts, conts, pens, cfg){
+            var sep = cfg.ns ? ',' : ', ';
+            var cl = (cfg.cont && conts.length) ? ((cfg.nCont == null) ? conts : conts.slice(0, cfg.nCont)) : [];
             var parts = ['Order ' + pcFormatOrders(orders, cfg.om)];
-            if (cfg.dep && pcts.length) parts.push('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(', '));
-            if (cfg.cont && conts.length) parts.push(conts.join(', '));
-            if (cfg.pen && pens.length) parts.push(pens.join(', '));
-            return parts.join(', ');
+            if (cfg.dep && pcts.length) parts.push('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(sep));
+            if (cl.length) parts.push(cl.join(sep));
+            if (cfg.pen && pens.length) parts.push(pens.join(sep));
+            return parts.join(sep);
+        }
+        // Ile CALYCH kontenerow zmiesci sie w limicie przy danym ukladzie (nigdy nie ucina numeru w polowie).
+        function pcFitConts(orders, pcts, conts, pens, cfg){
+            var best = 0;
+            for (var n = 1; n <= conts.length; n++){
+                var c = { om: cfg.om, ns: cfg.ns, dep: cfg.dep, cont: true, pen: cfg.pen, nCont: n };
+                if (pcBuildTitle(orders, pcts, conts, pens, c).length <= PC_TITLE_MAX) best = n; else break;
+            }
+            return best;
         }
         function pcTitleFor(G){
             var orders = [], pcts = [], conts = [], pens = [];
@@ -11424,15 +11436,31 @@
             if (!orders.length) return '';
             orders.sort(function(a, b){ var na = parseInt(a, 10), nb = parseInt(b, 10); if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb; return String(a).localeCompare(String(b)); });
             var cfgs = [
-                { om: 'full', dep: true, cont: true, pen: true },
-                { om: 'range', dep: true, cont: true, pen: true },
-                { om: 'rangenospace', dep: true, cont: true, pen: true },
-                { om: 'rangenospace', dep: true, cont: false, pen: true },
-                { om: 'rangenospace', dep: true, cont: false, pen: false },
-                { om: 'rangenospace', dep: false, cont: false, pen: false }
+                { om: 'full', ns: false, dep: true, cont: true, pen: true },
+                { om: 'range', ns: false, dep: true, cont: true, pen: true },
+                { om: 'rangenospace', ns: false, dep: true, cont: true, pen: true },
+                { om: 'rangenospace', ns: true, dep: true, cont: true, pen: true }
             ];
             var title = '';
             for (var ci = 0; ci < cfgs.length; ci++){ title = pcBuildTitle(orders, pcts, conts, pens, cfgs[ci]); if (title.length <= PC_TITLE_MAX) return title; }
+            // Nie wchodza wszystkie kontenery -> wpisz tyle CALYCH ile sie zmiesci.
+            // Wersja bez spacji tylko wtedy, gdy dzieki niej wejdzie WIECEJ kontenerow.
+            if (conts.length){
+                var cSp = { om: 'rangenospace', ns: false, dep: true, cont: true, pen: true };
+                var cNs = { om: 'rangenospace', ns: true, dep: true, cont: true, pen: true };
+                var nSp = pcFitConts(orders, pcts, conts, pens, cSp), nNs = pcFitConts(orders, pcts, conts, pens, cNs);
+                if (nSp > 0 || nNs > 0){
+                    var use = (nNs > nSp) ? cNs : cSp;
+                    use.nCont = Math.max(nSp, nNs);
+                    return pcBuildTitle(orders, pcts, conts, pens, use);
+                }
+            }
+            var tail = [
+                { om: 'rangenospace', ns: true, dep: true, cont: false, pen: true },
+                { om: 'rangenospace', ns: true, dep: true, cont: false, pen: false },
+                { om: 'rangenospace', ns: true, dep: false, cont: false, pen: false }
+            ];
+            for (var ti = 0; ti < tail.length; ti++){ title = pcBuildTitle(orders, pcts, conts, pens, tail[ti]); if (title.length <= PC_TITLE_MAX) return title; }
             return title;
         }
         function pcTransferTitles(){
@@ -11467,7 +11495,21 @@
             return '<span style="color:#c00;font-weight:700;white-space:nowrap" title="Po komentarzu z prośbą o depozyt nie ma potwierdzenia „ok"">Brak OK</span>';
         }
         function pcRowDepo(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel(pcOkCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
-        function pcRowBal(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel('', bg) + cel('', bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcBalPiCellHtml(r){
+            if (!r || !r.bpi) return '';
+            var v = r.bpi, t = v.title ? ' title="' + pcAttr(v.title) + '"' : '';
+            if (v.warn) return '<span' + t + ' style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(v.msg) + '</span>';
+            if (v.ok) return '<span' + t + ' style="color:#0a0;font-weight:700">P/I ✓ ' + esc(v.msg) + '</span>';
+            return '<span' + t + ' style="color:#c00;font-weight:700">P/I ✗ ' + esc(v.msg) + '</span>';
+        }
+        function pcBalComCellHtml(r){
+            if (!r || !r.bc) return '';
+            var v = r.bc, t = v.title ? ' title="' + pcAttr(v.title) + '"' : '';
+            if (v.ok) return '<span' + t + ' style="color:#0a0;font-weight:700">✓ ' + esc(v.msg) + '</span>';
+            if (v.warn) return '<span' + t + ' style="color:#c47f00;font-weight:700">⚠ ' + esc(v.msg) + '</span>';
+            return '<span' + t + ' style="color:#c00;font-weight:700">✗ ' + esc(v.msg) + '</span>';
+        }
+        function pcRowBal(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel(pcBalPiCellHtml(r), bg) + cel(pcBalComCellHtml(r), bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
         function pcGroupHeader(G, gi, gcol){
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
@@ -11488,7 +11530,7 @@
             var el = wp.querySelector('#wp-out-merged'); if (!el) return;
             var MG = pcMergedGroups(); state._groups = []; state._rowMap = {}; var CM = pcCombinedColorMap();
             var gi = 0, html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
-            function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">OK depo</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
+            function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">OK depo / komentarz</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
             function section(title, groups){
                 if (!groups.length) return;
                 html += '<tr><td colspan="8" style="background:#750000;color:#fff;font-weight:700;padding:5px 8px">' + esc(title) + ' <span style="font-weight:400;opacity:.7">(' + groups.length + ')</span></td></tr>';
@@ -11556,9 +11598,85 @@
                 if (am) au = pcTxt(am[1]);
                 if (!au){ var um = c.match(/class="comment-author"[^>]*data-user="([^"]*)"/i); if (um) au = pcTxt(um[1]); }
                 var tm = c.match(/class="commentText"[^>]*>([\s\S]*?)<\/span>/i);
-                out.push({ date: dm ? dm[1] : '', author: au, text: tm ? pcTxt(tm[1]) : '' });
+                var cell = c.split(/<\/tr>/i)[0];
+                var cm = cell.match(/Container\s*:\s*([^<\n\r]*)/i);
+                var sm = c.match(/^[^>]*\bdata-src="([^"]*)"/i);
+                out.push({ date: dm ? dm[1] : '', author: au, text: tm ? pcTxt(tm[1]) : '', cont: cm ? pcTxt(cm[1]) : '', src: sm ? pcTxt(sm[1]) : '' });
             }
             return out;
+        }
+        // ===== balance: dopasowanie wklejonych wierszy do komentarzy (kontener + kwota) =====
+        var PC_CUR_RE = "(?:usd|eur|cny|rmb|chf|pln|\\$|€)";
+        var PC_NUM_RE = "\\d{1,3}(?:[ '’,]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?";
+        function pcNormCont(s){ return String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+        function pcMoneyTokens(text){
+            var out = [], re = new RegExp('(?:' + PC_CUR_RE + ')\\s*(' + PC_NUM_RE + ')|(' + PC_NUM_RE + ')\\s*(?:' + PC_CUR_RE + ')', 'gi'), m;
+            while ((m = re.exec(String(text == null ? '' : text))) !== null){
+                var v = parseMoney(m[1] != null ? m[1] : m[2]);
+                if (isFinite(v) && v > 0 && out.indexOf(v) === -1) out.push(v);
+            }
+            return out;
+        }
+        function pcIsDepoText(t){ var s = String(t == null ? '' : t); return /deposit/i.test(s) && /%/.test(s); }
+        function pcBalCands(cs){
+            var out = [];
+            (cs || []).forEach(function(c, i){
+                var t = c.text || '';
+                if (pcIsDepoText(t)) return;
+                var amts = pcMoneyTokens(t);
+                if (!amts.length) return;
+                out.push({ i: i, cont: pcNormCont(c.cont), contRaw: String(c.cont || '').trim(), amts: amts, date: c.date || '', author: c.author || '', text: t });
+            });
+            return out;
+        }
+        function pcAmtEq(a, b){ return a != null && b != null && isFinite(a) && isFinite(b) && Math.abs(a - b) < 0.005; }
+        function pcCandAmt(cand, want){ for (var k = 0; k < cand.amts.length; k++){ if (pcAmtEq(cand.amts[k], want)) return cand.amts[k]; } return null; }
+        function pcCandDesc(c){ return (c.contRaw ? c.contRaw + ' — ' : '') + c.text + (c.date ? ' (' + c.date + (c.author ? ', ' + c.author : '') + ')' : ''); }
+        // Dopasowuje kazdy wklejony wiersz balance do wlasnego komentarza (jeden komentarz = jedna platnosc).
+        // rows -> [{ok|warn|bad, msg, title}] w tej samej kolejnosci.
+        function pcMatchBalRows(rows, cands){
+            var list = rows || [], cs = (cands || []).slice(), used = {}, res = [];
+            for (var z = 0; z < list.length; z++) res.push(null);
+            function want(r){ var a = pcBalAmtVal(r); return (a != null && isFinite(a)) ? a : null; }
+            function contOf(r){ return pcNormCont(r && r.container); }
+            // najnowsze komentarze maja pierwszenstwo
+            function pick(test){ for (var k = cs.length - 1; k >= 0; k--){ if (used[k]) continue; if (test(cs[k])) { used[k] = 1; return cs[k]; } } return null; }
+            function pass(test, make){
+                for (var i = 0; i < list.length; i++){
+                    if (res[i]) continue;
+                    var r = list[i], w = want(r), rc = contOf(r);
+                    if (w == null) { res[i] = { bad: true, msg: 'brak kwoty', title: '' }; continue; }
+                    var hit = pick(function(c){ return test(c, w, rc); });
+                    if (hit) res[i] = make(hit, w, rc);
+                }
+            }
+            // 1) kontener + kwota
+            pass(function(c, w, rc){ return !!c.cont && c.cont === rc && pcCandAmt(c, w) != null; },
+                function(c, w){ return { ok: true, msg: 'kwota + kontener', title: 'Komentarz: ' + pcCandDesc(c) }; });
+            // 2) kwota sie zgadza, komentarz bez kontenera
+            pass(function(c, w){ return !c.cont && pcCandAmt(c, w) != null; },
+                function(c, w){ return { warn: true, msg: 'kwota OK, komentarz bez kontenera', title: 'Komentarz: ' + pcCandDesc(c) }; });
+            // 3) kwota sie zgadza, ale kontener inny
+            pass(function(c, w){ return pcCandAmt(c, w) != null; },
+                function(c, w, rc){ return { warn: true, msg: 'kwota OK, kontener w komentarzu: ' + (c.contRaw || '?'), title: 'Wklejony kontener: ' + (rc || '?') + '\nKomentarz: ' + pcCandDesc(c) }; });
+            // 4) kontener sie zgadza, ale kwota inna
+            pass(function(c, w, rc){ return !!c.cont && c.cont === rc; },
+                function(c, w){
+                    var best = null;
+                    c.amts.forEach(function(a){ if (best == null || Math.abs(a - w) < Math.abs(best - w)) best = a; });
+                    var d = (best != null) ? (w - best) : null;
+                    return { warn: true, msg: 'kwota ≠ ' + (best != null ? best.toFixed(2) : '?') + (d != null ? ' (' + (d > 0 ? '+' : '') + d.toFixed(2) + ')' : ''), title: 'Wklejona kwota: ' + w.toFixed(2) + '\nKomentarz: ' + pcCandDesc(c) };
+                });
+            // 5) nic nie pasuje
+            var left = [];
+            cs.forEach(function(c, k){ if (!used[k]) left.push(pcCandDesc(c)); });
+            for (var j = 0; j < list.length; j++){
+                if (res[j]) continue;
+                res[j] = { bad: true, msg: cs.length ? 'brak pasującego komentarza' : 'brak komentarza z kwotą',
+                    title: left.length ? ('Niewykorzystane komentarze z kwotą:\n' + left.join('\n')) : 'W komentarzach ordera nie ma kwoty do dopasowania.' };
+            }
+            if (left.length) res.forEach(function(v){ if (v && !v.title) v.title = 'Niewykorzystane komentarze z kwotą:\n' + left.join('\n'); });
+            return res;
         }
         function pcIsOkText(t){
             var s = String(t == null ? '' : t).trim().toLowerCase().replace(/[\s.!,:;–—-]+$/, '');
@@ -11754,6 +11872,52 @@
             uniq.forEach(function(o){ if (res[o] && res[o].ok) okc++; else badc++; });
             return { ok: okc, bad: badc };
         }
+        // BALANCE: komentarze (kontener + kwota) oraz ostatni P/I — tylko numer konta.
+        async function checkOneBal(order, doPI){
+            var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
+            if (!h) return { cands: [], pi: { ok: false, msg: 'nie otwarto ordera' }, err: 1 };
+            var cs = pcComments(h), cands = pcBalCands(cs);
+            if (!doPI) return { cands: cands, pi: null };
+            var banks = extractBankAccts(h), piUrl = extractLatestPI(h);
+            if (!piUrl) return { cands: cands, pi: { ok: false, msg: 'brak P/I' } };
+            var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
+            if (!buf) return { cands: cands, pi: { ok: false, msg: 'nie pobrano P/I' } };
+            var pi = await parsePI(buf, order);
+            var ttl = [];
+            if (pi && pi.sheet) ttl.push('Arkusz P/I: ' + pi.sheet + (pi.hidden ? ' [ukryty]' : ''));
+            if (banks.length) ttl.push('Konto w systemie: ' + banks.join(' / '));
+            if (pi && pi.acc) ttl.push('Konto z P/I: ' + pi.acc);
+            var title = ttl.join(' | ');
+            if (pi && pi.manual) return { cands: cands, pi: { ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie', title: title } };
+            if (pi && pi.err) return { cands: cands, pi: { ok: false, msg: pi.err, title: title } };
+            if (!pi || !pi.acc) return { cands: cands, pi: { ok: false, msg: 'brak konta w P/I', title: title } };
+            if (!banks.length) return { cands: cands, pi: { ok: false, warn: true, msg: 'brak konta w systemie (P/I: ' + pi.acc + ')', title: title } };
+            if (banks.indexOf(pi.acc) === -1) return { cands: cands, pi: { ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title } };
+            return { cands: cands, pi: { ok: true, warn: !!(pi && pi.hidden), msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : ''), title: title } };
+        }
+        async function runBalCheck(status, doPI){
+            var uniq = [], seen = {}, res = {}, byOrder = {};
+            state.bal.order.forEach(function(sup){ state.bal.groups[sup].forEach(function(r){
+                r.bc = null; r.bpi = null;
+                if (!/^\d+$/.test(String(r.order || ''))) return;
+                if (!seen[r.order]) { seen[r.order] = 1; uniq.push(r.order); }
+                (byOrder[r.order] = byOrder[r.order] || []).push(r);
+            }); });
+            var sum = { ok: 0, warn: 0, bad: 0, piOk: 0, piBad: 0 };
+            if (!uniq.length) return sum;
+            var done = 0, tot = uniq.length; function prog(){ if (status) status.textContent = 'Sprawdzam balance (komentarze' + (doPI ? ' + P/I' : '') + '): ' + (tot ? Math.round(done / tot * 100) : 100) + '%'; } prog();
+            await runPool(uniq, async function(o){ res[o] = await checkOneBal(o, doPI); done++; prog(); }, 6);
+            Object.keys(byOrder).forEach(function(o){
+                var v = res[o]; if (!v) return;
+                var rows = byOrder[o], m = pcMatchBalRows(rows, v.cands);
+                rows.forEach(function(r, i){
+                    r.bc = m[i] || null; r.bpi = v.pi || null;
+                    if (m[i] && m[i].ok) sum.ok++; else if (m[i] && m[i].warn) sum.warn++; else sum.bad++;
+                });
+                if (v.pi) { if (v.pi.ok) sum.piOk++; else sum.piBad++; }
+            });
+            return sum;
+        }
         wp.querySelector('#wp-go').onclick = async function(){
             var status = wp.querySelector('#wp-status');
             var balRows = parseBalance(wp.querySelector('#wp-balance'));
@@ -11769,9 +11933,13 @@
             renderTables();
             var _pen = await runPenalties(status);
             var _pi = await runPICheck(status);
+            var _bpi = !!(wp.querySelector('#wp-bal-pi') || {}).checked;
+            var _bc = await runBalCheck(status, _bpi);
             renderTables();
             var c = state.bal.order.filter(function(s){ return !!state.matched[s]; }).length;
-            status.textContent = 'Gotowe. Dostawcy: ' + state.bal.order.length + ' | \u017c\u00f3\u0142te: ' + c + ' | penalties: ' + _pen + ' | P/I \u2713' + _pi.ok + ' \u2717' + _pi.bad + '.';
+            status.textContent = 'Gotowe. Dostawcy: ' + state.bal.order.length + ' | \u017c\u00f3\u0142te: ' + c + ' | penalties: ' + _pen + ' | P/I \u2713' + _pi.ok + ' \u2717' + _pi.bad
+                + ' | BAL komentarze \u2713' + _bc.ok + ' \u26a0' + _bc.warn + ' \u2717' + _bc.bad
+                + (_bpi ? (' | BAL P/I \u2713' + _bc.piOk + ' \u2717' + _bc.piBad) : '') + '.';
         };
         wp.querySelector('#wp-copy-bal').onclick = function(){
             var status = wp.querySelector('#wp-status');
