@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.67
+// @version      1.68
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10104,8 +10104,20 @@
                 <tbody id="tm-preview-body"></tbody>
             </table>
 
+            <div style="margin-top:10px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:12px;color:#333;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:6px 8px;">
+                <label style="display:flex;align-items:center;gap:5px;white-space:nowrap;" title="Ile orderów księgować jednocześnie. 1 = po kolei. Wiersze tego samego orderu zawsze idą po kolei.">
+                    ⚙️ Równolegle:
+                    <input id="tm-workers" type="number" min="1" max="10" value="5"
+                        style="width:52px;padding:3px 4px;border:1px solid #ccc;border-radius:4px;font-size:12px;text-align:center;">
+                </label>
+                <label style="display:flex;align-items:center;gap:5px;white-space:nowrap;cursor:pointer;" title="Nie księguj, jeśli ta sama kwota jest już zaksięgowana na tym orderze, ale z INNĄ datą (możliwy duplikat wpisany wcześniej).">
+                    <input id="tm-dup-strict" type="checkbox" checked> 🛡 blokuj też przy innej dacie
+                </label>
+                <span style="color:#6b7280;">Duplikat = ta sama kwota + ta sama data</span>
+            </div>
+
             <button id="tm-book-btn" style="
-                margin-top:10px;width:100%;padding:10px;background:#16a34a;color:white;
+                margin-top:8px;width:100%;padding:10px;background:#16a34a;color:white;
                 border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;">
                 🚀 Zaksięguj wszystkie w tle
             </button>
@@ -10242,7 +10254,7 @@
                     formData.append(el.name, el.value);
             }
         }
-        return { formData, depositComment };
+        return { formData, depositComment, doc };
     }
 
     function normalizeBookingAmount(value) {
@@ -10328,24 +10340,123 @@
     // (wierszy z datą YYYY-MM-DD w pierwszej komórce). To kluczowy sygnał:
     // jeśli po POST liczba nie wzrosła, serwer nic nie zapisał - nawet jeśli
     // verifyBookedOnOrderPage znalazł dopasowanie do istniejącego wpisu.
-    function countPaymentRows(doc) {
+    // v6.6: jeden parser tabeli Payments dla wszystkiego (licznik wierszy + wykrywanie duplikatow).
+    // Zwraca liste zapisanych platnosci: { date, amount, currency, debit, credit, comment }.
+    function parsePaymentRows(doc) {
+        const out = [];
+        if (!doc) return out;
         const paymentTables = [...doc.querySelectorAll('table')].filter(table => {
             const headerText = String(table.textContent || '').toLowerCase();
             return headerText.indexOf('payments') >= 0 &&
                 headerText.indexOf('debit account') >= 0 &&
                 headerText.indexOf('credit account') >= 0;
         });
-        let count = 0;
         for (const table of paymentTables) {
             for (const tr of table.querySelectorAll('tr')) {
                 const cells = [...tr.querySelectorAll('td,th')];
                 if (cells.length < 7) continue;
                 const firstCellText = String(cells[0].textContent || '').trim();
-                if (!/^\d{4}-\d{2}-\d{2}/.test(firstCellText)) continue;
-                count++;
+                const dm = firstCellText.match(/^(\d{4}-\d{2}-\d{2})/);
+                if (!dm) continue;
+                out.push({
+                    date: dm[1],
+                    amount: parseAmountCell(controlValueText(cells[1])),
+                    currency: controlValueText(cells[2]),
+                    debit: controlValueText(cells[3]),
+                    credit: controlValueText(cells[4]),
+                    comment: controlValueText(cells[6])
+                });
             }
         }
-        return count;
+        return out;
+    }
+
+    function countPaymentRows(doc) {
+        return parsePaymentRows(doc).length;
+    }
+
+    // Kwota z komorki tabeli: bierzemy PIERWSZY token liczbowy (komorka moze zawierac
+    // i wartosc <input>, i ten sam tekst obok, wiec sklejanie calosci dawaloby smieci).
+    function parseAmountCell(text) {
+        const t = String(text || '').replace(/ /g, ' ').replace(/[€$£]/g, ' ');
+        const m = t.match(/-?\d{1,3}(?:[ '’]\d{3})+(?:[.,]\d+)?|-?\d+(?:[.,]\d+)?/);
+        if (!m) return null;
+        const n = parseFloat(m[0].replace(/[ '’]/g, '').replace(',', '.'));
+        return isNaN(n) ? null : n.toFixed(2);
+    }
+
+    // Cache tabeli Payments per order (wypelniany przy „Sprawdz ordery" i przed kazdym POST).
+    const paymentsCache = {};
+
+    function currentBookingDate() {
+        const y = document.getElementById('tm-year');
+        const m = document.getElementById('tm-month');
+        const d = document.getElementById('tm-day');
+        if (!y || !m || !d) return '';
+        return normalizeDateYYYYMMDD(y.value, m.value, d.value);
+    }
+
+    // === OCHRONA PRZED DUPLIKATEM (v6.6) ===
+    // Duplikat = ten sam order + ta sama KWOTA + ta sama DATA ksiegowania.
+    // `need` obsluguje swiadome podwojne ksiegowanie: jesli ta sama para order+kwota
+    // wystepuje w Twojej liscie 2x, blokujemy dopiero gdy w Payments sa juz 2 takie wpisy.
+    function dupScan(pays, amountRaw, bookingDate, need) {
+        const want = normalizeBookingAmount(amountRaw);
+        const rows = Array.isArray(pays) ? pays : [];
+        const same = want ? rows.filter(p => p.amount && p.amount === want) : [];
+        const exact = same.filter(p => p.date === bookingDate);
+        const other = same.filter(p => p.date !== bookingDate);
+        return {
+            want, bookingDate, need: need || 1, rows,
+            same, exact, other,
+            isBooked: !!want && exact.length >= (need || 1),
+            hasOtherDate: !!want && other.length > 0
+        };
+    }
+
+    function dupScanForRow(row) {
+        const pays = paymentsCache[row.id];
+        if (!pays) return null;
+        return dupScan(pays, row.amount, currentBookingDate(), row.dupIndex || 1);
+    }
+
+    function dupDatesText(list) {
+        const seen = [];
+        (list || []).forEach(p => { if (seen.indexOf(p.date) < 0) seen.push(p.date); });
+        return seen.join(', ');
+    }
+
+    function dupStatusHtml(row) {
+        const d = dupScanForRow(row);
+        if (!d || !d.want) return '';
+        if (d.isBooked) {
+            const t = 'W tabeli Payments jest juz ' + d.exact.length + ' wpis(ow) ' + d.want + ' z data ' + d.bookingDate + ' — nie zaksieguje ponownie.';
+            return '<div style="color:#dc2626;font-size:11px;margin-top:2px;" title="' + t + '">⛔ już zaksięgowane (' + d.bookingDate + ')</div>';
+        }
+        if (d.hasOtherDate) {
+            const t = 'Ta sama kwota ' + d.want + ' jest juz zaksiegowana z data: ' + dupDatesText(d.other) + '. Przy zaznaczonym „blokuj tez przy innej dacie" pominiemy ten wiersz.';
+            return '<div style="color:#b45309;font-size:11px;margin-top:2px;" title="' + t + '">⚠️ ta sama kwota z ' + dupDatesText(d.other) + '</div>';
+        }
+        return '';
+    }
+
+    // Numeruje powtorzenia order+kwota w liscie wejsciowej (dupIndex/dupTotal).
+    function markDuplicateRows(rows) {
+        const cnt = {};
+        rows.forEach(r => {
+            const k = r.id + '|' + normalizeBookingAmount(r.amount);
+            cnt[k] = (cnt[k] || 0) + 1;
+            r.dupIndex = cnt[k];
+        });
+        rows.forEach(r => { r.dupTotal = cnt[r.id + '|' + normalizeBookingAmount(r.amount)] || 1; });
+    }
+
+    function refreshDupStatuses() {
+        previewRows.forEach(row => {
+            if (row.loading) return;
+            const cell = document.getElementById('tm-status-' + row.id + '-' + (row.dupIndex || 1));
+            if (cell) cell.innerHTML = statusCellHtml(row);
+        });
     }
 
     function verifyBookedOnOrderPage(doc, row, currency, month, day, year) {
@@ -10474,23 +10585,42 @@
         }
     }
 
-    async function bookOrder(row, currency, month, day, year) {
+    async function bookOrder(row, currency, month, day, year, opts) {
         let lastError = '';
+        const strictDup = !(opts && opts.strictDup === false);
 
         for (let attempt = 1; attempt <= 3; attempt++) {
             try {
                 // Pobierz stan PRZED i sprawdź czy już zaksięgowane
                 const beforeDoc = await fetchOrderDoc(row.id);
-                const beforeVerify = verifyBookedOnOrderPage(beforeDoc, row, currency, month, day, year);
-                if (beforeVerify.ok) {
-                    return { ok:true, attempts:attempt - 1, verified:true, alreadyBooked:true };
+
+                // === OCHRONA PRZED DUPLIKATEM (v6.6) ===
+                // Czytamy tabelę Payments na żywo tuż przed POST (nie z cache) i porównujemy
+                // KWOTĘ + DATĘ księgowania. To szersze kryterium niż verifyBookedOnOrderPage
+                // (które wymagało też zgodnego opisu/kont/waluty i przepuszczało duplikat,
+                // gdy np. opis się różnił).
+                const pays = parsePaymentRows(beforeDoc);
+                paymentsCache[row.id] = pays;
+                const dup = dupScan(pays, row.amount, normalizeDateYYYYMMDD(year, month, day), row.dupIndex || 1);
+
+                if (dup.isBooked) {
+                    return {
+                        ok: true, attempts: attempt - 1, verified: true, alreadyBooked: true,
+                        dupMsg: `w Payments jest już ${dup.exact.length}× kwota ${dup.want} z datą ${dup.bookingDate}`
+                    };
+                }
+                if (strictDup && dup.hasOtherDate) {
+                    return {
+                        ok: false, duplicate: true,
+                        error: `możliwy duplikat — kwota ${dup.want} jest już zaksięgowana z datą ${dupDatesText(dup.other)}. Nic nie zaksięgowano. Jeśli to celowe, odznacz „🛡 blokuj też przy innej dacie" i powtórz.`
+                    };
                 }
 
                 // === NOWE w v6.3 ===
                 // Policz wiersze Payments PRZED POST. Po POST musi wzrosnąć — inaczej
                 // serwer nic nie zapisał (mimo HTTP 200) i verifyBookedOnOrderPage
                 // mogłoby dać false-positive trafiając w istniejący wcześniej wpis.
-                const rowsBefore = countPaymentRows(beforeDoc);
+                const rowsBefore = pays.length;
 
                 const postResult = await postBookOrder(row, currency, month, day, year);
                 if (!postResult.ok) {
@@ -10595,7 +10725,7 @@
         commentWrap.style.cssText = 'display:flex;align-items:center;gap:5px;';
 
         const commentLabel = document.createElement('span');
-        commentLabel.id    = `tm-comment-label-${row.id}`;
+        commentLabel.id    = `tm-comment-label-${row.id}-${row.dupIndex || 1}`;
         commentLabel.style.cssText = 'flex:1;color:#374151;font-size:12px;';
         commentLabel.textContent   = row.comment || '—';
 
@@ -10615,12 +10745,8 @@
             openCommentPopup(row.id, previewRows[i].comment, editBtn, (newVal) => {
                 previewRows[i].comment = newVal;
                 commentLabel.textContent = newVal || '—';
-                const statusCell = document.getElementById(`tm-status-${row.id}`);
-                if (statusCell) {
-                    statusCell.innerHTML = newVal
-                        ? '<span style="color:#16a34a">✅ OK</span>'
-                        : '<span style="color:#f59e0b">⚠️ brak opisu</span>';
-                }
+                const statusCell = document.getElementById(statusCellId(previewRows[i]));
+                if (statusCell) statusCell.innerHTML = statusCellHtml(previewRows[i]);
             });
         };
 
@@ -10630,18 +10756,28 @@
         tr.appendChild(tdO);
 
         const tdS = document.createElement('td');
-        tdS.id    = `tm-status-${row.id}`;
+        tdS.id    = statusCellId(row);
         tdS.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;text-align:center;white-space:nowrap;';
-        if (row.error) {
-            tdS.innerHTML = `<span style="color:#dc2626" title="${row.error}">⚠️ błąd</span>`;
-        } else {
-            tdS.innerHTML = row.comment
-                ? '<span style="color:#16a34a">✅ OK</span>'
-                : '<span style="color:#f59e0b">⚠️ brak opisu</span>';
-        }
+        tdS.innerHTML = statusCellHtml(row);
         tr.appendChild(tdS);
 
         return tr;
+    }
+
+    function statusCellId(row) {
+        return 'tm-status-' + row.id + '-' + (row.dupIndex || 1);
+    }
+
+    // Status = stan opisu + ostrzezenie o duplikacie (kwota/data juz w Payments).
+    function statusCellHtml(row) {
+        if (row.error) return `<span style="color:#dc2626" title="${String(row.error).replace(/"/g, '&quot;')}">⚠️ błąd</span>`;
+        const base = row.comment
+            ? '<span style="color:#16a34a">✅ OK</span>'
+            : '<span style="color:#f59e0b">⚠️ brak opisu</span>';
+        const multi = (row.dupTotal || 1) > 1
+            ? `<div style="color:#6b7280;font-size:10px;">wpis ${row.dupIndex}/${row.dupTotal} tej kwoty</div>`
+            : '';
+        return base + multi + dupStatusHtml(row);
     }
 
     function makeInlineEditTd(value, rowIndex, key, minWidth) {
@@ -10719,6 +10855,7 @@
             id:o.id, amount:o.amount, debit, credit,
             comment:'', loading:true, error:null,
         }));
+        markDuplicateRows(previewRows);
 
         buildInitialTable(previewRows);
 
@@ -10726,24 +10863,42 @@
         checkBtn.disabled = true;
         checkBtn.textContent = '⏳ Sprawdzam…';
 
-        for (let i=0; i<previewRows.length; i++) {
-            const row = previewRows[i];
-            try {
-                const { formData, depositComment } = await fetchOrderData(row.id);
-                formDataCache[row.id] = formData;
-                row.comment = depositComment;
-                row.loading = false;
-            } catch(e) {
-                row.loading = false;
-                row.error   = e.message;
+        // Sprawdzanie tez rownolegle (tylko GET-y, wiec bezpiecznie).
+        const workersCheck = Math.max(1, Math.min(10, parseInt(document.getElementById('tm-workers')?.value, 10) || 5));
+        const seenIds = {};
+        const idQueue = [];
+        previewRows.forEach(r => { if (!seenIds[r.id]) { seenIds[r.id] = 1; idQueue.push(r.id); } });
+        let qi = 0;
+
+        async function checkWorker() {
+            while (true) {
+                const id = idQueue[qi++];
+                if (id === undefined) return;
+                let data = null, err = null;
+                try { data = await fetchOrderData(id); } catch(e) { err = e.message; }
+                if (data) {
+                    formDataCache[id] = data.formData;
+                    paymentsCache[id] = parsePaymentRows(data.doc);
+                }
+                previewRows.forEach((row, i) => {
+                    if (row.id !== id) return;
+                    row.loading = false;
+                    if (err) row.error = err; else row.comment = data.depositComment;
+                    updateRow(i);
+                });
             }
-            updateRow(i);
-            await new Promise(r => setTimeout(r, 200));
         }
+        await Promise.all(Array.from({ length: Math.min(workersCheck, idQueue.length) }, checkWorker));
 
         checkBtn.disabled = false;
         checkBtn.textContent = '🔍 Sprawdź ordery';
     };
+
+    // Zmiana daty/waluty => przeliczamy ostrzezenia o duplikatach w podgladzie.
+    ['tm-month','tm-day','tm-year'].forEach(id => {
+        const el = panel.querySelector('#' + id);
+        if (el) el.addEventListener('change', () => { try { refreshDupStatuses(); } catch(e) {} });
+    });
 
     panel.querySelector('#tm-book-btn').onclick = async () => {
         if (!previewRows.length) return;
@@ -10758,51 +10913,102 @@
         const summary      = document.getElementById('tm-summary');
         const bookBtn      = document.getElementById('tm-book-btn');
 
+        const workers = Math.max(1, Math.min(10, parseInt(document.getElementById('tm-workers').value, 10) || 5));
+        const strictDup = !!document.getElementById('tm-dup-strict').checked;
+
+        markDuplicateRows(previewRows);
+
         progressDiv.style.display = 'block';
         progressList.innerHTML = '';
         summary.innerHTML = '';
         bookBtn.disabled  = true;
-        bookBtn.textContent = '⏳ Księguję…';
+        bookBtn.textContent = workers > 1 ? `⏳ Księguję (${workers} równolegle)…` : '⏳ Księguję…';
 
-        let ok=0, fail=0;
+        let ok=0, fail=0, dupSkipped=0, already=0;
 
-        for (const row of previewRows) {
-            const logRow = document.createElement('div');
-            logRow.style.cssText = 'padding:3px 0;border-bottom:1px solid #f0f0f0;';
-            logRow.innerHTML = `⏳ <strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'brak opisu'}</em>…`;
-            progressList.appendChild(logRow);
+        function logLine(html) {
+            const div = document.createElement('div');
+            div.style.cssText = 'padding:3px 0;border-bottom:1px solid #f0f0f0;';
+            div.innerHTML = html;
+            progressList.appendChild(div);
             progressList.scrollTop = progressList.scrollHeight;
+            return div;
+        }
 
-            const result = await bookOrder(row, currency, month, day, year);
-            const statusCell = document.getElementById(`tm-status-${row.id}`);
+        // Wiersze TEGO SAMEGO orderu musza isc po kolei (licznik wierszy Payments przed/po
+        // oraz wspolny formDataCache). Rownolegle pracujemy wiec na roznych orderach.
+        const groups = [];
+        const byId = {};
+        previewRows.forEach((row, i) => {
+            if (!byId[row.id]) { byId[row.id] = []; groups.push(byId[row.id]); }
+            byId[row.id].push(i);
+        });
+
+        async function processOne(w, i) {
+            const row = previewRows[i];
+            const tag = workers > 1 ? `[W${w}] ` : '';
+            const logRow = logLine(`⏳ ${tag}<strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'brak opisu'}</em>…`);
+
+            let result;
+            try {
+                result = await bookOrder(row, currency, month, day, year, { strictDup });
+            } catch (e) {
+                result = { ok:false, error: e.message };
+            }
+            const statusCell = document.getElementById(statusCellId(row));
 
             if (result.ok) {
                 ok++;
-                // v6.5: pokaż info o zmianie liczby wierszy + ostrzeżenie jeśli weryfikator nie dopasował
+                if (result.alreadyBooked) already++;
                 const rowsInfo = (result.rowsBefore != null && result.rowsAfter != null)
                     ? ` | Payments: ${result.rowsBefore} → ${result.rowsAfter}`
                     : '';
                 const noteInfo = result.verifyNote
                     ? ` <span style="color:#b45309">(⚠ ${result.verifyNote})</span>`
                     : '';
-                logRow.innerHTML = `✅ <strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'—'}</em> — zaksięgowano i potwierdzono po ${result.attempts || 1} próbie/próbach${result.alreadyBooked ? ' (wpis był już widoczny)' : rowsInfo}${noteInfo}`;
-                logRow.style.color = '#16a34a';
-                if (statusCell) statusCell.innerHTML = '<span style="color:#16a34a">✅ zaksięgowany</span>';
+                if (result.alreadyBooked) {
+                    logRow.innerHTML = `⛔ ${tag}<strong>${row.id}</strong> — ${row.amount} ${currency} | POMINIĘTO, już zaksięgowane (${result.dupMsg || 'wpis był już widoczny'})`;
+                    logRow.style.color = '#b45309';
+                    if (statusCell) statusCell.innerHTML = '<span style="color:#b45309">⛔ już zaksięgowany</span>';
+                } else {
+                    logRow.innerHTML = `✅ ${tag}<strong>${row.id}</strong> — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'—'}</em> — zaksięgowano i potwierdzono po ${result.attempts || 1} próbie/próbach${rowsInfo}${noteInfo}`;
+                    logRow.style.color = '#16a34a';
+                    if (statusCell) statusCell.innerHTML = '<span style="color:#16a34a">✅ zaksięgowany</span>';
+                }
+                // status kontenera ustawiamy tak jak wczesniej — takze gdy wpis juz byl
                 const _st = await ensureContainerStatus(row.id);
                 logRow.innerHTML += _st.html;
+            } else if (result.duplicate) {
+                dupSkipped++;
+                logRow.innerHTML = `🛡 ${tag}<strong>${row.id}</strong> — POMINIĘTO: ${result.error}`;
+                logRow.style.color = '#b45309';
+                if (statusCell) statusCell.innerHTML = '<span style="color:#b45309">🛡 możliwy duplikat</span>';
             } else {
                 fail++;
-                logRow.innerHTML = `❌ <strong>${row.id}</strong> — BŁĄD: ${result.error}`;
+                logRow.innerHTML = `❌ ${tag}<strong>${row.id}</strong> — BŁĄD: ${result.error}`;
                 logRow.style.color = '#dc2626';
                 if (statusCell) statusCell.innerHTML = `<span style="color:#dc2626">❌ błąd</span>`;
             }
-
-            await new Promise(r => setTimeout(r, 600));
         }
 
-        summary.innerHTML = fail===0
+        let gi = 0;
+        async function worker(w) {
+            while (true) {
+                const g = groups[gi++];
+                if (!g) return;
+                for (const i of g) await processOne(w, i);
+                await new Promise(r => setTimeout(r, 150));
+            }
+        }
+        await Promise.all(Array.from({ length: Math.min(workers, groups.length) }, (_, k) => worker(k + 1)));
+
+        const parts = [`✅ OK: <strong>${ok - already}</strong>`];
+        if (already)    parts.push(`⛔ już było: <strong>${already}</strong>`);
+        if (dupSkipped) parts.push(`🛡 duplikaty pominięte: <strong>${dupSkipped}</strong>`);
+        if (fail)       parts.push(`❌ błędy: <strong>${fail}</strong>`);
+        summary.innerHTML = (fail === 0 && dupSkipped === 0 && already === 0)
             ? `🎉 Zaksięgowano wszystkie <strong>${ok}</strong> ordery poprawnie!`
-            : `✅ OK: <strong>${ok}</strong> &nbsp; ❌ Błędy: <strong>${fail}</strong>`;
+            : parts.join(' &nbsp; ');
         summary.style.color = fail===0 ? '#16a34a' : '#b45309';
 
         bookBtn.disabled = false;
