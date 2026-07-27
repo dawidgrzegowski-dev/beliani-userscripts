@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.73
+// @version      1.74
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11478,6 +11478,7 @@
                 sub('order ' + o);
                 L.push('  konta w systemie: ' + ((d.banks && d.banks.length) ? d.banks.join(' / ') : '—'));
                 L.push('  ostatni P/I     : ' + (d.piUrl || '—'));
+                if (d.piRaw) L.push('  sekcja P/I (surowa): ' + d.piRaw);
                 if (d.pi) L.push('  odczyt z P/I    : kwota ' + pcNum(d.pi.amount) + ' | % ' + (d.pi.pct == null ? '—' : d.pi.pct) + ' | konto ' + (d.pi.acc || '—') + (d.pi.sheet ? ' | arkusz ' + d.pi.sheet + (d.pi.hidden ? ' [ukryty]' : '') : '') + (d.pi.err ? ' | błąd: ' + d.pi.err : ''));
                 L.push('  kandydaci (kwoty z komentarzy): ' + ((d.cands && d.cands.length) ? d.cands.map(function(c){ return '#' + c.i + ' ' + (c.contRaw || '—') + ' [' + c.amts.map(function(a){ return a.toFixed(2); }).join(', ') + ']'; }).join(' ; ') : '—'));
                 L.push('  roszczenia (penalty/claim)   : ' + ((d.pens && d.pens.length) ? d.pens.map(function(p){ return '#' + p.i + ' ' + (p.nos.join('+') || 'penalty') + ' ' + (p.amt > 0 ? '+' : '') + p.amt.toFixed(2) + (p.contRaw ? ' @' + p.contRaw : ''); }).join(' ; ') : '—'));
@@ -11493,6 +11494,7 @@
                 sub('order ' + o);
                 L.push('  konta w systemie: ' + ((d.banks && d.banks.length) ? d.banks.join(' / ') : '—'));
                 L.push('  ostatni P/I     : ' + (d.piUrl || '—'));
+                if (d.piRaw) L.push('  sekcja P/I (surowa): ' + d.piRaw);
                 L.push('  wybrany komentarz deposit: ' + (d.com ? ('#' + d.com.idx + ' → kwota ' + pcNum(d.com.amount) + ', % ' + (d.com.pct == null ? '—' : d.com.pct)) : 'BRAK'));
                 if (d.pi) L.push('  odczyt z P/I    : kwota ' + pcNum(d.pi.amount) + ' | % ' + (d.pi.pct == null ? '—' : d.pi.pct) + ' | konto ' + (d.pi.acc || '—') + (d.pi.sheet ? ' | arkusz ' + d.pi.sheet + (d.pi.hidden ? ' [ukryty]' : '') : '') + (d.pi.err ? ' | błąd: ' + d.pi.err : ''));
                 L.push('  wszystkie komentarze:');
@@ -11943,18 +11945,57 @@
             while ((m = re.exec(html)) !== null){ m[1].split(/[\/,;]| or /i).forEach(function(part){ var d = normAcc(part); if (d.length >= 8 && d.length <= 24 && out.indexOf(d) === -1) out.push(d); }); }
             return out;
         }
-        function extractLatestPI(html){
-            var hi = html.search(/<b>\s*P\/?I\s*:\s*<\/b>/i);
+        // Wycina fragment HTML od naglowka "P/I:" do linku "dodaj" nastepnej sekcji.
+        // Naglowek czytamy luzniej niz kiedys: dopuszczamy atrybuty w <b>/<strong>,
+        // &nbsp; i spacje wokol "P/I" oraz brak dwukropka.
+        function piSection(html){
+            var hi = html.search(/<(?:b|strong)[^>]*>(?:\s|&nbsp;)*P(?:\s|&nbsp;)*\/?(?:\s|&nbsp;)*I(?:\s|&nbsp;)*:?(?:\s|&nbsp;)*<\/(?:b|strong)>/i);
             if (hi < 0) return null;
             var after = html.slice(hi);
             var addNew = after.search(/load_docs\.php\?[^"']*type=/i);
             var bound = after.length;
             if (addNew >= 0) { var rest = after.slice(addNew + 5); var nxt = rest.search(/load_docs\.php\?[^"']*type=/i); if (nxt >= 0) bound = addNew + 5 + nxt; }
-            var sec = after.slice(0, bound);
-            var re = /<a[^>]*href="([^"]*doc\.php\?[^"]*doc_id=\d+)"[^>]*>[^<]*<\/a>\s*<br\s*\/?>\s*\(by[^)]*?on\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\)/gi;
-            var m, best = null, bestD = '';
-            while ((m = re.exec(sec)) !== null) { var d = m[2]; if (d > bestD) { bestD = d; best = m[1]; } }
+            return after.slice(0, bound);
+        }
+        function extractLatestPI(html){
+            var sec = piSection(html);
+            if (sec == null) return null;
+            // Kazdy link do dokumentu bierzemy osobno, a date czytamy z ogonka ZA linkiem.
+            // Wczesniej robil to jeden wielki regex wymagajacy "...</a><br />(by X on DATA)",
+            // w ktorym nazwisko dopasowywalo sie przez [^)] — wiec kazde nazwisko z nawiasem,
+            // np. "(by Agata Betiuk (Rozkrut) on 2025-12-22 08:20:00)", wywracalo dopasowanie
+            // i caly dokument byl pomijany. Efekt: "brak P/I" mimo istniejacego pliku.
+            var re = /<a[^>]*href="([^"]*doc\.php\?[^"]*doc_id=(\d+)[^"]*)"/gi;
+            var m, best = null, bestD = '', bestId = -1;
+            while ((m = re.exec(sec)) !== null){
+                var href = m[1], id = parseInt(m[2], 10) || 0;
+                if (/[?&](?:del|delete|remove)\b/i.test(href) || /action=(?:del|remove)/i.test(href)) continue;
+                // Ogonek za linkiem, ucinany przed kolejnym <a>, zeby nie podkradac cudzej daty.
+                var tail = sec.slice(re.lastIndex, re.lastIndex + 400);
+                var cut = tail.search(/<a[\s>]/i); if (cut >= 0) tail = tail.slice(0, cut);
+                var dm = tail.match(/\bon\s+(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/i);
+                // Sekundy bywaja pominiete — normalizujemy, zeby porownanie tekstowe dzialalo.
+                var d = dm ? (dm[1] + ' ' + (dm[2] ? (dm[2].length === 5 ? dm[2] + ':00' : dm[2]) : '00:00:00')) : '';
+                // Bez daty decyduje doc_id — rosnie z czasem, wiec najwiekszy = najnowszy.
+                if (d > bestD || (d === bestD && id > bestId)) { bestD = d; bestId = id; best = href; }
+            }
             return best ? best.replace(/&amp;/g, '&') : null;
+        }
+        // Gdy P/I nie zostalo znalezione — zrzut sekcji do logu, zeby dalo sie ustalic
+        // przyczyne bez wchodzenia na strone zamowienia.
+        function pcPiSecDump(html){
+            try {
+                var sec = piSection(html);
+                if (sec == null) return 'brak nagłówka "P/I:" na stronie zamówienia';
+                var txt = sec.slice(0, 6000)
+                    .replace(/<a[^>]*href="([^"]*)"[^>]*>/gi, ' [LINK $1] ')
+                    .replace(/<br\s*\/?>/gi, ' / ')
+                    .replace(/<[^>]*$/, ' ')
+                    .replace(/<[^>]+>/g, ' ')
+                    .replace(/&nbsp;/gi, ' ')
+                    .replace(/\s+/g, ' ').trim();
+                return txt ? txt.slice(0, 1500) : '(sekcja pusta)';
+            } catch(e){ return '(nie odczytano: ' + e + ')'; }
         }
         async function fetchBin(url, ms){
             var ctl = new AbortController(); var t = setTimeout(function(){ try { ctl.abort(); } catch(e){} }, ms || 25000);
@@ -12108,6 +12149,7 @@
             var cs = pcComments(h);
             var com = extractDepoComment(h, cs), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
             dg.cs = pcDiagCs(cs); dg.com = com; dg.banks = banks; dg.piUrl = piUrl || '';
+            if (!piUrl) dg.piRaw = pcPiSecDump(h);
             var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', depOk: extractDepoOk(cs, com ? com.idx : -1) };
             function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; o.piSheet = base.piSheet; o.depOk = base.depOk; return o; }
             if (!com) { dlog('DEPO ' + order + ': brak komentarza deposit (komentarzy: ' + cs.length + ')'); return ret({ ok: false, msg: 'brak komentarza deposit' }); }
@@ -12151,6 +12193,7 @@
             if (!doPI) return { cands: cands, pens: pens, pi: null };
             var banks = extractBankAccts(h), piUrl = extractLatestPI(h);
             dg.banks = banks; dg.piUrl = piUrl || '';
+            if (!piUrl) dg.piRaw = pcPiSecDump(h);
             if (!piUrl) { dlog('BALANCE ' + order + ': brak pliku P/I'); return { cands: cands, pens: pens, pi: { ok: false, msg: 'brak P/I' } }; }
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
             if (!buf) { dlog('BALANCE ' + order + ': nie pobrano P/I (' + piUrl + ')'); return { cands: cands, pens: pens, pi: { ok: false, msg: 'nie pobrano P/I' } }; }
