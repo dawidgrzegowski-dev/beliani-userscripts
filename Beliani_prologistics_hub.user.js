@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.70
+// @version      1.72
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11410,13 +11410,29 @@
             }
             return out.join(sep);
         }
+        // Ten sam typ roszczenia laczymy w jeden wpis: ['penalty 814','penalty 1021','overpayment 451']
+        // -> ['penalty 814,1021', 'overpayment 451']. Kolejnosc typow wg pierwszego wystapienia, numery rosnaco.
+        function pcFormatPens(pens){
+            var order = [], byType = {};
+            (pens || []).forEach(function(p){
+                var s = String(p == null ? '' : p).trim();
+                if (!s) return;
+                var m = s.match(/^(.*?)\s*(\d+)$/), ty = m ? m[1].trim() : s, no = m ? m[2] : null;
+                if (!byType[ty]) { byType[ty] = []; order.push(ty); }
+                if (no != null && byType[ty].indexOf(no) === -1) byType[ty].push(no);
+            });
+            return order.map(function(ty){
+                var nos = byType[ty].slice().sort(function(a, b){ return parseInt(a, 10) - parseInt(b, 10); });
+                return nos.length ? (ty + ' ' + nos.join(',')) : ty;
+            });
+        }
         function pcBuildTitle(orders, pcts, conts, pens, cfg){
             var sep = cfg.ns ? ',' : ', ';
             var cl = (cfg.cont && conts.length) ? ((cfg.nCont == null) ? conts : conts.slice(0, cfg.nCont)) : [];
             var parts = ['Order ' + pcFormatOrders(orders, cfg.om)];
             if (cfg.dep && pcts.length) parts.push('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(sep));
             if (cl.length) parts.push(cl.join(sep));
-            if (cfg.pen && pens.length) parts.push(pens.join(sep));
+            if (cfg.pen && pens.length) parts.push(pcFormatPens(pens).join(sep));
             return parts.join(sep);
         }
         // Ile CALYCH kontenerow zmiesci sie w limicie przy danym ukladzie (nigdy nie ucina numeru w polowie).
@@ -11617,12 +11633,35 @@
             }
             return out;
         }
-        function pcIsDepoText(t){ var s = String(t == null ? '' : t); return /deposit/i.test(s) && /%/.test(s); }
+        // Komentarz z prosba o depozyt — procent bywa pominiety ("please pay deposit 2886.40 USD").
+        function pcIsDepoText(t){
+            var s = String(t == null ? '' : t);
+            if (!/deposit/i.test(s)) return false;
+            return /%/.test(s) || /\b(?:pay|payment|paid|prepay|prepayment)\b/i.test(s);
+        }
+        // Komentarze SYSTEM o roszczeniach (penalty/claim) — to nie sa kwoty balance, tylko korekta.
+        function pcIsPenText(t){
+            var s = String(t == null ? '' : t);
+            return /penalty\s*:\s*applied/i.test(s) || /\bclaim\s*:/i.test(s) || /\bopen\s+amount\s*:/i.test(s);
+        }
+        // -> [{i, amt (ze znakiem: -201.35 = do odjecia), nos:['penalty 1068'], cont, ...}]
+        function pcPenComments(cs){
+            var out = [];
+            (cs || []).forEach(function(c, i){
+                var t = c.text || '';
+                if (!pcIsPenText(t)) return;
+                var am = t.match(new RegExp('open\\s+amount\\s*:?\\s*(-?\\s*(?:' + PC_NUM_RE + '))', 'i'));
+                var v = am ? parseMoney(String(am[1]).replace(/\s+/g, '')) : NaN;
+                if (!isFinite(v) || v === 0) return;
+                out.push({ i: i, amt: v, nos: pcParsePenalties(t), cont: pcNormCont(c.cont), contRaw: String(c.cont || '').trim(), date: c.date || '', author: c.author || '', text: t });
+            });
+            return out;
+        }
         function pcBalCands(cs){
             var out = [];
             (cs || []).forEach(function(c, i){
                 var t = c.text || '';
-                if (pcIsDepoText(t)) return;
+                if (pcIsDepoText(t) || pcIsPenText(t)) return;
                 var amts = pcMoneyTokens(t);
                 if (!amts.length) return;
                 out.push({ i: i, cont: pcNormCont(c.cont), contRaw: String(c.cont || '').trim(), amts: amts, date: c.date || '', author: c.author || '', text: t });
@@ -11632,40 +11671,78 @@
         function pcAmtEq(a, b){ return a != null && b != null && isFinite(a) && isFinite(b) && Math.abs(a - b) < 0.005; }
         function pcCandAmt(cand, want){ for (var k = 0; k < cand.amts.length; k++){ if (pcAmtEq(cand.amts[k], want)) return cand.amts[k]; } return null; }
         function pcCandDesc(c){ return (c.contRaw ? c.contRaw + ' — ' : '') + c.text + (c.date ? ' (' + c.date + (c.author ? ', ' + c.author : '') + ')' : ''); }
+        // Numery roszczen z notatki wklejonego wiersza (np. "penalty 1068").
+        function pcRowPenNos(r){ return pcParsePenalties(r && r.note); }
+        // Mozliwe korekty kwoty dla wiersza: po numerze roszczenia z notatki, po kontenerze,
+        // a gdy penalty nie ma kontenera i notatka nic nie mowi — bierzemy je pod uwage mimo to.
+        function pcPenAdj(pens, r, rc){
+            var list = pens || [];
+            if (!list.length) return [];
+            var nos = pcRowPenNos(r);
+            var rel = list.filter(function(p){
+                if (nos.length && p.nos.some(function(n){ return nos.indexOf(n) !== -1; })) return true;
+                if (rc && p.cont && p.cont === rc) return true;
+                if (!p.cont && !nos.length) return true;
+                return false;
+            });
+            if (!rel.length) return [];
+            var out = [], seen = {};
+            function add(sum, used){ var k = sum.toFixed(2); if (!isFinite(sum) || sum === 0 || seen[k]) return; seen[k] = 1; out.push({ sum: sum, used: used }); }
+            add(rel.reduce(function(s, p){ return s + p.amt; }, 0), rel);
+            rel.forEach(function(p){ add(p.amt, [p]); });
+            return out;
+        }
+        function pcPenLabel(adj){ return (adj.used || []).map(function(p){ return (p.nos[0] || 'penalty') + ': ' + (p.amt > 0 ? '+' : '−') + Math.abs(p.amt).toFixed(2); }).join(', '); }
+        function pcPenDesc(adj){ return (adj.used || []).map(function(p){ return pcCandDesc(p); }).join('\n'); }
+        // Trafienie kwoty: wprost albo po uwzglednieniu penalty (kwota z komentarza + penalty = kwota wklejona).
+        function pcCandHit(c, w, adjs){
+            var a = pcCandAmt(c, w);
+            if (a != null) return { amt: a, adj: null };
+            for (var i = 0; i < (adjs || []).length; i++){
+                var v = pcCandAmt(c, w - adjs[i].sum);
+                if (v != null) return { amt: v, adj: adjs[i] };
+            }
+            return null;
+        }
         // Dopasowuje kazdy wklejony wiersz balance do wlasnego komentarza (jeden komentarz = jedna platnosc).
         // rows -> [{ok|warn|bad, msg, title}] w tej samej kolejnosci.
-        function pcMatchBalRows(rows, cands){
+        function pcMatchBalRows(rows, cands, pens){
             var list = rows || [], cs = (cands || []).slice(), used = {}, res = [];
             for (var z = 0; z < list.length; z++) res.push(null);
             function want(r){ var a = pcBalAmtVal(r); return (a != null && isFinite(a)) ? a : null; }
             function contOf(r){ return pcNormCont(r && r.container); }
             // najnowsze komentarze maja pierwszenstwo
-            function pick(test){ for (var k = cs.length - 1; k >= 0; k--){ if (used[k]) continue; if (test(cs[k])) { used[k] = 1; return cs[k]; } } return null; }
+            function pick(test){ for (var k = cs.length - 1; k >= 0; k--){ if (used[k]) continue; var v = test(cs[k]); if (v) { used[k] = 1; return { c: cs[k], v: v }; } } return null; }
             function pass(test, make){
                 for (var i = 0; i < list.length; i++){
                     if (res[i]) continue;
                     var r = list[i], w = want(r), rc = contOf(r);
                     if (w == null) { res[i] = { bad: true, msg: 'brak kwoty', title: '' }; continue; }
-                    var hit = pick(function(c){ return test(c, w, rc); });
-                    if (hit) res[i] = make(hit, w, rc);
+                    var adjs = pcPenAdj(pens, r, rc);
+                    var hit = pick(function(c){ return test(c, w, rc, adjs); });
+                    if (hit) res[i] = make(hit.c, w, rc, adjs, hit.v);
                 }
             }
-            // 1) kontener + kwota
-            pass(function(c, w, rc){ return !!c.cont && c.cont === rc && pcCandAmt(c, w) != null; },
-                function(c, w){ return { ok: true, msg: 'kwota + kontener', title: 'Komentarz: ' + pcCandDesc(c) }; });
+            function withPen(h){ return h && h.adj ? ' (po ' + pcPenLabel(h.adj) + ')' : ''; }
+            function penTtl(h){ return h && h.adj ? '\nKorekta penalty: ' + pcPenLabel(h.adj) + '\n' + pcPenDesc(h.adj) : ''; }
+            // 1) kontener + kwota (kwota wprost lub po korekcie o penalty)
+            pass(function(c, w, rc, adjs){ return (!!c.cont && c.cont === rc) ? pcCandHit(c, w, adjs) : null; },
+                function(c, w, rc, adjs, h){ return { ok: true, msg: 'kwota + kontener' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) }; });
             // 2) kwota sie zgadza, komentarz bez kontenera
-            pass(function(c, w){ return !c.cont && pcCandAmt(c, w) != null; },
-                function(c, w){ return { warn: true, msg: 'kwota OK, komentarz bez kontenera', title: 'Komentarz: ' + pcCandDesc(c) }; });
+            pass(function(c, w, rc, adjs){ return !c.cont ? pcCandHit(c, w, adjs) : null; },
+                function(c, w, rc, adjs, h){ return { warn: true, msg: 'kwota OK, komentarz bez kontenera' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) }; });
             // 3) kwota sie zgadza, ale kontener inny
-            pass(function(c, w){ return pcCandAmt(c, w) != null; },
-                function(c, w, rc){ return { warn: true, msg: 'kwota OK, kontener w komentarzu: ' + (c.contRaw || '?'), title: 'Wklejony kontener: ' + (rc || '?') + '\nKomentarz: ' + pcCandDesc(c) }; });
+            pass(function(c, w, rc, adjs){ return pcCandHit(c, w, adjs); },
+                function(c, w, rc, adjs, h){ return { warn: true, msg: 'kwota OK, kontener w komentarzu: ' + (c.contRaw || '?') + withPen(h), title: 'Wklejony kontener: ' + (rc || '?') + '\nKomentarz: ' + pcCandDesc(c) + penTtl(h) }; });
             // 4) kontener sie zgadza, ale kwota inna
-            pass(function(c, w, rc){ return !!c.cont && c.cont === rc; },
-                function(c, w){
+            pass(function(c, w, rc){ return (!!c.cont && c.cont === rc) ? true : null; },
+                function(c, w, rc, adjs){
                     var best = null;
                     c.amts.forEach(function(a){ if (best == null || Math.abs(a - w) < Math.abs(best - w)) best = a; });
                     var d = (best != null) ? (w - best) : null;
-                    return { warn: true, msg: 'kwota ≠ ' + (best != null ? best.toFixed(2) : '?') + (d != null ? ' (' + (d > 0 ? '+' : '') + d.toFixed(2) + ')' : ''), title: 'Wklejona kwota: ' + w.toFixed(2) + '\nKomentarz: ' + pcCandDesc(c) };
+                    var extra = '';
+                    if (best != null && adjs && adjs.length) extra = '\nZ korekta penalty byloby: ' + adjs.map(function(a){ return (best + a.sum).toFixed(2) + ' (' + pcPenLabel(a) + ')'; }).join('; ');
+                    return { warn: true, msg: 'kwota ≠ ' + (best != null ? best.toFixed(2) : '?') + (d != null ? ' (' + (d > 0 ? '+' : '') + d.toFixed(2) + ')' : ''), title: 'Wklejona kwota: ' + w.toFixed(2) + '\nKomentarz: ' + pcCandDesc(c) + extra };
                 });
             // 5) nic nie pasuje
             var left = [];
@@ -11697,13 +11774,18 @@
             for (var i = pool.length - 1; i >= 0; i--){
                 var t = pool[i];
                 if (!/deposit/i.test(t)) continue;
+                // procent bywa pominiety — wtedy pct = null, a sprawdzamy tylko kwote i konto
                 var pm = t.match(/(\d+(?:[.,]\d+)?)\s*%/);
-                if (!pm) continue;
-                var pct = parseFloat(String(pm[1]).replace(',', '.'));
+                var pct = pm ? parseFloat(String(pm[1]).replace(',', '.')) : null;
                 var di = t.toLowerCase().indexOf('deposit');
                 var after = t.slice(di + 7).replace(/\d+(?:[.,]\d+)?\s*%/g, ' ');
                 var amount = parseMoney(after);
-                if (isFinite(amount)) return { pct: pct, amount: amount, idx: spans.length ? i : -1 };
+                if (!isFinite(amount)){
+                    // np. "please pay 2886.40 USD deposit" — kwota przed slowem "deposit"
+                    var before = t.slice(0, di).replace(/\d+(?:[.,]\d+)?\s*%/g, ' ');
+                    amount = parseMoney(before);
+                }
+                if (amount != null && isFinite(amount) && amount > 0) return { pct: pct, amount: amount, idx: spans.length ? i : -1 };
             }
             return null;
         }
@@ -11805,11 +11887,41 @@
             return pick(false) || pick(true) || { pct: null, amount: null, acc: '', sheet: '' };
         }
         function extractPdfDeposit(txt){
-            var m = txt.match(/(\d+(?:[.,]\d+)?)\s*%\s*deposit\b[^0-9$\u20ac]*[$\u20ac]\s*([\d.,\u2019' ]+)/i);
-            if (m) return { pct: parseFloat(String(m[1]).replace(',', '.')), amount: parseMoney(m[2]) };
-            var di = txt.toLowerCase().indexOf('deposit');
-            if (di >= 0){ var win = txt.slice(Math.max(0, di - 40), di + 60); var pm = win.match(/(\d+(?:[.,]\d+)?)\s*%/); var am = win.match(/[$\u20ac]\s*([\d.,\u2019' ]+)/); if (pm && am) return { pct: parseFloat(String(pm[1]).replace(',', '.')), amount: parseMoney(am[1]) }; }
+            var s = String(txt == null ? '' : txt);
+            // 1) "15% deposit ... $4003.20"
+            var m = s.match(/(\d+(?:[.,]\d+)?)\s*%\s*deposit\b[^0-9$\u20ac]*[$\u20ac]\s*([\d.,\u2019' ]+)/i);
+            if (m){ var a1 = parseMoney(m[2]); if (isFinite(a1) && a1 > 0) return { pct: parseFloat(String(m[1]).replace(',', '.')), amount: a1 }; }
+            // 2) wiersz tabeli "Deposit 15% 4003,2" \u2014 kwota bez symbolu waluty
+            var lines = s.split(/\n+/);
+            for (var i = 0; i < lines.length; i++){
+                var ln = String(lines[i]).trim();
+                if (!/^deposit\b/i.test(ln)) continue;
+                var pm0 = ln.match(/(\d+(?:[.,]\d+)?)\s*%/);
+                var rest = ln.replace(/^deposit/i, ' ').replace(/\d+(?:[.,]\d+)?\s*%/g, ' ');
+                var a2 = parseMoney(rest);
+                if (isFinite(a2) && a2 > 0) return { pct: pm0 ? parseFloat(String(pm0[1]).replace(',', '.')) : null, amount: a2 };
+            }
+            // 3) okno wokol slowa "deposit" (wymaga symbolu waluty)
+            var di = s.toLowerCase().indexOf('deposit');
+            if (di >= 0){ var win = s.slice(Math.max(0, di - 40), di + 60); var pm = win.match(/(\d+(?:[.,]\d+)?)\s*%/); var am = win.match(/[$\u20ac]\s*([\d.,\u2019' ]+)/); if (pm && am){ var a3 = parseMoney(am[1]); if (isFinite(a3) && a3 > 0) return { pct: parseFloat(String(pm[1]).replace(',', '.')), amount: a3 }; } }
             return null;
+        }
+        // pdf.js zwraca fragmenty w kolejnosci strumienia, nie wizualnej \u2014 skladamy wiersze po wspolrzednych.
+        function pdfLinesFromItems(items){
+            var rows = [];
+            (items || []).forEach(function(it){
+                var s = it && it.str;
+                if (!s || !String(s).trim()) return;
+                var tr = it.transform || [], x = +tr[4] || 0, y = +tr[5] || 0, row = null;
+                for (var i = 0; i < rows.length; i++){ if (Math.abs(rows[i].y - y) <= 3) { row = rows[i]; break; } }
+                if (!row) { row = { y: y, items: [] }; rows.push(row); }
+                row.items.push({ x: x, s: String(s) });
+            });
+            rows.sort(function(a, b){ return b.y - a.y; });
+            return rows.map(function(r){
+                r.items.sort(function(a, b){ return a.x - b.x; });
+                return r.items.map(function(i){ return i.s; }).join(' ').replace(/\s+/g, ' ').trim();
+            }).join('\n');
         }
         function extractPdfAccount(txt){
             var best = '', re = /(?:a\/?c|acc(?:ount)?)\s*(?:no\b|num(?:ber)?)[\s:.#]*([A-Za-z]{0,5}(?:[0-9\-\u2019'()\uff08\uff09]+ ?)+)/gi, m;
@@ -11827,9 +11939,10 @@
         async function parsePIpdf(u8){
             var lib = await getPdfjs();
             if (!lib) return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie (brak pdf.js)' };
-            var txt = '';
-            try { var doc = await lib.getDocument({ data: u8 }).promise; for (var pg = 1; pg <= doc.numPages; pg++){ var page = await doc.getPage(pg); var tc = await page.getTextContent(); txt += tc.items.map(function(it){ return it.str; }).join(' ') + '\n'; } } catch(e){ return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie' }; }
-            var dep = extractPdfDeposit(txt), acc = extractPdfAccount(txt);
+            var txt = '', lines = '';
+            try { var doc = await lib.getDocument({ data: u8 }).promise; for (var pg = 1; pg <= doc.numPages; pg++){ var page = await doc.getPage(pg); var tc = await page.getTextContent(); txt += tc.items.map(function(it){ return it.str; }).join(' ') + '\n'; lines += pdfLinesFromItems(tc.items) + '\n'; } } catch(e){ return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie' }; }
+            var dep = extractPdfDeposit(lines) || extractPdfDeposit(txt);
+            var acc = extractPdfAccount(lines) || extractPdfAccount(txt);
             return { pct: dep ? dep.pct : null, amount: dep ? dep.amount : null, acc: acc };
         }
         async function parsePI(buf, order){
@@ -11855,11 +11968,14 @@
             base.piSheet = (pi && pi.sheet) ? (pi.sheet + (pi.hidden ? ' [ukryty]' : '')) : '';
             if (pi.manual) return ret({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie' });
             if (pi.err) return ret({ ok: false, msg: pi.err });
+            // Komentarz bez % — do tytulu przelewu bierzemy procent z P/I, a samego % nie porownujemy.
+            if (com.pct == null && pi.pct != null) base.comPct = pi.pct;
             var bad = [], sfx = (pi && pi.hidden) ? ' [tylko ukryty arkusz: ' + pi.sheet + ']' : '';
             if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '≠' + com.amount.toFixed(2));
-            if (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct)) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '≠' + Math.round(com.pct));
+            if (com.pct != null && (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct))) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '≠' + Math.round(com.pct));
             if (!pi.acc || banks.indexOf(pi.acc) === -1) bad.push('konto ' + (pi.acc || '?') + '≠' + (banks.join('/') || '?'));
-            return ret(bad.length ? { ok: false, msg: bad.join('; ') + sfx } : { ok: true, warn: !!sfx, msg: 'zgodne (' + Math.round(com.pct) + '% ' + com.amount.toFixed(2) + ')' + sfx });
+            var pctTxt = (com.pct != null) ? (Math.round(com.pct) + '% ') : (pi.pct != null ? Math.round(pi.pct) + '% (z P/I) ' : '');
+            return ret(bad.length ? { ok: false, msg: bad.join('; ') + sfx } : { ok: true, warn: !!sfx, msg: 'zgodne (' + pctTxt + com.amount.toFixed(2) + ')' + sfx });
         }
         async function runPICheck(status){
             var uniq = [], seen = {}, res = {};
@@ -11875,25 +11991,25 @@
         // BALANCE: komentarze (kontener + kwota) oraz ostatni P/I — tylko numer konta.
         async function checkOneBal(order, doPI){
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
-            if (!h) return { cands: [], pi: { ok: false, msg: 'nie otwarto ordera' }, err: 1 };
-            var cs = pcComments(h), cands = pcBalCands(cs);
-            if (!doPI) return { cands: cands, pi: null };
+            if (!h) return { cands: [], pens: [], pi: { ok: false, msg: 'nie otwarto ordera' }, err: 1 };
+            var cs = pcComments(h), cands = pcBalCands(cs), pens = pcPenComments(cs);
+            if (!doPI) return { cands: cands, pens: pens, pi: null };
             var banks = extractBankAccts(h), piUrl = extractLatestPI(h);
-            if (!piUrl) return { cands: cands, pi: { ok: false, msg: 'brak P/I' } };
+            if (!piUrl) return { cands: cands, pens: pens, pi: { ok: false, msg: 'brak P/I' } };
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
-            if (!buf) return { cands: cands, pi: { ok: false, msg: 'nie pobrano P/I' } };
+            if (!buf) return { cands: cands, pens: pens, pi: { ok: false, msg: 'nie pobrano P/I' } };
             var pi = await parsePI(buf, order);
             var ttl = [];
             if (pi && pi.sheet) ttl.push('Arkusz P/I: ' + pi.sheet + (pi.hidden ? ' [ukryty]' : ''));
             if (banks.length) ttl.push('Konto w systemie: ' + banks.join(' / '));
             if (pi && pi.acc) ttl.push('Konto z P/I: ' + pi.acc);
             var title = ttl.join(' | ');
-            if (pi && pi.manual) return { cands: cands, pi: { ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie', title: title } };
-            if (pi && pi.err) return { cands: cands, pi: { ok: false, msg: pi.err, title: title } };
-            if (!pi || !pi.acc) return { cands: cands, pi: { ok: false, msg: 'brak konta w P/I', title: title } };
-            if (!banks.length) return { cands: cands, pi: { ok: false, warn: true, msg: 'brak konta w systemie (P/I: ' + pi.acc + ')', title: title } };
-            if (banks.indexOf(pi.acc) === -1) return { cands: cands, pi: { ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title } };
-            return { cands: cands, pi: { ok: true, warn: !!(pi && pi.hidden), msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : ''), title: title } };
+            if (pi && pi.manual) return { cands: cands, pens: pens, pi: { ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie', title: title } };
+            if (pi && pi.err) return { cands: cands, pens: pens, pi: { ok: false, msg: pi.err, title: title } };
+            if (!pi || !pi.acc) return { cands: cands, pens: pens, pi: { ok: false, msg: 'brak konta w P/I', title: title } };
+            if (!banks.length) return { cands: cands, pens: pens, pi: { ok: false, warn: true, msg: 'brak konta w systemie (P/I: ' + pi.acc + ')', title: title } };
+            if (banks.indexOf(pi.acc) === -1) return { cands: cands, pens: pens, pi: { ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title } };
+            return { cands: cands, pens: pens, pi: { ok: true, warn: !!(pi && pi.hidden), msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : ''), title: title } };
         }
         async function runBalCheck(status, doPI){
             var uniq = [], seen = {}, res = {}, byOrder = {};
@@ -11909,7 +12025,7 @@
             await runPool(uniq, async function(o){ res[o] = await checkOneBal(o, doPI); done++; prog(); }, 6);
             Object.keys(byOrder).forEach(function(o){
                 var v = res[o]; if (!v) return;
-                var rows = byOrder[o], m = pcMatchBalRows(rows, v.cands);
+                var rows = byOrder[o], m = pcMatchBalRows(rows, v.cands, v.pens);
                 rows.forEach(function(r, i){
                     r.bc = m[i] || null; r.bpi = v.pi || null;
                     if (m[i] && m[i].ok) sum.ok++; else if (m[i] && m[i].warn) sum.warn++; else sum.bad++;
