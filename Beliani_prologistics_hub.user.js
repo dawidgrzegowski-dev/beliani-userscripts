@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.74
+// @version      1.76
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11069,14 +11069,28 @@
             '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Wprowadzanie (balance + depo) <span style="font-weight:400;font-size:11px;opacity:.6">v' + VER + '</span></div><button id="wp-close" class="chn-btn ghost" style="padding:4px 12px">\u2715</button></div>'
           + '<div style="padding:16px;overflow-y:auto">'
           + '<div style="display:flex;gap:10px;flex-wrap:wrap">'
-          + '<div style="flex:1;min-width:300px"><label style="font-weight:600;font-size:12px;color:#750000">BALANCE (wklej z systemu — z linkami):</label><div id="wp-balance" contenteditable="true" style="width:100%;height:140px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff"></div></div>'
-          + '<div style="flex:1;min-width:300px"><label style="font-weight:600;font-size:12px;color:#750000">DEPO (wklej z systemu — z linkami):</label><div id="wp-depo" contenteditable="true" style="width:100%;height:140px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff"></div></div>'
+          + '<div style="flex:1;min-width:300px">'
+          +   '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-height:24px">'
+          +     '<label style="font-weight:600;font-size:12px;color:#750000">BALANCE (wklej z systemu — z linkami):</label>'
+          +   '</div>'
+          +   '<div id="wp-balance" contenteditable="true" style="width:100%;height:140px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff;margin-top:4px"></div>'
+          + '</div>'
+          + '<div style="flex:1;min-width:300px">'
+          +   '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-height:24px">'
+          +     '<label style="font-weight:600;font-size:12px;color:#750000">DEPO (wklej z systemu — z linkami):</label>'
+          +     '<button id="wp-depo-fetch" class="chn-btn ghost" style="padding:2px 8px;font-size:11px" title="Pobiera tabelę zamówień z op_sheet.php (domyślnie: status „in payment”) i wstawia ją tutaj — zamiast ręcznego wklejania. Wynik możesz jeszcze poprawić przed „Przetwórz”.">⬇ Pobierz sam</button>'
+          +     '<button id="wp-depo-cfg" class="chn-btn ghost" style="padding:2px 6px;font-size:11px" title="Pokaż/ukryj adres (filtr), z którego pobieramy DEPO">⚙</button>'
+          +   '</div>'
+          +   '<input type="text" id="wp-depo-url" spellcheck="false" style="display:none;width:100%;font-size:10px;font-family:monospace;padding:3px 5px;margin-top:4px;border:1px solid #FFCCB7;border-radius:6px;box-sizing:border-box" title="Adres op_sheet.php z filtrami. Pusty = adres domyślny. Zapisuje się automatycznie.">'
+          +   '<div id="wp-depo" contenteditable="true" style="width:100%;height:140px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff;margin-top:4px"></div>'
+          + '</div>'
           + '</div>'
           + '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
           + '<button id="wp-go" class="chn-btn red">Przetwórz</button>'
           + '<button id="wp-copy-bal" class="chn-btn ghost">\ud83d\udccb Kopiuj Balance</button>'
           + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
           + '<button id="wp-copy-titles" class="chn-btn ghost">\ud83d\udccb Kopiuj tytuły</button>'
+          + '<button id="wp-pain" class="chn-btn maroon" title="Zbuduj plik przelewow ISO 20022 pain.001.001.09 (Swiss Payment Standards) ze wszystkich platnosci z tabeli \u2014 jedna platnosc na dostawce, waluta USD.">\ud83c\udfe6 pain.001 do banku</button>'
           + '<button id="wp-pc-all" class="chn-btn ghost" title="Zaznacz/odznacz wszystkie w tabeli DEPO">\u2611 Zaznacz wszystkie</button>'
           + '<button id="wp-upload-pc" class="chn-btn maroon" title="Wgraj wybrany plik jako Payment conformation do zaznaczonych zamowien">\u2b06 Wgraj payment confirmation</button>'
           + '<button id="wp-add-comment" class="chn-btn maroon" title="Dodaj komentarz do zaznaczonych zamowien">\ud83d\udcac Dodaj komentarz</button>'
@@ -11085,6 +11099,7 @@
           + '<label style="font-size:11px;color:#666;white-space:nowrap;cursor:pointer" title="Sprawdzaj też ostatni P/I dla wierszy BALANCE — tylko numer konta (bez kwoty i %). Wyłącz, żeby Przetwórz działało szybciej."><input type="checkbox" id="wp-bal-pi" checked> P/I dla balance</label>'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
           + '<div id="wp-out-merged" style="overflow-x:auto;margin-top:14px"></div>'
+          + '<div id="wp-pain-box" style="display:none;margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
           + '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           + '<button id="wp-log" class="chn-btn ghost" title="Zapisuje plik .txt z pelnym przebiegiem: wklejone dane, komentarze z zamowien, odczyty z P/I, werdykty i tytuly przelewow. Mozna go wkleic do rozmowy z Claude.">📄 Zapisz log (txt)</button>'
           + '<button id="wp-log-copy" class="chn-btn ghost" title="To samo co log, ale do schowka">📋 Kopiuj log</button>'
@@ -11174,6 +11189,76 @@
             }
             return { rows: rows, names: names };
         }
+        // ===== DEPO: automatyczne pobranie zamiast wklejania =====
+        // Domyślny filtr = ten, którego używamy do wprowadzania: kontenery w statusie
+        // „in payment” (cont_status=17), bez tych, które już w całości dotarły.
+        var DEPO_URL_DEF = 'https://www.prologistics.info/op_sheet.php?supplier_option=1&supplier%5B%5D=&mode=current&dest_country_code=&search_by_pol_id=&search_by_fob_name=&search_by_container_pol_id=0&cons=&arrival_ware%5B%5D=&arvl_from=&arvl_to=&arvl_till=&shipping_company_id=&shipping_line=&wwo=&sub=0&cont_status=17&cont_statuses_from=&cont_statuses_to=&search_by_added_to_trp=0&eda_from=&eda_to=&ped_from=&ped_to=&ptd_from=&ptd_to=&edd_from=&edd_to=&exclude_allaarived=1&show_changelog=1&show_container_name_length_min=&show_container_name_length_max=&date=&has_container_no=&search_by_incoterms_id=0&search_by_container_tags%5B%5D=0&search_by_container_tags_filter_type=OR&search_by_container_pod_ids%5B%5D=0&search_by_product_managers%5B%5D=&fees%5B0%5D%5Bcompare%5D=&filter=Filter';
+        function depoUrl(){ var v = ''; try { v = String(GM_getValue('chn_depo_url', '') || '').trim(); } catch(e){ v = ''; } return v || DEPO_URL_DEF; }
+        function depoUrlSave(v){ try { GM_setValue('chn_depo_url', String(v || '').trim()); } catch(e){} }
+        // Do Sheets idzie =HYPERLINK(...), więc link musi być pełny, nie względny
+        // (w tabeli systemowej dostawca ma href="op_suppliers.php?...", bez ukośnika).
+        function absUrl(u){
+            u = String(u || ''); if (!u) return '';
+            if (/^https?:\/\//i.test(u)) return u;
+            try { return new URL(u, location.origin + '/').href; } catch(e){ return u.charAt(0) === '/' ? location.origin + u : location.origin + '/' + u; }
+        }
+        // Fetch zawsze na bieżący origin — inaczej „same-origin” nie dołączy ciasteczek
+        // sesji (np. gdy jesteś na prologistics.info bez www, a w adresie jest www).
+        function depoSameOrigin(u){
+            try { var x = new URL(u, location.origin); return /(^|\.)prologistics\.info$/i.test(x.hostname) ? (location.origin + x.pathname + x.search) : x.href; } catch(e){ return u; }
+        }
+        // Zamienia stronę op_sheet.php na wiersze identyczne z ręczną wklejką:
+        // kolumna 1 = nr zamówienia (z linkiem), kolumna 2 = dostawca (z linkiem).
+        // Nazwę dostawcy bierzemy z tekstu SAMEGO linku, nie z całej komórki — w komórce
+        // siedzi jeszcze „Product Manager:” z listą osób, która inaczej wleciałaby do nazwy.
+        // Strona op_sheet.php potrafi ważyć kilka MB (głównie changelog). Parsujemy ją
+        // od miejsca, w którym zaczyna się tabela — reszta i tak nie jest potrzebna,
+        // a parsowanie całości jest kilka razy wolniejsze. Gdyby cięcie zawiodło,
+        // bierzemy całą stronę.
+        function sheetDoc(html){
+            var s = String(html || ''), P = new DOMParser();
+            var i = s.search(/<table[^>]*\bid=["']order-process-table["']/i);
+            if (i > 0) {
+                var d = P.parseFromString(s.slice(i), 'text/html');
+                if (d && (d.querySelector('#order-process-table') || d.querySelector('table.order-process-table'))) return d;
+            }
+            return P.parseFromString(s, 'text/html');
+        }
+        function parseSheetRows(html){
+            var out = { rows: [], skipped: 0, dups: [], total: 0, err: '' }, doc = null;
+            try { doc = sheetDoc(html); } catch(e){ out.err = 'nie udało się odczytać strony: ' + e; return out; }
+            var tbl = doc.querySelector('#order-process-table') || doc.querySelector('table.order-process-table');
+            if (!tbl) { out.err = 'na pobranej stronie nie ma tabeli zamówień (wygasła sesja albo zły adres?)'; return out; }
+            var trs = tbl.querySelectorAll('tr[id^="row_containers_array_"]');
+            if (!trs.length) trs = tbl.querySelectorAll('tbody tr');
+            out.total = trs.length;
+            var seen = {};
+            Array.prototype.forEach.call(trs, function(tr){
+                var ord = '', ordU = '', as = tr.querySelectorAll('a[href]');
+                for (var i = 0; i < as.length; i++){
+                    // tylko „goły” link do zamówienia — w wierszu są też linki
+                    // op_order.php?id=...&filter_container_id=..., które NIE są kolumną Order ID.
+                    var m = (as[i].getAttribute('href') || '').match(/op_order\.php\?id=(\d+)\s*$/i);
+                    if (m) { ord = m[1]; ordU = as[i].getAttribute('href'); break; }
+                }
+                if (!ord) { var cb = tr.querySelector('input[name="group[]"]'); if (cb && /^\d+$/.test(cb.value || '')) { ord = cb.value; ordU = '/op_order.php?id=' + ord; } }
+                var sa = tr.querySelector('a[href*="op_suppliers.php?company_id="]');
+                var sup = sa ? String(sa.textContent || '').replace(/\s+/g, ' ').trim() : '';
+                if (!ord || !sup) { out.skipped++; return; }
+                // Jedno zamówienie może mieć kilka kontenerów = kilka wierszy. Zostawiamy
+                // jeden, żeby kwota nie policzyła się podwójnie; pominięte wypisujemy.
+                if (seen[ord]) { out.dups.push(ord); return; }
+                seen[ord] = 1;
+                out.rows.push({ order: ord, orderUrl: absUrl(ordU), supplier: sup, supplierUrl: absUrl(sa.getAttribute('href') || '') });
+            });
+            return out;
+        }
+        function depoRowsToHtml(rows){
+            var h = '<table><tbody>';
+            rows.forEach(function(r){ h += '<tr><td>' + aLink(r.orderUrl, r.order) + '</td><td>' + aLink(r.supplierUrl, r.supplier) + '</td></tr>'; });
+            return h + '</tbody></table>';
+        }
+
         function matchName(supNorm, depoNames){
             for (var i = 0; i < depoNames.length; i++){ var d = depoNames[i]; if (!d) continue; if (supNorm === d) return true; var sh = supNorm.length <= d.length ? supNorm : d, lo = supNorm.length <= d.length ? d : supNorm; if (sh.length >= 8 && lo.indexOf(sh) === 0) return true; }
             return false;
@@ -11246,7 +11331,7 @@
         async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return h ? parsePenalties(h, PENALTY_DAYS) : []; }
         async function runPool(items, worker, workers){ var idx = 0, N = items.length, WORKERS = workers || 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
 
-        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {}, pcAccEdit: {}, diag: { bal: {}, dep: {}, raw: { bal: '', dep: '' }, started: '', log: [] } };
+        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {}, pcAccEdit: {}, depoSrc: '', diag: { bal: {}, dep: {}, raw: { bal: '', dep: '', depSrc: '' }, started: '', log: [] } };
         // Slad przebiegu do pliku log — zapisujemy wszystko, co pozwala odtworzyc decyzje skryptu.
         function dlog(msg){ try { state.diag.log.push(pcNow() + '  ' + String(msg)); } catch(e){} }
         function groupRows(rows){
@@ -11430,6 +11515,7 @@
             sect('1. WKLEJONE DANE — BALANCE (surowe)', function(){
             L.push((D.raw && D.raw.bal) ? D.raw.bal : '(puste)'); });
             sect('2. WKLEJONE DANE — DEPO (surowe)', function(){
+            L.push('Źródło: ' + ((D.raw && D.raw.depSrc) ? D.raw.depSrc : 'wklejone ręcznie'));
             L.push((D.raw && D.raw.dep) ? D.raw.dep : '(puste)'); });
 
             sect('3. BALANCE — wiersze i wynik sprawdzenia', function(){
@@ -11628,6 +11714,379 @@
             out.sort(function(a, b){ return String(a.sup).toLowerCase().localeCompare(String(b.sup).toLowerCase()); });
             return out;
         }
+        // ===== ISO 20022 pain.001.001.09 (Swiss Payment Standards) =====
+        // Jedna paczka = GrpHdr + JEDEN blok PmtInf (wszystko w USD, przelew zagraniczny SWIFT).
+        // Jedna transakcja na dostawce: kwota = suma depo + balance z tabeli scalonej,
+        // tytul ten sam, ktory panel juz generuje (pcTitleFor).
+        // Dane beneficjenta (nazwa, konto, BIC, adres) pochodza z bloku "Bank information"
+        // w pliku P/I - w ERP ich nie ma. Od 14.11.2026 SPS nie przyjmuje adresu czysto
+        // nieustrukturyzowanego: TwnNm i Ctry sa obowiazkowe (stad piBankGeo).
+        var PAIN_NS = 'urn:iso:std:iso:20022:tech:xsd:pain.001.001.09';
+        var PAIN_CCY = 'USD';
+        var PAIN_CFG_KEY = 'chn_pain_dbtr';
+        var PAIN_TITLE_MAX = 140;
+        // Transliteracja: znaki spoza ASCII, ktore maja sensowny odpowiednik lacinski.
+        // Umlauty po niemiecku/szwajcarsku (AE/OE/UE) - tak robia banki w CH.
+        var PAIN_DIA = {
+            'À':'A','Á':'A','Â':'A','Ã':'A','Ä':'AE','Å':'A','Ą':'A','Æ':'AE',
+            'Ç':'C','Ć':'C','Č':'C','È':'E','É':'E','Ê':'E','Ë':'E','Ę':'E','Ě':'E',
+            'Ì':'I','Í':'I','Î':'I','Ï':'I','Ł':'L','Ñ':'N','Ń':'N','Ň':'N',
+            'Ò':'O','Ó':'O','Ô':'O','Õ':'O','Ö':'OE','Ø':'O','Ř':'R',
+            'Ś':'S','Š':'S','Ş':'S','Ť':'T','Ù':'U','Ú':'U','Û':'U','Ü':'UE','Ů':'U',
+            'Ý':'Y','Ÿ':'Y','Ź':'Z','Ż':'Z','Ž':'Z','Þ':'TH','Ð':'D','ß':'ss',
+            'à':'a','á':'a','â':'a','ã':'a','ä':'ae','å':'a','ą':'a','æ':'ae',
+            'ç':'c','ć':'c','č':'c','è':'e','é':'e','ê':'e','ë':'e','ę':'e','ě':'e',
+            'ì':'i','í':'i','î':'i','ï':'i','ł':'l','ñ':'n','ń':'n','ň':'n',
+            'ò':'o','ó':'o','ô':'o','õ':'o','ö':'oe','ø':'o','ř':'r',
+            'ś':'s','š':'s','ş':'s','ť':'t','ù':'u','ú':'u','û':'u','ü':'ue','ů':'u',
+            'ý':'y','ÿ':'y','ź':'z','ż':'z','ž':'z','þ':'th','ð':'d',
+            '–':'-','—':'-','‘':"'",'’':"'",'‚':"'",'“':'"','”':'"','„':'"',
+            '…':'...',' ':' ','·':'.','×':'x','№':'No','º':'.','°':' '
+        };
+        // Waski zestaw SWIFT-x: litery, cyfry i  . , : ' + - / ( ) ? spacja.
+        var PAIN_SWIFT_OK = /[A-Za-z0-9.,:'+\-\/() ?]/;
+        // Zamienniki uzywane TYLKO w trybie scislym (reszta -> spacja).
+        var PAIN_MAP = { '&':'+', '%':' pct', '@':'(at)', '"':"'", '#':'No.', '*':'-', ';':',', '_':'-', '[':'(', ']':')', '{':'(', '}':')', '|':'/', '\\':'/', '=':'-', '!':'.', '$':'USD', '~':'-', '^':'-', '`':"'", '<':'(', '>':')' };
+
+        function painDia(ch){ return Object.prototype.hasOwnProperty.call(PAIN_DIA, ch) ? PAIN_DIA[ch] : null; }
+        // Zwraca oczyszczony tekst + liste znakow, ktore zostaly zamienione lub usuniete.
+        function painChars(s, strict){
+            var t = String(s == null ? '' : s), out = '', bad = [], seen = {};
+            function flag(ch){ if (!seen[ch]) { seen[ch] = 1; bad.push(ch); } }
+            for (var i = 0; i < t.length; i++){
+                var ch = t.charAt(i), c = t.charCodeAt(i);
+                if (c === 9 || c === 10 || c === 13) { out += ' '; continue; }
+                if (c < 32) { flag(ch); continue; }
+                if (c > 126){
+                    var tr = painDia(ch);
+                    if (tr != null) { out += tr; continue; }
+                    flag(ch); continue;                       // CJK, emoji itp. - wypada
+                }
+                if (!strict || PAIN_SWIFT_OK.test(ch)) { out += ch; continue; }
+                flag(ch);
+                out += (Object.prototype.hasOwnProperty.call(PAIN_MAP, ch) ? PAIN_MAP[ch] : ' ');
+            }
+            return { txt: out.replace(/\s+/g, ' ').trim(), bad: bad };
+        }
+        function painTxt(s, max, strict){
+            var t = painChars(s, strict).txt;
+            if (max && t.length > max) t = t.slice(0, max).replace(/[\s,;.\-]+$/, '').trim();
+            return t;
+        }
+        function painEsc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); }
+        function painNorm(s){ return String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+        // Kwoty licz w groszach - suma kontrolna musi sie zgadzac co do centa.
+        function painCents(n){ var v = Number(n); return isFinite(v) ? Math.round(v * 100) : 0; }
+        function painAmt(cents){ return (cents / 100).toFixed(2); }
+        function painPad(n, w){ var s = String(n); while (s.length < w) s = '0' + s; return s; }
+        function painDt(d){ return d.getFullYear() + '-' + painPad(d.getMonth() + 1, 2) + '-' + painPad(d.getDate(), 2); }
+        function painDtTm(d){ return painDt(d) + 'T' + painPad(d.getHours(), 2) + ':' + painPad(d.getMinutes(), 2) + ':' + painPad(d.getSeconds(), 2); }
+        function painNextBizDay(d){ var x = new Date(d.getTime()); do { x.setDate(x.getDate() + 1); } while (x.getDay() === 0 || x.getDay() === 6); return x; }
+        function painIbanOk(s){
+            var v = painNorm(s);
+            if (!/^[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}$/.test(v)) return false;
+            var r = v.slice(4) + v.slice(0, 4), n = '';
+            for (var i = 0; i < r.length; i++){ var c = r.charCodeAt(i); n += (c >= 65 && c <= 90) ? String(c - 55) : r.charAt(i); }
+            var rem = 0;
+            for (var j = 0; j < n.length; j++) rem = (rem * 10 + (n.charCodeAt(j) - 48)) % 97;
+            return rem === 1;
+        }
+        function painBicOk(s){ return /^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(painNorm(s)); }
+        // Adres hybrydowy: TwnNm i Ctry osobno, cala reszta w max 2 x 70 znakow AdrLine.
+        function painSplitAddr(addr, strict){
+            var t = painTxt(pbStripCtry(addr), 0, strict);
+            if (!t) return [];
+            if (t.length <= 70) return [t];
+            var cut = -1, i;
+            for (i = 70; i > 30; i--){ if (t.charAt(i) === ',') { cut = i; break; } }   // najpierw przecinek
+            if (cut < 0) for (i = 70; i > 30; i--){ if (t.charAt(i) === ' ') { cut = i; break; } }
+            if (cut < 0) cut = 70;
+            var a = t.slice(0, cut).replace(/[\s,]+$/, ''), b = t.slice(cut).replace(/^[\s,]+/, '');
+            if (b.length > 70) b = b.slice(0, 70).replace(/[\s,]+$/, '');
+            return b ? [a, b] : [a];
+        }
+        function painDbtrLines(cfg, strict){
+            var out = [], s = painTxt(cfg.str, 70, strict);
+            if (s) out.push(s);
+            var pc = painTxt(cfg.pstCd, 16, strict), tw = painTxt(cfg.town, 35, strict);
+            if (pc && tw) out.push(painTxt(pc + ' ' + tw, 70, strict));
+            return out;
+        }
+        // Blok bankowy grupy: zbieramy z P/I depo (r.pi.piBank) i z P/I balance (r.bpi.bank).
+        // Gdy P/I wskazuja rozne konta - nie zgadujemy, tylko oznaczamy konflikt.
+        function painBankOfG(G){
+            var list = [], seen = {};
+            function add(b){
+                if (!b || !b.ok) return;
+                var k = painNorm(b.acc) + '|' + painNorm(b.swift);
+                if (seen[k]) return;
+                seen[k] = 1; list.push(b);
+            }
+            (G.dep || []).forEach(function(r){ add(r.pi && r.pi.piBank); });
+            (G.bal || []).forEach(function(r){ add(r.bpi && r.bpi.bank); });
+            return { bank: list[0] || null, n: list.length, conflict: list.length > 1 };
+        }
+        // "Zielony" = wszystko sprawdzone. Ostrzezenie (zolte) tez NIE jest zielone.
+        function painGroupOk(G){
+            var why = [];
+            (G.dep || []).forEach(function(r){
+                if (!r.pi) { why.push('depo ' + r.order + ': nie sprawdzone'); return; }
+                if (!r.pi.ok || r.pi.warn) why.push('depo ' + r.order + ': ' + (r.pi.msg || 'nie OK'));
+                else if (!r.pi.depOk) why.push('depo ' + r.order + ': brak potwierdzenia „ok”');
+            });
+            (G.bal || []).forEach(function(r){
+                if (!r.bc) { why.push('balance ' + r.order + ': nie sprawdzone'); return; }
+                if (!r.bc.ok) why.push('balance ' + r.order + ': ' + (r.bc.msg || 'nie OK'));
+                if (r.bpi && !r.bpi.ok) why.push('balance ' + r.order + ' P/I: ' + (r.bpi.msg || 'nie OK'));
+            });
+            return { ok: why.length === 0, why: why };
+        }
+        function painFirstOrder(G){
+            var o = '';
+            (G.dep || []).concat(G.bal || []).some(function(r){ var v = String(r.order || '').trim(); if (/^\d+$/.test(v)) { o = v; return true; } return false; });
+            return o;
+        }
+        // Jeden wiersz = jeden przelew (jeden dostawca). Poprawki reczne trzymamy w state.painEdit[key].
+        function painRows(){
+            var MG = pcMergedGroups(), all = MG.combined.concat(MG.depoOnly).concat(MG.balOnly), out = [];
+            all.forEach(function(G, i){
+                var ds = pcSumRows(G.dep), bs = pcBalSum(G.bal);
+                var bk = painBankOfG(G), b = bk.bank || {}, geo = piBankGeo(b), st = painGroupOk(G);
+                var ed = (state.painEdit && state.painEdit[G.key]) || {};
+                function V(k, d){ return (ed[k] != null && String(ed[k]) !== '') ? ed[k] : d; }
+                var amtBase = (ds || 0) + (bs || 0);
+                var amt = (ed.amount != null && ed.amount !== '' && isFinite(Number(ed.amount))) ? Number(ed.amount) : amtBase;
+                out.push({
+                    key: G.key, gi: i, sup: G.sup,
+                    amount: amt, amountBase: amtBase, amountEdited: amt !== amtBase,
+                    title: String(V('title', pcTitleFor(G)) || ''),
+                    name: String(V('name', b.name || '')),
+                    acc: String(V('acc', b.acc || '')),
+                    bic: painNorm(V('bic', b.swift || '')),
+                    town: String(V('town', geo.town || '')),
+                    ctry: String(V('ctry', geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2),
+                    addr: String(V('addr', b.addr || '')),
+                    bankName: b.bankName || '', bankAddr: b.bankAddr || '',
+                    geoSrc: geo.src || '', geoWeak: !!(geo.weak && geo.ctry),
+                    hasBank: bk.n > 0, conflict: bk.conflict, nBank: bk.n,
+                    verified: st.ok, why: st.why,
+                    nDep: (G.dep || []).length, nBal: (G.bal || []).length,
+                    e2e: painFirstOrder(G)
+                });
+            });
+            return out;
+        }
+        function painValidate(cfg, rows, strict){
+            var errs = [], warns = [];
+            if (!painTxt(cfg.nm, 140, strict)) errs.push('Zleceniodawca: brak nazwy.');
+            if (!painIbanOk(cfg.iban)) errs.push('Zleceniodawca: IBAN niepoprawny (suma kontrolna mod-97).');
+            if (!painBicOk(cfg.bic)) errs.push('Zleceniodawca: BIC/SWIFT niepoprawny (8 lub 11 znaków).');
+            if (!painTxt(cfg.town, 35, strict)) errs.push('Zleceniodawca: brak miasta — TwnNm jest obowiązkowe.');
+            if (!/^[A-Z]{2}$/.test(String(cfg.ctry || '').toUpperCase())) errs.push('Zleceniodawca: brak kraju (2 litery, np. CH).');
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(String(cfg.exec || ''))) errs.push('Data wykonania: wymagany format RRRR-MM-DD.');
+            if (!rows.length) errs.push('Nie zaznaczono żadnej płatności.');
+            var e2e = {};
+            rows.forEach(function(r){
+                var p = '„' + r.sup + '”: ';
+                if (!(r.amount > 0)) errs.push(p + 'kwota musi być większa od zera.');
+                if (!r.hasBank) errs.push(p + 'brak bloku bankowego w P/I — uzupełnij dane ręcznie.');
+                if (!painTxt(r.name, 140, strict)) errs.push(p + 'brak nazwy beneficjenta.');
+                if (!painNorm(r.acc)) errs.push(p + 'brak numeru konta beneficjenta.');
+                if (!painBicOk(r.bic)) errs.push(p + 'BIC „' + r.bic + '” niepoprawny.');
+                if (!painTxt(r.town, 35, strict)) errs.push(p + 'brak miasta beneficjenta — TwnNm obowiązkowe od 14.11.2026.');
+                if (!/^[A-Z]{2}$/.test(r.ctry)) errs.push(p + 'brak kraju beneficjenta — Ctry obowiązkowe od 14.11.2026.');
+                var t = painChars(r.title, strict);
+                if (!t.txt) errs.push(p + 'pusty tytuł przelewu.');
+                if (t.txt.length > PAIN_TITLE_MAX) warns.push(p + 'tytuł ma ' + t.txt.length + ' znaków — zostanie przycięty do ' + PAIN_TITLE_MAX + '.');
+                if (t.bad.length) warns.push(p + 'w tytule zamieniono/usunięto znaki: ' + t.bad.join(' '));
+                var n = painChars(r.name, strict);
+                if (n.bad.length) warns.push(p + 'w nazwie beneficjenta zamieniono/usunięto znaki: ' + n.bad.join(' '));
+                if (!r.verified) warns.push(p + 'nie wszystko sprawdzone — ' + (r.why[0] || '') + (r.why.length > 1 ? (' (+' + (r.why.length - 1) + ')') : ''));
+                if (r.geoWeak) warns.push(p + 'kraj ustalony ' + (r.geoSrc === 'bic' ? 'z BIC banku — bank bywa w innym kraju niż firma, sprawdź' : 'z nazwy firmy — sprawdź') + '.');
+                if (r.conflict) warns.push(p + 'P/I wskazują ' + r.nBank + ' różne konta beneficjenta — użyto pierwszego.');
+                if (r.amountEdited) warns.push(p + 'kwota zmieniona ręcznie: ' + r.amountBase.toFixed(2) + ' → ' + r.amount.toFixed(2) + '.');
+                if (/^[A-Z]{2}\d{2}/.test(painNorm(r.acc)) && !painIbanOk(r.acc)) warns.push(p + 'konto wygląda jak IBAN, ale suma kontrolna się nie zgadza — wysyłamy jako „Othr”.');
+                var id = painE2E(r);
+                if (e2e[id]) errs.push(p + 'zduplikowany EndToEndId „' + id + '”.');
+                e2e[id] = 1;
+            });
+            return { errs: errs, warns: warns };
+        }
+        function painE2E(r){ return (('BEL-' + (r.e2e || 'X') + '-' + (r.gi + 1)).slice(0, 35)); }
+        function painBuild(cfg, rows, strict, now){
+            var L = [], d = 0;
+            function sp(){ var s = ''; for (var i = 0; i < d; i++) s += '  '; return s; }
+            function o(t, a){ L.push(sp() + '<' + t + (a || '') + '>'); d++; }
+            function c(t){ d--; L.push(sp() + '</' + t + '>'); }
+            function e(t, v, a){ L.push(sp() + '<' + t + (a || '') + '>' + painEsc(v) + '</' + t + '>'); }
+            function pstlAdr(town, ctry, lines){
+                o('PstlAdr');
+                if (town) e('TwnNm', town);
+                if (ctry) e('Ctry', ctry);
+                (lines || []).forEach(function(x){ if (x) e('AdrLine', x); });
+                c('PstlAdr');
+            }
+            now = now || new Date();
+            var stamp = painDt(now).replace(/-/g, '') + painPad(now.getHours(), 2) + painPad(now.getMinutes(), 2) + painPad(now.getSeconds(), 2);
+            var cents = 0;
+            rows.forEach(function(r){ cents += painCents(r.amount); });
+            var ctrl = painAmt(cents), dbtrNm = painTxt(cfg.nm, 140, strict), dbtrCtry = String(cfg.ctry || '').toUpperCase();
+
+            L.push('<?xml version="1.0" encoding="UTF-8"?>');
+            o('Document', ' xmlns="' + PAIN_NS + '" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"');
+            o('CstmrCdtTrfInitn');
+
+            o('GrpHdr');
+            e('MsgId', ('BEL' + stamp).slice(0, 35));
+            e('CreDtTm', painDtTm(now));
+            e('NbOfTxs', String(rows.length));
+            e('CtrlSum', ctrl);
+            o('InitgPty'); e('Nm', dbtrNm); c('InitgPty');
+            c('GrpHdr');
+
+            o('PmtInf');
+            e('PmtInfId', ('PMT' + stamp).slice(0, 35));
+            e('PmtMtd', 'TRF');
+            e('BtchBookg', cfg.batch === false ? 'false' : 'true');
+            e('NbOfTxs', String(rows.length));
+            e('CtrlSum', ctrl);
+            o('ReqdExctnDt'); e('Dt', cfg.exec); c('ReqdExctnDt');
+            o('Dbtr');
+            e('Nm', dbtrNm);
+            pstlAdr(painTxt(cfg.town, 35, strict), dbtrCtry, painDbtrLines(cfg, strict));
+            c('Dbtr');
+            o('DbtrAcct'); o('Id'); e('IBAN', painNorm(cfg.iban)); c('Id'); c('DbtrAcct');
+            o('DbtrAgt'); o('FinInstnId'); e('BICFI', painNorm(cfg.bic)); c('FinInstnId'); c('DbtrAgt');
+            e('ChrgBr', cfg.chrgBr || 'SHAR');
+
+            rows.forEach(function(r){
+                o('CdtTrfTxInf');
+                o('PmtId'); e('EndToEndId', painE2E(r)); c('PmtId');
+                o('Amt'); e('InstdAmt', painAmt(painCents(r.amount)), ' Ccy="' + PAIN_CCY + '"'); c('Amt');
+                o('CdtrAgt'); o('FinInstnId'); e('BICFI', painNorm(r.bic)); c('FinInstnId'); c('CdtrAgt');
+                o('Cdtr');
+                e('Nm', painTxt(r.name, 140, strict));
+                pstlAdr(painTxt(r.town, 35, strict), r.ctry, painSplitAddr(r.addr, strict));
+                c('Cdtr');
+                o('CdtrAcct'); o('Id');
+                if (painIbanOk(r.acc)) e('IBAN', painNorm(r.acc));
+                else { o('Othr'); e('Id', painNorm(r.acc).slice(0, 34)); c('Othr'); }
+                c('Id'); c('CdtrAcct');
+                o('RmtInf'); e('Ustrd', painTxt(r.title, PAIN_TITLE_MAX, strict)); c('RmtInf');
+                c('CdtTrfTxInf');
+            });
+
+            c('PmtInf');
+            c('CstmrCdtTrfInitn');
+            c('Document');
+            return L.join('\n') + '\n';
+        }
+        function painCfg(){
+            if (state._painCfg) return state._painCfg;
+            var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, exec: '' };
+            try { var raw = GM_getValue(PAIN_CFG_KEY, ''); if (raw) { var o = JSON.parse(raw); for (var k in o) if (o[k] != null) d[k] = o[k]; } } catch(e){}
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(d.exec) || d.exec < painDt(new Date())) d.exec = painDt(painNextBizDay(new Date()));
+            state._painCfg = d;
+            return d;
+        }
+        function painCfgSave(){ try { GM_setValue(PAIN_CFG_KEY, JSON.stringify(state._painCfg || {})); } catch(e){} }
+        function painSave(txt, name){
+            try {
+                var blob = new Blob([txt], { type: 'application/xml;charset=utf-8' });
+                var url = URL.createObjectURL(blob), a = document.createElement('a');
+                a.href = url; a.download = name; a.style.display = 'none';
+                document.body.appendChild(a); a.click();
+                setTimeout(function(){ try { document.body.removeChild(a); URL.revokeObjectURL(url); } catch(e){} }, 1000);
+                return { name: name, size: txt.length };
+            } catch(e){ return null; }
+        }
+        function painSelected(rows){ return rows.filter(function(r){ return !!(state.painSel || {})[r.key]; }); }
+        function painInp(k, key, val, w, ph, cls){
+            return '<input type="text" class="pain-ed ' + (cls || '') + '" data-key="' + pcAttr(key) + '" data-k="' + k + '" value="' + pcAttr(val == null ? '' : String(val)) + '"'
+                 + (ph ? ' placeholder="' + pcAttr(ph) + '"' : '') + ' style="width:' + w + 'px;font-size:11px;padding:1px 3px;border:1px solid #ddd;border-radius:3px">';
+        }
+        function painCfgInp(k, val, w, ph){
+            return '<input type="text" class="pain-cfg" data-k="' + k + '" value="' + pcAttr(val == null ? '' : String(val)) + '"'
+                 + (ph ? ' placeholder="' + pcAttr(ph) + '"' : '') + ' style="width:' + w + 'px;font-size:11px;padding:2px 4px;border:1px solid #FFCCB7;border-radius:4px">';
+        }
+        function painCfgFld(lbl, k, val, w, ph){
+            return '<label style="display:inline-flex;flex-direction:column;gap:1px;font-size:10px;color:#666">' + esc(lbl) + painCfgInp(k, val, w, ph) + '</label>';
+        }
+        function renderPain(){
+            var box = wp.querySelector('#wp-pain-box'); if (!box || box.style.display === 'none') return;
+            var cfg = painCfg(), strict = !!cfg.strict, rows = painRows();
+            if (!state.painSel) state.painSel = {};
+            rows.forEach(function(r){ if (state.painSel[r.key] === undefined) state.painSel[r.key] = !!(r.verified && r.hasBank && r.name && r.acc && painBicOk(r.bic) && r.town && r.ctry && r.amount > 0); });
+            var sel = painSelected(rows), v = painValidate(cfg, sel, strict);
+            var cents = 0; sel.forEach(function(r){ cents += painCents(r.amount); });
+
+            var h = '<div style="font-weight:700;color:#750000;font-size:12px;margin-bottom:6px">Plik do banku — ISO 20022 pain.001.001.09 (Swiss Payment Standards), waluta ' + PAIN_CCY + ', jedna płatność na dostawcę</div>';
+            h += '<div style="background:#F6E7E6;border:1px solid #FFCCB7;border-radius:6px;padding:7px 9px;margin-bottom:8px">'
+               + '<div style="font-size:11px;font-weight:700;color:#750000;margin-bottom:4px">Zleceniodawca (dane Twojego konta — zapisują się lokalnie w przeglądarce)</div>'
+               + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">'
+               + painCfgFld('Nazwa', 'nm', cfg.nm, 230, 'Beliani ... GmbH')
+               + painCfgFld('IBAN', 'iban', cfg.iban, 210, 'CH.. .... .... .... .')
+               + painCfgFld('BIC/SWIFT', 'bic', cfg.bic, 100, 'UBSWCHZH80A')
+               + painCfgFld('Ulica i nr', 'str', cfg.str, 180)
+               + painCfgFld('Kod poczt.', 'pstCd', cfg.pstCd, 70)
+               + painCfgFld('Miasto', 'town', cfg.town, 120)
+               + painCfgFld('Kraj', 'ctry', cfg.ctry, 40, 'CH')
+               + painCfgFld('Data wykonania', 'exec', cfg.exec, 100, 'RRRR-MM-DD')
+               + '<label style="display:inline-flex;flex-direction:column;gap:1px;font-size:10px;color:#666">Koszty (ChrgBr)'
+               + '<select class="pain-cfg" data-k="chrgBr" style="font-size:11px;padding:2px 4px;border:1px solid #FFCCB7;border-radius:4px">'
+               + ['SHAR', 'DEBT', 'CRED', 'SLEV'].map(function(x){ return '<option value="' + x + '"' + (cfg.chrgBr === x ? ' selected' : '') + '>' + x + '</option>'; }).join('')
+               + '</select></label>'
+               + '<label style="font-size:11px;color:#555;cursor:pointer" title="BtchBookg=true: bank księguje paczkę jedną zbiorczą pozycją na wyciągu."><input type="checkbox" class="pain-cfgb" data-k="batch"' + (cfg.batch === false ? '' : ' checked') + '> księgowanie zbiorcze</label>'
+               + '<label style="font-size:11px;color:#555;cursor:pointer" title="Domyślnie WYŁĄCZONE — Swiss Payment Standards 2025 (pkt 3.1) dopuszcza cały Basic Latin, więc „%” i „&” są legalne. Włącz tylko, jeśli bank odrzuci plik z powodu znaków: tekst zostanie ograniczony do zestawu SWIFT (a-z A-Z 0-9 . , : ’ + - / ( ) ?), „%” → „pct”, „&” → „+”."><input type="checkbox" class="pain-cfgb" data-k="strict"' + (cfg.strict ? ' checked' : '') + '> ścisły zestaw znaków</label>'
+               + '</div></div>';
+
+            h += '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;width:100%">';
+            h += '<tr style="color:#999;font-size:10px"><td style="padding:1px 4px"></td><td style="padding:1px 4px">Dostawca</td><td style="padding:1px 4px;text-align:right">Kwota ' + PAIN_CCY + '</td><td style="padding:1px 4px">Beneficjent (Nm)</td><td style="padding:1px 4px">Konto</td><td style="padding:1px 4px">BIC</td><td style="padding:1px 4px">Miasto</td><td style="padding:1px 4px">Kraj</td><td style="padding:1px 4px">Status</td></tr>';
+            if (!rows.length) h += '<tr><td colspan="9" style="padding:8px;color:#888">Brak danych — kliknij najpierw „Przetwórz”.</td></tr>';
+            rows.forEach(function(r){
+                var on = !!state.painSel[r.key];
+                var bg = on ? (r.verified ? '#EAF7EA' : '#FFF6E0') : '#fff';
+                var st = r.verified
+                    ? '<span style="color:#0a0;font-weight:700">✓ sprawdzone</span>'
+                    : '<span style="color:#c47f00;font-weight:700" title="' + pcAttr(r.why.join('\n')) + '">⚠ ' + esc(r.why.length) + ' uwag</span>';
+                if (!r.hasBank) st = '<span style="color:#c00;font-weight:700">✗ brak danych bankowych w P/I</span>';
+                else if (r.conflict) st += ' <span style="color:#c00;font-weight:700" title="P/I wskazują różne konta">✗ konflikt kont</span>';
+                if (r.geoWeak) st += ' <span style="color:#c47f00" title="Kraj wyprowadzony ' + (r.geoSrc === 'bic' ? 'z BIC banku' : 'z nazwy firmy') + ', nie z adresu">(kraj: ' + esc(r.geoSrc) + ')</span>';
+                var tl = painChars(r.title, strict).txt.length;
+                h += '<tr style="background:' + bg + '">'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top"><input type="checkbox" class="pain-chk" data-key="' + pcAttr(r.key) + '"' + (on ? ' checked' : '') + '></td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top;max-width:170px">' + esc(r.sup) + '<div style="font-size:10px;color:#888">D' + r.nDep + ' / B' + r.nBal + '</div></td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;text-align:right;vertical-align:top">' + painInp('amount', r.key, r.amount.toFixed(2), 78) + (r.amountEdited ? '<div style="font-size:10px;color:#0a58ca">było ' + r.amountBase.toFixed(2) + '</div>' : '') + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('name', r.key, r.name, 210) + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('acc', r.key, r.acc, 165) + (painIbanOk(r.acc) ? '<div style="font-size:10px;color:#0a0">IBAN ✓</div>' : '') + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('bic', r.key, r.bic, 95) + (r.bic && !painBicOk(r.bic) ? '<div style="font-size:10px;color:#c00">zły BIC</div>' : '') + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('town', r.key, r.town, 105) + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('ctry', r.key, r.ctry, 34) + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top;font-size:10px">' + st + '</td>'
+                   + '</tr>';
+                h += '<tr style="background:' + bg + '"><td></td><td colspan="8" style="padding:0 4px 4px 4px">'
+                   + '<span style="font-size:10px;color:#888">Adres</span> ' + painInp('addr', r.key, r.addr, 330, 'ulica, miasto')
+                   + ' <span style="font-size:10px;color:#888">Tytuł</span> ' + painInp('title', r.key, r.title, 430)
+                   + ' <span style="font-size:10px;color:' + (tl > PAIN_TITLE_MAX ? '#c00;font-weight:700' : '#888') + '">(' + tl + '/' + PAIN_TITLE_MAX + ')</span>'
+                   + (r.bankName ? ' <span style="font-size:10px;color:#888" title="' + pcAttr(r.bankName + (r.bankAddr ? ' — ' + r.bankAddr : '')) + '">bank: ' + esc(painTxt(r.bankName, 46, false)) + '</span>' : '')
+                   + '</td></tr>';
+            });
+            h += '<tr style="background:#332524;color:#fff;font-weight:700"><td colspan="2" style="padding:4px 6px">Zaznaczone: ' + sel.length + ' z ' + rows.length + '</td><td style="padding:4px 6px;text-align:right">' + painAmt(cents) + '</td><td colspan="6" style="padding:4px 6px;font-weight:400">' + PAIN_CCY + ' — CtrlSum w pliku</td></tr>';
+            h += '</table></div>';
+
+            if (v.errs.length) h += '<div style="margin-top:8px;background:#FDECEC;border:1px solid #f5b5b5;border-radius:6px;padding:6px 9px;font-size:11px;color:#8a1010"><b>Błędy (' + v.errs.length + ') — plik nie zostanie wygenerowany:</b><br>' + v.errs.map(esc).join('<br>') + '</div>';
+            if (v.warns.length) h += '<div style="margin-top:8px;background:#FFF6E0;border:1px solid #f0d59a;border-radius:6px;padding:6px 9px;font-size:11px;color:#7a5300"><b>Ostrzeżenia (' + v.warns.length + ') — sprawdź przed wysłaniem:</b><br>' + v.warns.map(esc).join('<br>') + '</div>';
+            if (!v.errs.length && !v.warns.length && sel.length) h += '<div style="margin-top:8px;background:#EAF7EA;border:1px solid #a8d8a8;border-radius:6px;padding:6px 9px;font-size:11px;color:#0a5a0a"><b>Wszystko się zgadza.</b> ' + sel.length + ' przelewów na ' + painAmt(cents) + ' ' + PAIN_CCY + '.</div>';
+
+            h += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+               + '<button id="pain-dl" class="chn-btn ' + (v.errs.length ? 'ghost' : 'red') + '"' + (v.errs.length ? ' disabled title="Najpierw popraw błędy"' : ' title="Zapisz plik XML do wczytania w banku"') + '>⬇ Pobierz pain.001 (XML)</button>'
+               + '<button id="pain-copy" class="chn-btn ghost" title="Skopiuj XML do schowka">📋 Kopiuj XML</button>'
+               + '<button id="pain-all" class="chn-btn ghost">☑ Zaznacz / odznacz wszystkie</button>'
+               + '<button id="pain-onlyok" class="chn-btn ghost" title="Zostaw zaznaczone tylko wiersze w pełni sprawdzone">✓ Tylko sprawdzone</button>'
+               + '<button id="pain-reset" class="chn-btn ghost" title="Cofnij ręczne poprawki w tabeli">↺ Cofnij poprawki</button>'
+               + '<span id="pain-status" style="font-size:11px;color:#666"></span></div>';
+            box.innerHTML = h;
+        }
         function pcInfoG(G){ return G && G.cid ? (_info[G.cid] || '') : ''; }
         function pcHasInfoG(G){ var t = pcInfoG(G); return !!(t && t.replace(/\s|&nbsp;/gi, '').length); }
         function pcChkHtml(r, gi){ return /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz do payment confirmation / komentarza"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : ''; }
@@ -11710,7 +12169,7 @@
             if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
             el.innerHTML = html + '</table>';
         }
-        function renderTables(){ renderMerged(); }
+        function renderTables(){ renderMerged(); renderPain(); }
         async function resolveAccounts(status){
             var depoAcc = {}, total = state.dep.order.length + state.bal.order.length, done = 0;
             function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
@@ -12010,6 +12469,123 @@
             var letters = (s.replace(/\(?\s*usd\s*\)?|\uff08\s*usd\s*\uff09/ig, '').match(/[A-Za-z]/g) || []).length;
             return letters <= 4;
         }
+        // --- blok bankowy z P/I (dane beneficjenta do pain.001) ---
+        // Etykiety w plikach dostawcow sa niekonsekwentne: literowka "BANEFICIARY",
+        // raz "SWIFT NO. :" a raz "BENEFICIARY'S SWIFT NO.:", kolumna etykiety to A albo B.
+        // Dlatego normalizujemy tekst i szukamy wartosci "pierwsza niepusta komorka w prawo".
+        function piBankNorm(x){
+            var t = String(x == null ? '' : x).toUpperCase().replace(/[^A-Z0-9]+/g, ' ');
+            return t.replace(/\bS\b/g, ' ').replace(/\s+/g, ' ').trim();
+        }
+        function piBankKey(x){
+            var t = piBankNorm(x);
+            if (!t || t.length > 60) return '';
+            var B = '(?:BENEFICIARY|BANEFICIARY|BENIFICIARY|BENEFICARY|BENFICIARY|BENEFICIERY)';
+            if (new RegExp('^' + B + ' BANK NAME$').test(t)) return 'bankName';
+            if (new RegExp('^' + B + ' BANK (?:ADDRESS|ADDR)$').test(t)) return 'bankAddr';
+            if (new RegExp('^(?:' + B + ' )?BANK NAME$').test(t)) return 'bankName';
+            if (new RegExp('^(?:' + B + ' )?BANK (?:ADDRESS|ADDR)$').test(t)) return 'bankAddr';
+            if (new RegExp('^' + B + ' (?:ACCOUNT|ACCT|A C|AC) (?:NO|NUMBER|NUM)$').test(t)) return 'acc';
+            if (new RegExp('^(?:' + B + ' )?(?:SWIFT|BIC)(?: (?:NO|NUMBER|CODE))?$').test(t)) return 'swift';
+            if (new RegExp('^(?:' + B + ' )?SWIFT BIC(?: CODE)?$').test(t)) return 'swift';
+            if (new RegExp('^' + B + ' NAME$').test(t)) return 'name';
+            if (new RegExp('^' + B + ' (?:ADDRESS|ADDR)$').test(t)) return 'addr';
+            return '';
+        }
+        // Etykieta bywa sklejona z wartoscia w jednej komorce ("SWIFT NO. : ABOCCNBJ020").
+        function piBankCell(x){
+            var s = String(x == null ? '' : x);
+            if (!s.trim()) return null;
+            var k = piBankKey(s);
+            if (k) return { key: k, val: '' };
+            var ci = s.indexOf(':');
+            if (ci > 0){ k = piBankKey(s.slice(0, ci)); if (k) return { key: k, val: s.slice(ci + 1).trim() }; }
+            return null;
+        }
+        function scanPIbank(aoa){
+            var out = { name: '', addr: '', bankName: '', bankAddr: '', acc: '', swift: '', sheet: '' };
+            for (var i = 0; i < aoa.length; i++){
+                var row = aoa[i] || [];
+                for (var j = 0; j < row.length; j++){
+                    var hit = piBankCell(row[j]);
+                    if (!hit || out[hit.key]) continue;
+                    var v = hit.val;
+                    if (!v){
+                        for (var c = j + 1; c < row.length; c++){
+                            var cv = String(row[c] == null ? '' : row[c]).trim();
+                            if (cv) { v = cv; break; }
+                        }
+                    }
+                    if (v) out[hit.key] = v.replace(/\s+/g, ' ').trim();
+                }
+            }
+            // SWIFT/BIC: 8 lub 11 znakow, format AAAACCXX[XXX].
+            out.swift = String(out.swift || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+            if (!/^[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$/.test(out.swift)) out.swiftBad = out.swift ? true : false;
+            out.accRaw = out.acc;
+            out.ok = !!(out.name && out.acc && out.swift && !out.swiftBad);
+            return out;
+        }
+        // --- miasto i kraj beneficjenta (TwnNm/Ctry) ---
+        // Od 14.11.2026 oba pola sa w pain.001 obowiazkowe, a w P/I nie ma ich osobno —
+        // trzeba je wyprowadzic z tekstu adresu. Kraj z BIC to ostatecznosc: bank
+        // beneficjenta bywa w innym kraju niz beneficjent (INTCO: firma HK, bank DBSSSGSG = SG).
+        var PB_CTRY = {
+            'CHINA': 'CN', 'P R CHINA': 'CN', 'PR CHINA': 'CN', 'PEOPLES REPUBLIC OF CHINA': 'CN', 'MAINLAND CHINA': 'CN',
+            'HONG KONG': 'HK', 'HONGKONG': 'HK', 'HK': 'HK', 'MACAU': 'MO', 'MACAO': 'MO',
+            'TAIWAN': 'TW', 'VIETNAM': 'VN', 'VIET NAM': 'VN', 'INDONESIA': 'ID', 'INDIA': 'IN',
+            'SINGAPORE': 'SG', 'MALAYSIA': 'MY', 'THAILAND': 'TH', 'PHILIPPINES': 'PH', 'CAMBODIA': 'KH',
+            'MYANMAR': 'MM', 'BANGLADESH': 'BD', 'PAKISTAN': 'PK', 'SRI LANKA': 'LK', 'NEPAL': 'NP',
+            'JAPAN': 'JP', 'SOUTH KOREA': 'KR', 'REPUBLIC OF KOREA': 'KR', 'KOREA': 'KR',
+            'TURKEY': 'TR', 'TURKIYE': 'TR', 'UNITED ARAB EMIRATES': 'AE', 'UAE': 'AE',
+            'POLAND': 'PL', 'POLSKA': 'PL', 'GERMANY': 'DE', 'DEUTSCHLAND': 'DE', 'ITALY': 'IT', 'ITALIA': 'IT',
+            'SPAIN': 'ES', 'FRANCE': 'FR', 'PORTUGAL': 'PT', 'NETHERLANDS': 'NL', 'BELGIUM': 'BE',
+            'CZECH REPUBLIC': 'CZ', 'CZECHIA': 'CZ', 'SLOVAKIA': 'SK', 'HUNGARY': 'HU', 'ROMANIA': 'RO',
+            'BULGARIA': 'BG', 'LITHUANIA': 'LT', 'LATVIA': 'LV', 'ESTONIA': 'EE', 'SWITZERLAND': 'CH',
+            'AUSTRIA': 'AT', 'UNITED KINGDOM': 'GB', 'GREAT BRITAIN': 'GB', 'ENGLAND': 'GB',
+            'UNITED STATES': 'US', 'USA': 'US', 'BRAZIL': 'BR', 'MEXICO': 'MX', 'UKRAINE': 'UA'
+        };
+        // Regiony/prowincje — to nie sa miasta, przeskakujemy je szukajac TwnNm.
+        var PB_PROV = /^(?:HUNAN|FUJIAN|ZHEJIANG|GUANGDONG|JIANGSU|SHANDONG|HEBEI|HENAN|HUBEI|ANHUI|JIANGXI|SHANXI|SHAANXI|LIAONING|JILIN|HEILONGJIANG|SICHUAN|YUNNAN|GUIZHOU|GANSU|QINGHAI|HAINAN|GUANGXI|NINGXIA|XINJIANG|XIZANG|TIBET|INNER MONGOLIA|NEI MONGGOL|JAVA|WEST JAVA|EAST JAVA|CENTRAL JAVA|BALI|SUMATRA)$/;
+        var PB_NOTOWN = /\b(?:PROVINCE|PREFECTURE|COUNTY|DISTRICT|WARD|BLOCK|VILLAGE|TOWNSHIP|ROAD|RD|STREET|AVENUE|AVE|LANE|BUILDING|BLDG|FLOOR|ROOM|RM|SUITE|UNIT|NO|ZONE|PARK|INDUSTRIAL|PLAZA|TOWER|CENTRE|CENTER|BOX|HARBOUR|HARBOR|GATEWAY|WHARF|QUAY|MALL|HOUSE|ESTATE|GARDEN|GARDENS|COURT|MANSION|TERRACE|HIGHWAY|HWY|SECTION|FLAT|ANNEX)\b/;
+        function pbNorm(s){ return String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').replace(/\s+/g, ' ').trim(); }
+        function pbFindCtry(txt){
+            var t = ' ' + pbNorm(txt) + ' ', bestI = -1, bestC = '';
+            for (var k in PB_CTRY){ var i = t.lastIndexOf(' ' + k + ' '); if (i > bestI){ bestI = i; bestC = PB_CTRY[k]; } }
+            return bestC;
+        }
+        function pbStripCtry(s){
+            var r = String(s == null ? '' : s);
+            for (var k in PB_CTRY){
+                var re = new RegExp('(^|[^A-Za-z])' + k.replace(/ /g, '[^A-Za-z0-9]*') + '(?![A-Za-z])', 'i');
+                r = r.replace(re, '$1');
+            }
+            return r.replace(/^[^A-Za-z0-9]+/, '').replace(/[^A-Za-z0-9]+$/, '').replace(/\s+/g, ' ').trim();
+        }
+        function pbTown(addr){
+            var segs = String(addr == null ? '' : addr).split(/[,;\n、]/), out = '';
+            for (var i = segs.length - 1; i >= 0; i--){
+                var s = pbStripCtry(segs[i]);
+                // kod pocztowy przed/po nazwie miasta: "00-838 Warszawa", "FUZHOU 350003"
+                s = s.replace(/^\d{2,6}(?:[-\s]\d{3,4})?\s+(?=[A-Za-z])/, '').replace(/\s+\d{4,6}$/, '').trim();
+                if (!s) continue;
+                var n = pbNorm(s);
+                if (!n) continue;
+                var m = s.match(/^(.+?)\s+CITY$/i);
+                if (m && m[1] && !PB_NOTOWN.test(pbNorm(m[1]))) return m[1].trim();
+                if (PB_PROV.test(n) || PB_NOTOWN.test(n) || /^[0-9 ]+$/.test(n)) continue;
+                if (!out) out = s;
+            }
+            return out;
+        }
+        // src: 'addr' = kraj z adresu (pewne), 'name' = z nazwy firmy, 'bic' = z kodu SWIFT (do potwierdzenia)
+        function piBankGeo(bank){
+            var b = bank || {}, addr = String(b.addr || ''), nm = String(b.name || ''), bic = String(b.swift || '');
+            var cc = pbFindCtry(addr), src = cc ? 'addr' : '';
+            if (!cc) { cc = pbFindCtry(nm); if (cc) src = 'name'; }
+            if (!cc && /^[A-Z]{6}/.test(bic)) { cc = bic.substr(4, 2); if (/^[A-Z]{2}$/.test(cc)) src = 'bic'; else cc = ''; }
+            return { town: pbTown(addr), ctry: cc, src: src, weak: src !== 'addr' };
+        }
         function scanPIsheet(aoa){
             var pct = null, amount = null, acc = '';
             var depRow = -1, depLabel = '';
@@ -12035,7 +12611,7 @@
                 if (!acc){ for (var c2 = 0; c2 < lrow.length; c2++){ if (isAccLbl(lrow[c2])){ var d2 = normAcc(lrow[c2]); if (d2.length >= 8 && d2.length > acc.length) acc = d2; } } }
                 if (acc.length < 8){ for (var w = Math.max(0, accLblRow - 3); w <= accLblRow + 3 && w < aoa.length; w++){ var wr = aoa[w] || []; for (var wj = 0; wj < wr.length; wj++){ if (isCleanAcc(wr[wj])){ var d3 = normAcc(wr[wj]); if (d3.length > acc.length) acc = d3; } } } }
             }
-            return { pct: pct, amount: amount, acc: acc };
+            return { pct: pct, amount: amount, acc: acc, bank: scanPIbank(aoa) };
         }
         function piSheetOrderMatch(aoa, order){
             var ord = String(order == null ? '' : order).replace(/\D+/g, '');
@@ -12074,7 +12650,26 @@
                 }
                 return best;
             }
-            return pick(false) || pick(true) || { pct: null, amount: null, acc: '', sheet: '' };
+            // Gdy wybrany arkusz nie ma pelnego bloku bankowego — szukamy w pozostalych,
+            // ale tylko gdy wszystkie znalezione bloki wskazuja tego samego beneficjenta.
+            // Plik z kilkoma dostawcami (P/I BELUNA: Kinor + Tianjin Dingge) nie moze zgadywac.
+            function bankFallback(res){
+                if (!res || (res.bank && res.bank.ok)) return res;
+                var found = [], seen = {};
+                for (var si = 0; si < wb.SheetNames.length; si++){
+                    var nm = wb.SheetNames[si], ws = wb.Sheets[nm]; if (!ws) continue;
+                    var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ continue; }
+                    var b = scanPIbank(aoa);
+                    if (!b.ok) continue;
+                    var k = normAcc(b.acc) + '|' + b.swift;
+                    if (seen[k]) continue;
+                    seen[k] = 1; b.sheet = nm; found.push(b);
+                }
+                if (found.length === 1){ found[0].alt = found[0].sheet; res.bank = found[0]; }
+                else if (found.length > 1){ res.bankAmbig = found.length; }
+                return res;
+            }
+            return bankFallback(pick(false) || pick(true)) || { pct: null, amount: null, acc: '', sheet: '', bank: scanPIbank([]) };
         }
         function extractPdfDeposit(txt){
             var s = String(txt == null ? '' : txt);
@@ -12150,8 +12745,8 @@
             var com = extractDepoComment(h, cs), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
             dg.cs = pcDiagCs(cs); dg.com = com; dg.banks = banks; dg.piUrl = piUrl || '';
             if (!piUrl) dg.piRaw = pcPiSecDump(h);
-            var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', depOk: extractDepoOk(cs, com ? com.idx : -1) };
-            function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; o.piSheet = base.piSheet; o.depOk = base.depOk; return o; }
+            var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', piBank: null, depOk: extractDepoOk(cs, com ? com.idx : -1) };
+            function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; o.piSheet = base.piSheet; o.piBank = base.piBank; o.depOk = base.depOk; return o; }
             if (!com) { dlog('DEPO ' + order + ': brak komentarza deposit (komentarzy: ' + cs.length + ')'); return ret({ ok: false, msg: 'brak komentarza deposit' }); }
             if (!piUrl) { dlog('DEPO ' + order + ': brak pliku P/I'); return ret({ ok: false, msg: 'brak P/I' }); }
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
@@ -12161,6 +12756,7 @@
             base.piAmount = (pi && pi.amount != null) ? pi.amount : null;
             base.piAcc = (pi && pi.acc) ? pi.acc : null;
             base.piSheet = (pi && pi.sheet) ? (pi.sheet + (pi.hidden ? ' [ukryty]' : '')) : '';
+            base.piBank = (pi && pi.bank && pi.bank.ok) ? pi.bank : null;
             if (pi.manual) return ret({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie' });
             if (pi.err) return ret({ ok: false, msg: pi.err });
             // Komentarz bez % — do tytulu przelewu bierzemy procent z P/I, a samego % nie porownujemy.
@@ -12204,12 +12800,16 @@
             if (banks.length) ttl.push('Konto w systemie: ' + banks.join(' / '));
             if (pi && pi.acc) ttl.push('Konto z P/I: ' + pi.acc);
             var title = ttl.join(' | ');
-            if (pi && pi.manual) return { cands: cands, pens: pens, pi: { ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie', title: title } };
-            if (pi && pi.err) return { cands: cands, pens: pens, pi: { ok: false, msg: pi.err, title: title } };
-            if (!pi || !pi.acc) return { cands: cands, pens: pens, pi: { ok: false, msg: 'brak konta w P/I', title: title } };
-            if (!banks.length) return { cands: cands, pens: pens, pi: { ok: false, warn: true, msg: 'brak konta w systemie (P/I: ' + pi.acc + ')', title: title } };
-            if (banks.indexOf(pi.acc) === -1) return { cands: cands, pens: pens, pi: { ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title } };
-            return { cands: cands, pens: pens, pi: { ok: true, warn: !!(pi && pi.hidden), msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : ''), title: title } };
+            // Dane bankowe z P/I doklejamy do kazdego wyniku — sa potrzebne do pain.001
+            // niezaleznie od tego, czy kontrola konta wypadla OK.
+            var pbank = (pi && pi.bank && pi.bank.ok) ? pi.bank : null;
+            function R(p){ p.bank = pbank; p.piAcc = (pi && pi.acc) ? pi.acc : ''; return { cands: cands, pens: pens, pi: p }; }
+            if (pi && pi.manual) return R({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie', title: title });
+            if (pi && pi.err) return R({ ok: false, msg: pi.err, title: title });
+            if (!pi || !pi.acc) return R({ ok: false, msg: 'brak konta w P/I', title: title });
+            if (!banks.length) return R({ ok: false, warn: true, msg: 'brak konta w systemie (P/I: ' + pi.acc + ')', title: title });
+            if (banks.indexOf(pi.acc) === -1) return R({ ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title });
+            return R({ ok: true, warn: !!(pi && pi.hidden), msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : ''), title: title });
         }
         async function runBalCheck(status, doPI){
             var uniq = [], seen = {}, res = {}, byOrder = {};
@@ -12234,10 +12834,46 @@
             });
             return sum;
         }
+        // Ręczna zmiana treści po auto-pobraniu ma być widoczna w logu.
+        // Ustawienie innerHTML przez skrypt nie odpala „input”, więc łapiemy tylko człowieka.
+        wp.querySelector('#wp-depo').addEventListener('input', function(){
+            if (!state.depoSrc) return;
+            if (state.depoSrc.indexOf('ręcznie zmienione') < 0) state.depoSrc += '  [potem ręcznie zmienione]';
+        });
+        // ⚙ — pokaż/ukryj pole z adresem filtru; puste pole = wróć do domyślnego.
+        wp.querySelector('#wp-depo-cfg').onclick = function(){
+            var inp = wp.querySelector('#wp-depo-url');
+            if (inp.style.display === 'none') { inp.value = depoUrl(); inp.style.display = ''; inp.focus(); }
+            else { inp.style.display = 'none'; }
+        };
+        wp.querySelector('#wp-depo-url').onchange = function(){
+            var v = this.value.trim();
+            depoUrlSave(v === DEPO_URL_DEF ? '' : v);
+            if (!v) this.value = DEPO_URL_DEF;
+            wp.querySelector('#wp-status').textContent = v ? 'Zapisano adres pobierania DEPO.' : 'Przywrócono domyślny adres pobierania DEPO.';
+        };
+        wp.querySelector('#wp-depo-fetch').onclick = async function(){
+            var status = wp.querySelector('#wp-status'), btn = this, lab = btn.textContent, url = depoUrl();
+            btn.disabled = true; btn.textContent = 'Pobieram…';
+            status.textContent = 'Pobieram tabelę DEPO z systemu (to może potrwać — strona jest duża)…';
+            var t0 = Date.now(), html = await fetchT(depoSameOrigin(url), 180000);
+            btn.disabled = false; btn.textContent = lab;
+            if (!html) { status.textContent = 'Nie udało się pobrać strony (przekroczony czas albo brak sesji). Zaloguj się w systemie i spróbuj ponownie — albo wklej dane ręcznie.'; return; }
+            var r = parseSheetRows(html);
+            if (r.err) { status.textContent = 'Pobrano stronę, ale ' + r.err + ' Wklej dane ręcznie.'; return; }
+            if (!r.rows.length) { status.textContent = 'Tabela jest pusta — filtr nic nie zwrócił (wierszy w tabeli: ' + r.total + ').'; return; }
+            wp.querySelector('#wp-depo').innerHTML = depoRowsToHtml(r.rows);
+            state.depoSrc = 'pobrane automatycznie ' + pcNow() + ' z: ' + url;
+            var extra = [];
+            if (r.dups.length) extra.push('pominięto ' + r.dups.length + ' powtórzony wiersz/e tego samego zamówienia (' + r.dups.join(', ') + ')');
+            if (r.skipped) extra.push('pominięto ' + r.skipped + ' wiersz/e bez numeru zamówienia lub dostawcy');
+            status.textContent = 'Pobrano DEPO: ' + r.rows.length + ' zamówień w ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s (wierszy w tabeli: ' + r.total + ')'
+                + (extra.length ? ' — ' + extra.join('; ') : '') + '. Teraz kliknij „Przetwórz”.';
+        };
         wp.querySelector('#wp-go').onclick = async function(){
             var status = wp.querySelector('#wp-status');
             // Nowy przebieg = czysty log. Zapisujemy tez surowe wklejki, zeby dalo sie odtworzyc wejscie.
-            state.diag = { bal: {}, dep: {}, raw: { bal: pcPasteTxt('#wp-balance'), dep: pcPasteTxt('#wp-depo') }, started: pcNow(), log: [] };
+            state.diag = { bal: {}, dep: {}, raw: { bal: pcPasteTxt('#wp-balance'), dep: pcPasteTxt('#wp-depo'), depSrc: state.depoSrc || 'wklejone ręcznie' }, started: pcNow(), log: [] };
             var balRows = parseBalance(wp.querySelector('#wp-balance'));
             var dep = parseDepo(wp.querySelector('#wp-depo'));
             if (!balRows.length && !dep.rows.length) { dlog('Przerwano: nic nie wklejono.'); status.textContent = 'Wklej dane.'; return; }
@@ -12269,6 +12905,54 @@
                 + ' | BAL komentarze \u2713' + _bc.ok + ' \u26a0' + _bc.warn + ' \u2717' + _bc.bad
                 + (_bpi ? (' | BAL P/I \u2713' + _bc.piOk + ' \u2717' + _bc.piBad) : '') + '.';
         };
+        // --- pain.001: pokaz/ukryj panel + obsluga (listener na kontenerze, bo innerHTML wymieniamy) ---
+        wp.querySelector('#wp-pain').onclick = function(){
+            var box = wp.querySelector('#wp-pain-box'); if (!box) return;
+            var show = (box.style.display === 'none');
+            box.style.display = show ? '' : 'none';
+            if (show) { renderPain(); box.scrollIntoView({ block: 'nearest' }); }
+        };
+        (function(){
+            var box = wp.querySelector('#wp-pain-box'); if (!box) return;
+            function setEd(key, k, val){
+                if (!state.painEdit) state.painEdit = {};
+                if (!state.painEdit[key]) state.painEdit[key] = {};
+                state.painEdit[key][k] = val;
+            }
+            box.addEventListener('change', function(ev){
+                var t = ev.target; if (!t) return;
+                if (t.classList.contains('pain-chk')) { state.painSel[t.getAttribute('data-key')] = t.checked; renderPain(); return; }
+                if (t.classList.contains('pain-cfgb')) { painCfg()[t.getAttribute('data-k')] = t.checked; painCfgSave(); renderPain(); return; }
+                if (t.classList.contains('pain-cfg')) { painCfg()[t.getAttribute('data-k')] = t.value.trim(); painCfgSave(); renderPain(); return; }
+                if (t.classList.contains('pain-ed')) {
+                    var k = t.getAttribute('data-k'), key = t.getAttribute('data-key'), val = t.value.trim();
+                    if (k === 'amount') { var n = parseAmount(val); setEd(key, 'amount', (val === '' || !isFinite(n)) ? '' : n); }
+                    else setEd(key, k, val);
+                    renderPain(); return;
+                }
+            });
+            box.addEventListener('click', function(ev){
+                var t = ev.target; if (!t || t.tagName !== 'BUTTON') return;
+                var st = wp.querySelector('#pain-status'), rows = painRows(), cfg = painCfg(), strict = !!cfg.strict;
+                function say(m, col){ if (st) { st.textContent = m; st.style.color = col || '#666'; } }
+                if (t.id === 'pain-all'){
+                    var anyOff = rows.some(function(r){ return !state.painSel[r.key]; });
+                    rows.forEach(function(r){ state.painSel[r.key] = anyOff; });
+                    renderPain(); return;
+                }
+                if (t.id === 'pain-onlyok'){ rows.forEach(function(r){ state.painSel[r.key] = !!(r.verified && r.hasBank && !r.conflict); }); renderPain(); return; }
+                if (t.id === 'pain-reset'){ state.painEdit = {}; renderPain(); return; }
+                if (t.id === 'pain-dl' || t.id === 'pain-copy'){
+                    var sel = painSelected(rows), v = painValidate(cfg, sel, strict);
+                    if (v.errs.length) { say('Popraw najpierw ' + v.errs.length + ' błędów.', '#c00'); return; }
+                    var xml = painBuild(cfg, sel, strict);
+                    if (t.id === 'pain-copy'){ var okc = pcCopyText(xml); say(okc ? ('Skopiowano XML (' + sel.length + ' przelewów).') : 'Nie udało się skopiować.', okc ? '#0a0' : '#c00'); return; }
+                    var r2 = painSave(xml, 'pain001 ' + pcToday() + ' chinskie ' + PAIN_CCY + '.xml');
+                    say(r2 ? ('Zapisano: ' + r2.name + ' — ' + sel.length + ' przelewów, ' + Math.round(r2.size / 1024) + ' kB. Sprawdź folder Pobrane.') : 'Nie udało się zapisać pliku.', r2 ? '#0a0' : '#c00');
+                    return;
+                }
+            });
+        })();
         wp.querySelector('#wp-log').onclick = function(){
             var st = wp.querySelector('#wp-log-status');
             var r = pcSaveLog();
