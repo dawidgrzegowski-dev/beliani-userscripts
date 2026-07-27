@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.64
+// @version      1.67
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11161,7 +11161,7 @@
                         amtCell = (a != null && isFinite(a)) ? '<span style="font-weight:600">' + esc(a.toFixed(2)) + '</span>' : '';
                     }
                     tds += cel(amtCell, bg, true);
-                    var pv = ''; if (r.pi) { if (r.pi.warn) pv = '<span style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; else if (r.pi.ok) pv = '<span style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; else pv = '<span style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; } tds += cel(pv, bg);
+                    var pv = ''; if (r.pi) { var _pt = pcPiTitle(r); if (r.pi.warn) pv = '<span' + _pt + ' style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; else if (r.pi.ok) pv = '<span' + _pt + ' style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; else pv = '<span' + _pt + ' style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; } tds += cel(pv, bg);
                     var pcC = /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz, aby wgrać payment confirmation do tego zamówienia"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : '';
                     tds += cel(pcC, bg);
                     html += '<tr>' + tds + '</tr>'; lines.push(lc.join('\t'));
@@ -11252,14 +11252,21 @@
             return val;
         }
         function pcBalCellHtml(r, rid){ var a = pcBalAmtVal(r), edited = (r._editAmt != null && isFinite(r._editAmt)); return pcAmtValSpan(rid, 'b', (a != null && isFinite(a)) ? a.toFixed(2) : '', edited); }
-        function pcPiCellHtml(r){ if (!r.pi) return ''; if (r.pi.warn) return '<span style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; if (r.pi.ok) return '<span style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; return '<span style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; }
-        function pcRowDepo(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
-        function pcRowBal(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel('', bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcPiTitle(r){ if (!r || !r.pi) return ''; var b = []; if (r.pi.piSheet) b.push('Arkusz P/I: ' + r.pi.piSheet); if (r.pi.piAmount != null) b.push('kwota P/I: ' + r.pi.piAmount.toFixed(2)); if (r.pi.piAcc) b.push('konto P/I: ' + r.pi.piAcc); if (!b.length) return ''; return ' title="' + esc(b.join(' | ')) + '"'; }
+        function pcPiCellHtml(r){ if (!r.pi) return ''; var t = pcPiTitle(r); if (r.pi.warn) return '<span' + t + ' style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; if (r.pi.ok) return '<span' + t + ' style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; return '<span' + t + ' style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; }
+        function pcOkCellHtml(r){
+            if (!r || !r.pi) return '';
+            var o = r.pi.depOk;
+            if (o) return '<span style="color:#0a0;font-weight:700;white-space:nowrap" title="' + pcAttr('Komentarz „ok" po prośbie o depozyt' + (o.date ? ' — ' + o.date : '')) + '">OK od ' + esc(o.author) + '</span>';
+            return '<span style="color:#c00;font-weight:700;white-space:nowrap" title="Po komentarzu z prośbą o depozyt nie ma potwierdzenia „ok"">Brak OK</span>';
+        }
+        function pcRowDepo(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel(pcOkCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcRowBal(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel('', bg) + cel('', bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
         function pcGroupHeader(G, gi, gcol){
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
             var accBase = G.cid ? (_acc[G.cid] || '') : ''; var accShown = (state.pcAccEdit && state.pcAccEdit[G.key] != null) ? state.pcAccEdit[G.key] : accBase;
-            var h = '<tr class="pc-suphdr"><td colspan="7" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
+            var h = '<tr class="pc-suphdr"><td colspan="8" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
                 + ''
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
@@ -11275,10 +11282,10 @@
             var el = wp.querySelector('#wp-out-merged'); if (!el) return;
             var MG = pcMergedGroups(); state._groups = []; state._rowMap = {}; var CM = pcCombinedColorMap();
             var gi = 0, html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
-            function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
+            function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">OK depo</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
             function section(title, groups){
                 if (!groups.length) return;
-                html += '<tr><td colspan="7" style="background:#750000;color:#fff;font-weight:700;padding:5px 8px">' + esc(title) + ' <span style="font-weight:400;opacity:.7">(' + groups.length + ')</span></td></tr>';
+                html += '<tr><td colspan="8" style="background:#750000;color:#fff;font-weight:700;padding:5px 8px">' + esc(title) + ' <span style="font-weight:400;opacity:.7">(' + groups.length + ')</span></td></tr>';
                 html += colhead();
                 groups.forEach(function(G){
                     state._groups.push({ gi: gi, dep: G.dep, bal: G.bal });
@@ -11292,7 +11299,7 @@
             section('ŁĄCZONE (depo + balance)', MG.combined);
             section('DEPO', MG.depoOnly);
             section('BALANCE', MG.balOnly);
-            if (gi){ var gDepo = 0, gBal = 0; state._groups.forEach(function(g){ var d = pcSumRows(g.dep); if (d != null) gDepo += d; var bb = pcBalSum(g.bal); if (bb != null) gBal += bb; }); html += '<tr><td colspan="7" style="background:#332524;color:#fff;font-weight:700;padding:5px 8px">RAZEM &nbsp; Depo: <b id="pc-grand-depo">' + gDepo.toFixed(2) + '</b> &nbsp;·&nbsp; Balance: <b id="pc-grand-bal">' + gBal.toFixed(2) + '</b> &nbsp;·&nbsp; Łącznie: <b id="pc-grand-total">' + (gDepo + gBal).toFixed(2) + '</b></td></tr>'; }
+            if (gi){ var gDepo = 0, gBal = 0; state._groups.forEach(function(g){ var d = pcSumRows(g.dep); if (d != null) gDepo += d; var bb = pcBalSum(g.bal); if (bb != null) gBal += bb; }); html += '<tr><td colspan="8" style="background:#332524;color:#fff;font-weight:700;padding:5px 8px">RAZEM &nbsp; Depo: <b id="pc-grand-depo">' + gDepo.toFixed(2) + '</b> &nbsp;·&nbsp; Balance: <b id="pc-grand-bal">' + gBal.toFixed(2) + '</b> &nbsp;·&nbsp; Łącznie: <b id="pc-grand-total">' + (gDepo + gBal).toFixed(2) + '</b></td></tr>'; }
             if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
             el.innerHTML = html + '</table>';
         }
@@ -11332,10 +11339,37 @@
             return added;
         }
         function normAcc(s){ return String(s == null ? '' : s).replace(/\D+/g, ''); }
-        function extractDepoComment(html){
-            var spans = [], sre = /class="commentText"[^>]*>([\s\S]*?)<\/span>/gi, sm;
-            while ((sm = sre.exec(html)) !== null) spans.push(sm[1].replace(/<[^>]+>/g, ' '));
-            var pool = spans.length ? spans : [html];
+        function pcTxt(s){ return String(s == null ? '' : s).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#0?39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim(); }
+        function pcComments(html){
+            var out = [], parts = String(html == null ? '' : html).split(/<tr[^>]*class="[^"]*comment-row[^"]*"/i);
+            for (var i = 1; i < parts.length; i++){
+                var c = parts[i];
+                var dm = c.match(/(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/);
+                var au = '';
+                var am = c.match(/class="comment-author-name[^"]*"[^>]*>([\s\S]*?)<\/(?:a|span)>/i);
+                if (am) au = pcTxt(am[1]);
+                if (!au){ var um = c.match(/class="comment-author"[^>]*data-user="([^"]*)"/i); if (um) au = pcTxt(um[1]); }
+                var tm = c.match(/class="commentText"[^>]*>([\s\S]*?)<\/span>/i);
+                out.push({ date: dm ? dm[1] : '', author: au, text: tm ? pcTxt(tm[1]) : '' });
+            }
+            return out;
+        }
+        function pcIsOkText(t){
+            var s = String(t == null ? '' : t).trim().toLowerCase().replace(/[\s.!,:;–—-]+$/, '');
+            if (!s) return false;
+            if (/^(ok|okay|okey|oki|okk)$/.test(s)) return true;
+            return /^ok\b/.test(s) && s.length <= 20;
+        }
+        function extractDepoOk(cs, depIdx){
+            if (!cs || !cs.length || depIdx == null || depIdx < 0) return null;
+            for (var i = depIdx + 1; i < cs.length; i++){ if (pcIsOkText(cs[i].text)) return { author: cs[i].author || '?', date: cs[i].date || '' }; }
+            return null;
+        }
+        function extractDepoComment(html, csIn){
+            var cs = csIn || pcComments(html);
+            var spans = [];
+            for (var s0 = 0; s0 < cs.length; s0++) spans.push(cs[s0].text);
+            var pool = spans.length ? spans : [String(html == null ? '' : html).replace(/<[^>]+>/g, ' ')];
             for (var i = pool.length - 1; i >= 0; i--){
                 var t = pool[i];
                 if (!/deposit/i.test(t)) continue;
@@ -11345,7 +11379,7 @@
                 var di = t.toLowerCase().indexOf('deposit');
                 var after = t.slice(di + 7).replace(/\d+(?:[.,]\d+)?\s*%/g, ' ');
                 var amount = parseMoney(after);
-                if (isFinite(amount)) return { pct: pct, amount: amount };
+                if (isFinite(amount)) return { pct: pct, amount: amount, idx: spans.length ? i : -1 };
             }
             return null;
         }
@@ -11407,17 +11441,44 @@
             }
             return { pct: pct, amount: amount, acc: acc };
         }
-        function parsePIxlsx(u8){
+        function piSheetOrderMatch(aoa, order){
+            var ord = String(order == null ? '' : order).replace(/\D+/g, '');
+            if (!ord) return false;
+            var lbl = /(?:beliani\s*)?order\s*(?:no|nr|number)\b/i, num = new RegExp('(^|\\D)' + ord + '(\\D|$)');
+            for (var i = 0; i < aoa.length; i++){
+                var row = aoa[i] || [], hit = false;
+                for (var j = 0; j < row.length; j++){ if (lbl.test(String(row[j] == null ? '' : row[j]))) { hit = true; break; } }
+                if (!hit) continue;
+                var txt = row.map(function(v){ return String(v == null ? '' : v); }).join(' ');
+                if (num.test(txt)) return true;
+            }
+            return false;
+        }
+        function parsePIxlsx(u8, order){
             var X = getXLSX(); if (!X) return { err: 'brak SheetJS' };
             var wb; try { wb = X.read(u8, { type: 'array' }); } catch(e){ return { err: 'P/I nieczytelne' }; }
-            var best = null;
-            for (var si = 0; si < wb.SheetNames.length; si++){
-                var ws = wb.Sheets[wb.SheetNames[si]]; if (!ws) continue;
-                var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ continue; }
-                var r = scanPIsheet(aoa);
-                if (r.pct != null || r.acc) { if (!best) best = r; if (r.pct != null && r.amount != null && r.acc) { best = r; break; } }
+            var meta = (wb.Workbook && wb.Workbook.Sheets) || [];
+            function pick(wantHidden){
+                var best = null, bestScore = -1;
+                for (var si = 0; si < wb.SheetNames.length; si++){
+                    var hid = (meta[si] && meta[si].Hidden) ? 1 : 0;
+                    if (hid !== (wantHidden ? 1 : 0)) continue;
+                    var nm = wb.SheetNames[si];
+                    var ws = wb.Sheets[nm]; if (!ws) continue;
+                    var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ continue; }
+                    var r = scanPIsheet(aoa);
+                    if (r.pct == null && !r.acc) continue;
+                    var sc = 0;
+                    if (piSheetOrderMatch(aoa, order)) sc += 100;
+                    if (r.pct != null && r.amount != null && r.acc) sc += 5;
+                    else if (r.pct != null && r.amount != null) sc += 2;
+                    r.sheet = nm; r.hidden = !!hid;
+                    if (sc > bestScore) { bestScore = sc; best = r; }
+                    if (bestScore >= 105) break;
+                }
+                return best;
             }
-            return best || { pct: null, amount: null, acc: '' };
+            return pick(false) || pick(true) || { pct: null, amount: null, acc: '', sheet: '' };
         }
         function extractPdfDeposit(txt){
             var m = txt.match(/(\d+(?:[.,]\d+)?)\s*%\s*deposit\b[^0-9$\u20ac]*[$\u20ac]\s*([\d.,\u2019' ]+)/i);
@@ -11447,32 +11508,34 @@
             var dep = extractPdfDeposit(txt), acc = extractPdfAccount(txt);
             return { pct: dep ? dep.pct : null, amount: dep ? dep.amount : null, acc: acc };
         }
-        async function parsePI(buf){
+        async function parsePI(buf, order){
             var u8 = new Uint8Array(buf);
             var sig = String.fromCharCode(u8[0] || 0, u8[1] || 0, u8[2] || 0, u8[3] || 0);
             if (sig === '%PDF') return await parsePIpdf(u8);
-            return parsePIxlsx(u8);
+            return parsePIxlsx(u8, order);
         }
         async function checkOnePI(order){
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
             if (!h) return { ok: false, msg: 'nie otwarto ordera' };
-            var com = extractDepoComment(h), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
-            var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null };
-            function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; return o; }
+            var cs = pcComments(h);
+            var com = extractDepoComment(h, cs), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
+            var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', depOk: extractDepoOk(cs, com ? com.idx : -1) };
+            function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; o.piSheet = base.piSheet; o.depOk = base.depOk; return o; }
             if (!com) return ret({ ok: false, msg: 'brak komentarza deposit' });
             if (!piUrl) return ret({ ok: false, msg: 'brak P/I' });
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
             if (!buf) return ret({ ok: false, msg: 'nie pobrano P/I' });
-            var pi = await parsePI(buf);
+            var pi = await parsePI(buf, order);
             base.piAmount = (pi && pi.amount != null) ? pi.amount : null;
             base.piAcc = (pi && pi.acc) ? pi.acc : null;
+            base.piSheet = (pi && pi.sheet) ? (pi.sheet + (pi.hidden ? ' [ukryty]' : '')) : '';
             if (pi.manual) return ret({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie' });
             if (pi.err) return ret({ ok: false, msg: pi.err });
-            var bad = [];
+            var bad = [], sfx = (pi && pi.hidden) ? ' [tylko ukryty arkusz: ' + pi.sheet + ']' : '';
             if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '≠' + com.amount.toFixed(2));
             if (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct)) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '≠' + Math.round(com.pct));
             if (!pi.acc || banks.indexOf(pi.acc) === -1) bad.push('konto ' + (pi.acc || '?') + '≠' + (banks.join('/') || '?'));
-            return ret(bad.length ? { ok: false, msg: bad.join('; ') } : { ok: true, msg: 'zgodne (' + Math.round(com.pct) + '% ' + com.amount.toFixed(2) + ')' });
+            return ret(bad.length ? { ok: false, msg: bad.join('; ') + sfx } : { ok: true, warn: !!sfx, msg: 'zgodne (' + Math.round(com.pct) + '% ' + com.amount.toFixed(2) + ')' + sfx });
         }
         async function runPICheck(status){
             var uniq = [], seen = {}, res = {};
