@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.82
+// @version      1.83
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10385,6 +10385,93 @@
         });
         return out;
     }
+    // Typ pojedynczego roszczenia z listy: „other - 579" -> „other -".
+    function balClaimType(c) {
+        const m = String(c).match(/^(.*?)\s*(\d+)$/);
+        return (m ? m[1] : String(c)).trim().toLowerCase();
+    }
+    // Roszczenia jednego rodzaju: (['penalty 692','other - 579'], 'other') -> ['other - 579'].
+    function balClaimsOfKind(claims, kind) {
+        return (claims || []).filter(function (c) { return balKindName(balClaimType(c)) === kind; });
+    }
+    // Rodzaj z prologistics do porownania z notatka. Serwer trzyma znak w nazwie („penalty -",
+    // „other +"), notatka nie — bez obcinania znaku KAZDE penalty wygladaloby na rozjazd.
+    function balProloKind(ty) {
+        return balKindName(String(ty == null ? '' : ty).trim().toLowerCase().replace(/\s*[+-]\s*$/, ''));
+    }
+    // Wiersz z kilkoma RODZAJAMI roszczen (np. penalty + other). Z wklejki mamy jedna roznice,
+    // ale prologistics zna kwote kazdego roszczenia z osobna. Jesli te kwoty — przy jakimkolwiek
+    // ukladzie znakow — skladaja sie DOKLADNIE na roznice, to podzial na konta nie jest
+    // zgadywaniem tylko rachunkiem i mozemy go zaksiegowac. Znaki przeszukujemy, bo jedno
+    // roszczenie potraca, a inne doplaca, i notatka tego nie mowi.
+    // Kilka roznych ukladow dajacych rozny podzial = niejednoznaczne, wiec dalej blokujemy.
+    function balSplitKinds(claims, claimData, diff) {
+        const ids = balClaimIds(claims);
+        if (!ids.length) return { ok: false, reason: 'nofit', items: [] };
+        if (ids.length > 10) return { ok: false, reason: 'too-many', count: ids.length };
+        const items = [], missing = [], mism = [], kinds = [];
+        (claims || []).forEach(function (c) {
+            const id = (String(c).match(/(\d+)\s*$/) || [])[1];
+            if (!id) return;
+            const kind = balKindName(balClaimType(c));
+            if (kinds.indexOf(kind) < 0) kinds.push(kind);
+            if (items.some(function (it) { return it.id === id; })) return;
+            const rec = claimData ? claimData[id] : null;
+            if (!rec) { missing.push(id); return; }
+            if (rec.ty && balProloKind(rec.ty) !== kind) {
+                mism.push({ id: id, note: kind, prolo: String(rec.ty).trim() });
+            }
+            items.push({ id: id, kind: kind, amt: Math.abs(parseFloat(rec.amt)) });
+        });
+        if (missing.length) return { ok: false, reason: 'missing', missing: missing };
+        if (items.some(function (it) { return isNaN(it.amt); })) return { ok: false, reason: 'nan', items: items };
+        // Ten sam numer pod dwoma rodzajami (np. „penalty 692, other - 692") — jeden z nich
+        // zostalby bez kwoty, a wtedy podzial jest fikcja. Blokujemy.
+        if (kinds.some(function (k) { return !items.some(function (it) { return it.kind === k; }); })) {
+            return { ok: false, reason: 'dup', items: items };
+        }
+        const n = items.length, hits = [], seen = {};
+        for (let mask = 0; mask < (1 << n); mask++) {
+            let sum = 0; const byKind = {};
+            for (let i = 0; i < n; i++) {
+                const v = bal2(((mask >> i) & 1 ? -1 : 1) * items[i].amt);
+                sum = bal2(sum + v);
+                byKind[items[i].kind] = bal2((byKind[items[i].kind] || 0) + v);
+            }
+            if (Math.abs(bal2(sum - diff)) >= 0.005) continue;
+            const key = Object.keys(byKind).sort().map(function (k) { return k + '=' + balFix(byKind[k]); }).join('|');
+            if (seen[key]) continue;
+            seen[key] = 1; hits.push(byKind);
+        }
+        if (!hits.length) return { ok: false, reason: 'nofit', items: items };
+        if (hits.length > 1) return { ok: false, reason: 'ambiguous', items: items, splits: hits };
+        return { ok: true, byKind: hits[0], items: items, mism: mism };
+    }
+    // Dlaczego podzialu nie da sie zrobic — tresc bledu pod wklejka.
+    function balSplitWhy(sp, label, diff, pending, kinds, penCredit, discCredit) {
+        const accs = (kinds || []).map(function (t) {
+            return t + '→' + (t === 'other' ? 'wg treści roszczenia' : (balTypeAccount(t, penCredit, discCredit) || '?'));
+        }).join(', ');
+        // Kazdy powod zaczyna sie tak samo: co jest w notatce, jaka jest roznica i na jakie konta
+        // musialaby sie rozejsc. Dopiero potem — czemu akurat tego podzialu nie umiem policzyc.
+        const head = 'w notatce są różne typy roszczeń (' + label + '), a różnica to jedna kwota ' + balFix(diff) +
+            ' — każdy typ ma inne konto (' + accs + '), więc ';
+        if (sp.reason === 'missing') {
+            return head + (pending ? 'pobieram kwoty roszczeń z prologistics, chwila.'
+                : 'muszę znać kwotę każdego roszczenia, a nie mam z prologistics numerów ' + sp.missing.join(', ') + '.');
+        }
+        if (sp.reason === 'too-many') return head + 'trzeba ją rozdzielić — a w wierszu jest ' + sp.count + ' roszczeń, za dużo, żeby bezpiecznie szukać podziału.';
+        if (sp.reason === 'nan') return head + 'trzeba ją rozdzielić — a kwoty roszczeń z prologistics nie dają się odczytać jako liczby.';
+        if (sp.reason === 'dup') return head + 'trzeba ją rozdzielić — a ten sam numer roszczenia występuje pod dwoma rodzajami, więc jeden z nich zostałby bez kwoty. Popraw notatkę.';
+        const list = (sp.items || []).map(function (it) { return it.id + ': ' + balFix(it.amt); }).join(', ');
+        if (sp.reason === 'ambiguous') {
+            return head + 'kwoty z prologistics (' + list + ') składają się na nią na ' + sp.splits.length +
+                ' różne sposoby (' + sp.splits.map(function (s) {
+                    return Object.keys(s).map(function (k) { return k + ' ' + balFix(s[k]); }).join(' / ');
+                }).join(' albo ') + ') i podział byłby zgadywaniem.';
+        }
+        return head + 'kwoty z prologistics (' + list + ') nie składają się na nią w żadnym układzie znaków i nie ma z czego jej rozdzielić.';
+    }
     // Opisy roszczen + propozycja konta. „data" to mapa numer roszczenia -> rekord z prologistics.
     // KAZDE roszczenie dopasowujemy do SOP OSOBNO. Dopasowanie do sklejonego opisu bylo blednie
     // ciche: przy „airmail" (4224) i „bank fee" (6561) w jednym wierszu wygrywala regula o nizszym
@@ -10427,6 +10514,9 @@
     function parseBalancePaste(raw, debit, credit, penCredit, discCredit, opts) {
         const lines = String(raw || '').replace(/\r/g, '').split('\n');
         const entries = [], errors = [], warns = [], groups = [], byOrder = {}, others = [];
+        // Numery roszczen, ktorych kwoty musimy miec z prologistics, zeby w ogole ruszyc z wierszem
+        // (wiersz z kilkoma rodzajami roszczen). Panel dociaga je po tej liscie.
+        const needClaims = [];
         // opts.claims — mapa numer roszczenia -> rekord z prologistics (opis „other").
         // opts.picks  — konta wpisane recznie dla „other", kluczowane balOtherKey.
         const claimData = (opts && opts.claims) || null;
@@ -10494,8 +10584,10 @@
                 continue;
             }
             // Rozne typy roszczen w jednym wierszu ida na rozne konta, a z wklejki mamy tylko
-            // jedna roznice — nie ma z czego jej rozdzielic. Zgadywanie podzialu byloby gorsze
-            // niz odmowa, wiec taki wiersz blokuje calosc i idzie recznie.
+            // jedna roznice. Do 1.82 taki wiersz byl blokowany bez dyskusji. Od 1.83: prologistics
+            // zna kwote KAZDEGO roszczenia z osobna, wiec jesli te kwoty skladaja sie dokladnie na
+            // roznice, to podzial nie jest zgadywaniem tylko rachunkiem — i wtedy ksiegujemy go
+            // sami. Jesli sie nie skladaja albo skladaja na wiecej niz jeden sposob — blokada jak dotad.
             // „other +" i „other −" to dla nas jeden rodzaj: oba i tak trafiaja na konto
             // wybrane recznie wg tresci roszczenia, wiec nie ma powodu ich rozdzielac.
             const types = [];
@@ -10503,87 +10595,119 @@
                 const k = balKindName(t);
                 if (types.indexOf(k) < 0) types.push(k);
             });
+            let split = null;
             if (types.length > 1) {
-                const accs = types.map(function (t) {
-                    return t + '→' + (t === 'other' ? 'wg treści roszczenia' : (balTypeAccount(t, penCredit, discCredit) || '?'));
-                }).join(', ');
-                errors.push('wiersz ' + no + ': w notatce są różne typy roszczeń (' + label + '), a różnica to jedna kwota ' +
-                    balFix(diff) + ' — każdy typ ma inne konto (' + accs + ') i nie ma z czego rozdzielić tej kwoty. ' +
-                    'Zaksięguj ten order ręcznie albo rozbij go w arkuszu na osobne wiersze. ' + balShort(line));
-                continue;
+                // Bez kwot z prologistics nie ma podzialu — mowimy panelowi, czego dociagnac.
+                balClaimIds(claims).forEach(function (id) { if (needClaims.indexOf(id) < 0) needClaims.push(id); });
+                const sp = balSplitKinds(claims, claimData, diff);
+                if (!sp.ok) {
+                    // Gdy kwoty wlasnie sie pobieraja, to nie jest wiersz do reki — to jest „poczekaj".
+                    const wait = sp.reason === 'missing' && pending;
+                    errors.push('wiersz ' + no + ': ' + balSplitWhy(sp, label, diff, pending, types, penCredit, discCredit) +
+                        (wait ? ' ' : ' Zaksięguj ten order ręcznie albo rozbij go w arkuszu na osobne wiersze. ') + balShort(line));
+                    continue;
+                }
+                split = sp;
+                warns.push('wiersz ' + no + ': w notatce są różne typy roszczeń (' + label + ') — różnicę ' + balFix(diff) +
+                    ' rozdzieliłem po kwotach z prologistics (' + sp.items.map(function (it) {
+                        return it.id + ': ' + balFix(it.amt);
+                    }).join(', ') + ') na ' + types.map(function (t) {
+                        return t + ' ' + balFix(sp.byKind[t] || 0);
+                    }).join(' + ') + ' — sprawdź, czy tak ma być.');
+                sp.mism.forEach(function (m) {
+                    warns.push('wiersz ' + no + ': roszczenie nr ' + m.id + ' jest w notatce jako „' + m.note +
+                        '", a w prologistics jako „' + m.prolo + '" — sprawdź numer.');
+                });
             }
-            const ty = types[0];
-            let legCredit;
-            if (ty === 'other') {
-                // Konto „other" nie wynika z typu, tylko z tresci roszczenia. Propozycja z SOP
-                // jest tylko propozycja — dopoki pole jest puste, NIC sie nie ksieguje.
-                const okey = balOtherKey(order, claims);
-                const info = balClaimInfo(claims, claimData);
-                const proposed = balSopAccount(info.sop);
-                const picked = Object.prototype.hasOwnProperty.call(picks, okey);
-                legCredit = picked ? String(picks[okey] == null ? '' : picks[okey]).trim() : proposed;
-                others.push({
-                    key: okey, line: no, order: order, label: label, amount: balFix(Math.abs(diff)),
-                    ids: info.ids, recs: info.recs, missing: info.missing, desc: info.desc,
-                    parts: info.parts, sop: info.sop, account: legCredit, picked: picked, proposed: proposed
-                });
-                // Numer roszczenia z notatki musi wskazywac na TEN order i TE kwote — inaczej
-                // najpewniej zostal przepisany z sasiedniego wiersza. To uwaga, nie blokada.
-                info.recs.forEach(function (rec) {
-                    if (rec.ord && rec.ord !== String(order)) {
-                        warns.push('wiersz ' + no + ': roszczenie „other ' + rec.id + '" jest w prologistics przypisane do orderu ' +
-                            rec.ord + ', a wiersz dotyczy orderu ' + order + ' — sprawdź numer.');
-                    }
-                });
-                // Kwoty roszczen musza sie skladac na roznice z wklejki. Znak zalezy od tego, czy
-                // roszczenie dopłaca czy potraca, wiec sprawdzamy KAZDA kombinacje znakow —
-                // ostrzegamy dopiero wtedy, gdy zadna nie trafia w roznice. Przy jednym roszczeniu
-                // wychodzi na to samo, co bylo: |kwota| musi sie rownac |roznica|.
-                const ramts = info.recs.map(function (rc) { return Math.abs(parseFloat(rc.amt)); });
-                if (ramts.length && ramts.length <= 8 && ramts.every(function (a) { return !isNaN(a); })) {
-                    let sums = [0];
-                    ramts.forEach(function (a) {
-                        const nx = [];
-                        sums.forEach(function (s) { nx.push(bal2(s + a)); nx.push(bal2(s - a)); });
-                        sums = nx;
+            // Kazdy rodzaj roszczenia to osobna „druga noga" ze swoim kontem i swoja kwota.
+            // Przy jednym rodzaju noga jest jedna i wychodzi dokladnie to, co przed 1.83.
+            const legs = [];
+            let blocked = false;
+            for (let ti = 0; ti < types.length && !blocked; ti++) {
+                const ty = types[ti];
+                const kClaims = split ? balClaimsOfKind(claims, ty) : claims;
+                const kLabel = split ? balClaimLabel(kClaims) : label;
+                const kAmt = split ? bal2(split.byKind[ty] || 0) : diff;
+                let legCredit;
+                if (ty === 'other') {
+                    // Konto „other" nie wynika z typu, tylko z tresci roszczenia. Propozycja z SOP
+                    // jest tylko propozycja — dopoki pole jest puste, NIC sie nie ksieguje.
+                    // Uwaga: patrzymy TYLKO na roszczenia „other" z tego wiersza — opis penalty
+                    // nie ma prawa wplynac na dopasowanie do SOP.
+                    const okey = balOtherKey(order, kClaims);
+                    const info = balClaimInfo(kClaims, claimData);
+                    const proposed = balSopAccount(info.sop);
+                    const picked = Object.prototype.hasOwnProperty.call(picks, okey);
+                    legCredit = picked ? String(picks[okey] == null ? '' : picks[okey]).trim() : proposed;
+                    others.push({
+                        key: okey, line: no, order: order, label: kLabel, amount: balFix(Math.abs(kAmt)),
+                        ids: info.ids, recs: info.recs, missing: info.missing, desc: info.desc,
+                        parts: info.parts, sop: info.sop, account: legCredit, picked: picked, proposed: proposed
                     });
-                    const target = Math.abs(diff);
-                    const fits = sums.some(function (s) { return Math.abs(Math.abs(s) - target) < 0.005; });
-                    if (!fits && ramts.length === 1) {
-                        warns.push('wiersz ' + no + ': roszczenie „other ' + info.recs[0].id + '" ma w prologistics kwotę ' +
-                            balFix(ramts[0]) + ', a z wklejki wychodzi różnica ' + balFix(target) + ' — sprawdź.');
-                    } else if (!fits) {
-                        warns.push('wiersz ' + no + ': kwoty roszczeń w prologistics (' + info.recs.map(function (rc, ix) {
-                            return rc.id + ': ' + balFix(ramts[ix]);
-                        }).join(', ') + ') nie składają się na różnicę ' + balFix(target) + ' z wklejki — sprawdź.');
+                    // Numer roszczenia z notatki musi wskazywac na TEN order i TE kwote — inaczej
+                    // najpewniej zostal przepisany z sasiedniego wiersza. To uwaga, nie blokada.
+                    info.recs.forEach(function (rec) {
+                        if (rec.ord && rec.ord !== String(order)) {
+                            warns.push('wiersz ' + no + ': roszczenie „other ' + rec.id + '" jest w prologistics przypisane do orderu ' +
+                                rec.ord + ', a wiersz dotyczy orderu ' + order + ' — sprawdź numer.');
+                        }
+                    });
+                    // Kwoty roszczen musza sie skladac na roznice z wklejki. Znak zalezy od tego, czy
+                    // roszczenie dopłaca czy potraca, wiec sprawdzamy KAZDA kombinacje znakow —
+                    // ostrzegamy dopiero wtedy, gdy zadna nie trafia w roznice. Przy jednym roszczeniu
+                    // wychodzi na to samo, co bylo: |kwota| musi sie rownac |roznica|.
+                    const ramts = info.recs.map(function (rc) { return Math.abs(parseFloat(rc.amt)); });
+                    if (ramts.length && ramts.length <= 8 && ramts.every(function (a) { return !isNaN(a); })) {
+                        let sums = [0];
+                        ramts.forEach(function (a) {
+                            const nx = [];
+                            sums.forEach(function (s) { nx.push(bal2(s + a)); nx.push(bal2(s - a)); });
+                            sums = nx;
+                        });
+                        const target = Math.abs(kAmt);
+                        const fits = sums.some(function (s) { return Math.abs(Math.abs(s) - target) < 0.005; });
+                        if (!fits && ramts.length === 1) {
+                            warns.push('wiersz ' + no + ': roszczenie „other ' + info.recs[0].id + '" ma w prologistics kwotę ' +
+                                balFix(ramts[0]) + ', a z wklejki wychodzi różnica ' + balFix(target) + ' — sprawdź.');
+                        } else if (!fits) {
+                            warns.push('wiersz ' + no + ': kwoty roszczeń w prologistics (' + info.recs.map(function (rc, ix) {
+                                return rc.id + ': ' + balFix(ramts[ix]);
+                            }).join(', ') + ') nie składają się na różnicę ' + balFix(target) + ' z wklejki — sprawdź.');
+                        }
+                    }
+                    if (claimData && !pending && info.missing.length) {
+                        warns.push('wiersz ' + no + ': nie znalazłem w prologistics roszczenia nr ' + info.missing.join(', ') +
+                            ' — opis i propozycja konta niedostępne.');
+                    }
+                    if (!legCredit) {
+                        errors.push('wiersz ' + no + ': roszczenie „' + kLabel + '" nie ma stałego konta — przy „other" konto wybiera się wg treści roszczenia. ' +
+                            (info.desc ? 'Powód: „' + info.desc + '". ' : '') +
+                            (info.sop && info.sop.note ? info.sop.note + ' ' : '') +
+                            (info.sop && info.sop.conflict ? 'Te roszczenia idą wg SOP na różne konta (' +
+                                info.sop.conflict.map(function (p) { return p.id + '→' + (p.acc || 'bez konta'); }).join(', ') +
+                                '), a z wklejki jest jedna kwota — rozbij ten wiersz w arkuszu na osobne roszczenia. ' : '') +
+                            'Wpisz konto w ramce „Roszczenia other" pod wklejką. ' + balShort(line));
+                        blocked = true;
+                        continue;
+                    }
+                } else {
+                    legCredit = balTypeAccount(ty, penCredit, discCredit);
+                    if (!legCredit) {
+                        errors.push('wiersz ' + no + ': roszczenie „' + kLabel + '" ma iść na konto ' +
+                            (ty === 'discount' ? '„Discount"' : '„Penalty"') + ', a to pole w panelu jest puste — uzupełnij je. ' + balShort(line));
+                        blocked = true;
+                        continue;
                     }
                 }
-                if (claimData && !pending && info.missing.length) {
-                    warns.push('wiersz ' + no + ': nie znalazłem w prologistics roszczenia nr ' + info.missing.join(', ') +
-                        ' — opis i propozycja konta niedostępne.');
-                }
-                if (!legCredit) {
-                    errors.push('wiersz ' + no + ': roszczenie „' + label + '" nie ma stałego konta — przy „other" konto wybiera się wg treści roszczenia. ' +
-                        (info.desc ? 'Powód: „' + info.desc + '". ' : '') +
-                        (info.sop && info.sop.note ? info.sop.note + ' ' : '') +
-                        (info.sop && info.sop.conflict ? 'Te roszczenia idą wg SOP na różne konta (' +
-                            info.sop.conflict.map(function (p) { return p.id + '→' + (p.acc || 'bez konta'); }).join(', ') +
-                            '), a z wklejki jest jedna kwota — rozbij ten wiersz w arkuszu na osobne roszczenia. ' : '') +
-                        'Wpisz konto w ramce „Roszczenia other" pod wklejką. ' + balShort(line));
-                    continue;
-                }
-            } else {
-                legCredit = balTypeAccount(ty, penCredit, discCredit);
-                if (!legCredit) {
-                    errors.push('wiersz ' + no + ': roszczenie „' + label + '" ma iść na konto ' +
-                        (ty === 'discount' ? '„Discount"' : '„Penalty"') + ', a to pole w panelu jest puste — uzupełnij je. ' + balShort(line));
-                    continue;
-                }
+                legs.push({ ty: ty, credit: legCredit, amount: kAmt, label: kLabel });
             }
+            if (blocked) continue;
             if (!hasCont) warns.push('wiersz ' + no + ': brak numeru kontenera — w opisie pierwszego wpisu pójdzie „' + label + '".');
             entries.push(Object.assign({}, base, { amount: balFix(gross), comment: hasCont ? cont : label, kind: 'kontener' }));
-            entries.push(Object.assign({}, base, { amount: balFix(-diff), comment: label, kind: balKindName(ty) + ' −' }));
-            entries.push(Object.assign({}, base, { amount: balFix(diff), credit: legCredit, comment: label, kind: balKindName(ty) + ' +', plus: true }));
+            entries.push(Object.assign({}, base, { amount: balFix(-diff), comment: label, kind: legs.map(function (l) { return l.ty; }).join('+') + ' −' }));
+            legs.forEach(function (l) {
+                entries.push(Object.assign({}, base, { amount: balFix(l.amount), credit: l.credit, comment: l.label, kind: l.ty + ' +', plus: true }));
+            });
         }
         closeGroup(null);
 
@@ -10613,7 +10737,7 @@
 
         return { entries: entries, groups: groups, errors: errors, warns: warns, bank: bal2(bank),
                  pen: bal2(accs[penCredit] || 0), disc: bal2(accs[discCredit] || 0), accs: accs,
-                 others: others };
+                 others: others, needClaims: needClaims };
     }
 
     // Wartosci kont z pol panelu — podglad musi liczyc dokladnie to, co pojdzie w POST.
@@ -10676,7 +10800,11 @@
         if (!want.length) return;
         balClaimStore.loading = true;
         balClaimStore.error = null;
-        try { renderOtherBox(balParseCurrent()); } catch (e) {}
+        // Przerysowujemy CALY podglad, nie sama ramke — od 1.83 na pobranie czeka takze
+        // komunikat wiersza z kilkoma rodzajami roszczen („chwila" zamiast „ksieguj recznie").
+        // Bez rekurencji: balClaimStore.loading jest juz true, wiec powrotne wejscie tutaj
+        // konczy sie na pierwszej linii.
+        try { updateTextPreview(); } catch (e) {}
         try {
             const last = await balClaimPage(1);
             balClaimStore.pages = last;
@@ -10866,13 +10994,15 @@
             el.innerHTML = bits.join(' | ');
             if (box) box.innerHTML = balMsgHtml(r);
             renderOtherBox(r);
-            // Opisy roszczen „other" doczytujemy dopiero wtedy, gdy w wklejce faktycznie sa —
-            // przy zwyklych penalty panel nie odpytuje serwera w ogole.
-            if (r.others.length) {
+            // Roszczenia z prologistics doczytujemy dopiero wtedy, gdy sa naprawde potrzebne:
+            // przy „other" po opis i konto, a przy wierszu z kilkoma rodzajami po KWOTY, bez
+            // ktorych nie ma jak rozdzielic roznicy. Przy zwyklych penalty — zero zapytan.
+            {
                 const need = [];
                 r.others.forEach(function (o) {
                     o.missing.forEach(function (id) { if (need.indexOf(id) < 0) need.push(id); });
                 });
+                (r.needClaims || []).forEach(function (id) { if (need.indexOf(id) < 0) need.push(id); });
                 if (need.length) balEnsureClaims(need);
             }
             return;
