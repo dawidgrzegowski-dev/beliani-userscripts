@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.80
+// @version      1.81
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10060,6 +10060,8 @@
             Wiersze puste pomijane, wiersze z sumą grupy sprawdzane. Kwota wpisu = ta z notatki,
             różnica względem kolumny „kwota" musi być wytłumaczona roszczeniem (penalty, discount,
             overpayment, underpayment). Penalty idzie na konto „Penalty", discount na „Discount".
+            Roszczenia „other +" / „other −" nie mają stałego konta — panel pobiera ich treść
+            z prologistics, proponuje konto wg SOP i czeka, aż potwierdzisz je w ramce pod spodem.
         </div>
         <textarea id="tm-order-input"
             placeholder="20730&#9;ZHANGZHOU YOKA&#9;2527.5&#10;20731&#9;ZHANGZHOU YOKA&#9;2851.5"
@@ -10068,6 +10070,7 @@
                    box-sizing:border-box;font-family:monospace;"></textarea>
         <div id="tm-parsed-preview" style="margin-top:4px;font-size:11px;color:#555;min-height:16px;"></div>
         <div id="tm-bal-msgs" style="margin-top:4px;font-size:11px;"></div>
+        <div id="tm-other-box" style="margin-top:4px;font-size:11px;"></div>
 
         <div style="margin-top:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
             <label style="font-size:12px;color:#333;">Waluta:</label>
@@ -10082,7 +10085,7 @@
             <input id="tm-debit" value="1270" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
             <label style="font-size:12px;color:#333;">Credit:</label>
             <input id="tm-credit" value="1049" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
-            <span id="tm-pen-wrap" style="display:none;gap:6px;align-items:center;" title="Druga noga korekty: 1270 / to konto, kwota z plusem. Pierwsza noga to ta sama kwota z minusem na Debit/Credit powyżej. Konto zależy od typu roszczenia: discount ma własne, reszta (penalty / overpayment / underpayment / other) idzie na konto Penalty.">
+            <span id="tm-pen-wrap" style="display:none;gap:6px;align-items:center;" title="Druga noga korekty: 1270 / to konto, kwota z plusem. Pierwsza noga to ta sama kwota z minusem na Debit/Credit powyżej. Konto zależy od typu roszczenia: discount ma własne, penalty / overpayment / underpayment idą na konto Penalty, a „other +" / „other −" nie ma stałego konta — wybiera się je wg treści roszczenia w ramce pod wklejką.">
                 <label style="font-size:12px;color:#333;">Penalty:</label>
                 <input id="tm-pen-credit" value="8100" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
                 <label style="font-size:12px;color:#333;">Discount:</label>
@@ -10314,12 +10317,103 @@
         return s.length > 90 ? s.slice(0, 90) + '…' : s;
     }
 
+    // ---- Roszczenia „other +" / „other −": konto wg tresci, nie wg typu --------------------
+    // penalty / discount / overpayment / underpayment maja w SOP jedno stale konto. „other" nie —
+    // SOP kaze wybrac konto na podstawie tego, CZEGO roszczenie dotyczy (kolumna „Claim
+    // description" na liscie roszczen dostawcow). Na stronie orderu tego opisu nie ma; w komentarzu
+    // systemowym jest tylko typ i numer roszczenia. Dlatego opis pobieramy z listy roszczen.
+    //
+    // Ponizsza tabela to przelozenie SOP na slowa kluczowe, sprawdzone na wszystkich 30 roszczeniach
+    // „other" jakie sa w systemie. Nizszy prio = mocniejszy sygnal; „bank fee" bije „penalty",
+    // bo nazywa sam koszt, a „penalty" jest w takim zdaniu tylko kontekstem („Bank fee for penalty
+    // refund"). Skrypt tylko PROPONUJE — konto potwierdza czlowiek w ramce pod wklejka.
+    // UWAGA: konto bankowe w SOP jest nieaktualne (1070); obowiazuje 1049 z pola „Credit".
+    const BAL_SOP_RULES = [
+        { prio: 1, acc: '', name: 'przeniesienie między orderami',
+          re: /cancellation of order|order cancel+ed|deduct(?:ed)?\s+(?:it\s+)?from\s+the\s+order|deposit payment from balance of order|old deposit|deposit reduction|left from order/i,
+          note: 'To nie jest koszt, tylko przeniesienie depozytu / płatności z innego orderu — SOP każe zrobić to funkcją „Transfer payment to another OP Order", a nie wpisem na konto wynikowe. Ten order zaksięguj ręcznie.' },
+        { prio: 2, acc: '6561', name: 'opłaty bankowe USD',
+          re: /bank\s*fees?/i },
+        { prio: 3, acc: '4224', name: 'koszt towaru — części zamienne / airmail',
+          re: /air\s*-?\s*mail|spare\s*parts?/i },
+        { prio: 4, acc: '4276', name: 'koszty inbound — fracht / trucking',
+          re: /ocean\s*freight|freight|trucking|participation with cost/i, reCs: /\bOF\b/ },
+        { prio: 5, acc: '4221', name: 'rabat / kompensata dla dostawcy (FOC)',
+          re: /\bFOC\b(?!\s*ticket)|free of charge|carton layout/i },
+        { prio: 6, acc: '8100', name: 'pozostałe przychody — penalty i korekty penalty',
+          re: /penalt(?:y|ies)|doubled|deducted twice|too much was deducted|wrongly deducted|free space in container|not full container|goods not shipped/i },
+        { prio: 7, acc: '8002|8104', name: 'różnica ilościowa — strata 8002 / zysk 8104',
+          re: /arrived with|\+\s*\d+\s*x\b|without\s+\d+\s*x\b|quantity difference/i }
+    ];
+    // Zwraca { acc, name, note, hits, alts, empty, none, mixed }. acc='' = SOP nie wskazuje konta
+    // wynikowego (przeniesienie), acc z „|" = dwa mozliwe konta i trzeba wybrac recznie.
+    function balSopMatch(desc) {
+        const s = String(desc == null ? '' : desc);
+        const base = { acc: '', name: '', note: '', hits: [], alts: [], empty: false, none: false, mixed: false };
+        if (!s.trim()) return Object.assign(base, { empty: true });
+        const hits = [];
+        BAL_SOP_RULES.forEach(function (r) {
+            if ((r.re && r.re.test(s)) || (r.reCs && r.reCs.test(s))) hits.push(r);
+        });
+        hits.sort(function (a, b) { return a.prio - b.prio; });
+        const top = hits[0] || null;
+        // „A + B" w opisie (litera-plus-litera, wiec nie „16006+15575") = roszczenie moze laczyc
+        // dwie rzeczy o roznych kontach. Propozycji nie kasujemy, ale zaznaczamy to wyraznie.
+        return Object.assign(base, {
+            acc: top ? top.acc : '', name: top ? top.name : '', note: (top && top.note) || '',
+            hits: hits, none: !top,
+            alts: hits.slice(1).filter(function (h) { return h.acc !== (top ? top.acc : ''); }),
+            mixed: /[a-z]\s*\+\s*[a-z]/i.test(s)
+        });
+    }
+    // Konto podstawiamy automatycznie tylko wtedy, gdy SOP wskazuje DOKLADNIE jedno.
+    function balSopAccount(sop) {
+        if (!sop || !sop.acc || sop.acc.indexOf('|') >= 0) return '';
+        return sop.acc;
+    }
+    // Klucz wyboru konta. Numer wiersza sie przesuwa przy edycji wklejki, order + numery
+    // roszczen nie — dzieki temu raz wpisane konto nie znika po dopisaniu wiersza wyzej.
+    function balOtherKey(order, claims) {
+        return String(order) + '#' + (claims || []).slice().sort().join(',');
+    }
+    // ['other + 1152'] -> ['1152']
+    function balClaimIds(claims) {
+        const out = [];
+        (claims || []).forEach(function (c) {
+            const m = String(c).match(/(\d+)\s*$/);
+            if (m && out.indexOf(m[1]) < 0) out.push(m[1]);
+        });
+        return out;
+    }
+    // Opisy roszczen + propozycja konta. „data" to mapa numer roszczenia -> rekord z prologistics.
+    function balClaimInfo(claims, data) {
+        const ids = balClaimIds(claims), recs = [], missing = [];
+        ids.forEach(function (id) {
+            const rec = data ? data[id] : null;
+            if (!rec) { missing.push(id); return; }
+            recs.push({
+                id: id,
+                desc: String(rec.desc == null ? '' : rec.desc).replace(/\s+/g, ' ').trim(),
+                ord: String(rec.ord == null ? '' : rec.ord),
+                amt: rec.amt, ty: rec.ty
+            });
+        });
+        const joined = recs.map(function (r) { return r.desc; }).filter(Boolean).join(' | ');
+        return { ids: ids, recs: recs, missing: missing, desc: joined, sop: balSopMatch(joined) };
+    }
+
     // Zwraca { entries, groups, errors, warns }. Przy jakimkolwiek bledzie NIE ksiegujemy nic —
     // lepiej zeby czlowiek poprawil wklejke, niz zeby poszedl w system wpis, ktorego nie umiemy
     // wytlumaczyc.
-    function parseBalancePaste(raw, debit, credit, penCredit, discCredit) {
+    function parseBalancePaste(raw, debit, credit, penCredit, discCredit, opts) {
         const lines = String(raw || '').replace(/\r/g, '').split('\n');
-        const entries = [], errors = [], warns = [], groups = [], byOrder = {};
+        const entries = [], errors = [], warns = [], groups = [], byOrder = {}, others = [];
+        // opts.claims — mapa numer roszczenia -> rekord z prologistics (opis „other").
+        // opts.picks  — konta wpisane recznie dla „other", kluczowane balOtherKey.
+        const claimData = (opts && opts.claims) || null;
+        const picks = (opts && opts.picks) || {};
+        // opts.pending — lista roszczen wlasnie sie pobiera, wiec „nie znalazlem" byloby klamstwem.
+        const pending = !!(opts && opts.pending);
         let cur = null, lostSum = 0;
 
         function closeGroup(declared) {
@@ -10383,20 +10477,70 @@
             // Rozne typy roszczen w jednym wierszu ida na rozne konta, a z wklejki mamy tylko
             // jedna roznice — nie ma z czego jej rozdzielic. Zgadywanie podzialu byloby gorsze
             // niz odmowa, wiec taki wiersz blokuje calosc i idzie recznie.
-            const types = balClaimTypes(claims);
+            // „other +" i „other −" to dla nas jeden rodzaj: oba i tak trafiaja na konto
+            // wybrane recznie wg tresci roszczenia, wiec nie ma powodu ich rozdzielac.
+            const types = [];
+            balClaimTypes(claims).forEach(function (t) {
+                const k = balKindName(t);
+                if (types.indexOf(k) < 0) types.push(k);
+            });
             if (types.length > 1) {
-                const accs = types.map(function (t) { return balKindName(t) + '→' + (balTypeAccount(t, penCredit, discCredit) || '?'); }).join(', ');
+                const accs = types.map(function (t) {
+                    return t + '→' + (t === 'other' ? 'wg treści roszczenia' : (balTypeAccount(t, penCredit, discCredit) || '?'));
+                }).join(', ');
                 errors.push('wiersz ' + no + ': w notatce są różne typy roszczeń (' + label + '), a różnica to jedna kwota ' +
                     balFix(diff) + ' — każdy typ ma inne konto (' + accs + ') i nie ma z czego rozdzielić tej kwoty. ' +
                     'Zaksięguj ten order ręcznie albo rozbij go w arkuszu na osobne wiersze. ' + balShort(line));
                 continue;
             }
             const ty = types[0];
-            const legCredit = balTypeAccount(ty, penCredit, discCredit);
-            if (!legCredit) {
-                errors.push('wiersz ' + no + ': roszczenie „' + label + '" ma iść na konto ' +
-                    (ty === 'discount' ? '„Discount"' : '„Penalty"') + ', a to pole w panelu jest puste — uzupełnij je. ' + balShort(line));
-                continue;
+            let legCredit;
+            if (ty === 'other') {
+                // Konto „other" nie wynika z typu, tylko z tresci roszczenia. Propozycja z SOP
+                // jest tylko propozycja — dopoki pole jest puste, NIC sie nie ksieguje.
+                const okey = balOtherKey(order, claims);
+                const info = balClaimInfo(claims, claimData);
+                const proposed = balSopAccount(info.sop);
+                const picked = Object.prototype.hasOwnProperty.call(picks, okey);
+                legCredit = picked ? String(picks[okey] == null ? '' : picks[okey]).trim() : proposed;
+                others.push({
+                    key: okey, line: no, order: order, label: label, amount: balFix(Math.abs(diff)),
+                    ids: info.ids, recs: info.recs, missing: info.missing, desc: info.desc,
+                    sop: info.sop, account: legCredit, picked: picked, proposed: proposed
+                });
+                // Numer roszczenia z notatki musi wskazywac na TEN order i TE kwote — inaczej
+                // najpewniej zostal przepisany z sasiedniego wiersza. To uwaga, nie blokada.
+                info.recs.forEach(function (rec) {
+                    if (rec.ord && rec.ord !== String(order)) {
+                        warns.push('wiersz ' + no + ': roszczenie „other ' + rec.id + '" jest w prologistics przypisane do orderu ' +
+                            rec.ord + ', a wiersz dotyczy orderu ' + order + ' — sprawdź numer.');
+                    }
+                });
+                if (info.recs.length === 1) {
+                    const ra = Math.abs(parseFloat(info.recs[0].amt));
+                    if (!isNaN(ra) && Math.abs(ra - Math.abs(diff)) >= 0.005) {
+                        warns.push('wiersz ' + no + ': roszczenie „other ' + info.recs[0].id + '" ma w prologistics kwotę ' +
+                            balFix(ra) + ', a z wklejki wychodzi różnica ' + balFix(Math.abs(diff)) + ' — sprawdź.');
+                    }
+                }
+                if (claimData && !pending && info.missing.length) {
+                    warns.push('wiersz ' + no + ': nie znalazłem w prologistics roszczenia nr ' + info.missing.join(', ') +
+                        ' — opis i propozycja konta niedostępne.');
+                }
+                if (!legCredit) {
+                    errors.push('wiersz ' + no + ': roszczenie „' + label + '" nie ma stałego konta — przy „other" konto wybiera się wg treści roszczenia. ' +
+                        (info.desc ? 'Powód: „' + info.desc + '". ' : '') +
+                        (info.sop && info.sop.note ? info.sop.note + ' ' : '') +
+                        'Wpisz konto w ramce „Roszczenia other" pod wklejką. ' + balShort(line));
+                    continue;
+                }
+            } else {
+                legCredit = balTypeAccount(ty, penCredit, discCredit);
+                if (!legCredit) {
+                    errors.push('wiersz ' + no + ': roszczenie „' + label + '" ma iść na konto ' +
+                        (ty === 'discount' ? '„Discount"' : '„Penalty"') + ', a to pole w panelu jest puste — uzupełnij je. ' + balShort(line));
+                    continue;
+                }
             }
             if (!hasCont) warns.push('wiersz ' + no + ': brak numeru kontenera — w opisie pierwszego wpisu pójdzie „' + label + '".');
             entries.push(Object.assign({}, base, { amount: balFix(gross), comment: hasCont ? cont : label, kind: 'kontener' }));
@@ -10430,7 +10574,8 @@
         });
 
         return { entries: entries, groups: groups, errors: errors, warns: warns, bank: bal2(bank),
-                 pen: bal2(accs[penCredit] || 0), disc: bal2(accs[discCredit] || 0), accs: accs };
+                 pen: bal2(accs[penCredit] || 0), disc: bal2(accs[discCredit] || 0), accs: accs,
+                 others: others };
     }
 
     // Wartosci kont z pol panelu — podglad musi liczyc dokladnie to, co pojdzie w POST.
@@ -10444,10 +10589,72 @@
     }
     function balParseCurrent() {
         const a = balAccounts();
-        return parseBalancePaste(document.getElementById('tm-order-input')?.value || '', a.debit, a.credit, a.pen, a.disc);
+        return parseBalancePaste(document.getElementById('tm-order-input')?.value || '', a.debit, a.credit, a.pen, a.disc,
+            { claims: balClaimStore.byId, picks: balOtherPick, pending: balClaimStore.loading });
     }
     function balEsc(s) {
         return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    function balAttr(s) { return balEsc(s).replace(/"/g, '&quot;'); }
+
+    // ---- Pobieranie tresci roszczen z prologistics ----------------------------------------
+    // Ta sama lista, ktora widac na stronie „Penalties for Suppliers". Leci na sesji, ktora
+    // uzytkownik juz ma w przegladarce (credentials: same-origin) — zadnych hasel, tokenow ani
+    // ciasteczek skrypt nie czyta, nie zapisuje i nie wysyla nigdzie indziej.
+    // Strony sa posortowane rosnaco po numerze roszczenia, wiec po stronie 1 (z ktorej znamy
+    // liczbe stron) idziemy OD KONCA i przerywamy, gdy mamy juz wszystkie szukane numery —
+    // zwykle wystarczaja 2 zapytania zamiast 30.
+    const BAL_CLAIM_URL = '/api/rest/penalty/list?log=1&filter[inactive]=0&filter[applied]=1&page=';
+    const balClaimStore = { byId: {}, loading: false, error: null, done: false, pages: 0, fetched: 0 };
+    let balOtherPick = {};
+
+    async function balClaimPage(page) {
+        const resp = await fetch(BAL_CLAIM_URL + page, { credentials: 'same-origin', headers: { 'Accept': 'application/json' } });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const j = await resp.json();
+        const res = j && j.result;
+        if (!res || !Array.isArray(res.data)) throw new Error('nieznany format odpowiedzi listy roszczeń');
+        res.data.forEach(function (x) {
+            balClaimStore.byId[String(x.id)] = {
+                id: String(x.id),
+                ord: String(x.target_order_id == null ? '' : x.target_order_id),
+                cont: x.target_container_id, amt: x.amount,
+                ty: x.penalty_name, sign: x.penalty_value,
+                desc: x.description, sup: x.op_company_name
+            };
+        });
+        balClaimStore.fetched++;
+        const p = res.pagination || {};
+        const per = parseInt(p.penalty_per_page, 10) || res.data.length || 30;
+        const total = parseInt(p.total, 10) || res.data.length;
+        return Math.max(1, Math.ceil(total / per));
+    }
+
+    async function balEnsureClaims(ids) {
+        // Po bledzie NIE ponawiamy sami — inaczej kazde przeliczenie podgladu wysylaloby
+        // kolejne zapytanie w kolko. Ponowienie jest recznie, linkiem w ramce „other".
+        if (balClaimStore.loading || balClaimStore.done || balClaimStore.error) return;
+        const want = (ids || []).filter(function (id) { return !balClaimStore.byId[id]; });
+        if (!want.length) return;
+        balClaimStore.loading = true;
+        balClaimStore.error = null;
+        try { renderOtherBox(balParseCurrent()); } catch (e) {}
+        try {
+            const last = await balClaimPage(1);
+            balClaimStore.pages = last;
+            let swept = true;
+            for (let p = last; p >= 2; p--) {
+                if (want.every(function (id) { return !!balClaimStore.byId[id]; })) { swept = false; break; }
+                await balClaimPage(p);
+            }
+            // Pelny przemiat = mamy wszystko, wiec nie ma po co pytac drugi raz. Przerwanie
+            // w polowie zostawia „done" na false, zeby przy innej wklejce doczytac reszte.
+            if (swept) balClaimStore.done = true;
+        } catch (e) {
+            balClaimStore.error = (e && e.message) ? e.message : String(e);
+        }
+        balClaimStore.loading = false;
+        try { updateTextPreview(); } catch (e) {}
     }
     // Bledy i uwagi pod polem wklejki. Blad = nie ksiegujemy nic, uwaga = ksiegujemy, ale pokaz.
     function balMsgHtml(r) {
@@ -10465,13 +10672,112 @@
         return html;
     }
 
+    // ---- Ramka „Roszczenia other" ---------------------------------------------------------
+    // „other +" i „other −" nie maja stalego konta — wg SOP wybiera sie je po tresci
+    // roszczenia. Ramka pokazuje te tresc (pobrana z prologistics), propozycje konta wg SOP
+    // i pole, w ktorym decyzje podejmuje uzytkownik. Puste pole = ten order sie nie ksieguje.
+    let balOtherSig = '';
+
+    function balOtherSopHtml(o) {
+        const sop = o.sop || {};
+        let main;
+        if (sop.note) {
+            main = '<span style="color:#92400e">SOP: ' + balEsc(sop.name) + ' — to nie jest koszt, wiec nie ma konta wynikowego. ' + balEsc(sop.note) + '</span>';
+        } else if (sop.empty) {
+            main = '<span style="color:#92400e">SOP: roszczenie nie ma treści, więc nie mam czego dopasować — konto wybierz sam.</span>';
+        } else if (sop.none) {
+            main = '<span style="color:#92400e">SOP: treść nie pasuje do żadnej reguły z SOP — konto wybierz sam.</span>';
+        } else if (String(sop.acc).indexOf('|') >= 0) {
+            main = '<span style="color:#92400e">SOP: ' + balEsc(sop.name) + ' → ' + balEsc(String(sop.acc).replace('|', ' albo ')) +
+                ' — zależy, czy wychodzi strata czy zysk; wybierz sam.</span>';
+        } else {
+            main = '<span style="color:#166534">SOP: ' + balEsc(sop.name) + ' → <strong>' + balEsc(sop.acc) + '</strong></span>';
+        }
+        let extra = '';
+        if (sop.alts && sop.alts.length) {
+            extra += '<div style="color:#6b7280">pasuje też: ' + sop.alts.map(function (a) {
+                return balEsc(a.name) + (a.acc ? ' → ' + balEsc(a.acc) : '');
+            }).join(' · ') + '</div>';
+        }
+        if (sop.mixed) {
+            extra += '<div style="color:#b45309">⚠ w treści są dwie różne rzeczy naraz — sprawdź, czy cała kwota może iść na jedno konto.</div>';
+        }
+        return '<div>' + main + '</div>' + extra;
+    }
+
+    function renderOtherBox(r) {
+        const box = document.getElementById('tm-other-box');
+        if (!box) return;
+        const list = (r && r.others) || [];
+        if (!list.length) { balOtherSig = ''; box.innerHTML = ''; return; }
+        // Sygnatura CELOWO bez wpisanego konta: inaczej kazde nacisniecie klawisza
+        // przebudowywaloby ramke i zabieralo focus z pola, w ktorym uzytkownik wlasnie pisze.
+        const sig = JSON.stringify([balClaimStore.loading, balClaimStore.error,
+            list.map(function (o) {
+                return [o.key, o.line, o.order, o.amount, o.label, o.desc, o.proposed, o.missing.join(',')];
+            })]);
+        if (sig === balOtherSig) return;
+        balOtherSig = sig;
+
+        const items = list.map(function (o) {
+            let h = '<div><strong>wiersz ' + o.line + '</strong> · order ' + balEsc(o.order) +
+                ' · ' + balEsc(o.label) + ' · ' + balEsc(o.amount) + '</div>';
+            if (o.desc) h += '<div style="color:#111827;margin:2px 0;">„' + balEsc(o.desc) + '"</div>';
+            if (o.missing.length) {
+                if (balClaimStore.loading) {
+                    h += '<div style="color:#6b7280">⏳ pobieram treść roszczenia ' + balEsc(o.missing.join(', ')) + ' z prologistics…</div>';
+                } else if (balClaimStore.error) {
+                    h += '<div style="color:#b91c1c">nie udało się pobrać listy roszczeń (' + balEsc(balClaimStore.error) +
+                        ') — <a href="#" class="tm-other-retry" style="color:#2563eb">spróbuj ponownie</a> albo wpisz konto ręcznie.</div>';
+                } else {
+                    h += '<div style="color:#b45309">nie znalazłem roszczenia nr ' + balEsc(o.missing.join(', ')) +
+                        ' na liście „applied" w prologistics — wpisz konto ręcznie.</div>';
+                }
+            }
+            h += balOtherSopHtml(o);
+            const acc = String(o.account == null ? '' : o.account);
+            h += '<div style="margin-top:3px;">konto: <input type="text" class="tm-other-acc" data-key="' + balAttr(o.key) +
+                '" value="' + balAttr(acc) + '" placeholder="konto" style="width:70px;padding:2px 4px;border:1px solid ' +
+                (acc.trim() ? '#d1d5db' : '#dc2626') + ';border-radius:4px;font-size:11px;text-align:center;">' +
+                ' <span style="color:#6b7280">druga noga wpisu +' + balEsc(o.amount) + '</span></div>';
+            return '<div style="border-top:1px solid #e5e7eb;padding:4px 0;">' + h + '</div>';
+        }).join('');
+
+        box.innerHTML = '<div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px;padding:6px 8px;">' +
+            '<strong>Roszczenia „other" (' + list.length + ') — konto wybierasz sam</strong>' +
+            '<div style="color:#6b7280;">Propozycja jest wyliczona z SOP, ale decyzja należy do Ciebie. ' +
+            'Puste pole = cała wklejka się nie księguje.</div>' + items + '</div>';
+
+        box.querySelectorAll('.tm-other-acc').forEach(function (inp) {
+            inp.addEventListener('input', function () {
+                balOtherPick[inp.getAttribute('data-key')] = inp.value;
+                inp.style.borderColor = inp.value.trim() ? '#d1d5db' : '#dc2626';
+                updateTextPreview();
+            });
+        });
+        box.querySelectorAll('.tm-other-retry').forEach(function (a) {
+            a.addEventListener('click', function (ev) {
+                ev.preventDefault();
+                balClaimStore.error = null;
+                balOtherSig = '';
+                updateTextPreview();
+            });
+        });
+    }
+
     function updateTextPreview() {
         const el = document.getElementById('tm-parsed-preview');
         if (!el) return;
         const raw = document.getElementById('tm-order-input')?.value || '';
         if (balMode() === 'bal') {
             const box = document.getElementById('tm-bal-msgs');
-            if (!raw.trim()) { el.innerHTML = ''; if (box) box.innerHTML = ''; return; }
+            const obox = document.getElementById('tm-other-box');
+            if (!raw.trim()) {
+                el.innerHTML = '';
+                if (box) box.innerHTML = '';
+                if (obox) { obox.innerHTML = ''; balOtherSig = ''; }
+                return;
+            }
             const r = balParseCurrent();
             const a = balAccounts();
             const orders = {}; r.entries.forEach(function (e) { orders[e.id] = 1; });
@@ -10480,14 +10786,33 @@
                 (r.errors.length ? '⚠️' : '✓') + ' ' + Object.keys(orders).length + ' orderów, ' + r.entries.length + ' wpisów</span>'];
             if (r.entries.length) bits.push('<span style="color:#374151" title="Tyle netto schodzi z konta ' + balEsc(a.credit) + ' — musi się zgadzać z przelewem.">' +
                 a.credit + ': <strong>' + balFix(r.bank) + '</strong></span>');
-            if (r.pen) bits.push('<span style="color:#374151" title="Suma penalty przeksięgowana na konto ' + balEsc(a.pen) + '.">' + a.pen + ': <strong>' + balFix(r.pen) + '</strong></span>');
-            if (r.disc && a.disc !== a.pen) bits.push('<span style="color:#374151" title="Suma discount przeksięgowana na konto ' + balEsc(a.disc) + '.">' + a.disc + ': <strong>' + balFix(r.disc) + '</strong></span>');
+            // Kazde konto drugiej nogi osobno — przy „other" konta sa dowolne, wiec nie da sie
+            // ich juz wypisac z gory (penalty / discount). Klucze liczbowe leca rosnaco.
+            Object.keys(r.accs).forEach(function (ac) {
+                if (!ac) return;
+                bits.push('<span style="color:#374151" title="Suma przeksięgowana na konto ' + balEsc(ac) + '.">' +
+                    balEsc(ac) + ': <strong>' + balFix(r.accs[ac]) + '</strong></span>');
+            });
             if (checked) bits.push('<span style="color:#6b7280">sumy grup sprawdzone: ' + checked + '</span>');
             if (r.warns.length) bits.push('<span style="color:#b45309">uwagi: ' + r.warns.length + '</span>');
             if (r.errors.length) bits.push('<span style="color:#dc2626">błędy: ' + r.errors.length + '</span>');
             el.innerHTML = bits.join(' | ');
             if (box) box.innerHTML = balMsgHtml(r);
+            renderOtherBox(r);
+            // Opisy roszczen „other" doczytujemy dopiero wtedy, gdy w wklejce faktycznie sa —
+            // przy zwyklych penalty panel nie odpytuje serwera w ogole.
+            if (r.others.length) {
+                const need = [];
+                r.others.forEach(function (o) {
+                    o.missing.forEach(function (id) { if (need.indexOf(id) < 0) need.push(id); });
+                });
+                if (need.length) balEnsureClaims(need);
+            }
             return;
+        }
+        {
+            const obox = document.getElementById('tm-other-box');
+            if (obox) { obox.innerHTML = ''; balOtherSig = ''; }
         }
         const orders = parseOrders(raw);
         el.innerHTML = orders.length
@@ -10515,6 +10840,11 @@
         previewRows = [];
         const box = document.getElementById('tm-bal-msgs');
         if (box) box.innerHTML = '';
+        // Konta wpisane recznie dla „other" zostaja (te same ordery moga wrocic),
+        // ale ramka i jej sygnatura ida do kosza razem z podgladem.
+        const obox = document.getElementById('tm-other-box');
+        if (obox) obox.innerHTML = '';
+        balOtherSig = '';
         updateTextPreview();
     }
 
