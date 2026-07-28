@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.79
+// @version      1.80
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10058,7 +10058,8 @@
             Wklej tabelę balance prosto z arkusza — 6 kolumn:
             <code style="background:#f5f5f5;padding:2px 4px;">dostawca ⇥ kontener ⇥ 1/sub/- ⇥ order ⇥ kwota ⇥ notatka</code><br>
             Wiersze puste pomijane, wiersze z sumą grupy sprawdzane. Kwota wpisu = ta z notatki,
-            różnica względem kolumny „kwota" musi być wytłumaczona penalty.
+            różnica względem kolumny „kwota" musi być wytłumaczona roszczeniem (penalty, discount,
+            overpayment, underpayment). Penalty idzie na konto „Penalty", discount na „Discount".
         </div>
         <textarea id="tm-order-input"
             placeholder="20730&#9;ZHANGZHOU YOKA&#9;2527.5&#10;20731&#9;ZHANGZHOU YOKA&#9;2851.5"
@@ -10081,9 +10082,11 @@
             <input id="tm-debit" value="1270" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
             <label style="font-size:12px;color:#333;">Credit:</label>
             <input id="tm-credit" value="1049" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
-            <span id="tm-pen-wrap" style="display:none;gap:6px;align-items:center;" title="Druga noga penalty: 1270 / to konto, kwota z plusem. Pierwsza noga to ta sama kwota z minusem na Debit/Credit powyżej.">
+            <span id="tm-pen-wrap" style="display:none;gap:6px;align-items:center;" title="Druga noga korekty: 1270 / to konto, kwota z plusem. Pierwsza noga to ta sama kwota z minusem na Debit/Credit powyżej. Konto zależy od typu roszczenia: discount ma własne, reszta (penalty / overpayment / underpayment / other) idzie na konto Penalty.">
                 <label style="font-size:12px;color:#333;">Penalty:</label>
                 <input id="tm-pen-credit" value="8100" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
+                <label style="font-size:12px;color:#333;">Discount:</label>
+                <input id="tm-disc-credit" value="4221" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
             </span>
         </div>
 
@@ -10274,6 +10277,24 @@
         }
         return out;
     }
+    // Same typy roszczen z listy balClaims, bez numerow, w kolejnosci pierwszego wystapienia.
+    // ['penalty 814','penalty 1021','discount 626'] -> ['penalty','discount']
+    function balClaimTypes(claims) {
+        const out = [];
+        (claims || []).forEach(function (c) {
+            const m = String(c).match(/^(.*?)\s*(\d+)$/);
+            const ty = (m ? m[1] : String(c)).trim().toLowerCase();
+            if (ty && out.indexOf(ty) < 0) out.push(ty);
+        });
+        return out;
+    }
+    // Konto drugiej nogi zalezy od typu roszczenia. Discount ma wlasne konto (4221),
+    // penalty / overpayment / underpayment / other ida na konto penalty (8100).
+    function balTypeAccount(ty, penCredit, discCredit) {
+        return ty === 'discount' ? discCredit : penCredit;
+    }
+    // „other +" / „other -" w nazwie rodzaju wpisu myli sie ze znakiem nogi — skracamy do „other".
+    function balKindName(ty) { return /^other/.test(String(ty)) ? 'other' : String(ty); }
     // Ten sam typ w jeden opis: ['penalty 814','penalty 1021'] -> „penalty 814,1021".
     function balClaimLabel(claims) {
         const order = [], byType = {};
@@ -10296,7 +10317,7 @@
     // Zwraca { entries, groups, errors, warns }. Przy jakimkolwiek bledzie NIE ksiegujemy nic —
     // lepiej zeby czlowiek poprawil wklejke, niz zeby poszedl w system wpis, ktorego nie umiemy
     // wytlumaczyc.
-    function parseBalancePaste(raw, debit, credit, penCredit) {
+    function parseBalancePaste(raw, debit, credit, penCredit, discCredit) {
         const lines = String(raw || '').replace(/\r/g, '').split('\n');
         const entries = [], errors = [], warns = [], groups = [], byOrder = {};
         let cur = null, lostSum = 0;
@@ -10359,10 +10380,28 @@
                 errors.push('wiersz ' + no + ': kwota z notatki (' + balFix(gross) + ') różni się od kwoty (' + balFix(paid) + ') o ' + balFix(diff) + ', a notatka nie podaje numeru penalty — nie księguję. ' + balShort(line));
                 continue;
             }
+            // Rozne typy roszczen w jednym wierszu ida na rozne konta, a z wklejki mamy tylko
+            // jedna roznice — nie ma z czego jej rozdzielic. Zgadywanie podzialu byloby gorsze
+            // niz odmowa, wiec taki wiersz blokuje calosc i idzie recznie.
+            const types = balClaimTypes(claims);
+            if (types.length > 1) {
+                const accs = types.map(function (t) { return balKindName(t) + '→' + (balTypeAccount(t, penCredit, discCredit) || '?'); }).join(', ');
+                errors.push('wiersz ' + no + ': w notatce są różne typy roszczeń (' + label + '), a różnica to jedna kwota ' +
+                    balFix(diff) + ' — każdy typ ma inne konto (' + accs + ') i nie ma z czego rozdzielić tej kwoty. ' +
+                    'Zaksięguj ten order ręcznie albo rozbij go w arkuszu na osobne wiersze. ' + balShort(line));
+                continue;
+            }
+            const ty = types[0];
+            const legCredit = balTypeAccount(ty, penCredit, discCredit);
+            if (!legCredit) {
+                errors.push('wiersz ' + no + ': roszczenie „' + label + '" ma iść na konto ' +
+                    (ty === 'discount' ? '„Discount"' : '„Penalty"') + ', a to pole w panelu jest puste — uzupełnij je. ' + balShort(line));
+                continue;
+            }
             if (!hasCont) warns.push('wiersz ' + no + ': brak numeru kontenera — w opisie pierwszego wpisu pójdzie „' + label + '".');
             entries.push(Object.assign({}, base, { amount: balFix(gross), comment: hasCont ? cont : label, kind: 'kontener' }));
-            entries.push(Object.assign({}, base, { amount: balFix(-diff), comment: label, kind: 'penalty −' }));
-            entries.push(Object.assign({}, base, { amount: balFix(diff), credit: penCredit, comment: label, kind: 'penalty +' }));
+            entries.push(Object.assign({}, base, { amount: balFix(-diff), comment: label, kind: balKindName(ty) + ' −' }));
+            entries.push(Object.assign({}, base, { amount: balFix(diff), credit: legCredit, comment: label, kind: balKindName(ty) + ' +', plus: true }));
         }
         closeGroup(null);
 
@@ -10382,14 +10421,16 @@
 
         entries.forEach(function (e, i) { e.uid = 'b' + i; });
 
-        // Suma tego, co faktycznie wyjdzie z konta bankowego (credit) i co wpadnie na konto penalty.
-        let bank = 0, pen = 0;
+        // Suma tego, co faktycznie wyjdzie z konta bankowego (credit), i osobno kazda druga noga
+        // wedlug konta, na ktore trafia — penalty i discount licza sie oddzielnie.
+        let bank = 0; const accs = {};
         entries.forEach(function (e) {
             const v = parseFloat(e.amount);
-            if (e.kind === 'penalty +') pen += v; else bank += v;
+            if (e.plus) accs[e.credit] = bal2((accs[e.credit] || 0) + v); else bank += v;
         });
 
-        return { entries: entries, groups: groups, errors: errors, warns: warns, bank: bal2(bank), pen: bal2(pen) };
+        return { entries: entries, groups: groups, errors: errors, warns: warns, bank: bal2(bank),
+                 pen: bal2(accs[penCredit] || 0), disc: bal2(accs[discCredit] || 0), accs: accs };
     }
 
     // Wartosci kont z pol panelu — podglad musi liczyc dokladnie to, co pojdzie w POST.
@@ -10397,12 +10438,13 @@
         return {
             debit:  (document.getElementById('tm-debit')?.value  || '').trim(),
             credit: (document.getElementById('tm-credit')?.value || '').trim(),
-            pen:    (document.getElementById('tm-pen-credit')?.value || '').trim()
+            pen:    (document.getElementById('tm-pen-credit')?.value || '').trim(),
+            disc:   (document.getElementById('tm-disc-credit')?.value || '').trim()
         };
     }
     function balParseCurrent() {
         const a = balAccounts();
-        return parseBalancePaste(document.getElementById('tm-order-input')?.value || '', a.debit, a.credit, a.pen);
+        return parseBalancePaste(document.getElementById('tm-order-input')?.value || '', a.debit, a.credit, a.pen, a.disc);
     }
     function balEsc(s) {
         return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -10439,6 +10481,7 @@
             if (r.entries.length) bits.push('<span style="color:#374151" title="Tyle netto schodzi z konta ' + balEsc(a.credit) + ' — musi się zgadzać z przelewem.">' +
                 a.credit + ': <strong>' + balFix(r.bank) + '</strong></span>');
             if (r.pen) bits.push('<span style="color:#374151" title="Suma penalty przeksięgowana na konto ' + balEsc(a.pen) + '.">' + a.pen + ': <strong>' + balFix(r.pen) + '</strong></span>');
+            if (r.disc && a.disc !== a.pen) bits.push('<span style="color:#374151" title="Suma discount przeksięgowana na konto ' + balEsc(a.disc) + '.">' + a.disc + ': <strong>' + balFix(r.disc) + '</strong></span>');
             if (checked) bits.push('<span style="color:#6b7280">sumy grup sprawdzone: ' + checked + '</span>');
             if (r.warns.length) bits.push('<span style="color:#b45309">uwagi: ' + r.warns.length + '</span>');
             if (r.errors.length) bits.push('<span style="color:#dc2626">błędy: ' + r.errors.length + '</span>');
@@ -11193,7 +11236,7 @@
     });
 
     panel.querySelectorAll('input[name="tm-mode"]').forEach(r => r.addEventListener('change', () => { try { applyMode(); } catch(e) {} }));
-    ['tm-debit','tm-credit','tm-pen-credit'].forEach(id => {
+    ['tm-debit','tm-credit','tm-pen-credit','tm-disc-credit'].forEach(id => {
         const el = panel.querySelector('#' + id);
         if (el) el.addEventListener('input', () => { try { updateTextPreview(); } catch(e) {} });
     });
