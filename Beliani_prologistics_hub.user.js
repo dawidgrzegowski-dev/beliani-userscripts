@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.90
+// @version      1.91
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12809,9 +12809,12 @@
         // (pi.acc — porownane z kontami w systemie przy kontroli P/I). Blok bankowy
         // z P/I sluzy do nazwy, adresu i BIC; jego slot "konto" bywa przesuniety.
         function painBankOfG(G){
-            var list = [], seen = {};
+            var list = [], seen = {}, why = '';
             function add(b, vacc){
-                if (!b || !b.ok) return;
+                if (!b) return;
+                // Blok odrzucony i tak nie moze pojsc do przelewu, ale zapamietujemy,
+                // CZEGO w nim brakuje — inaczej dalej wychodzi „brak bloku bankowego”.
+                if (!b.ok){ if (!why) why = piBankWhy(b); return; }
                 var cur = String(b.acc || ''), ver = normAcc(vacc || ''), o = b;
                 if (ver.length >= 8 && normAcc(cur) !== ver && (!piAccShape(cur) || b.accFix)){
                     o = {}; for (var kk in b) if (Object.prototype.hasOwnProperty.call(b, kk)) o[kk] = b[kk];
@@ -12823,7 +12826,7 @@
             }
             (G.dep || []).forEach(function(r){ add(r.pi && r.pi.piBank, r.pi && r.pi.piAcc); });
             (G.bal || []).forEach(function(r){ add(r.bpi && r.bpi.bank, r.bpi && r.bpi.piAcc); });
-            return { bank: list[0] || null, n: list.length, conflict: list.length > 1 };
+            return { bank: list[0] || null, n: list.length, conflict: list.length > 1, why: list.length ? '' : why };
         }
         // "Zielony" = wszystko sprawdzone. Ostrzezenie (zolte) tez NIE jest zielone.
         function painGroupOk(G){
@@ -12871,7 +12874,7 @@
                     bankGeoSrc: ageo.src || '',
                     accWasWrong: b.accWasWrong || '', accFix: !!b.accFix, accBad: b.accBad || '',
                     geoSrc: geo.src || '', geoWeak: !!(geo.weak && geo.ctry),
-                    hasBank: bk.n > 0, conflict: bk.conflict, nBank: bk.n,
+                    hasBank: bk.n > 0, bankWhy: bk.why || '', conflict: bk.conflict, nBank: bk.n,
                     verified: st.ok, why: st.why,
                     nDep: (G.dep || []).length, nBal: (G.bal || []).length,
                     e2e: painFirstOrder(G)
@@ -12892,7 +12895,7 @@
             rows.forEach(function(r){
                 var p = '„' + r.sup + '”: ';
                 if (!(r.amount > 0)) errs.push(p + 'kwota musi być większa od zera.');
-                if (!r.hasBank) errs.push(p + 'brak bloku bankowego w P/I — uzupełnij dane ręcznie.');
+                if (!r.hasBank) errs.push(p + (r.bankWhy || 'brak bloku bankowego w P/I') + ' — uzupełnij dane ręcznie.');
                 if (!painTxt(r.name, 140, strict)) errs.push(p + 'brak nazwy beneficjenta.');
                 if (!painNorm(r.acc)) errs.push(p + 'brak numeru konta beneficjenta.');
                 if (!painBicOk(r.bic)) errs.push(p + 'BIC „' + r.bic + '” niepoprawny.');
@@ -13266,7 +13269,8 @@
         // Status calej platnosci — to jest kolumna, ktora decyduje, czy ktos ma to wklepac do banku.
         function xlStatusOf(pr){
             if (!pr) return { t: '✗ NIE WPROWADZAĆ', s: 'bad', why: 'nie udało się złożyć danych płatności' };
-            if (!pr.hasBank) return { t: '✗ NIE WPROWADZAĆ', s: 'bad', why: 'brak bloku „Bank information” w P/I — konto, SWIFT i beneficjenta trzeba uzupełnić ręcznie' };
+            if (!pr.hasBank) return { t: '✗ NIE WPROWADZAĆ', s: 'bad',
+                why: (pr.bankWhy || 'brak bloku „Bank information” w P/I') + ' — te dane trzeba uzupełnić ręcznie' };
             var miss = [];
             if (!pr.name) miss.push('nazwa beneficjenta');
             if (!pr.acc) miss.push('numer konta');
@@ -14483,6 +14487,44 @@
             var s = String(v == null ? '' : v).trim();
             return /^[0-9][0-9\s.–—\-]*$/.test(s) && s.replace(/\D+/g, '').length >= 8;
         }
+        // Ksztalt BIC-u: 8 albo 11 znakow, AAAACCXX[XXX]. Jedno miejsce dla calego modulu.
+        var PI_BIC_RE = /^[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$/;
+        // W komorce SWIFT-u dostawca dopisuje komentarz obok wartosci, np.
+        //   "CHASHKHH, （CHASHKHHXXX*If 11 characters are required)"
+        // Sklejenie calej komorki dawalo CHASHKHHCHASHKHHXXXIF11CHARACTERS... czyli
+        // "SWIFT nieczytelny" i w efekcie odrzucenie CALEGO bloku bankowego.
+        // Dopisek w nawiasie wycinamy PRZED szukaniem, bo angielskie slowo REQUIRED
+        // ma ksztalt BIC-u (8 liter, a IR na pozycji kraju to Iran) i zostaloby wziete.
+        function piSwiftPick(v){
+            var s = String(v == null ? '' : v).toUpperCase();
+            var noPar = s.replace(/[(（][^)）]*[)）]?/g, ' ');
+            function pick(t){
+                var r = '';
+                t.replace(/[^A-Z0-9]+/g, ' ').trim().split(' ').some(function(w){
+                    if (PI_BIC_RE.test(w)) { r = w; return true; }
+                    return false;
+                });
+                return r;
+            }
+            var r = pick(noPar) || pick(s);
+            if (r) return r;
+            // Nic nie pasowalo jako osobne slowo — BIC bywa rozbity spacjami
+            // ("BKCH CN BJ 300"). Zostawiamy sklejona wartosc: albo przejdzie test
+            // ksztaltu, albo bedzie widoczna jako blad, tak jak przed zmiana.
+            var w = noPar.replace(/[^A-Z0-9]/g, '');
+            return PI_BIC_RE.test(w) ? w : s.replace(/[^A-Z0-9]/g, '');
+        }
+        // Czego brakuje w bloku, ktory sie nie zakwalifikowal. Bez tego komunikat mowil
+        // „brak bloku Bank information", a blok byl — nie zgadzalo sie w nim jedno pole.
+        function piBankWhy(b){
+            if (!b) return '';
+            var m = [];
+            if (!b.name) m.push('nazwy beneficjenta');
+            if (!b.acc) m.push('numeru konta');
+            if (!b.swift) m.push('SWIFT-u/BIC-u');
+            else if (b.swiftBad) m.push('czytelnego SWIFT-u/BIC-u (w P/I stoi „' + String(b.swiftRaw || b.swift).slice(0, 60) + '”)');
+            return m.length ? 'w bloku „Bank information” w P/I nie da się odczytać: ' + m.join(', ') : '';
+        }
         function scanPIbank(aoa){
             var out = { name: '', addr: '', bankName: '', bankAddr: '', acc: '', swift: '', sheet: '' };
             var nums = [], numSeen = {}, raw = [], lastRaw = -1;
@@ -14521,8 +14563,9 @@
                 }
             }
             // SWIFT/BIC: 8 lub 11 znakow, format AAAACCXX[XXX].
-            out.swift = String(out.swift || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-            if (!/^[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$/.test(out.swift)) out.swiftBad = out.swift ? true : false;
+            out.swiftRaw = String(out.swift == null ? '' : out.swift).replace(/\s+/g, ' ').trim();
+            out.swift = piSwiftPick(out.swift);
+            if (!PI_BIC_RE.test(out.swift)) out.swiftBad = out.swift ? true : false;
             // Ratunek: w slocie konta stalo cos innego, ale w bloku jest dokladnie jeden
             // numer wygladajacy na konto (stal pod inna etykieta) — bierzemy go i oznaczamy.
             if (!out.acc && nums.length === 1){ out.acc = nums[0]; out.accFix = true; }
