@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.92
+// @version      1.93
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11996,12 +11996,15 @@
           +   '<div style="margin-top:6px"><b style="color:#8B0000">Przeciągnij tu pliki</b> albo kliknij, żeby wybrać</div>'
           +   '<div style="margin-top:4px;font-size:12px">jeden plik <b>.xlsx</b> („Excel do banku” z Wprowadzania) + dowolna liczba <b>.pdf</b> — potwierdzeń przelewów</div>'
           +   '<div style="margin-top:4px;font-size:11px;color:#999">Bez pliku .xlsx wezmę dane wprost z panelu Wprowadzanie. Pliki czytane są lokalnie — nic nie wychodzi poza przeglądarkę.</div>'
+          +   '<div style="margin-top:4px;font-size:11px;color:#0a58ca">Potwierdzeń nie musisz mieć u siebie — mogę je dociągnąć wprost z zamówień (guzik niżej).</div>'
           + '</div>'
           + '<input type="file" id="sp-file" accept=".pdf,.xlsx" multiple style="display:none">'
           + '<div id="sp-list" style="margin-top:10px"></div>'
           + '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-          +   '<button id="sp-run" class="chn-btn red" title="Porównuje Excel z potwierdzeniami z banku: dopasowuje po numerach zamówień z tytułu przelewu, sprawdza kwotę, walutę, konto, BIC, nazwę i tytuł. Brak miasta lub kodu pocztowego beneficjenta nie jest błędem.">🔍 Sprawdź z bankiem</button>'
-          +   '<button id="sp-clear" class="chn-btn ghost" title="Usuń wszystkie wczytane pliki i wynik">↺ Wyczyść</button>'
+          +   '<button id="sp-run" class="chn-btn red" title="Porównuje Excel z potwierdzeniami z banku: dopasowuje po numerach zamówień z tytułu przelewu, sprawdza kwotę, walutę, konto, BIC, nazwę i tytuł. Brak miasta lub kodu pocztowego beneficjenta nie jest błędem. Gdy nie ma ani jednego pliku PDF — najpierw sam dociągnie potwierdzenia z zamówień.">🔍 Sprawdź z bankiem</button>'
+          +   '<button id="sp-grab" class="chn-btn ghost" title="Wchodzi na strony zamówień z Excela, znajduje sekcję „Payment conformation”, czyta załączniki z podanego dnia prosto do pamięci i dokłada je do sprawdzenia. Nic nie zapisuje się na dysku.">⬇ Dociągnij potwierdzenia z zamówień</button>'
+          +   '<label style="font-size:11px;color:#666;display:inline-flex;align-items:center;gap:4px" title="Bierzemy tylko załączniki dodane tego dnia. Domyślnie dzień, z którego pochodzi Excel. Puste pole = bez ograniczenia daty.">z dnia <input type="date" id="sp-day" style="font-size:11px;padding:2px 4px;border:1px solid #FFCCB7;border-radius:4px"></label>'
+          +   '<button id="sp-clear" class="chn-btn ghost" title="Usuń wszystkie wczytane pliki, dociągnięte potwierdzenia i wynik">↺ Wyczyść</button>'
           +   '<span id="sp-status" style="font-size:12px;color:#666"></span>'
           + '</div>'
           + '<div id="sp-box" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
@@ -13789,12 +13792,12 @@
         function bcRun(book, pdfs){
             var mm = bcMatch(book.pays, pdfs), items = [], dates = {}, nErr = 0, nWarn = 0, nOk = 0, nMiss = 0;
             mm.pairs.forEach(function(pr){
-                if (!pr.q){ nMiss++; items.push({ p: pr.p, q: null, lv: 'miss', res: [], score: 0 }); return; }
+                if (!pr.q){ nMiss++; items.push({ p: pr.p, q: null, lv: 'miss', res: [], score: 0, orders: bcPayOrders(pr.p) }); return; }
                 var res = bcCheck(pr.p, pr.q, book.head);
                 res.forEach(function(x){ if (x.lv === 'date') dates[x.m] = 1; });
                 var lv = bcLv(res);
                 if (lv === 'err') nErr++; else if (lv === 'warn') nWarn++; else nOk++;
-                items.push({ p: pr.p, q: pr.q, lv: lv, res: res, score: pr.score });
+                items.push({ p: pr.p, q: pr.q, lv: lv, res: res, score: pr.score, orders: bcPayOrders(pr.p) });
             });
             var orph = mm.orphans.map(function(q){
                 return { q: q, test: bcCents(q.amt) === 100 };
@@ -13833,6 +13836,306 @@
             return 'Ten Excel zrobiła wersja ' + excelVer + ', a masz ' + runVer
                 + ' — poprawki z nowszych wersji go NIE dotyczą. Wygeneruj Excel na nowo i sprawdź jeszcze raz.';
         }
+        // ================= 1.93: dociaganie potwierdzen z zamowien + komentarz "Ok" =================
+        // Sekcja zalacznikow na stronie zamowienia. 8 = "Payment conformation" — ten sam
+        // numer, ktorym panel WGRYWA potwierdzenie, wiec czytamy dokladnie to samo miejsce.
+        var BC_DOC_TYPE = 8;
+        // Wstrzykiwane wejscie/wyjscie. Produkcja bierze przegladarke, testy — atrapy.
+        // Sesja jest ta, ktora uzytkownik ma otwarta (credentials:'same-origin');
+        // skrypt NIE czyta, nie zapisuje i nie przesyla zadnych ciasteczek ani hasel.
+        function bcIO(){
+            return {
+                orderHtml: function(o){ return pcOrderHtml(o); },
+                docBin: function(href){ return fetchBin(href, 30000); },
+                parsePdf: function(u8, name){ return bcParsePdf(u8, name); },
+                post: function(o, t){ return pcPostComment(o, t); }
+            };
+        }
+        // Pula N rownoleglych zadan po liscie. Blad pojedynczego zadania nie przewraca calosci.
+        async function bcPool(items, n, fn){
+            var list = items || [], out = new Array(list.length), i = 0;
+            if (!list.length) return out;
+            var w = Math.max(1, Math.min(n || 5, list.length));
+            async function worker(){
+                for (;;){
+                    var k = i++;
+                    if (k >= list.length) return;
+                    try { out[k] = await fn(list[k], k); }
+                    catch (e){ out[k] = { err: String((e && e.message) || e) }; }
+                }
+            }
+            var ws = [];
+            for (var j = 0; j < w; j++) ws.push(worker());
+            await Promise.all(ws);
+            return out;
+        }
+        // Numery zamowien jednej platnosci: najpierw wiersze D/B z Excela, potem to,
+        // co stoi w tytule przelewu (tam bywaja zakresy "21454-21458").
+        function bcPayOrders(p){
+            var out = [], seen = {};
+            (((p || {}).rows) || []).forEach(function(r){
+                var o = String((r && r.order) || '').trim();
+                if (/^\d{4,6}$/.test(o) && !seen[o]){ seen[o] = 1; out.push(o); }
+            });
+            var t = bcOrders(bcTitleToks((p || {}).title || ''));
+            Object.keys(t).sort().forEach(function(o){ if (!seen[o]){ seen[o] = 1; out.push(o); } });
+            return out;
+        }
+        function bcAllOrders(book){
+            var out = [], seen = {};
+            (((book || {}).pays) || []).forEach(function(p){
+                bcPayOrders(p).forEach(function(o){ if (!seen[o]){ seen[o] = 1; out.push(o); } });
+            });
+            return out;
+        }
+        // Dzien, z ktorego biora sie potwierdzenia = dzien wygenerowania Excela.
+        function bcDayOf(head){
+            var g = String(((head || {}).gen) || '').match(/(\d{4}-\d{2}-\d{2})/);
+            if (g) return g[1];
+            var e = String(((head || {}).exec) || '').match(/(\d{4}-\d{2}-\d{2})/);
+            return e ? e[1] : '';
+        }
+        function bcUnent(s){
+            return String(s == null ? '' : s)
+                .replace(/&nbsp;/gi, ' ').replace(/&quot;/gi, '"').replace(/&#0*39;/g, "'")
+                .replace(/&apos;/gi, "'").replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+                .replace(/&amp;/gi, '&');
+        }
+        // Strona zamowienia to ciag sekcji: <b>ETYKIETA:</b> [link "dodaj" load_docs.php?...type=N]
+        // [linki doc.php?doc_id=... z ogonkiem "(by X on RRRR-MM-DD GG:MM:SS)"]. Sekcja typu N
+        // konczy sie tam, gdzie zaczyna sie link "dodaj" nastepnej sekcji.
+        function bcDocSection(html, type){
+            var s = String(html == null ? '' : html);
+            var re = new RegExp('load_docs\\.php\\?[^"\'<>]*\\btype=' + String(type) + '(?![0-9])', 'i');
+            var i = s.search(re);
+            if (i < 0) return null;
+            var after = s.slice(i), rest = after.slice(5);
+            var nxt = rest.search(/load_docs\.php\?[^"'<>]*\btype=\d+/i);
+            return nxt >= 0 ? after.slice(0, 5 + nxt) : after;
+        }
+        // Zalaczniki w sekcji. Data brana z ogonka za linkiem, ucietego przed kolejnym <a>.
+        function bcDocsIn(sec){
+            var s = String(sec == null ? '' : sec), out = [];
+            var re = /<a[^>]*href="([^"]*doc\.php\?[^"]*doc_id=(\d+)[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, m;
+            while ((m = re.exec(s))){
+                var href = bcUnent(m[1]);
+                if (/[?&](?:del|delete|remove)\b/i.test(href) || /action=(?:del|remove)/i.test(href)) continue;
+                var name = bcUnent(String(m[3] || '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+                var tail = s.slice(re.lastIndex, re.lastIndex + 400);
+                var cut = tail.search(/<a[\s>]/i); if (cut >= 0) tail = tail.slice(0, cut);
+                tail = bcUnent(tail.replace(/<[^>]*>/g, ' '));
+                var dm = tail.match(/\bon\s+(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/i);
+                var bm = tail.match(/\bby\s+(.+?)\s+on\s+\d{4}-\d{2}-\d{2}/i);
+                out.push({ href: href, id: m[2], name: name,
+                    date: dm ? dm[1] : '', time: (dm && dm[2]) ? dm[2] : '',
+                    by: bm ? bm[1].replace(/[(\s]+$/, '').replace(/^[(\s]+/, '').trim() : '' });
+            }
+            return out;
+        }
+        // Ten sam plik jest wgrywany OSOBNO do kazdego zamowienia platnosci — 33 zamowienia
+        // to 33 rozne doc_id tego samego potwierdzenia. Klucz po nazwie pliku scala je
+        // JESZCZE PRZED pobraniem, zeby nie ciagnac 33 razy tego samego.
+        function bcDocKey(d){
+            var n = String(((d || {}).name) || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            return n || ('#' + String(((d || {}).id) || ''));
+        }
+        // Drugie sito, juz po odczytaniu tresci: ten sam przelew wgrany pod rozna nazwa.
+        // Pusty klucz = nie ma czym odroznic, wiec NICZEGO nie scalamy (lepiej duplikat
+        // niz zgubiona platnosc).
+        function bcPdfKey(q){
+            if (!q) return '';
+            var e = String(q.e2e || '').trim();
+            if (e) return 'e|' + e.toUpperCase();
+            var a = String(q.amt == null ? '' : q.amt).trim(), ac = bcNormAcc(q.acct || ''),
+                m = bcTitleToks(q.msg || '').join(' ');
+            if (!a || !ac || !m) return '';
+            return 'x|' + a + '|' + ac + '|' + m + '|' + String(q.exec || '');
+        }
+        function bcDedupPdfs(list){
+            var out = [], ix = {};
+            (list || []).forEach(function(q){
+                if (!q) return;
+                var k = bcPdfKey(q);
+                if (!k || ix[k] === undefined){ if (k) ix[k] = out.length; out.push(q); return; }
+                var t = out[ix[k]];
+                t.dupe = (t.dupe || 0) + 1;
+                var a = t.from || [];
+                (q.from || []).forEach(function(o){ if (a.indexOf(o) < 0) a.push(o); });
+                if (a.length) t.from = a.sort(function(x, y){ return Number(x) - Number(y); });
+                if (!t.file && q.file) t.file = q.file;
+            });
+            return out;
+        }
+        // Dociaganie potwierdzen wprost z zamowien.
+        // NIC nie ląduje na dysku: strona zamowienia -> tekst, plik -> ArrayBuffer w pamieci
+        // -> pdf.js czyta tekst -> bajty od razu porzucone. Zadnego okna "Zapisz jako",
+        // zadnego folderu Pobrane, zadnego wyjscia poza przegladarke.
+        async function bcGrabConfs(orders, day, io, say, workers){
+            var IO = io || bcIO(), ord = (orders || []).slice(), errs = [];
+            var stat = { orders: ord.length, pages: 0, pageErr: 0, docs: 0, sameDay: 0, noDate: 0,
+                files: 0, got: 0, fail: 0, notPdf: 0, parseErr: 0, pdfs: 0, day: day || '' };
+            if (!ord.length) return { pdfs: [], stat: stat, errs: errs };
+            var W = workers || 5, seen = 0;
+            if (say) say('Czytam zamówienia: 0/' + ord.length + '…', '#666');
+            var pages = await bcPool(ord, W, async function(o){
+                var html = '';
+                try { html = await IO.orderHtml(o); } catch (e){ html = ''; }
+                seen++;
+                if (say) say('Czytam zamówienia: ' + seen + '/' + ord.length + '…', '#666');
+                return { o: o, html: html || '' };
+            });
+            var uniq = {}, from = {};
+            pages.forEach(function(p){
+                if (!p || p.err || !p.html){
+                    stat.pageErr++;
+                    errs.push({ file: 'zamówienie ' + ((p && p.o) || '?'), err: 'nie udało się wczytać strony zamówienia' });
+                    return;
+                }
+                stat.pages++;
+                var sec = bcDocSection(p.html, BC_DOC_TYPE);
+                if (!sec) return;
+                bcDocsIn(sec).forEach(function(d){
+                    stat.docs++;
+                    if (!d.date){ stat.noDate++; return; }
+                    if (day && d.date !== day) return;
+                    stat.sameDay++;
+                    var k = bcDocKey(d);
+                    if (!uniq[k]){ uniq[k] = d; from[k] = []; }
+                    if (from[k].indexOf(p.o) < 0) from[k].push(p.o);
+                });
+            });
+            var keys = Object.keys(uniq);
+            stat.files = keys.length;
+            if (!keys.length) return { pdfs: [], stat: stat, errs: errs };
+            var done = 0;
+            if (say) say('Pobieram potwierdzenia: 0/' + keys.length + '…', '#666');
+            var got = await bcPool(keys, W, async function(k){
+                var d = uniq[k], r = { d: d, from: from[k], q: null, err: '', tag: '' };
+                var ab = null;
+                try { ab = await IO.docBin(d.href); } catch (e){ ab = null; }
+                if (!ab){ r.err = 'nie udało się pobrać pliku z zamówienia'; r.tag = 'fail'; done++; return r; }
+                var u8 = (ab && ab.byteLength !== undefined && !(ab instanceof Uint8Array)) ? new Uint8Array(ab) : ab;
+                ab = null;
+                if (!u8 || !u8.length){ r.err = 'pusty plik'; r.tag = 'fail'; done++; return r; }
+                if (!bcIsPdf(u8)){ r.err = 'to nie jest PDF — pomijam'; r.tag = 'notPdf'; done++; return r; }
+                var q = null;
+                try { q = await IO.parsePdf(u8, d.name || ('dokument ' + d.id)); }
+                catch (e){ q = { err: String((e && e.message) || e) }; }
+                u8 = null;   // bajty ida do kosza od razu po odczytaniu tekstu
+                done++;
+                if (say) say('Pobieram potwierdzenia: ' + done + '/' + keys.length + '…', '#666');
+                if (!q || q.err){ r.err = (q && q.err) || 'nie udało się odczytać'; r.tag = 'parseErr'; return r; }
+                r.q = q;
+                return r;
+            });
+            var pdfs = [];
+            got.forEach(function(r){
+                if (!r || r.err || !r.q){
+                    if (r && r.tag === 'notPdf') stat.notPdf++;
+                    else if (r && r.tag === 'parseErr'){ stat.got++; stat.parseErr++; }
+                    else stat.fail++;
+                    errs.push({ file: (r && r.d && (r.d.name || ('dokument ' + r.d.id))) || 'dokument',
+                        err: (r && r.err) || 'nie udało się pobrać' });
+                    return;
+                }
+                stat.got++;
+                var q = r.q;
+                q.from = (r.from || []).slice();
+                q.doc = r.d.id;
+                q.day = r.d.date;
+                q.src = 'order';
+                pdfs.push(q);
+            });
+            stat.pdfs = pdfs.length;
+            return { pdfs: pdfs, stat: stat, errs: errs };
+        }
+        // Komentarz w zamowieniach, po 5 naraz, z weryfikacja NA STRONIE.
+        // Sprawdzamy PRZYROST liczby wystapien tresci (przed -> po), nie sam fakt jej
+        // obecnosci: przy tresci tak krotkiej jak "Ok" samo wystapienie nic nie dowodzi.
+        async function bcAddComments(orders, text, io, say, workers){
+            var IO = io || bcIO(), ord = (orders || []).slice(), t = String(text == null ? '' : text).trim();
+            var out = { text: t, n: ord.length, ok: [], blind: [], fail: [] };
+            if (!ord.length || !t) return out;
+            var done = 0;
+            var res = await bcPool(ord, workers || 5, async function(o){
+                var before = '';
+                try { before = await IO.orderHtml(o); } catch (e){ before = ''; }
+                var nb = pcCountOcc(before, t);
+                var pr = null;
+                try { pr = await IO.post(o, t); }
+                catch (e){ pr = { ok: false, error: String((e && e.message) || e) }; }
+                var after = '';
+                try { after = await IO.orderHtml(o); } catch (e){ after = ''; }
+                done++;
+                if (say) say('Komentarz „' + t + '”: ' + done + '/' + ord.length + '…', '#666');
+                if (pcCountOcc(after, t) > nb) return { o: o, st: 'ok' };
+                if (pr && pr.ok && !after) return { o: o, st: 'blind' };
+                return { o: o, st: 'fail', why: (pr && pr.error) ? pr.error
+                    : (pr && pr.ok ? 'wysłane, ale na stronie go nie widać' : 'serwer odrzucił') };
+            });
+            res.forEach(function(r, i){
+                if (!r || r.err || !r.st){ out.fail.push({ o: ord[i], why: (r && r.err) || 'błąd' }); return; }
+                if (r.st === 'ok') out.ok.push(r.o);
+                else if (r.st === 'blind') out.blind.push(r.o);
+                else out.fail.push({ o: r.o, why: r.why });
+            });
+            return out;
+        }
+        // Domyslne zaznaczenie: TYLKO platnosci "zgodne". Reszta zostaje do recznego
+        // klikniecia. Samo zaznaczenie niczego nie wysyla — komentarz idzie dopiero po
+        // kliknięciu guzika.
+        function bcInitSel(R){
+            var sel = {};
+            (((R || {}).items) || []).forEach(function(it){
+                if (!it || it.lv !== 'ok') return;
+                (it.orders || []).forEach(function(o){ sel[o] = 1; });
+            });
+            return sel;
+        }
+        function bcAllSel(R){
+            var sel = {};
+            (((R || {}).items) || []).forEach(function(it){
+                ((it && it.orders) || []).forEach(function(o){ sel[o] = 1; });
+            });
+            return sel;
+        }
+        function bcSelList(sel){
+            var out = [];
+            for (var k in (sel || {})) if (sel[k]) out.push(k);
+            return out.sort(function(a, b){ return Number(a) - Number(b); });
+        }
+        function bcOrdUrl(o){ return '/op_order.php?id=' + encodeURIComponent(String(o)); }
+        // Zamienia numery zamowien w GOTOWYM, juz zaescapowanym tekscie na odnosniki.
+        // Kolejnosc jest istotna: najpierw esc(), potem to — inaczej wstawione znaczniki
+        // zostalyby zaescapowane. Linkujemy wylacznie numery nalezace do tej platnosci,
+        // wiec kwoty i daty zostaja tekstem. Odrzucamy tylko koncowke groszowa
+        // (".00", ",50") — po przecinku moze stac NASTEPNY numer zamowienia
+        // ("15495,15496"), a to ma sie linkowac.
+        function bcLinkOrders(escaped, orders){
+            var ok = {};
+            (orders || []).forEach(function(o){ ok[String(o)] = 1; });
+            return String(escaped == null ? '' : escaped)
+                .replace(/(?<!\d)(\d{4,6})(?!\s*[.,]\d{1,2}(?!\d))(?!\d)/g, function(m){
+                    if (!ok[m]) return m;
+                    return '<a href="' + bcOrdUrl(m) + '" target="_blank" rel="noopener"'
+                        + ' style="color:#0a58ca;text-decoration:none;border-bottom:1px dotted #0a58ca">' + m + '</a>';
+                });
+        }
+        function bcGrabLine(g){
+            var s = (g || {}).stat;
+            if (!s) return '';
+            return 'Dociągnięte z zamówień: ' + s.pdfs + ' potwierdzeń'
+                + '  (zamówienia ' + s.pages + '/' + s.orders
+                + (s.day ? ('  ·  z dnia ' + s.day) : '  ·  bez filtra daty')
+                + '  ·  załączników w sekcji „Payment conformation”: ' + s.docs
+                + ', z tego z tego dnia: ' + s.sameDay
+                + (s.noDate ? (', bez czytelnej daty (pominięte): ' + s.noDate) : '')
+                + '  ·  różnych plików: ' + s.files
+                + (s.fail ? (', nie pobrano: ' + s.fail) : '')
+                + (s.notPdf ? (', nie PDF: ' + s.notPdf) : '')
+                + (s.parseErr ? (', nie odczytano: ' + s.parseErr) : '')
+                + ')';
+        }
         function bcVerdict(R){
             if (R.nErr || R.nMiss || R.nOrphReal) return { t: 'SĄ RÓŻNICE — sprawdź przed zamknięciem dnia', c: '#c00' };
             if (R.nWarn) return { t: 'do przejrzenia — nic krytycznego', c: '#c47f00' };
@@ -13848,7 +14151,8 @@
             L.push('Excel: ' + R.nPays + ' płatności' + (R.file ? ('  ·  ' + R.file) : '')
                 + '  ·  IBAN ' + (R.head.iban || '—') + '  ·  ' + (R.head.ccy || '—') + '  ·  data ' + (R.head.exec || '—')
                 + '  ·  zrobiony wersją ' + (R.head.ver || '—') + (R.head.gen ? (' z ' + R.head.gen) : ''));
-            L.push('PDF:   ' + R.nPdf + ' potwierdzeń');
+            L.push('PDF:   ' + R.nPdf + ' potwierdzeń' + (R.nMerged ? ('  ·  scalone kopie tego samego przelewu: ' + R.nMerged) : ''));
+            if (R.grab) L.push(bcGrabLine(R.grab));
             L.push('WYNIK: ' + v.t + '   (zgodne ' + R.nOk + ', uwagi ' + R.nWarn + ', błędy ' + R.nErr
                 + ', bez potwierdzenia ' + R.nMiss + ', w banku bez odpowiednika ' + R.nOrphReal + ')');
             L.push('');
@@ -13879,7 +14183,28 @@
             }
             return L.join('\n');
         }
-        function bcRowHtml(it){
+        // Numery zamowien platnosci jako kratki: kwadracik do zaznaczenia + odnosnik,
+        // ktory otwiera zamowienie w nowej karcie.
+        function bcOrdChips(it, sel){
+            var ord = ((it || {}).orders) || [];
+            if (!ord.length) return '';
+            var S = sel || {}, on = 0;
+            ord.forEach(function(o){ if (S[o]) on++; });
+            var h = '<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px;align-items:center">'
+                + '<span style="font-size:10px;color:#888;margin-right:2px">zamówienia (' + ord.length
+                + (on === ord.length ? ', wszystkie zaznaczone' : (on ? (', zaznaczonych ' + on) : '')) + '):</span>';
+            ord.forEach(function(o){
+                var chk = !!S[o];
+                h += '<span class="bc-chip" data-o="' + pcAttr(o) + '" style="display:inline-flex;align-items:center;gap:3px;'
+                    + 'border:1px solid ' + (chk ? '#0a0' : '#ddd') + ';background:' + (chk ? '#EAF7EA' : '#fff')
+                    + ';border-radius:5px;padding:1px 4px;font-size:11px">'
+                    + '<input type="checkbox" class="bc-ord" data-o="' + pcAttr(o) + '"' + (chk ? ' checked' : '') + ' style="margin:0;cursor:pointer">'
+                    + '<a href="' + bcOrdUrl(o) + '" target="_blank" rel="noopener" style="color:#0a58ca;text-decoration:none">' + esc(o) + '</a>'
+                    + '</span>';
+            });
+            return h + '</div>';
+        }
+        function bcRowHtml(it, sel){
             var col = it.lv === 'err' ? '#c00' : (it.lv === 'warn' ? '#c47f00' : (it.lv === 'miss' ? '#c00' : '#0a0'));
             var bg = it.lv === 'err' || it.lv === 'miss' ? '#fff3f0' : (it.lv === 'warn' ? '#fffaf0' : '#f4fbf4');
             var h = '<div style="border-left:3px solid ' + col + ';background:' + bg + ';padding:6px 9px;margin-bottom:6px;border-radius:0 5px 5px 0">'
@@ -13887,21 +14212,26 @@
                 + (it.lv === 'miss' ? '✗ BRAK POTWIERDZENIA W BANKU' : (it.lv === 'err' ? '✗ BŁĄD' : (it.lv === 'warn' ? '⚠ UWAGA' : '✓ zgodne')))
                 + ' &nbsp;·&nbsp; ' + esc(it.p.sup) + '</div>';
             if (it.lv === 'miss'){
-                h += '<div style="font-size:11px;color:#555;margin-top:3px">tytuł: ' + esc(it.p.title || '—')
+                h += '<div style="font-size:11px;color:#555;margin-top:3px">tytuł: ' + bcLinkOrders(esc(it.p.title || '—'), it.orders)
                     + ' &nbsp;·&nbsp; kwota: ' + esc(it.p.amt == null ? '—' : String(it.p.amt)) + '</div>';
-                return h + '</div>';
+                return h + bcOrdChips(it, sel) + '</div>';
             }
-            h += '<div style="font-size:10px;color:#888;margin-top:2px">wspólnych numerów zamówień: ' + it.score + ' &nbsp;·&nbsp; ' + esc(it.q.file || '—') + '</div>';
+            h += '<div style="font-size:10px;color:#888;margin-top:2px">wspólnych numerów zamówień: ' + it.score
+                + ' &nbsp;·&nbsp; ' + bcLinkOrders(esc(it.q.file || '—'), it.orders)
+                + (it.q.src === 'order' ? (' &nbsp;·&nbsp; <span style="color:#0a58ca">dociągnięte z zamówień'
+                    + (it.q.from && it.q.from.length ? (' (' + it.q.from.length + ')') : '') + '</span>') : '')
+                + (it.q.dupe ? (' &nbsp;·&nbsp; <span style="color:#888">ten sam plik w ' + (it.q.dupe + 1) + ' zamówieniach</span>') : '')
+                + '</div>';
             ['err', 'warn', 'info'].forEach(function(lv){
                 it.res.forEach(function(x){
                     if (x.lv !== lv) return;
                     var c = lv === 'err' ? '#c00' : (lv === 'warn' ? '#c47f00' : '#666');
-                    h += '<div style="font-size:11px;color:' + c + ';margin-top:2px">' + BC_ICON[lv] + ' ' + esc(x.m) + '</div>';
+                    h += '<div style="font-size:11px;color:' + c + ';margin-top:2px">' + BC_ICON[lv] + ' ' + bcLinkOrders(esc(x.m), it.orders) + '</div>';
                 });
             });
-            return h + '</div>';
+            return h + bcOrdChips(it, sel) + '</div>';
         }
-        function bcReportHtml(R){
+        function bcReportHtml(R, sel){
             var v = bcVerdict(R);
             var h = '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
                 + '<b style="font-size:13px;color:' + v.c + '">' + esc(v.t) + '</b>'
@@ -13917,9 +14247,31 @@
                 + '<div style="font-size:11px;color:#666;margin-bottom:8px">Excel: ' + R.nPays + ' płatności'
                 + (R.file ? (' · ' + esc(R.file)) : '') + ' · IBAN ' + esc(R.head.iban || '—') + ' · ' + esc(R.head.ccy || '—')
                 + ' · data ' + esc(R.head.exec || '—') + ' · zrobiony wersją ' + esc(R.head.ver || '—')
-                + (R.head.gen ? (' z ' + esc(R.head.gen)) : '') + ' &nbsp;|&nbsp; PDF: ' + R.nPdf + ' potwierdzeń</div>';
+                + (R.head.gen ? (' z ' + esc(R.head.gen)) : '') + ' &nbsp;|&nbsp; PDF: ' + R.nPdf + ' potwierdzeń'
+                + (R.nMerged ? (' &nbsp;|&nbsp; scalone kopie tego samego przelewu: ' + R.nMerged) : '') + '</div>';
+            if (R.grab){
+                h += '<div style="font-size:11px;color:#0a58ca;background:#f2f7ff;border:1px solid #cfe0ff;border-radius:5px;'
+                   + 'padding:5px 8px;margin-bottom:8px">⬇ ' + esc(bcGrabLine(R.grab))
+                   + '<div style="color:#888;margin-top:2px">Pliki czytane prosto do pamięci przeglądarki — nic nie zapisuje się na dysku.</div></div>';
+            }
+            var nAll = 0, nSel = 0;
+            R.items.forEach(function(it){ (it.orders || []).forEach(function(o){ nAll++; if (sel && sel[o]) nSel++; }); });
+            if (nAll){
+                h += '<div id="bc-cmt" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;background:#F6E7E6;'
+                   + 'border:1px solid #FFCCB7;border-radius:6px;padding:6px 8px;margin-bottom:8px">'
+                   + '<span style="font-size:11px;font-weight:700;color:#750000">Komentarz w zamówieniach</span>'
+                   + '<input type="text" id="bc-cmt-text" value="Ok" style="width:110px;font-size:11px;padding:2px 4px;border:1px solid #FFCCB7;border-radius:4px">'
+                   + '<button id="bc-cmt-add" class="chn-btn red" title="Dodaje komentarz w ZAZNACZONYCH zamówieniach — po 5 naraz — i od razu sprawdza na stronie zamówienia, czy komentarz naprawdę się pojawił.">💬 Dodaj w zaznaczonych (<span id="bc-cmt-n">' + nSel + '</span>)</button>'
+                   + '<span style="font-size:11px;color:#888">z ' + nAll + '</span>'
+                   + '<button id="bc-sel-ok" class="chn-btn ghost" title="Zaznacz tylko zamówienia z płatności oznaczonych ✓ zgodne">✓ tylko zgodne</button>'
+                   + '<button id="bc-sel-all" class="chn-btn ghost">zaznacz wszystkie</button>'
+                   + '<button id="bc-sel-none" class="chn-btn ghost">odznacz wszystkie</button>'
+                   + '<span id="bc-cmt-status" style="font-size:11px;color:#666"></span>'
+                   + '<div style="flex-basis:100%;font-size:10px;color:#888">Zaznaczone są z góry tylko płatności ✓ zgodne. Resztę zaznaczasz sam. Nic nie idzie do zamówień, dopóki nie klikniesz guzika.</div>'
+                   + '</div>';
+            }
             var ord = { err: 0, miss: 0, warn: 1, ok: 2 };
-            R.items.slice().sort(function(a, b){ return ord[a.lv] - ord[b.lv]; }).forEach(function(it){ h += bcRowHtml(it); });
+            R.items.slice().sort(function(a, b){ return ord[a.lv] - ord[b.lv]; }).forEach(function(it){ h += bcRowHtml(it, sel); });
             R.orphans.forEach(function(o){
                 var col = o.test ? '#888' : '#c00', bg = o.test ? '#fafafa' : '#fff3f0';
                 h += '<div style="border-left:3px solid ' + col + ';background:' + bg + ';padding:6px 9px;margin-bottom:6px;border-radius:0 5px 5px 0">'
@@ -13957,7 +14309,24 @@
         }
         function bcIsPdf(u8){ return u8 && u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46; }
         function bcIsZip(u8){ return u8 && u8.length > 4 && u8[0] === 0x50 && u8[1] === 0x4b; }
-        async function bcProcess(files, say){
+        // Skad wziac numery zamowien i dzien Excela JESZCZE PRZED sprawdzeniem:
+        // z wgranego pliku .xlsx, a gdy go nie ma — wprost z panelu Wprowadzanie.
+        async function bcBookOf(files){
+            var list = files || [];
+            for (var i = 0; i < list.length; i++){
+                var f = list[i];
+                if (!/\.xlsx$/i.test(String((f && f.name) || ''))) continue;
+                var u8 = null;
+                try { u8 = await bcReadFile(f); } catch (e){ continue; }
+                if (!bcIsZip(u8)) continue;
+                var b = bcParseXlsx(u8, f.name);
+                if (b && !b.err) return b;
+            }
+            var pnl = null;
+            try { pnl = bcFromPanel(); } catch (e){ pnl = null; }
+            return (pnl && !pnl.err && pnl.pays && pnl.pays.length) ? pnl : null;
+        }
+        async function bcProcess(files, say, extra){
             var pdfs = [], books = [], errs = [];
             for (var i = 0; i < files.length; i++){
                 var f = files[i];
@@ -13974,7 +14343,16 @@
                     errs.push({ file: f.name, err: 'nieznany format — przyjmuję tylko .pdf i .xlsx' });
                 }
             }
-            if (!pdfs.length) return { err: 'Nie wczytałem żadnego potwierdzenia PDF.', errFiles: errs };
+            // Potwierdzenia dociagniete z zamowien dokladamy do wgranych recznie.
+            var ex = ((extra || {}).pdfs) || [];
+            if (ex.length) pdfs = pdfs.concat(ex);
+            if (extra && extra.errs && extra.errs.length) errs = errs.concat(extra.errs);
+            // Ten sam plik bywa wgrany do KAZDEGO zamowienia platnosci — bez scalenia
+            // jedna platnosc na 33 zamowienia dalaby 32 falszywe "w banku bez odpowiednika".
+            var nRaw = pdfs.length;
+            pdfs = bcDedupPdfs(pdfs);
+            var nMerged = nRaw - pdfs.length;
+            if (!pdfs.length) return { err: 'Nie mam ani jednego potwierdzenia PDF — ani wgranego, ani dociągniętego z zamówień.', errFiles: errs };
             var book = books[0] || null;
             if (books.length > 1) errs.push({ file: books.slice(1).map(function(b){ return b.file; }).join(', '), err: 'pominięty — biorę tylko jeden plik xlsx (pierwszy: ' + books[0].file + ')' });
             if (!book){
@@ -13983,6 +14361,8 @@
             }
             var R = bcRun(book, pdfs);
             R.errFiles = errs;
+            R.nMerged = nMerged;
+            R.grab = (extra && extra.stat) ? { stat: extra.stat } : null;
             return R;
         }
 
@@ -15132,7 +15512,7 @@
         (function(){
             var box = sp.querySelector('#sp-box'), inp = sp.querySelector('#sp-file'),
                 drop = sp.querySelector('#sp-drop'), listEl = sp.querySelector('#sp-list'),
-                FILES = [], busy = false, LAST = null;
+                FILES = [], busy = false, LAST = null, GRAB = null, SEL = {};
             function say(t, c){ var st = sp.querySelector('#sp-status'); st.textContent = t; st.style.color = c || '#666'; }
             function kb(n){ return n < 1024 ? (n + ' B') : (Math.round(n / 1024) + ' kB'); }
             function kind(f){
@@ -15143,8 +15523,15 @@
             }
             function nPdf(){ var n = 0; FILES.forEach(function(f){ if (kind(f).t === 'pdf') n++; }); return n; }
             function nXls(){ var n = 0; FILES.forEach(function(f){ if (kind(f).t === 'xlsx') n++; }); return n; }
+            function nGrab(){ return (GRAB && GRAB.pdfs) ? GRAB.pdfs.length : 0; }
+            function grabHtml(){
+                if (!GRAB || !GRAB.stat) return '';
+                return '<div style="margin-top:6px;font-size:11px;color:#0a58ca;background:#f2f7ff;border:1px solid #cfe0ff;'
+                    + 'border-radius:6px;padding:5px 8px">⬇ ' + esc(bcGrabLine(GRAB))
+                    + '<div style="color:#888;margin-top:2px">Czytane prosto do pamięci — nic nie zapisuje się na dysku.</div></div>';
+            }
             function renderList(){
-                if (!FILES.length){ listEl.innerHTML = ''; return; }
+                if (!FILES.length){ listEl.innerHTML = grabHtml(); return; }
                 var h = '<div style="font-size:11px;color:#750000;font-weight:600;margin-bottom:4px">Wczytane pliki: '
                     + FILES.length + ' (Excel ' + nXls() + ', potwierdze\u0144 ' + nPdf() + ')</div>'
                     + '<div style="display:flex;flex-wrap:wrap;gap:6px">';
@@ -15154,7 +15541,7 @@
                         + k.ico + ' ' + esc(f.name) + ' <span style="color:#888">' + kb(f.size) + '</span>'
                         + '<button class="sp-del" data-i="' + i + '" title="Usu\u0144 z listy" style="border:none;background:none;color:#8B0000;cursor:pointer;font:700 12px system-ui;padding:0 2px">\u2715</button></span>';
                 });
-                listEl.innerHTML = h + '</div>';
+                listEl.innerHTML = h + '</div>' + grabHtml();
                 Array.prototype.forEach.call(listEl.querySelectorAll('.sp-del'), function(b){
                     b.onclick = function(){ if (busy) return; FILES.splice(parseInt(b.getAttribute('data-i'), 10), 1); renderList(); say(FILES.length ? (FILES.length + ' plik(\u00f3w) na li\u015bcie.') : 'Lista pusta.', '#666'); };
                 });
@@ -15170,8 +15557,48 @@
                           : 'Te pliki ju\u017c s\u0105 na li\u015bcie.', added ? '#666' : '#c47f00');
             }
             function show(html){ box.style.display = 'block'; box.innerHTML = html; }
+            function selN(){ var n = 0; for (var k in SEL) if (SEL[k]) n++; return n; }
+            function selPaint(){
+                Array.prototype.forEach.call(box.querySelectorAll('.bc-ord'), function(c){
+                    var o = c.getAttribute('data-o'), on = !!SEL[o];
+                    c.checked = on;
+                    var chip = c.parentNode;
+                    if (chip && chip.style){ chip.style.borderColor = on ? '#0a0' : '#ddd'; chip.style.background = on ? '#EAF7EA' : '#fff'; }
+                });
+                var n = box.querySelector('#bc-cmt-n'); if (n) n.textContent = String(selN());
+            }
             function bindResult(){
                 var c = box.querySelector('#bc-copy'), s = box.querySelector('#bc-save');
+                Array.prototype.forEach.call(box.querySelectorAll('.bc-ord'), function(ch){
+                    ch.onchange = function(){ SEL[ch.getAttribute('data-o')] = ch.checked ? 1 : 0; selPaint(); };
+                });
+                var so = box.querySelector('#bc-sel-ok');
+                if (so) so.onclick = function(){ SEL = bcInitSel(LAST); selPaint(); };
+                var sa = box.querySelector('#bc-sel-all');
+                if (sa) sa.onclick = function(){ SEL = bcAllSel(LAST); selPaint(); };
+                var sn = box.querySelector('#bc-sel-none');
+                if (sn) sn.onclick = function(){ SEL = {}; selPaint(); };
+                var ca = box.querySelector('#bc-cmt-add');
+                if (ca) ca.onclick = async function(){
+                    if (busy) return;
+                    var ti = box.querySelector('#bc-cmt-text'), cs = box.querySelector('#bc-cmt-status');
+                    function tell(t, col){ if (cs){ cs.textContent = t; cs.style.color = col; } say(t, col); }
+                    var txt = String((ti && ti.value) || '').trim();
+                    if (!txt){ tell('Wpisz treść komentarza.', '#c00'); return; }
+                    var list = bcSelList(SEL);
+                    if (!list.length){ tell('Nie zaznaczyłeś ani jednego zamówienia.', '#c00'); return; }
+                    busy = true; ca.disabled = true;
+                    tell('Dodaję „' + txt + '” w ' + list.length + ' zamówieniach (po 5 naraz)…', '#666');
+                    var r = null;
+                    try { r = await bcAddComments(list, txt, null, say, 5); }
+                    catch (e){ r = null; }
+                    busy = false; ca.disabled = false;
+                    if (!r){ tell('Dodawanie komentarza nie doszło do skutku.', '#c00'); return; }
+                    var bad = r.fail.length, msg = 'Komentarz „' + r.text + '”: dodane i sprawdzone ' + r.ok.length + ' z ' + r.n
+                        + (r.blind.length ? ('  ·  wysłane, ale nie dało się potwierdzić: ' + r.blind.join(', ')) : '')
+                        + (bad ? ('  ·  NIE dodane: ' + r.fail.map(function(f){ return f.o; }).join(', ')) : '');
+                    tell(msg, bad ? '#c00' : (r.blind.length ? '#c47f00' : '#0a0'));
+                };
                 if (c) c.onclick = function(){
                     var ok = pcCopyText(bcReportTxt(LAST));
                     say(ok ? 'Skopiowano raport ze sprawdzenia.' : 'Nie uda\u0142o si\u0119 skopiowa\u0107.', ok ? '#0a0' : '#c00');
@@ -15197,17 +15624,55 @@
             };
             sp.querySelector('#sp-clear').onclick = function(){
                 if (busy) return;
-                FILES = []; LAST = null; renderList(); box.style.display = 'none'; box.innerHTML = '';
+                FILES = []; LAST = null; GRAB = null; SEL = {}; renderList(); box.style.display = 'none'; box.innerHTML = '';
                 say('Wyczyszczone. Wrzu\u0107 pliki jeszcze raz.', '#666');
             };
+            async function doGrab(){
+                if (busy) return 0;
+                busy = true;
+                say('Szukam numerów zamówień…', '#666');
+                var book = null;
+                try { book = await bcBookOf(FILES); } catch (e){ book = null; }
+                if (!book || !book.pays || !book.pays.length){
+                    busy = false;
+                    say('Nie mam skąd wziąć numerów zamówień — wrzuć „Excel do banku” albo otwórz Wprowadzanie i kliknij Przetwórz.', '#c00');
+                    return 0;
+                }
+                var dayEl = sp.querySelector('#sp-day');
+                var day = String((dayEl && dayEl.value) || '').trim();
+                if (!day){ day = bcDayOf(book.head); if (dayEl && day) dayEl.value = day; }
+                var orders = bcAllOrders(book);
+                if (!orders.length){ busy = false; say('W tym Excelu nie ma numerów zamówień.', '#c00'); return 0; }
+                var g = null;
+                try { g = await bcGrabConfs(orders, day, null, say, 5); }
+                catch (e){ busy = false; say('Dociąganie nie doszło do skutku: ' + String((e && e.message) || e), '#c00'); return 0; }
+                busy = false;
+                GRAB = g; renderList();
+                var st = g.stat;
+                say(st.pdfs
+                    ? ('Dociągnięte: ' + st.pdfs + ' potwierdzeń z ' + st.files + ' plików, z ' + st.pages + '/' + st.orders
+                        + ' zamówień' + (day ? (', z dnia ' + day) : ', bez filtra daty') + '.')
+                    : ('Nie znalazłem ani jednego potwierdzenia' + (day ? (' z dnia ' + day) : '')
+                        + ' — przejrzane zamówienia: ' + st.pages + '/' + st.orders + ', załączników w sekcji: ' + st.docs + '.'),
+                    st.pdfs ? '#0a0' : '#c47f00');
+                return st.pdfs;
+            }
+            sp.querySelector('#sp-grab').onclick = function(){ doGrab(); };
             sp.querySelector('#sp-run').onclick = async function(){
                 if (busy) return;
-                if (!FILES.length){ say('Najpierw dodaj potwierdzenia PDF (i opcjonalnie plik Excel).', '#c00'); return; }
-                if (!nPdf()){ say('Nie ma ani jednego pliku .pdf \u2014 nie ma czego por\u00f3wna\u0107 z Excelem.', '#c00'); return; }
+                // Osoba sprawdzajaca zwykle NIE ma potwierdzen u siebie — wgrywaja je
+                // osoby wprowadzajace, wprost do zamowien. Gdy nie ma ani jednego PDF-a,
+                // sciagamy je same, zamiast odsylac z bledem.
+                if (!nPdf() && !nGrab()){
+                    say('Nie ma żadnego pliku .pdf — dociągam potwierdzenia z zamówień…', '#666');
+                    var g = await doGrab();
+                    if (!g){ say('Nie mam ani jednego potwierdzenia — ani wgranego, ani w zamówieniach.', '#c00'); return; }
+                }
+                if (!FILES.length && !nGrab()){ say('Najpierw dodaj potwierdzenia PDF (i opcjonalnie plik Excel).', '#c00'); return; }
                 busy = true;
-                show('<div style="font-size:12px;color:#666">Czytam ' + FILES.length + ' plik(\u00f3w)\u2026</div>');
+                show('<div style="font-size:12px;color:#666">Czytam ' + (FILES.length + nGrab()) + ' plik(\u00f3w)\u2026</div>');
                 var R = null;
-                try { R = await bcProcess(FILES, say); }
+                try { R = await bcProcess(FILES, say, GRAB); }
                 catch(e){ busy = false; show('<div style="font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); return; }
                 busy = false;
                 if (R && R.err){
@@ -15217,8 +15682,9 @@
                     say(R.err, '#c00'); return;
                 }
                 LAST = R;
+                SEL = bcInitSel(R);
                 var v = bcVerdict(R);
-                show(bcReportHtml(R));
+                show(bcReportHtml(R, SEL));
                 bindResult();
                 say('Sprawdzenie z bankiem: ' + v.t + '.', v.c);
             };
