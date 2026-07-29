@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.85
+// @version      1.86
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12031,6 +12031,39 @@
             var order = ordC ? ordC.t : '';
             return { supplier: supplier, cid: cid, order: order, cells: c, bg: bg, supplierUrl: supC ? supC.u : '', orderUrl: ordC ? ordC.u : '' };
         }
+        // Wklejka BALANCE z prologistics ma po bloku kazdego dostawcy wiersz sumy:
+        // pusta nazwa dostawcy, pusty kontener, pusty numer zamowienia — sama kwota
+        // w 5. kolumnie. To NIE jest platnosc, tylko podsumowanie wierszy stojacych
+        // wyzej. Do 1.85 takie wiersze wchodzily do danych jako osobny „dostawca" bez
+        // nazwy i doliczaly sie do kwoty do zaplaty (w pliku z 29.07.2026 bylo to
+        // 283'128.38 USD nadmiaru na 9 wierszach). Od 1.86 sa wyjmowane i uzywane jako
+        // suma kontrolna bloku — dokladnie tak, jak od dawna robi modul ksiegowania
+        // (parseBalancePaste, „suma grupy sie nie zgadza").
+        // Warunek celowo wymaga BRAKU wszystkich trzech identyfikatorow. Wiersz, ktory
+        // ma chocby numer zamowienia, zostaje w danych — nigdy nie wyrzucamy po cichu
+        // czegos, co moze byc prawdziwa platnoscia.
+        function balNoIdent(r){
+            return !String((r && r.supplier) || '').trim()
+                && !String((r && r.order) || '').trim()
+                && !String((r && r.container) || '').trim();
+        }
+        // Dzieli wiersze na platnosci i sumy kontrolne. Suma dotyczy dostawcy, ktorego
+        // blok wlasnie sie skonczyl, wiec zapamietujemy ostatnia widziana nazwe.
+        function balSplitSums(rows){
+            var keep = [], sums = [], dropped = 0, lastSup = '';
+            (rows || []).forEach(function(r){
+                if (balNoIdent(r)) {
+                    dropped++;
+                    var a = parseMoney(r && r.amount);
+                    if (isFinite(a)) sums.push({ sup: lastSup, declared: a });
+                    return;
+                }
+                var s = String((r && r.supplier) || '').trim();
+                if (s) lastSup = s;
+                keep.push(r);
+            });
+            return { rows: keep, sums: sums, dropped: dropped };
+        }
         function parseBalance(el){
             var rows = [], trs = el.querySelectorAll('tr');
             if (trs.length) {
@@ -12043,7 +12076,26 @@
                     rows.push({ supplier: c[0].trim(), supplierUrl: '', container: c[1].trim(), seq: c[2].trim(), order: c[3].trim(), orderUrl: '', amount: c[4].trim(), note: c[5].trim(), cid: cid, bg: '' });
                 });
             }
-            return rows;
+            return balSplitSums(rows);
+        }
+        // Porownuje sume wierszy kazdego dostawcy z suma zadeklarowana we wklejce.
+        // Rozjazd zwykle znaczy, ze wklejka jest ucieta albo ze jakis wiersz nie
+        // zostal rozpoznany — czyli dokladnie to, czego przy przelewach nie wolno
+        // przeoczyc. Liczone od razu po wczytaniu, zanim ktokolwiek recznie ruszy kwoty.
+        function balSumCheck(g, sums){
+            var res = { n: 0, ok: 0, bad: [] };
+            (sums || []).forEach(function(s){
+                if (!s || !s.sup) return;
+                var rows = (g && g.groups && g.groups[s.sup]) || null;
+                if (!rows || !rows.length) return;
+                res.n++;
+                var got = 0;
+                rows.forEach(function(r){ var a = pcBalAmtVal(r); if (a != null && isFinite(a)) got += a; });
+                got = Math.round(got * 100) / 100;
+                if (Math.abs(got - s.declared) < 0.005) res.ok++;
+                else res.bad.push({ sup: s.sup, declared: s.declared, got: got });
+            });
+            return res;
         }
         function parseDepo(el){
             var rows = [], names = [], trs = el.querySelectorAll('tr');
@@ -13220,7 +13272,10 @@
             xlBand(1, XL_NCOL, 'IBAN: ' + (cfg.iban || '—') + '     BIC: ' + (cfg.bic || '—'), XLS.BOLD);
             xlBand(1, XL_NCOL, 'Data wykonania: ' + (cfg.exec || '—') + '     Waluta: ' + PAIN_CCY
                 + '     Płatności: ' + nGroups + '     Pozycji: ' + nRows + '     Razem: ' + sumAll.toFixed(2) + ' ' + PAIN_CCY, XLS.BOLD);
-            xlBand(1, XL_NCOL, 'Sprawdzone: ' + nOk + '   ·   do sprawdzenia: ' + nWarn + '   ·   NIE wprowadzać: ' + nBad, XLS.SMALL);
+            var bsc = state.balSumChk || null;
+            xlBand(1, XL_NCOL, 'Sprawdzone: ' + nOk + '   ·   do sprawdzenia: ' + nWarn + '   ·   NIE wprowadzać: ' + nBad
+                + ((bsc && bsc.n) ? ('   ·   sumy kontrolne z wklejki: ' + bsc.ok + '/' + bsc.n + ' zgodnych'
+                    + (bsc.bad.length ? ('   ⚠ ROZJAZD: ' + bsc.bad.map(function(b){ return b.sup + ' (wklejka ' + b.declared.toFixed(2) + ', wiersze ' + b.got.toFixed(2) + ')'; }).join('; ')) : '')) : ''), XLS.SMALL);
             xlBand(1, XL_NCOL, 'Wygenerowano: ' + pcNow() + '   ·   skrypt hub ' + VER + '   ·   plik roboczy, nie jest to dokument księgowy', XLS.SMALL);
             xlBand(1, XL_NCOL, 'Żółte kolumny I–L wypełnia osoba wprowadzająca przelew do banku. Jedna płatność = jeden wiersz z nazwą dostawcy (kolorowy pasek).', XLS.SMALL);
             xlBlank();
@@ -14307,13 +14362,37 @@
             var status = wp.querySelector('#wp-status');
             // Nowy przebieg = czysty log. Zapisujemy tez surowe wklejki, zeby dalo sie odtworzyc wejscie.
             state.diag = { bal: {}, dep: {}, raw: { bal: pcPasteTxt('#wp-balance'), dep: pcPasteTxt('#wp-depo'), depSrc: state.depoSrc || 'wklejone ręcznie' }, started: pcNow(), log: [] };
-            var balRows = parseBalance(wp.querySelector('#wp-balance'));
+            var balP = parseBalance(wp.querySelector('#wp-balance')), balRows = balP.rows;
             var dep = parseDepo(wp.querySelector('#wp-depo'));
             if (!balRows.length && !dep.rows.length) { dlog('Przerwano: nic nie wklejono.'); status.textContent = 'Wklej dane.'; return; }
             state.bal = groupRows(balRows); state.dep = groupRows(dep.rows); state.depoNames = dep.names;
             state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {}; state.pcAccEdit = {};
             state.bal.order.forEach(function(sup){ if (matchName(norm(sup), state.depoNames)) state.matched[sup] = 1; });
             dlog('Wczytano: BALANCE ' + balRows.length + ' wierszy / ' + state.bal.order.length + ' dostawcow, DEPO ' + dep.rows.length + ' wierszy / ' + state.dep.order.length + ' dostawcow.');
+            // Wiersze sum z wklejki: wyjete z danych (nie sa platnoscia) i uzyte jako kontrola.
+            state.balSums = balP.sums;
+            state.balSumChk = balSumCheck(state.bal, balP.sums);
+            if (balP.dropped) {
+                dlog('Wklejka BALANCE: pominieto ' + balP.dropped + ' wiersz/e podsumowania (bez dostawcy, kontenera i numeru zamowienia) — to sumy blokow, nie platnosci.');
+                if (state.balSumChk.n) {
+                    dlog('Sumy kontrolne z wklejki: ' + state.balSumChk.ok + '/' + state.balSumChk.n + ' zgodnych.');
+                    state.balSumChk.bad.forEach(function(b){
+                        dlog('  ROZJAZD u „' + b.sup + '": we wklejce ' + b.declared.toFixed(2) + ', z wierszy wychodzi ' + b.got.toFixed(2) + ' (roznica ' + (b.got - b.declared).toFixed(2) + ') — sprawdz, czy wklejka nie jest ucieta.');
+                    });
+                }
+            }
+            // Siatka bezpieczenstwa. Grupa bez nazwy dostawcy nie ma prawa istniec: nie da
+            // sie jej znalezc konta, a i tak wlicza sie do kwoty do zaplaty. Wlasnie tak
+            // wygladal blad z 1.85 (wiersze sum z wklejki). Gdyby kiedys inna wklejka
+            // przemycila cos podobnego, ma to krzyknac od razu, a nie po przelewie.
+            ['bal', 'dep'].forEach(function(w){
+                var g = state[w]; if (!g || !g.order) return;
+                g.order.forEach(function(sup){
+                    if (String(sup || '').trim()) return;
+                    var n = (g.groups[sup] || []).length;
+                    dlog('UWAGA: we wklejce ' + (w === 'bal' ? 'BALANCE' : 'DEPO') + ' powstala grupa BEZ NAZWY dostawcy (' + n + ' wiersz/y). To prawie na pewno wiersz podsumowania albo smiec \u2014 sprawdz przed przelewem.');
+                });
+            });
             renderTables();
             status.textContent = 'Sprawdzam konta\u2026';
             dlog('Start: rozwiazywanie kont dostawcow.');
@@ -14334,9 +14413,11 @@
             renderTables();
             dlog('Koniec przetwarzania.');
             var c = state.bal.order.filter(function(s){ return !!state.matched[s]; }).length;
+            var _bs = state.balSumChk || { n: 0, ok: 0, bad: [] };
             status.textContent = 'Gotowe. Dostawcy: ' + state.bal.order.length + ' | \u017c\u00f3\u0142te: ' + c + ' | penalties: ' + _pen + ' | P/I \u2713' + _pi.ok + ' \u2717' + _pi.bad
                 + ' | BAL komentarze \u2713' + _bc.ok + ' \u26a0' + _bc.warn + ' \u2717' + _bc.bad
-                + (_bpi ? (' | BAL P/I \u2713' + _bc.piOk + ' \u2717' + _bc.piBad) : '') + '.';
+                + (_bpi ? (' | BAL P/I \u2713' + _bc.piOk + ' \u2717' + _bc.piBad) : '')
+                + (_bs.n ? (' | sumy z wklejki \u2713' + _bs.ok + '/' + _bs.n + (_bs.bad.length ? (' \u26a0 rozjazd: ' + _bs.bad.map(function(b){ return b.sup; }).join(', ')) : '')) : '') + '.';
         };
         // --- pain.001: pokaz/ukryj panel + obsluga (listener na kontenerze, bo innerHTML wymieniamy) ---
         wp.querySelector('#wp-pain').onclick = function(){
