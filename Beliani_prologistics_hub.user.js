@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.87
+// @version      1.88
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11976,8 +11976,11 @@
           + '<button id="wp-log" class="chn-btn ghost" title="Zapisuje plik .txt z pelnym przebiegiem: wklejone dane, komentarze z zamowien, odczyty z P/I, werdykty i tytuly przelewow. Mozna go wkleic do rozmowy z Claude.">📄 Zapisz log (txt)</button>'
           + '<button id="wp-log-copy" class="chn-btn ghost" title="To samo co log, ale do schowka">📋 Kopiuj log</button>'
           + '<button id="wp-xlsx" class="chn-btn ghost" title="Zapisuje plik .xlsx z calym przetworzonym widokiem: dostawcy, konta beneficjentow, SWIFT, tytuly przelewow, kwoty i status kazdej platnosci, plus puste kolumny Wprowadzone / Kto / Data / Uwagi. Do wyslania mailem osobom, ktore wklepuja przelewy do banku. Niezalezne od Kopiuj depo i Kopiuj balance.">📊 Excel do banku (xlsx)</button>'
+          + '<button id="wp-bankchk" class="chn-btn maroon" title="Porownuje wygenerowany plik Excel z potwierdzeniami przelewow z e-finance (PDF). Wrzucasz jeden plik .xlsx i dowolna liczbe .pdf naraz — skrypt dopasowuje je po numerach zamowien z tytulu przelewu i pokazuje, gdzie bank ma cos innego niz Excel. Brak miasta lub kodu pocztowego beneficjenta nie jest bledem.">🔍 Sprawdź z bankiem</button>'
+          + '<input type="file" id="wp-bc-file" accept=".pdf,.xlsx" multiple style="display:none">'
           + '<span id="wp-log-status" style="font-size:11px;color:#666"></span>'
           + '</div>'
+          + '<div id="wp-bc-box" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
           + '</div>';
         document.body.appendChild(wp);
         wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
@@ -13400,6 +13403,499 @@
             } catch(e){ return null; }
         }
 
+        // ===== Sprawdzenie z bankiem: Excel z tego panelu <-> potwierdzenia PDF z e-finance =====
+        // Zasada dopasowania: kluczem sa NUMERY ZAMOWIEN z tytulu przelewu, nie kwota.
+        // Gdyby kluczem byla kwota, przelew z bledna kwota wygladalby jak "brak potwierdzenia",
+        // a to jest dokladnie ten blad, ktory to narzedzie ma znalezc.
+        var BC_LEGAL = { CO: 1, LTD: 1, LIMITED: 1, LLC: 1, INC: 1, CORP: 1, CORPORATION: 1, COMPANY: 1, PT: 1, CV: 1, JSC: 1, GMBH: 1, SA: 1, AG: 1 };
+        // Etykiety z wydruku e-finance. Kolejnosc ma znaczenie: dluzsze przed krotszymi,
+        // inaczej "Payment details" wpadnie w "Payment", a "Execution date" w "Execution".
+        var BC_LBL = ["Recipient's account", 'Recipient bank', 'Recipient address', 'Name and address of recipient',
+            'Debit account', 'Transfer amount', 'Amount', 'Execution date', 'Execution', 'Transfer option',
+            'Status', 'Captured/approved by', 'Signed by', 'Message', 'Booking text', 'Multiple debits',
+            'End To End ID', 'Payment information', 'Payment details', 'Payment', 'Recipient'];
+        // Powody statusu "NIE WPROWADZAC", ktore NIE sa bledem, gdy przelew w banku jednak jest.
+        // Hongkong nie ma kodow pocztowych, a bank i tak przyjmuje przelew — decyzja uzytkownika.
+        var BC_SOFT_WHY = /^brakuje:\s*(miasto beneficjenta|kod pocztowy beneficjenta|miasto i kod pocztowy beneficjenta)\s*$/i;
+
+        function bcUp(s){
+            var t = String(s == null ? '' : s);
+            try { t = t.normalize('NFKD').replace(/[̀-ͯ]/g, ''); } catch(e){}
+            return t.toUpperCase();
+        }
+        function bcNormAcc(s){ return bcUp(s).replace(/\([^)]*\)/g, ' ').replace(/[^A-Z0-9]/g, ''); }
+        function bcNormBic(s){ var t = bcUp(s).replace(/[^A-Z0-9]/g, ''); return t.length === 8 ? (t + 'XXX') : t; }
+        function bcNormName(s){ return bcUp(s).replace(/&/g, ' AND ').replace(/[^A-Z0-9]/g, ' ').replace(/\s+/g, ' ').trim(); }
+        function bcNameToks(s){
+            return bcNormName(s).split(' ').filter(function(t){ return t && !BC_LEGAL[t]; });
+        }
+        // Kwota w groszach (int) — porownywanie floatow to proszenie sie o 0.01 roznicy.
+        function bcCents(x){
+            if (x == null || x === '') return null;
+            if (typeof x === 'number') return isFinite(x) ? Math.round(x * 100) : null;
+            var s = String(x).replace(/['’  ]/g, '');
+            var nc = (s.match(/,/g) || []).length, nd = (s.match(/\./g) || []).length;
+            s = (nc === 1 && nd === 0) ? s.replace(',', '.') : s.replace(/,/g, '');
+            var m = s.match(/-?\d+(?:\.\d+)?/);
+            return m ? Math.round(parseFloat(m[0]) * 100) : null;
+        }
+        // "100-102" -> "100 101 102". Tytul z Excela bywa zwiniety w zakres (patrz pcRangeList),
+        // a w banku stoi rozpisany albo odwrotnie — bez tego kazda taka para bylaby "roznica".
+        function bcExpandRange(s){
+            return String(s == null ? '' : s).replace(/(^|[^\d-])(\d{2,})\s*[-–]\s*(\d{2,})(?![\d-])/g, function(all, pre, a, b){
+                var x = parseInt(a, 10), y = parseInt(b, 10);
+                if (!(y > x && y - x <= 60 && a.length === b.length)) return all;
+                var out = [];
+                for (var i = x; i <= y; i++) out.push(String(i));
+                return pre + out.join(' ');
+            });
+        }
+        // Tytul -> tokeny. Przecinek, kropka i spacja przestaja mieć znaczenie, wiec
+        // "Order 101, Penalty 102" i "Order 101,Penalty 102" daja ten sam wynik.
+        function bcTitleToks(s){
+            var t = bcUp(s);
+            t = t.replace(/\(\s*\d+\s*\/\s*\d+\s*ZNAK\w*\s*\)/g, ' ');   // ogonek z Excela "(24/140 znakow)"
+            t = bcExpandRange(t);
+            t = t.replace(/[,.;:/\\'"()\[\]’–—_]/g, ' ');
+            return t.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+        }
+        function bcMultiset(toks){
+            var d = {};
+            (toks || []).forEach(function(t){ d[t] = (d[t] || 0) + 1; });
+            return d;
+        }
+        function bcMsDiff(a, b){
+            var A = bcMultiset(a), B = bcMultiset(b), miss = [], extra = [], k, n;
+            for (k in A){ n = A[k] - (B[k] || 0); while (n-- > 0) miss.push(k); }
+            for (k in B){ n = B[k] - (A[k] || 0); while (n-- > 0) extra.push(k); }
+            return { miss: miss, extra: extra };
+        }
+        function bcOrders(toks){
+            var o = {};
+            (toks || []).forEach(function(t){ if (/^\d{4,6}$/.test(t)) o[t] = 1; });
+            return o;
+        }
+        function bcInter(a, b){ var n = 0, k; for (k in a) if (b[k]) n++; return n; }
+
+        // --- PDF: automat na etykietach. Dziala na obu ukladach e-finance
+        //     (zlecenie recznie wklepane i zlecenie z wgranego pliku pain.001).
+        function bcParsePdfText(txt, fname){
+            var lines = String(txt || '').split('\n'), fields = {}, cur = null;
+            for (var i = 0; i < lines.length; i++){
+                var raw = lines[i].replace(/\s+$/, ''), ln = raw.trim();
+                if (!ln) continue;
+                var hit = null;
+                for (var j = 0; j < BC_LBL.length; j++){
+                    var lb = BC_LBL[j];
+                    if (ln.indexOf(lb) === 0){
+                        var rest = ln.slice(lb.length);
+                        if (rest === '' || rest.charAt(0) === ' ' || rest.charAt(0) === '\t'){ hit = { lb: lb, v: rest.trim() }; break; }
+                    }
+                }
+                if (hit){
+                    cur = hit.lb;
+                    if (!fields[cur]) fields[cur] = [];
+                    if (hit.v) fields[cur].push(hit.v);
+                } else if (cur !== null && /^\s{6,}\S/.test(raw)){
+                    fields[cur].push(ln);
+                }
+            }
+            if (!fields["Recipient's account"]) return null;
+            function g(k, i){ var a = fields[k] || []; return a.length > (i || 0) ? a[i || 0] : ''; }
+            var addr = fields['Recipient address'] || fields['Name and address of recipient'] || [];
+            var amt = g('Transfer amount') || g('Amount');
+            var bank = fields['Recipient bank'] || [];
+            return {
+                file: fname || '',
+                acct: g("Recipient's account"),
+                bic: bank.length ? bank[0] : '',
+                bankLines: bank.slice(1),
+                name: addr.length ? addr[0] : '',
+                addr: addr.slice(1),
+                ccy: (String(amt).split(/\s+/)[0] || ''),
+                amt: amt,
+                debit: (fields['Debit account'] || []).slice(1).join(' '),
+                exec: g('Execution date'),
+                status: g('Status'),
+                msg: (fields['Message'] || []).join(' '),
+                e2e: g('End To End ID'),
+                opt: g('Transfer option')
+            };
+        }
+        // pdf.js gubi wciecia, a automat wyzej stoi na "co najmniej 6 spacji = ciag dalszy".
+        // Dlatego wiersz skladamy z odstepow miedzy fragmentami: duza przerwa w X -> spacje.
+        function bcPdfLayoutLines(items){
+            var rows = [];
+            (items || []).forEach(function(it){
+                var s = it && it.str;
+                if (s == null || !String(s).length) return;
+                var tr = it.transform || [], x = +tr[4] || 0, y = +tr[5] || 0, row = null;
+                for (var i = 0; i < rows.length; i++){ if (Math.abs(rows[i].y - y) <= 3){ row = rows[i]; break; } }
+                if (!row){ row = { y: y, items: [] }; rows.push(row); }
+                row.items.push({ x: x, w: +it.width || 0, s: String(s) });
+            });
+            rows.sort(function(a, b){ return b.y - a.y; });
+            return rows.map(function(r){
+                r.items.sort(function(a, b){ return a.x - b.x; });
+                var out = '', end = null;
+                r.items.forEach(function(it){
+                    if (end === null){
+                        var pad = Math.round(it.x / 5.2);
+                        out += new Array(Math.max(0, Math.min(pad, 200)) + 1).join(' ');
+                    } else {
+                        var gap = it.x - end, n = gap > 4 ? Math.max(1, Math.round(gap / 5.2)) : (gap > 0.6 ? 1 : 0);
+                        out += new Array(Math.min(n, 200) + 1).join(' ');
+                    }
+                    out += it.s;
+                    end = it.x + (it.w || 0);
+                });
+                return out.replace(/\s+$/, '');
+            }).join('\n');
+        }
+        async function bcParsePdf(u8, fname){
+            var lib = await getPdfjs();
+            if (!lib) return { err: 'brak pdf.js — nie mogę odczytać PDF', file: fname };
+            var txt = '';
+            try {
+                var doc = await lib.getDocument({ data: u8 }).promise;
+                for (var pg = 1; pg <= doc.numPages; pg++){
+                    var page = await doc.getPage(pg);
+                    var tc = await page.getTextContent();
+                    txt += bcPdfLayoutLines(tc.items) + '\n';
+                }
+            } catch(e){ return { err: 'nie udało się otworzyć PDF (' + e + ')', file: fname }; }
+            var r = bcParsePdfText(txt, fname);
+            if (!r) return { err: 'to nie wygląda na potwierdzenie z e-finance (brak „Recipient’s account”)', file: fname };
+            return r;
+        }
+
+        // --- Excel: czytamy WLASNY eksport (xlBuildBook) przez SheetJS.
+        //     Etykiety w kolumnie A, wartosci od kolumny D, status platnosci w kolumnie H.
+        function bcRowsFromSheet(ws, X){
+            return X.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: true });
+        }
+        function bcCellStr(v){ return v == null ? '' : String(v).trim(); }
+        function bcParseXlsxRows(rows){
+            var head = { iban: '', bic: '', ccy: '', exec: '', gen: '' }, pays = [], cur = null;
+            for (var r = 0; r < rows.length; r++){
+                var row = rows[r] || [], a = bcCellStr(row[0]), d = row[3] == null ? null : row[3], m;
+                if (r < 8){
+                    m = a.match(/IBAN:\s*([A-Z0-9 ]+?)\s{2,}BIC:\s*(\S*)/);
+                    if (m){ head.iban = m[1].trim(); head.bic = m[2] || ''; }
+                    m = a.match(/Data wykonania:\s*(\S+)/); if (m) head.exec = m[1];
+                    m = a.match(/Waluta:\s*(\w+)/); if (m) head.ccy = m[1];
+                    m = a.match(/Wygenerowano:\s*([\d-]+ [\d:]+)/); if (m) head.gen = m[1];
+                    continue;
+                }
+                if (!a && d == null) continue;
+                if (/\(\d+ poz\.\)\s*$/.test(a)){
+                    cur = { sup: a.replace(/\s*\(\d+ poz\.\)\s*$/, '').trim(), row: r + 1,
+                        status: bcCellStr(row[7]), why: '', acct: '', bic: '', name: '', addr: '', title: '', amt: null, rows: [] };
+                    pays.push(cur);
+                    continue;
+                }
+                if (!cur) continue;
+                if (a.indexOf('Uwaga:') === 0) cur.why = bcCellStr(d);
+                else if (a.indexOf('Konto beneficjenta:') === 0) cur.acct = bcCellStr(d).split(/\s{4,}/)[0];
+                else if (a.indexOf('SWIFT') === 0) cur.bic = (bcCellStr(d).split(/\s+/)[0] || '');
+                else if (a.indexOf('Beneficjent:') === 0) cur.name = bcCellStr(d);
+                else if (a.indexOf('Adres beneficjenta:') === 0) cur.addr = bcCellStr(d);
+                else if (a.indexOf('Tytu') === 0) cur.title = bcCellStr(d).replace(/\s{2,}\(\d+\/\d+.*$/, '');
+                else if (a.indexOf('DO ZAP') === 0) cur.amt = d;
+                else if ((a === 'D' || a === 'B')) cur.rows.push({ typ: a, order: bcCellStr(row[1]), cont: bcCellStr(row[2]), amt: row[3] });
+            }
+            return { head: head, pays: pays };
+        }
+        function bcParseXlsx(u8, fname){
+            var X = getXLSX();
+            if (!X) return { err: 'brak biblioteki XLSX — odśwież stronę', file: fname };
+            var wb;
+            try { wb = X.read(u8, { type: 'array' }); } catch(e){ return { err: 'nie udało się otworzyć pliku (' + e + ')', file: fname }; }
+            var ws = wb.Sheets[wb.SheetNames[0]];
+            if (!ws) return { err: 'pusty skoroszyt', file: fname };
+            var out = bcParseXlsxRows(bcRowsFromSheet(ws, X));
+            if (!out.pays.length) return { err: 'nie znalazłem w tym pliku żadnej płatności — czy to na pewno „Excel do banku” z tego panelu?', file: fname };
+            out.file = fname || '';
+            return out;
+        }
+        // Awaryjnie: gdy uzytkownik wrzucil same PDF-y, bierzemy dane wprost z panelu.
+        function bcFromPanel(){
+            var b = null;
+            try { b = xlBuildBook(); } catch(e){ return { err: 'nie udało się złożyć danych z panelu (' + e + ')' }; }
+            if (!b) return { err: 'nie udało się złożyć danych z panelu' };
+            var X = getXLSX();
+            if (!X) return { err: 'brak biblioteki XLSX — odśwież stronę' };
+            var wb;
+            try { wb = X.read(b.bytes, { type: 'array' }); } catch(e){ return { err: 'nie udało się odczytać danych z panelu (' + e + ')' }; }
+            var out = bcParseXlsxRows(bcRowsFromSheet(wb.Sheets[wb.SheetNames[0]], X));
+            out.file = '(dane wprost z panelu, bez pliku)';
+            return out;
+        }
+
+        // --- dopasowanie platnosc <-> potwierdzenie
+        function bcMatch(pays, pdfs){
+            var pairs = [], used = {};
+            (pays || []).forEach(function(p){
+                var po = bcOrders(bcTitleToks(p.title || '')), best = -1, bs = 0, pc = bcCents(p.amt);
+                for (var i = 0; i < pdfs.length; i++){
+                    if (used[i]) continue;
+                    var q = pdfs[i], inter = bcInter(po, bcOrders(bcTitleToks(q.msg || '')));
+                    if (inter === 0){
+                        var e2 = String(q.e2e || '').match(/BEL-(\d+)-/);
+                        if (e2 && po[e2[1]]) inter = 1;
+                    }
+                    // Remis rozstrzyga kwota. Bez tego testowy przelew na 1 USD z tym samym
+                    // numerem zamowienia potrafi podmienic prawdziwa platnosc.
+                    var tie = (inter === bs && inter > 0 && best >= 0
+                        && pc != null && bcCents(q.amt) === pc && bcCents(pdfs[best].amt) !== pc);
+                    if (inter > bs || tie){ best = i; bs = inter; }
+                }
+                if (best >= 0){ used[best] = 1; pairs.push({ p: p, q: pdfs[best], score: bs }); }
+                else pairs.push({ p: p, q: null, score: 0 });
+            });
+            var orph = [];
+            for (var k = 0; k < pdfs.length; k++) if (!used[k]) orph.push(pdfs[k]);
+            return { pairs: pairs, orphans: orph };
+        }
+
+        // --- kontrole jednej pary
+        function bcCheck(p, q, head){
+            var out = [];
+            function E(m){ out.push({ lv: 'err', m: m }); }
+            function W(m){ out.push({ lv: 'warn', m: m }); }
+            function I(m){ out.push({ lv: 'info', m: m }); }
+            function D(m){ out.push({ lv: 'date', m: m }); }
+
+            if (bcUp(p.status).indexOf('NIE WPROWADZA') >= 0){
+                var why = p.why || '';
+                if (BC_SOFT_WHY.test(why)) I('Excel mówił „NIE WPROWADZAĆ” tylko z powodu: ' + why + ' — to nie jest błąd, bank przelew przyjął');
+                else E('Excel mówi NIE WPROWADZAĆ (' + (why || 'bez podanego powodu') + '), a w banku przelew JEST');
+            }
+            var ce = bcCents(p.amt), cq = bcCents(q.amt);
+            if (ce == null || cq == null) W('nie odczytałem kwoty' + (ce == null ? ' z Excela' : ' z PDF'));
+            else if (ce !== cq) E('kwota: Excel ' + (ce / 100).toFixed(2) + ', bank ' + (cq / 100).toFixed(2) + ' (różnica ' + ((cq - ce) / 100).toFixed(2) + ')');
+
+            if (head.ccy && bcUp(q.ccy) !== bcUp(head.ccy)) E('waluta: Excel ' + head.ccy + ', bank ' + q.ccy);
+
+            var accE = p.acct || '';
+            if (bcUp(accE).indexOf('BRAK') >= 0) W('konto: Excel nie zna konta (brak w P/I), bank ma ' + q.acct + ' — nie mam czym porównać');
+            else if (bcNormAcc(accE) !== bcNormAcc(q.acct)) E('konto: Excel ' + accE + ', bank ' + q.acct);
+
+            if (!q.bic) I('SWIFT/BIC: nie ma go na tym wydruku (zlecenie z pliku pain.001)');
+            else if (bcUp(p.bic || '').indexOf('BRAK') >= 0) W('SWIFT/BIC: Excel nie zna, bank ma ' + q.bic);
+            else if (bcNormBic(p.bic) !== bcNormBic(q.bic)) E('SWIFT/BIC: Excel ' + p.bic + ', bank ' + q.bic);
+
+            var nE = bcNormName(p.name || ''), nQ = bcNormName(q.name || '');
+            if (bcUp(p.name || '').indexOf('BRAK') >= 0) W('nazwa: Excel nie zna, bank ma „' + q.name + '”');
+            else if (nE !== nQ){
+                if (nQ && (nE.indexOf(nQ) === 0 || nQ.indexOf(nE) === 0)) I('nazwa skrócona w banku: „' + q.name + '” zamiast „' + p.name + '”');
+                else if (bcNameToks(p.name).slice().sort().join(' ') === bcNameToks(q.name).slice().sort().join(' ')) I('nazwa: ta sama treść, inny zapis („' + p.name + '” / „' + q.name + '”)');
+                else W('nazwa: Excel „' + p.name + '”, bank „' + q.name + '”');
+            }
+
+            var tE = bcTitleToks(p.title || ''), tQ = bcTitleToks(q.msg || ''), df = bcMsDiff(tE, tQ);
+            if (df.miss.length || df.extra.length){
+                E('tytuł przelewu: brakuje w banku [' + (df.miss.join(', ') || '—') + '], nadmiar w banku [' + (df.extra.join(', ') || '—') + ']');
+            } else if (tE.join(' ') !== tQ.join(' ')){
+                I('tytuł: ta sama treść, inna kolejność (Excel „' + p.title + '” / bank „' + q.msg + '”)');
+            }
+
+            if (head.iban && q.debit && bcNormAcc(q.debit) !== bcNormAcc(head.iban)) E('konto obciążane: Excel ' + head.iban + ', bank ' + q.debit);
+
+            if (q.exec){
+                var d2 = String(q.exec).match(/(\d{2})\.(\d{2})\.(\d{4})/);
+                var iso = d2 ? (d2[3] + '-' + d2[2] + '-' + d2[1]) : String(q.exec);
+                if (head.exec && iso !== head.exec) D('data wykonania: Excel ' + head.exec + ', bank ' + q.exec);
+            }
+
+            var st = bcUp(q.status);
+            if (st.indexOf('CANCEL') >= 0 || st.indexOf('REJECT') >= 0) E('status w banku: ' + q.status);
+            else if (st) I('status w banku: ' + q.status);
+
+            // Miasto i kod pocztowy NIGDY nie sa bledem — Hongkong ich nie ma.
+            if ((q.addr || []).length < 2) I('brak miasta / kodu pocztowego beneficjenta w banku — OK, nie każdy kraj tego wymaga');
+            return out;
+        }
+
+        function bcLv(res){
+            for (var i = 0; i < res.length; i++) if (res[i].lv === 'err') return 'err';
+            for (var j = 0; j < res.length; j++) if (res[j].lv === 'warn') return 'warn';
+            return 'ok';
+        }
+        // --- caly przebieg
+        function bcRun(book, pdfs){
+            var mm = bcMatch(book.pays, pdfs), items = [], dates = {}, nErr = 0, nWarn = 0, nOk = 0, nMiss = 0;
+            mm.pairs.forEach(function(pr){
+                if (!pr.q){ nMiss++; items.push({ p: pr.p, q: null, lv: 'miss', res: [], score: 0 }); return; }
+                var res = bcCheck(pr.p, pr.q, book.head);
+                res.forEach(function(x){ if (x.lv === 'date') dates[x.m] = 1; });
+                var lv = bcLv(res);
+                if (lv === 'err') nErr++; else if (lv === 'warn') nWarn++; else nOk++;
+                items.push({ p: pr.p, q: pr.q, lv: lv, res: res, score: pr.score });
+            });
+            var orph = mm.orphans.map(function(q){
+                return { q: q, test: bcCents(q.amt) === 100 };
+            });
+            var dl = [];
+            for (var k in dates) dl.push(k);
+            dl.sort();
+            return {
+                head: book.head, file: book.file || '', items: items, orphans: orph, dates: dl,
+                nErr: nErr, nWarn: nWarn, nOk: nOk, nMiss: nMiss,
+                nPays: book.pays.length, nPdf: pdfs.length,
+                nOrphReal: orph.filter(function(o){ return !o.test; }).length,
+                nOrphTest: orph.filter(function(o){ return o.test; }).length
+            };
+        }
+
+        function bcVerdict(R){
+            if (R.nErr || R.nMiss || R.nOrphReal) return { t: 'SĄ RÓŻNICE — sprawdź przed zamknięciem dnia', c: '#c00' };
+            if (R.nWarn) return { t: 'do przejrzenia — nic krytycznego', c: '#c47f00' };
+            return { t: 'wszystko się zgadza', c: '#0a0' };
+        }
+        var BC_ICON = { err: '✗', warn: '⚠', info: 'i', ok: '✓', miss: '✗', date: '·' };
+        function bcReportTxt(R){
+            var L = [], v = bcVerdict(R);
+            L.push('SPRAWDZENIE Z BANKIEM — ' + pcNow());
+            L.push('skrypt hub ' + VER);
+            L.push('');
+            L.push('Excel: ' + R.nPays + ' płatności' + (R.file ? ('  ·  ' + R.file) : '')
+                + '  ·  IBAN ' + (R.head.iban || '—') + '  ·  ' + (R.head.ccy || '—') + '  ·  data ' + (R.head.exec || '—'));
+            L.push('PDF:   ' + R.nPdf + ' potwierdzeń');
+            L.push('WYNIK: ' + v.t + '   (zgodne ' + R.nOk + ', uwagi ' + R.nWarn + ', błędy ' + R.nErr
+                + ', bez potwierdzenia ' + R.nMiss + ', w banku bez odpowiednika ' + R.nOrphReal + ')');
+            L.push('');
+            R.items.forEach(function(it){
+                if (it.lv === 'miss'){
+                    L.push('[BRAK POTWIERDZENIA] ' + it.p.sup);
+                    L.push('    tytuł: ' + (it.p.title || '—') + '   kwota: ' + (it.p.amt == null ? '—' : it.p.amt));
+                    L.push('');
+                    return;
+                }
+                L.push('[' + (it.lv === 'err' ? 'BŁĄD' : (it.lv === 'warn' ? 'UWAGA' : 'OK')) + '] ' + it.p.sup
+                    + '   (wspólnych numerów zamówień: ' + it.score + ', plik: ' + (it.q.file || '—') + ')');
+                ['err', 'warn', 'info'].forEach(function(lv){
+                    it.res.forEach(function(x){ if (x.lv === lv) L.push('    ' + BC_ICON[lv] + ' ' + x.m); });
+                });
+                L.push('');
+            });
+            R.orphans.forEach(function(o){
+                L.push('[' + (o.test ? 'TEST 1 USD' : 'W BANKU, BEZ ODPOWIEDNIKA W EXCELU') + '] ' + (o.q.name || '—'));
+                L.push('    kwota: ' + (o.q.amt || '—') + '   tytuł: ' + (o.q.msg || '—') + '   status: ' + (o.q.status || '—') + '   plik: ' + (o.q.file || '—'));
+                L.push('');
+            });
+            if (R.dates.length){ L.push('WSPÓLNE DLA WSZYSTKICH:'); R.dates.forEach(function(d){ L.push('    · ' + d); }); L.push(''); }
+            if (R.errFiles && R.errFiles.length){
+                L.push('NIE ODCZYTANO:');
+                R.errFiles.forEach(function(e){ L.push('    ' + (e.file || '?') + ' — ' + e.err); });
+                L.push('');
+            }
+            return L.join('\n');
+        }
+        function bcRowHtml(it){
+            var col = it.lv === 'err' ? '#c00' : (it.lv === 'warn' ? '#c47f00' : (it.lv === 'miss' ? '#c00' : '#0a0'));
+            var bg = it.lv === 'err' || it.lv === 'miss' ? '#fff3f0' : (it.lv === 'warn' ? '#fffaf0' : '#f4fbf4');
+            var h = '<div style="border-left:3px solid ' + col + ';background:' + bg + ';padding:6px 9px;margin-bottom:6px;border-radius:0 5px 5px 0">'
+                + '<div style="font-weight:600;color:' + col + ';font-size:12px">'
+                + (it.lv === 'miss' ? '✗ BRAK POTWIERDZENIA W BANKU' : (it.lv === 'err' ? '✗ BŁĄD' : (it.lv === 'warn' ? '⚠ UWAGA' : '✓ zgodne')))
+                + ' &nbsp;·&nbsp; ' + esc(it.p.sup) + '</div>';
+            if (it.lv === 'miss'){
+                h += '<div style="font-size:11px;color:#555;margin-top:3px">tytuł: ' + esc(it.p.title || '—')
+                    + ' &nbsp;·&nbsp; kwota: ' + esc(it.p.amt == null ? '—' : String(it.p.amt)) + '</div>';
+                return h + '</div>';
+            }
+            h += '<div style="font-size:10px;color:#888;margin-top:2px">wspólnych numerów zamówień: ' + it.score + ' &nbsp;·&nbsp; ' + esc(it.q.file || '—') + '</div>';
+            ['err', 'warn', 'info'].forEach(function(lv){
+                it.res.forEach(function(x){
+                    if (x.lv !== lv) return;
+                    var c = lv === 'err' ? '#c00' : (lv === 'warn' ? '#c47f00' : '#666');
+                    h += '<div style="font-size:11px;color:' + c + ';margin-top:2px">' + BC_ICON[lv] + ' ' + esc(x.m) + '</div>';
+                });
+            });
+            return h + '</div>';
+        }
+        function bcReportHtml(R){
+            var v = bcVerdict(R);
+            var h = '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+                + '<b style="font-size:13px;color:' + v.c + '">' + esc(v.t) + '</b>'
+                + '<span style="font-size:11px;color:#666">zgodne ' + R.nOk + ' · uwagi ' + R.nWarn + ' · błędy ' + R.nErr
+                + ' · bez potwierdzenia ' + R.nMiss + ' · w banku bez odpowiednika ' + R.nOrphReal
+                + (R.nOrphTest ? (' · testy 1 USD ' + R.nOrphTest) : '') + '</span>'
+                + '<span style="flex:1"></span>'
+                + '<button id="bc-copy" class="chn-btn ghost">📋 Kopiuj raport</button>'
+                + '<button id="bc-save" class="chn-btn ghost">📄 Zapisz raport (txt)</button>'
+                + '</div>'
+                + '<div style="font-size:11px;color:#666;margin-bottom:8px">Excel: ' + R.nPays + ' płatności'
+                + (R.file ? (' · ' + esc(R.file)) : '') + ' · IBAN ' + esc(R.head.iban || '—') + ' · ' + esc(R.head.ccy || '—')
+                + ' · data ' + esc(R.head.exec || '—') + ' &nbsp;|&nbsp; PDF: ' + R.nPdf + ' potwierdzeń</div>';
+            var ord = { err: 0, miss: 0, warn: 1, ok: 2 };
+            R.items.slice().sort(function(a, b){ return ord[a.lv] - ord[b.lv]; }).forEach(function(it){ h += bcRowHtml(it); });
+            R.orphans.forEach(function(o){
+                var col = o.test ? '#888' : '#c00', bg = o.test ? '#fafafa' : '#fff3f0';
+                h += '<div style="border-left:3px solid ' + col + ';background:' + bg + ';padding:6px 9px;margin-bottom:6px;border-radius:0 5px 5px 0">'
+                    + '<div style="font-weight:600;color:' + col + ';font-size:12px">' + (o.test ? '· TEST 1 USD' : '✗ W BANKU, BEZ ODPOWIEDNIKA W EXCELU') + ' &nbsp;·&nbsp; ' + esc(o.q.name || '—') + '</div>'
+                    + '<div style="font-size:11px;color:#555;margin-top:3px">kwota: ' + esc(o.q.amt || '—') + ' &nbsp;·&nbsp; tytuł: ' + esc(o.q.msg || '—')
+                    + ' &nbsp;·&nbsp; status: ' + esc(o.q.status || '—') + ' &nbsp;·&nbsp; ' + esc(o.q.file || '—') + '</div></div>';
+            });
+            if (R.dates.length){
+                h += '<div style="font-size:11px;color:#666;margin-top:6px;padding-top:6px;border-top:1px dashed #ddd">Wspólne dla wszystkich: '
+                    + R.dates.map(function(d){ return esc(d); }).join(' · ') + '</div>';
+            }
+            if (R.errFiles && R.errFiles.length){
+                h += '<div style="font-size:11px;color:#c00;margin-top:6px">Nie odczytano: '
+                    + R.errFiles.map(function(e){ return esc((e.file || '?') + ' — ' + e.err); }).join(' &nbsp;|&nbsp; ') + '</div>';
+            }
+            return h;
+        }
+        function bcSaveTxt(txt, name){
+            try {
+                var blob = new Blob(['﻿' + txt], { type: 'text/plain;charset=utf-8' });
+                var url = URL.createObjectURL(blob), a = document.createElement('a');
+                a.href = url; a.download = name; a.style.display = 'none';
+                document.body.appendChild(a); a.click();
+                setTimeout(function(){ try { document.body.removeChild(a); URL.revokeObjectURL(url); } catch(e){} }, 1000);
+                return { name: name, size: txt.length };
+            } catch(e){ return null; }
+        }
+        function bcReadFile(f){
+            return new Promise(function(res, rej){
+                var fr = new FileReader();
+                fr.onload = function(){ res(new Uint8Array(fr.result)); };
+                fr.onerror = function(){ rej(new Error('nie udało się odczytać ' + f.name)); };
+                fr.readAsArrayBuffer(f);
+            });
+        }
+        function bcIsPdf(u8){ return u8 && u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46; }
+        function bcIsZip(u8){ return u8 && u8.length > 4 && u8[0] === 0x50 && u8[1] === 0x4b; }
+        async function bcProcess(files, say){
+            var pdfs = [], books = [], errs = [];
+            for (var i = 0; i < files.length; i++){
+                var f = files[i];
+                if (say) say('Czytam ' + (i + 1) + '/' + files.length + ': ' + f.name + '…', '#666');
+                var u8 = null;
+                try { u8 = await bcReadFile(f); } catch(e){ errs.push({ file: f.name, err: String(e.message || e) }); continue; }
+                if (bcIsPdf(u8)){
+                    var q = await bcParsePdf(u8, f.name);
+                    if (q && q.err) errs.push({ file: f.name, err: q.err }); else if (q) pdfs.push(q);
+                } else if (bcIsZip(u8)){
+                    var b = bcParseXlsx(u8, f.name);
+                    if (b && b.err) errs.push({ file: f.name, err: b.err }); else if (b) books.push(b);
+                } else {
+                    errs.push({ file: f.name, err: 'nieznany format — przyjmuję tylko .pdf i .xlsx' });
+                }
+            }
+            if (!pdfs.length) return { err: 'Nie wczytałem żadnego potwierdzenia PDF.', errFiles: errs };
+            var book = books[0] || null;
+            if (books.length > 1) errs.push({ file: books.slice(1).map(function(b){ return b.file; }).join(', '), err: 'pominięty — biorę tylko jeden plik xlsx (pierwszy: ' + books[0].file + ')' });
+            if (!book){
+                book = bcFromPanel();
+                if (book.err) return { err: 'Nie było pliku xlsx, a z panelu też nie dało się wziąć danych: ' + book.err, errFiles: errs };
+            }
+            var R = bcRun(book, pdfs);
+            R.errFiles = errs;
+            return R;
+        }
+
         function painSelected(rows){ return rows.filter(function(r){ return !!(state.painSel || {})[r.key]; }); }
         function painInp(k, key, val, w, ph, cls){
             return '<input type="text" class="pain-ed ' + (cls || '') + '" data-key="' + pcAttr(key) + '" data-k="' + k + '" value="' + pcAttr(val == null ? '' : String(val)) + '"'
@@ -14503,6 +14999,72 @@
                 + '  \u00b7  sprawdzone ' + b.nOk + ', do sprawdzenia ' + b.nWarn + ', NIE wprowadza\u0107 ' + b.nBad + '. Sprawd\u017a folder Pobrane.';
             st.style.color = b.nBad ? '#c00' : (b.nWarn ? '#c47f00' : '#0a0');
         };
+        // ===== Sprawdz z bankiem: obsluga panelu =====
+        (function(){
+            var box = wp.querySelector('#wp-bc-box'), inp = wp.querySelector('#wp-bc-file'), busy = false, LAST = null;
+            function say(t, c){ var st = wp.querySelector('#wp-log-status'); st.textContent = t; st.style.color = c || '#666'; }
+            function drop(){
+                return '<div id="bc-drop" style="border:2px dashed #FFCCB7;border-radius:8px;padding:14px;text-align:center;color:#666;font-size:12px;cursor:pointer;background:#fffdfc">'
+                    + '<b style="color:#8B0000">Przeci\u0105gnij tu pliki</b> albo kliknij, \u017ceby wybra\u0107.<br>'
+                    + 'Jeden plik <b>.xlsx</b> (\u201eExcel do banku\u201d z tego panelu) + dowolna liczba <b>.pdf</b> \u2014 potwierdze\u0144 z e-finance.<br>'
+                    + '<span style="font-size:11px;color:#999">Bez pliku .xlsx wezm\u0119 dane wprost z tego panelu. Nic nie wychodzi poza przegl\u0105dark\u0119 \u2014 pliki czytane s\u0105 lokalnie.</span></div>';
+            }
+            function show(html){ box.style.display = 'block'; box.innerHTML = html; }
+            function bindResult(){
+                var c = box.querySelector('#bc-copy'), s = box.querySelector('#bc-save');
+                if (c) c.onclick = function(){
+                    var ok = pcCopyText(bcReportTxt(LAST));
+                    say(ok ? 'Skopiowano raport ze sprawdzenia.' : 'Nie uda\u0142o si\u0119 skopiowa\u0107.', ok ? '#0a0' : '#c00');
+                };
+                if (s) s.onclick = function(){
+                    var r = bcSaveTxt(bcReportTxt(LAST), 'sprawdzenie z bankiem ' + pcToday() + '.txt');
+                    say(r ? ('Zapisano: ' + r.name + ' \u2014 sprawd\u017a folder Pobrane.') : 'Nie uda\u0142o si\u0119 zapisa\u0107 pliku.', r ? '#0a0' : '#c00');
+                };
+            }
+            function bindDrop(){
+                var d = box.querySelector('#bc-drop');
+                if (!d) return;
+                d.onclick = function(){ if (!busy) inp.click(); };
+                d.addEventListener('dragover', function(e){ e.preventDefault(); d.style.background = '#fff3ee'; d.style.borderColor = '#8B0000'; });
+                d.addEventListener('dragleave', function(){ d.style.background = '#fffdfc'; d.style.borderColor = '#FFCCB7'; });
+                d.addEventListener('drop', function(e){
+                    e.preventDefault(); d.style.background = '#fffdfc'; d.style.borderColor = '#FFCCB7';
+                    var fl = (e.dataTransfer && e.dataTransfer.files) ? Array.prototype.slice.call(e.dataTransfer.files) : [];
+                    if (fl.length) run(fl);
+                });
+            }
+            async function run(files){
+                if (busy) return;
+                busy = true;
+                show('<div style="font-size:12px;color:#666">Czytam ' + files.length + ' plik(\u00f3w)\u2026</div>');
+                var R = null;
+                try { R = await bcProcess(files, say); }
+                catch(e){ busy = false; show(drop() + '<div style="margin-top:8px;font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); bindDrop(); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); return; }
+                busy = false;
+                if (R && R.err){
+                    var extra = (R.errFiles && R.errFiles.length)
+                        ? ('<div style="margin-top:6px;font-size:11px;color:#c00">' + R.errFiles.map(function(e){ return esc((e.file || '?') + ' \u2014 ' + e.err); }).join('<br>') + '</div>') : '';
+                    show(drop() + '<div style="margin-top:8px;font-size:12px;color:#c00">' + esc(R.err) + '</div>' + extra);
+                    bindDrop(); say(R.err, '#c00'); return;
+                }
+                LAST = R;
+                var v = bcVerdict(R);
+                show(drop() + '<div style="margin-top:10px">' + bcReportHtml(R) + '</div>');
+                bindDrop(); bindResult();
+                say('Sprawdzenie z bankiem: ' + v.t + '.', v.c);
+            }
+            wp.querySelector('#wp-bankchk').onclick = function(){
+                if (box.style.display === 'block' && !box.querySelector('#bc-drop')) { box.style.display = 'none'; return; }
+                if (box.style.display === 'block' && box.innerHTML.indexOf('bc-copy') >= 0) { box.style.display = 'none'; return; }
+                show(drop()); bindDrop();
+                say('Wrzu\u0107 plik Excel i potwierdzenia PDF.', '#666');
+            };
+            inp.onchange = function(){
+                var fl = Array.prototype.slice.call(inp.files || []);
+                inp.value = '';
+                if (fl.length) run(fl);
+            };
+        })();
         wp.querySelector('#wp-copy-bal').onclick = function(){
             var status = wp.querySelector('#wp-status');
             if (!state.bal.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
