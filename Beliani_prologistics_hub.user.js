@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.91
+// @version      1.92
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13628,7 +13628,7 @@
         }
         function bcCellStr(v){ return v == null ? '' : String(v).trim(); }
         function bcParseXlsxRows(rows){
-            var head = { iban: '', bic: '', ccy: '', exec: '', gen: '' }, pays = [], cur = null;
+            var head = { iban: '', bic: '', ccy: '', exec: '', gen: '', ver: '' }, pays = [], cur = null;
             for (var r = 0; r < rows.length; r++){
                 var row = rows[r] || [], a = bcCellStr(row[0]), d = row[3] == null ? null : row[3], m;
                 if (r < 8){
@@ -13637,6 +13637,9 @@
                     m = a.match(/Data wykonania:\s*(\S+)/); if (m) head.exec = m[1];
                     m = a.match(/Waluta:\s*(\w+)/); if (m) head.ccy = m[1];
                     m = a.match(/Wygenerowano:\s*([\d-]+ [\d:]+)/); if (m) head.gen = m[1];
+                    // Wersja, ktora zrobila TEN Excel. Bez tego nie da sie zauwazyc,
+                    // ze ktos poprawil skrypt, ale sprawdza plik sprzed poprawki.
+                    m = a.match(/skrypt hub\s+([0-9][0-9.]*)/); if (m) head.ver = m[1];
                     continue;
                 }
                 if (!a && d == null) continue;
@@ -13801,6 +13804,7 @@
             dl.sort();
             return {
                 head: book.head, file: book.file || '', items: items, orphans: orph, dates: dl,
+                stale: bcStale(book.head && book.head.ver, VER),
                 nErr: nErr, nWarn: nWarn, nOk: nOk, nMiss: nMiss,
                 nPays: book.pays.length, nPdf: pdfs.length,
                 nOrphReal: orph.filter(function(o){ return !o.test; }).length,
@@ -13808,6 +13812,27 @@
             };
         }
 
+        // Porownanie wersji "1.9" < "1.10" — czlon po czlonie, liczbowo.
+        // null, gdy ktorejs nie da sie odczytac (stary Excel bez stempla).
+        function bcVerCmp(a, b){
+            var A = String(a == null ? '' : a).match(/\d+/g), B = String(b == null ? '' : b).match(/\d+/g);
+            if (!A || !B) return null;
+            for (var i = 0; i < Math.max(A.length, B.length); i++){
+                var x = Number(A[i] || 0), y = Number(B[i] || 0);
+                if (x !== y) return x < y ? -1 : 1;
+            }
+            return 0;
+        }
+        // Excel zrobiony starsza wersja skryptu. Sprawdzanie porownuje PDF-y z tym,
+        // co stoi w Excelu — wiec poprawki z nowszych wersji nie maja jak zadzialac,
+        // a raport wyglada tak samo jak przed poprawka. To jest najczestsza pomylka
+        // po aktualizacji: skrypt nowy, plik stary.
+        function bcStale(excelVer, runVer){
+            var c = bcVerCmp(excelVer, runVer);
+            if (c === null || c >= 0) return '';
+            return 'Ten Excel zrobiła wersja ' + excelVer + ', a masz ' + runVer
+                + ' — poprawki z nowszych wersji go NIE dotyczą. Wygeneruj Excel na nowo i sprawdź jeszcze raz.';
+        }
         function bcVerdict(R){
             if (R.nErr || R.nMiss || R.nOrphReal) return { t: 'SĄ RÓŻNICE — sprawdź przed zamknięciem dnia', c: '#c00' };
             if (R.nWarn) return { t: 'do przejrzenia — nic krytycznego', c: '#c47f00' };
@@ -13819,8 +13844,10 @@
             L.push('SPRAWDZENIE Z BANKIEM — ' + pcNow());
             L.push('skrypt hub ' + VER);
             L.push('');
+            if (R.stale){ L.push('!!! ' + R.stale); L.push(''); }
             L.push('Excel: ' + R.nPays + ' płatności' + (R.file ? ('  ·  ' + R.file) : '')
-                + '  ·  IBAN ' + (R.head.iban || '—') + '  ·  ' + (R.head.ccy || '—') + '  ·  data ' + (R.head.exec || '—'));
+                + '  ·  IBAN ' + (R.head.iban || '—') + '  ·  ' + (R.head.ccy || '—') + '  ·  data ' + (R.head.exec || '—')
+                + '  ·  zrobiony wersją ' + (R.head.ver || '—') + (R.head.gen ? (' z ' + R.head.gen) : ''));
             L.push('PDF:   ' + R.nPdf + ' potwierdzeń');
             L.push('WYNIK: ' + v.t + '   (zgodne ' + R.nOk + ', uwagi ' + R.nWarn + ', błędy ' + R.nErr
                 + ', bez potwierdzenia ' + R.nMiss + ', w banku bez odpowiednika ' + R.nOrphReal + ')');
@@ -13885,9 +13912,12 @@
                 + '<button id="bc-copy" class="chn-btn ghost">📋 Kopiuj raport</button>'
                 + '<button id="bc-save" class="chn-btn ghost">📄 Zapisz raport (txt)</button>'
                 + '</div>'
+                + (R.stale ? ('<div style="border:2px solid #c00;background:#fff3f0;color:#c00;font-weight:600;'
+                    + 'font-size:12px;padding:7px 9px;border-radius:5px;margin-bottom:8px">⚠ ' + esc(R.stale) + '</div>') : '')
                 + '<div style="font-size:11px;color:#666;margin-bottom:8px">Excel: ' + R.nPays + ' płatności'
                 + (R.file ? (' · ' + esc(R.file)) : '') + ' · IBAN ' + esc(R.head.iban || '—') + ' · ' + esc(R.head.ccy || '—')
-                + ' · data ' + esc(R.head.exec || '—') + ' &nbsp;|&nbsp; PDF: ' + R.nPdf + ' potwierdzeń</div>';
+                + ' · data ' + esc(R.head.exec || '—') + ' · zrobiony wersją ' + esc(R.head.ver || '—')
+                + (R.head.gen ? (' z ' + esc(R.head.gen)) : '') + ' &nbsp;|&nbsp; PDF: ' + R.nPdf + ' potwierdzeń</div>';
             var ord = { err: 0, miss: 0, warn: 1, ok: 2 };
             R.items.slice().sort(function(a, b){ return ord[a.lv] - ord[b.lv]; }).forEach(function(it){ h += bcRowHtml(it); });
             R.orphans.forEach(function(o){
