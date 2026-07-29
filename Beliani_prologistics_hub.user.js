@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.83
+// @version      1.84
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12376,7 +12376,14 @@
             L.push(pad + 'blok bankowy P/I: ' + (b.ok ? 'kompletny' : 'NIEKOMPLETNY') + (b.sheet ? ' [arkusz ' + b.sheet + ']' : '') + (b.alt ? ' [z innego arkusza: ' + b.alt + ']' : ''));
             L.push(pad + '  beneficjent : ' + pcLogTxt(b.name, 120) + ' | ' + pcLogTxt(b.addr, 200));
             L.push(pad + '  bank        : ' + pcLogTxt(b.bankName, 120) + ' | ' + pcLogTxt(b.bankAddr, 200));
-            try { var ag = painAgtGeo(b); L.push(pad + '  bank CdtrAgt: miasto ' + (ag.town || '—') + ' | kraj ' + (ag.ctry || '—') + (ag.src ? ' (z ' + ag.src + ')' : '') + (ag.town && ag.ctry ? '' : '  [niepelny adres — do pliku pojdzie sama nazwa banku]')); } catch(e){}
+            try {
+                var ag = painAgtGeo(b), agBic = painNorm(b.swift || '');
+                L.push(pad + '  bank CdtrAgt: ' + (painBicOk(agBic)
+                    ? ('BIC ' + agBic + ' — do pliku idzie SAM BICFI, nazwa i adres banku sa pomijane (SPS: przy BIC-u Nm/PstlAdr niedozwolone)')
+                    : ('brak poprawnego BIC — do pliku pojdzie nazwa banku' + (ag.town && ag.ctry
+                        ? (' + adres (miasto ' + ag.town + ', kraj ' + ag.ctry + (ag.src ? ', z ' + ag.src : '') + ')')
+                        : ' bez adresu [niepelny adres: miasto ' + (ag.town || '—') + ', kraj ' + (ag.ctry || '—') + ']'))));
+            } catch(e){}
             L.push(pad + '  konto       : ' + (b.acc || '—') + (b.accFix ? '  [ODTWORZONE — stalo pod inna etykieta]' : '') + ' | SWIFT ' + (b.swift || '—') + (b.swiftBad ? ' [zly format]' : ''));
             if (b.accBad) L.push(pad + '  UWAGA: pod etykieta konta stalo: „' + pcLogTxt(b.accBad, 120) + '” — odrzucone, to nie jest numer konta');
             if (b.accNums && b.accNums.length > 1) L.push(pad + '  numery wygladajace na konto w bloku: ' + b.accNums.join(' / '));
@@ -12806,11 +12813,10 @@
                 if (!r.verified) warns.push(p + 'nie wszystko sprawdzone — ' + (r.why[0] || '') + (r.why.length > 1 ? (' (+' + (r.why.length - 1) + ')') : ''));
                 if (r.geoWeak) warns.push(p + 'kraj ustalony ' + (r.geoSrc === 'bic' ? 'z BIC banku — bank bywa w innym kraju niż firma, sprawdź' : 'z nazwy firmy — sprawdź') + '.');
                 if (r.conflict) warns.push(p + 'P/I wskazują ' + r.nBank + ' różne konta beneficjenta — użyto pierwszego.');
-                if (cfg.agt !== false){
-                    if (!painTxt(r.bankName, 140, strict)) warns.push(p + 'brak nazwy banku beneficjenta — w pliku pójdzie sam BIC (CdtrAgt/BICFI). Wpisz nazwę, jeśli bank ma widzieć pełne dane.');
-                    else if (!painTxt(r.bankTown, 35, strict)) warns.push(p + 'brak miasta banku beneficjenta — w pliku będzie sama nazwa banku, bez adresu.');
-                    else if (!/^[A-Z]{2}$/.test(String(r.bankCtry || '').toUpperCase())) warns.push(p + 'brak kraju banku beneficjenta — adres banku nie zostanie wpisany do pliku.');
-                }
+                // Od 1.84 nazwa i adres banku beneficjenta NIE ida do pliku, gdy jest BIC
+                // (SPS: „When using a BIC, the specification of 'Name'/'Postal Address' is not
+                // permitted."). BIC jest bledem blokujacym powyzej, wiec kazdy wiersz w pliku
+                // ma BIC — nie ostrzegamy juz o braku nazwy/miasta/kraju banku.
                 if (r.accWasWrong) warns.push(p + 'w bloku bankowym P/I pod etykietą konta stało „' + String(r.accWasWrong).slice(0, 60) + '” — użyto numeru potwierdzonego przy kontroli P/I (etykiety w pliku są przesunięte).');
                 else if (r.accFix) warns.push(p + 'numer konta odczytany spod innej etykiety w P/I (etykiety przesunięte' + (r.accBad ? ', pod „konto” stało: „' + String(r.accBad).slice(0, 60) + '”' : '') + ') — sprawdź.');
                 if (r.amountEdited) warns.push(p + 'kwota zmieniona ręcznie: ' + r.amountBase.toFixed(2) + ' → ' + r.amount.toFixed(2) + '.');
@@ -12872,22 +12878,26 @@
                 o('CdtTrfTxInf');
                 o('PmtId'); e('EndToEndId', painE2E(r)); c('PmtId');
                 o('Amt'); e('InstdAmt', painAmt(painCents(r.amount)), ' Ccy="' + PAIN_CCY + '"'); c('Amt');
-                o('CdtrAgt'); o('FinInstnId');
-                e('BICFI', painNorm(r.bic));
-                // Zawsze przelew zagraniczny (Chiny/Indie/Singapur/Hongkong): dokladamy nazwe
-                // i adres banku beneficjenta. Kolejnosc dzieci wg FinancialInstitutionIdentification18:
-                // BICFI -> ClrSysMmbId -> LEI -> Nm -> PstlAdr -> Othr. ClrSysMmbId nie uzywamy,
-                // wiec BICFI + Nm + PstlAdr jest dozwolone (SPS 2025, typ platnosci X).
-                if (cfg.agt !== false){
-                    var agtNm = painTxt(r.bankName, 140, strict);
-                    if (agtNm){
+                // CdtrAgt — bank beneficjenta. Swiss Payment Standards (Credit Transfer IG):
+                // „When using a BIC, the specification of 'Name'/'Postal Address' is not permitted."
+                // BIC i nazwa/adres banku WYKLUCZAJA sie. Do 1.83 wysylalismy oba naraz i
+                // PostFinance renderowal wtedy konto beneficjenta jak szwajcarskie konto pocztowe
+                // (ostatnie 9 cyfr w formacie XX-XXXXXX-X: 13050170384800000544 -> „80-54-4",
+                // 431258388785 -> „25-838878-5"). Od 1.84: jest BIC -> idzie sam BICFI;
+                // nazwa i adres banku tylko wtedy, gdy BIC-u nie ma.
+                var agtBic = painNorm(r.bic);
+                var agtNm  = agtBic ? '' : painTxt(r.bankName, 140, strict);
+                if (agtBic || agtNm){
+                    o('CdtrAgt'); o('FinInstnId');
+                    if (agtBic) e('BICFI', agtBic);
+                    else {
                         e('Nm', agtNm);
                         var agtTown = painTxt(r.bankTown, 35, strict), agtCtry = String(r.bankCtry || '').toUpperCase();
                         // PstlAdr tylko z kompletem TwnNm+Ctry — od 14.11.2026 obie sa obowiazkowe.
                         if (agtTown && /^[A-Z]{2}$/.test(agtCtry)) pstlAdr(agtTown, agtCtry, []);
                     }
+                    c('FinInstnId'); c('CdtrAgt');
                 }
-                c('FinInstnId'); c('CdtrAgt');
                 o('Cdtr');
                 e('Nm', painTxt(r.name, 140, strict));
                 pstlAdr(painTxt(r.town, 35, strict), r.ctry, painSplitAddr(r.addr, strict));
@@ -12907,7 +12917,8 @@
         }
         function painCfg(){
             if (state._painCfg) return state._painCfg;
-            var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, agt: true, exec: '' };
+            // 'agt' zniknal w 1.84 — nazwa/adres banku beneficjenta nigdy nie ida obok BIC-u.
+            var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, exec: '' };
             try { var raw = GM_getValue(PAIN_CFG_KEY, ''); if (raw) { var o = JSON.parse(raw); for (var k in o) if (o[k] != null) d[k] = o[k]; } } catch(e){}
             if (!/^\d{4}-\d{2}-\d{2}$/.test(d.exec) || d.exec < painDt(new Date())) d.exec = painDt(painNextBizDay(new Date()));
             state._painCfg = d;
@@ -12961,7 +12972,6 @@
                + ['SHAR', 'DEBT', 'CRED', 'SLEV'].map(function(x){ return '<option value="' + x + '"' + (cfg.chrgBr === x ? ' selected' : '') + '>' + x + '</option>'; }).join('')
                + '</select></label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="BtchBookg=true: bank księguje paczkę jedną zbiorczą pozycją na wyciągu."><input type="checkbox" class="pain-cfgb" data-k="batch"' + (cfg.batch === false ? '' : ' checked') + '> księgowanie zbiorcze</label>'
-               + '<label style="font-size:11px;color:#555;cursor:pointer" title="Domyślnie WŁĄCZONE. Te przelewy zawsze idą za granicę (Chiny, Indie, Singapur, Hongkong), więc do CdtrAgt obok BIC-u trafia nazwa banku beneficjenta, a gdy P/I podaje adres banku — też miasto i kraj. Wyłącz tylko, gdyby bank odrzucił plik: zostanie sam BICFI, czyli dokładnie tak jak w 1.77."><input type="checkbox" class="pain-cfgb" data-k="agt"' + (cfg.agt === false ? '' : ' checked') + '> dane banku beneficjenta</label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="Domyślnie WYŁĄCZONE — Swiss Payment Standards 2025 (pkt 3.1) dopuszcza cały Basic Latin, więc „%” i „&” są legalne. Włącz tylko, jeśli bank odrzuci plik z powodu znaków: tekst zostanie ograniczony do zestawu SWIFT (a-z A-Z 0-9 . , : ’ + - / ( ) ?), „%” → „pct”, „&” → „+”."><input type="checkbox" class="pain-cfgb" data-k="strict"' + (cfg.strict ? ' checked' : '') + '> ścisły zestaw znaków</label>'
                + '</div></div>';
 
@@ -12994,13 +13004,17 @@
                    + ' <span style="font-size:10px;color:#888">Tytuł</span> ' + painInp('title', r.key, r.title, 430)
                    + ' <span style="font-size:10px;color:' + (tl > PAIN_TITLE_MAX ? '#c00;font-weight:700' : '#888') + '">(' + tl + '/' + PAIN_TITLE_MAX + ')</span>'
                    + '</td></tr>';
-                if (cfg.agt !== false) h += '<tr style="background:' + bg + '"><td></td><td colspan="8" style="padding:0 4px 4px 4px" title="' + pcAttr('CdtrAgt — bank beneficjenta w pliku pain.001' + (r.bankAddr ? ('\nadres z P/I: ' + r.bankAddr) : '')) + '">'
+                // Bank beneficjenta — pokazujemy do wglądu (tak czyta P/I), ale od 1.84 przy
+                // obecnym BIC-u NIC z tego wiersza nie idzie do pliku: SPS zabrania Nm/PstlAdr
+                // razem z BIC-em. Pola zostają edytowalne tylko na wypadek wiersza bez BIC-u.
+                var hasBic = painBicOk(r.bic);
+                h += '<tr style="background:' + bg + '"><td></td><td colspan="8" style="padding:0 4px 4px 4px" title="' + pcAttr('CdtrAgt — bank beneficjenta' + (r.bankAddr ? ('\nadres z P/I: ' + r.bankAddr) : '') + '\nPrzy obecnym BIC-u do pliku idzie sam BICFI — nazwa i adres banku są pomijane (Swiss Payment Standards).') + '">'
                    + '<span style="font-size:10px;color:#888">Bank benef.</span> ' + painInp('bankName', r.key, r.bankName, 300, 'nazwa banku')
                    + ' <span style="font-size:10px;color:#888">Miasto banku</span> ' + painInp('bankTown', r.key, r.bankTown, 120)
                    + ' <span style="font-size:10px;color:#888">Kraj</span> ' + painInp('bankCtry', r.key, r.bankCtry, 34)
                    + (r.bankCtry && r.bankGeoSrc === 'bic' ? ' <span style="font-size:10px;color:#888">(z BIC)</span>' : '')
-                   + (r.bankName && !r.bankTown ? ' <span style="font-size:10px;color:#c47f00">bez miasta → w pliku sama nazwa banku</span>' : '')
-                   + (!r.bankName ? ' <span style="font-size:10px;color:#c47f00">brak w P/I → w pliku sam BIC</span>' : '')
+                   + (hasBic ? ' <span style="font-size:10px;color:#888">— tylko do wglądu, do pliku idzie sam BIC ' + painEsc(painNorm(r.bic)) + '</span>'
+                             : ' <span style="font-size:10px;color:#c47f00">brak BIC — do pliku pójdzie nazwa banku</span>')
                    + '</td></tr>';
             });
             h += '<tr style="background:#332524;color:#fff;font-weight:700"><td colspan="2" style="padding:4px 6px">Zaznaczone: ' + sel.length + ' z ' + rows.length + '</td><td style="padding:4px 6px;text-align:right">' + painAmt(cents) + '</td><td colspan="6" style="padding:4px 6px;font-weight:400">' + PAIN_CCY + ' — CtrlSum w pliku</td></tr>';
