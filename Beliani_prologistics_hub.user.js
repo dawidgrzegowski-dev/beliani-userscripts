@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.89
+// @version      1.90
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13455,6 +13455,18 @@
         function bcNameToks(s){
             return bcNormName(s).split(' ').filter(function(t){ return t && !BC_LEGAL[t]; });
         }
+        // "— brak —", "—", "-", puste — to nie jest wartosc, tylko informacja, ze jej nie ma.
+        // Bez tego "— brak —" po obcieciu do pierwszego slowa zostaje "—" i wyglada jak BIC.
+        function bcNoVal(s){
+            var t = bcUp(s);
+            return !/[A-Z0-9]/.test(t) || t.indexOf('BRAK') >= 0 || /^N\/?A$/.test(t.trim());
+        }
+        // Numer rozliczeniowy zamiast BIC-u (ABA/Fedwire w USA, sort code w UK): same cyfry.
+        // BIC zawsze zaczyna sie od czterech liter, wiec czegos takiego nie da sie porownac.
+        function bcClearingNo(s){
+            var t = bcUp(s).replace(/[^A-Z0-9]/g, '');
+            return /^\d{5,}$/.test(t);
+        }
         // Kwota w groszach (int) — porownywanie floatow to proszenie sie o 0.01 roznicy.
         function bcCents(x){
             if (x == null || x === '') return null;
@@ -13481,6 +13493,10 @@
         function bcTitleToks(s){
             var t = bcUp(s);
             t = t.replace(/\(\s*\d+\s*\/\s*\d+\s*ZNAK\w*\s*\)/g, ' ');   // ogonek z Excela "(24/140 znakow)"
+            // Bank lamie slowo, ktore nie miesci sie w linii, i wstawia lacznik:
+            // "PEN- ALTY" to jest PENALTY, a nie dwa slowa. Tylko litera-lacznik-litera,
+            // bo przy cyfrach "983- 984" to zakres i zajmuje sie nim bcExpandRange nizej.
+            t = t.replace(/([A-Z])-\s+([A-Z])/g, '$1$2');
             t = bcExpandRange(t);
             t = t.replace(/[,.;:/\\'"()\[\]’–—_]/g, ' ');
             return t.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
@@ -13523,7 +13539,13 @@
                     if (!fields[cur]) fields[cur] = [];
                     if (hit.v) fields[cur].push(hit.v);
                 } else if (cur !== null && /^\s{6,}\S/.test(raw)){
-                    fields[cur].push(ln);
+                    var arr = fields[cur], prev = arr.length ? arr[arr.length - 1] : '';
+                    // Slowo przeniesione do nastepnej linii: bank urywa je lacznikiem
+                    // ("PEN-" + "ALTY" = PENALTY). Sklejamy z powrotem, ale tylko w tresci
+                    // przelewu i tylko litera-lacznik-litera — nazw i adresow nie ruszamy.
+                    if (cur === 'Message' && arr.length && /[A-Za-z]-$/.test(prev) && /^[A-Za-z]/.test(ln))
+                        arr[arr.length - 1] = prev.slice(0, -1) + ln;
+                    else arr.push(ln);
                 }
             }
             if (!fields["Recipient's account"]) return null;
@@ -13623,7 +13645,13 @@
                 if (!cur) continue;
                 if (a.indexOf('Uwaga:') === 0) cur.why = bcCellStr(d);
                 else if (a.indexOf('Konto beneficjenta:') === 0) cur.acct = bcCellStr(d).split(/\s{4,}/)[0];
-                else if (a.indexOf('SWIFT') === 0) cur.bic = (bcCellStr(d).split(/\s+/)[0] || '');
+                else if (a.indexOf('SWIFT') === 0){
+                    // W komorce jest "BIC     bank: nazwa, adres" albo "— brak —".
+                    // Najpierw odcinamy ogon po duzym odstepie, a dopiero potem bierzemy
+                    // pierwsze slowo — inaczej z "— brak —" zostaje samo "—".
+                    var sv = bcCellStr(d).split(/\s{4,}/)[0].trim();
+                    cur.bic = bcNoVal(sv) ? sv : (sv.split(/\s+/)[0] || '');
+                }
                 else if (a.indexOf('Beneficjent:') === 0) cur.name = bcCellStr(d);
                 else if (a.indexOf('Adres beneficjenta:') === 0) cur.addr = bcCellStr(d);
                 else if (a.indexOf('Tytu') === 0) cur.title = bcCellStr(d).replace(/\s{2,}\(\d+\/\d+.*$/, '');
@@ -13704,15 +13732,17 @@
             if (head.ccy && bcUp(q.ccy) !== bcUp(head.ccy)) E('waluta: Excel ' + head.ccy + ', bank ' + q.ccy);
 
             var accE = p.acct || '';
-            if (bcUp(accE).indexOf('BRAK') >= 0) W('konto: Excel nie zna konta (brak w P/I), bank ma ' + q.acct + ' — nie mam czym porównać');
+            if (bcNoVal(accE)) W('konto: Excel nie zna konta (brak w P/I), bank ma ' + q.acct + ' — nie mam czym porównać');
             else if (bcNormAcc(accE) !== bcNormAcc(q.acct)) E('konto: Excel ' + accE + ', bank ' + q.acct);
 
             if (!q.bic) I('SWIFT/BIC: nie ma go na tym wydruku (zlecenie z pliku pain.001)');
-            else if (bcUp(p.bic || '').indexOf('BRAK') >= 0) W('SWIFT/BIC: Excel nie zna, bank ma ' + q.bic);
+            else if (bcNoVal(p.bic)) W('SWIFT/BIC: Excel nie zna (brak w P/I), bank ma ' + q.bic + ' — nie mam czym porównać');
+            else if (bcClearingNo(q.bic)) W('SWIFT/BIC: w banku bank odbiorcy wskazany numerem rozliczeniowym ' + q.bic
+                + ' (ABA/clearing), a nie BIC-iem — Excel ma ' + p.bic + ', nie ma czym porównać');
             else if (bcNormBic(p.bic) !== bcNormBic(q.bic)) E('SWIFT/BIC: Excel ' + p.bic + ', bank ' + q.bic);
 
             var nE = bcNormName(p.name || ''), nQ = bcNormName(q.name || '');
-            if (bcUp(p.name || '').indexOf('BRAK') >= 0) W('nazwa: Excel nie zna, bank ma „' + q.name + '”');
+            if (bcNoVal(p.name)) W('nazwa: Excel nie zna, bank ma „' + q.name + '”');
             else if (nE !== nQ){
                 if (nQ && (nE.indexOf(nQ) === 0 || nQ.indexOf(nE) === 0)) I('nazwa skrócona w banku: „' + q.name + '” zamiast „' + p.name + '”');
                 else if (bcNameToks(p.name).slice().sort().join(' ') === bcNameToks(q.name).slice().sort().join(' ')) I('nazwa: ta sama treść, inny zapis („' + p.name + '” / „' + q.name + '”)');
