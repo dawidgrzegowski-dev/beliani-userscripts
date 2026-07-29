@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.88
+// @version      1.89
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11928,7 +11928,8 @@
         chooser.style.cssText = 'display:none;position:fixed;right:16px;bottom:64px;z-index:2147483006;background:#fff;border:1px solid #FFCCB7;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.18);padding:8px;width:230px;font-family:system-ui';
         chooser.innerHTML = '<div style="font-weight:700;color:#750000;padding:6px 10px 8px;font-size:13px">Chińskie</div>'
             + '<button class="ch-row" id="ch-ksieg">\ud83d\udce5 Księgowanie</button>'
-            + '<button class="ch-row" id="ch-wprow">\u270d Wprowadzanie</button>';
+            + '<button class="ch-row" id="ch-wprow">\u270d Wprowadzanie</button>'
+            + '<button class="ch-row" id="ch-sprawdz">\ud83d\udd0d Sprawdzanie</button>';
         document.body.appendChild(cbtn);
         document.body.appendChild(chooser);
         cbtn.addEventListener('click', function(){ chooser.style.display = (chooser.style.display === 'none') ? 'block' : 'none'; });
@@ -11976,16 +11977,41 @@
           + '<button id="wp-log" class="chn-btn ghost" title="Zapisuje plik .txt z pelnym przebiegiem: wklejone dane, komentarze z zamowien, odczyty z P/I, werdykty i tytuly przelewow. Mozna go wkleic do rozmowy z Claude.">📄 Zapisz log (txt)</button>'
           + '<button id="wp-log-copy" class="chn-btn ghost" title="To samo co log, ale do schowka">📋 Kopiuj log</button>'
           + '<button id="wp-xlsx" class="chn-btn ghost" title="Zapisuje plik .xlsx z calym przetworzonym widokiem: dostawcy, konta beneficjentow, SWIFT, tytuly przelewow, kwoty i status kazdej platnosci, plus puste kolumny Wprowadzone / Kto / Data / Uwagi. Do wyslania mailem osobom, ktore wklepuja przelewy do banku. Niezalezne od Kopiuj depo i Kopiuj balance.">📊 Excel do banku (xlsx)</button>'
-          + '<button id="wp-bankchk" class="chn-btn maroon" title="Porownuje wygenerowany plik Excel z potwierdzeniami przelewow z e-finance (PDF). Wrzucasz jeden plik .xlsx i dowolna liczbe .pdf naraz — skrypt dopasowuje je po numerach zamowien z tytulu przelewu i pokazuje, gdzie bank ma cos innego niz Excel. Brak miasta lub kodu pocztowego beneficjenta nie jest bledem.">🔍 Sprawdź z bankiem</button>'
-          + '<input type="file" id="wp-bc-file" accept=".pdf,.xlsx" multiple style="display:none">'
           + '<span id="wp-log-status" style="font-size:11px;color:#666"></span>'
           + '</div>'
-          + '<div id="wp-bc-box" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
           + '</div>';
         document.body.appendChild(wp);
         wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
-        chooser.querySelector('#ch-ksieg').onclick = function(){ chooser.style.display = 'none'; wp.style.display = 'none'; var b = document.getElementById('deposit-btn'); if (b) { b.style.display = ''; setTimeout(function(){ b.click(); b.style.display = 'none'; }, 0); } };
-        chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); wp.style.display = 'flex'; };
+
+        // ===== Chinskie / Sprawdzanie: osobne okno (Excel do banku <-> potwierdzenia PDF) =====
+        var sp = document.createElement('div');
+        sp.id = 'chinskie-sprawdz';
+        sp.style.cssText = wp.style.cssText;
+        sp.style.display = 'none';
+        sp.innerHTML =
+            '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Sprawdzanie (Excel do banku ↔ potwierdzenia z e-finance) <span style="font-weight:400;font-size:11px;opacity:.6">v' + VER + '</span></div><button id="sp-close" class="chn-btn ghost" style="padding:4px 12px">✕</button></div>'
+          + '<div style="padding:16px;overflow-y:auto">'
+          + '<div id="sp-drop" style="border:2px dashed #FFCCB7;border-radius:10px;padding:22px 14px;text-align:center;color:#666;font-size:13px;cursor:pointer;background:#fffdfc">'
+          +   '<div style="font-size:22px;line-height:1">📄</div>'
+          +   '<div style="margin-top:6px"><b style="color:#8B0000">Przeciągnij tu pliki</b> albo kliknij, żeby wybrać</div>'
+          +   '<div style="margin-top:4px;font-size:12px">jeden plik <b>.xlsx</b> („Excel do banku” z Wprowadzania) + dowolna liczba <b>.pdf</b> — potwierdzeń przelewów</div>'
+          +   '<div style="margin-top:4px;font-size:11px;color:#999">Bez pliku .xlsx wezmę dane wprost z panelu Wprowadzanie. Pliki czytane są lokalnie — nic nie wychodzi poza przeglądarkę.</div>'
+          + '</div>'
+          + '<input type="file" id="sp-file" accept=".pdf,.xlsx" multiple style="display:none">'
+          + '<div id="sp-list" style="margin-top:10px"></div>'
+          + '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +   '<button id="sp-run" class="chn-btn red" title="Porównuje Excel z potwierdzeniami z banku: dopasowuje po numerach zamówień z tytułu przelewu, sprawdza kwotę, walutę, konto, BIC, nazwę i tytuł. Brak miasta lub kodu pocztowego beneficjenta nie jest błędem.">🔍 Sprawdź z bankiem</button>'
+          +   '<button id="sp-clear" class="chn-btn ghost" title="Usuń wszystkie wczytane pliki i wynik">↺ Wyczyść</button>'
+          +   '<span id="sp-status" style="font-size:12px;color:#666"></span>'
+          + '</div>'
+          + '<div id="sp-box" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
+          + '</div>';
+        document.body.appendChild(sp);
+        sp.querySelector('#sp-close').onclick = function(){ sp.style.display = 'none'; };
+
+        chooser.querySelector('#ch-ksieg').onclick = function(){ chooser.style.display = 'none'; wp.style.display = 'none'; sp.style.display = 'none'; var b = document.getElementById('deposit-btn'); if (b) { b.style.display = ''; setTimeout(function(){ b.click(); b.style.display = 'none'; }, 0); } };
+        chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); sp.style.display = 'none'; wp.style.display = 'flex'; };
+        chooser.querySelector('#ch-sprawdz').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); wp.style.display = 'none'; sp.style.display = 'flex'; };
 
         function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
         function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
@@ -14999,15 +15025,46 @@
                 + '  \u00b7  sprawdzone ' + b.nOk + ', do sprawdzenia ' + b.nWarn + ', NIE wprowadza\u0107 ' + b.nBad + '. Sprawd\u017a folder Pobrane.';
             st.style.color = b.nBad ? '#c00' : (b.nWarn ? '#c47f00' : '#0a0');
         };
-        // ===== Sprawdz z bankiem: obsluga panelu =====
+        // ===== Chinskie / Sprawdzanie: obsluga osobnego okna =====
         (function(){
-            var box = wp.querySelector('#wp-bc-box'), inp = wp.querySelector('#wp-bc-file'), busy = false, LAST = null;
-            function say(t, c){ var st = wp.querySelector('#wp-log-status'); st.textContent = t; st.style.color = c || '#666'; }
-            function drop(){
-                return '<div id="bc-drop" style="border:2px dashed #FFCCB7;border-radius:8px;padding:14px;text-align:center;color:#666;font-size:12px;cursor:pointer;background:#fffdfc">'
-                    + '<b style="color:#8B0000">Przeci\u0105gnij tu pliki</b> albo kliknij, \u017ceby wybra\u0107.<br>'
-                    + 'Jeden plik <b>.xlsx</b> (\u201eExcel do banku\u201d z tego panelu) + dowolna liczba <b>.pdf</b> \u2014 potwierdze\u0144 z e-finance.<br>'
-                    + '<span style="font-size:11px;color:#999">Bez pliku .xlsx wezm\u0119 dane wprost z tego panelu. Nic nie wychodzi poza przegl\u0105dark\u0119 \u2014 pliki czytane s\u0105 lokalnie.</span></div>';
+            var box = sp.querySelector('#sp-box'), inp = sp.querySelector('#sp-file'),
+                drop = sp.querySelector('#sp-drop'), listEl = sp.querySelector('#sp-list'),
+                FILES = [], busy = false, LAST = null;
+            function say(t, c){ var st = sp.querySelector('#sp-status'); st.textContent = t; st.style.color = c || '#666'; }
+            function kb(n){ return n < 1024 ? (n + ' B') : (Math.round(n / 1024) + ' kB'); }
+            function kind(f){
+                var n = String(f.name || '').toLowerCase();
+                if (/\.pdf$/.test(n)) return { t: 'pdf', ico: '\ud83d\udcc4', lbl: 'potwierdzenie' };
+                if (/\.xlsx$/.test(n)) return { t: 'xlsx', ico: '\ud83d\udcca', lbl: 'Excel do banku' };
+                return { t: '?', ico: '\u2754', lbl: 'nieznany format' };
+            }
+            function nPdf(){ var n = 0; FILES.forEach(function(f){ if (kind(f).t === 'pdf') n++; }); return n; }
+            function nXls(){ var n = 0; FILES.forEach(function(f){ if (kind(f).t === 'xlsx') n++; }); return n; }
+            function renderList(){
+                if (!FILES.length){ listEl.innerHTML = ''; return; }
+                var h = '<div style="font-size:11px;color:#750000;font-weight:600;margin-bottom:4px">Wczytane pliki: '
+                    + FILES.length + ' (Excel ' + nXls() + ', potwierdze\u0144 ' + nPdf() + ')</div>'
+                    + '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+                FILES.forEach(function(f, i){
+                    var k = kind(f);
+                    h += '<span style="display:inline-flex;align-items:center;gap:5px;background:#F6E7E6;border:1px solid #FFCCB7;border-radius:6px;padding:3px 6px;font-size:11px;color:#332524" title="' + pcAttr(k.lbl + ' \u00b7 ' + kb(f.size)) + '">'
+                        + k.ico + ' ' + esc(f.name) + ' <span style="color:#888">' + kb(f.size) + '</span>'
+                        + '<button class="sp-del" data-i="' + i + '" title="Usu\u0144 z listy" style="border:none;background:none;color:#8B0000;cursor:pointer;font:700 12px system-ui;padding:0 2px">\u2715</button></span>';
+                });
+                listEl.innerHTML = h + '</div>';
+                Array.prototype.forEach.call(listEl.querySelectorAll('.sp-del'), function(b){
+                    b.onclick = function(){ if (busy) return; FILES.splice(parseInt(b.getAttribute('data-i'), 10), 1); renderList(); say(FILES.length ? (FILES.length + ' plik(\u00f3w) na li\u015bcie.') : 'Lista pusta.', '#666'); };
+                });
+            }
+            function add(fl){
+                var added = 0;
+                fl.forEach(function(f){
+                    for (var i = 0; i < FILES.length; i++){ if (FILES[i].name === f.name && FILES[i].size === f.size) return; }
+                    FILES.push(f); added++;
+                });
+                renderList();
+                say(added ? ('Dodano ' + added + ' plik(\u00f3w) \u2014 razem ' + FILES.length + '. Kliknij \u201eSprawd\u017a z bankiem\u201d.')
+                          : 'Te pliki ju\u017c s\u0105 na li\u015bcie.', added ? '#666' : '#c47f00');
             }
             function show(html){ box.style.display = 'block'; box.innerHTML = html; }
             function bindResult(){
@@ -15021,48 +15078,46 @@
                     say(r ? ('Zapisano: ' + r.name + ' \u2014 sprawd\u017a folder Pobrane.') : 'Nie uda\u0142o si\u0119 zapisa\u0107 pliku.', r ? '#0a0' : '#c00');
                 };
             }
-            function bindDrop(){
-                var d = box.querySelector('#bc-drop');
-                if (!d) return;
-                d.onclick = function(){ if (!busy) inp.click(); };
-                d.addEventListener('dragover', function(e){ e.preventDefault(); d.style.background = '#fff3ee'; d.style.borderColor = '#8B0000'; });
-                d.addEventListener('dragleave', function(){ d.style.background = '#fffdfc'; d.style.borderColor = '#FFCCB7'; });
-                d.addEventListener('drop', function(e){
-                    e.preventDefault(); d.style.background = '#fffdfc'; d.style.borderColor = '#FFCCB7';
-                    var fl = (e.dataTransfer && e.dataTransfer.files) ? Array.prototype.slice.call(e.dataTransfer.files) : [];
-                    if (fl.length) run(fl);
-                });
-            }
-            async function run(files){
+            drop.onclick = function(){ if (!busy) inp.click(); };
+            drop.addEventListener('dragover', function(e){ e.preventDefault(); drop.style.background = '#fff3ee'; drop.style.borderColor = '#8B0000'; });
+            drop.addEventListener('dragleave', function(){ drop.style.background = '#fffdfc'; drop.style.borderColor = '#FFCCB7'; });
+            drop.addEventListener('drop', function(e){
+                e.preventDefault(); drop.style.background = '#fffdfc'; drop.style.borderColor = '#FFCCB7';
                 if (busy) return;
+                var fl = (e.dataTransfer && e.dataTransfer.files) ? Array.prototype.slice.call(e.dataTransfer.files) : [];
+                if (fl.length) add(fl);
+            });
+            inp.onchange = function(){
+                var fl = Array.prototype.slice.call(inp.files || []);
+                inp.value = '';
+                if (fl.length) add(fl);
+            };
+            sp.querySelector('#sp-clear').onclick = function(){
+                if (busy) return;
+                FILES = []; LAST = null; renderList(); box.style.display = 'none'; box.innerHTML = '';
+                say('Wyczyszczone. Wrzu\u0107 pliki jeszcze raz.', '#666');
+            };
+            sp.querySelector('#sp-run').onclick = async function(){
+                if (busy) return;
+                if (!FILES.length){ say('Najpierw dodaj potwierdzenia PDF (i opcjonalnie plik Excel).', '#c00'); return; }
+                if (!nPdf()){ say('Nie ma ani jednego pliku .pdf \u2014 nie ma czego por\u00f3wna\u0107 z Excelem.', '#c00'); return; }
                 busy = true;
-                show('<div style="font-size:12px;color:#666">Czytam ' + files.length + ' plik(\u00f3w)\u2026</div>');
+                show('<div style="font-size:12px;color:#666">Czytam ' + FILES.length + ' plik(\u00f3w)\u2026</div>');
                 var R = null;
-                try { R = await bcProcess(files, say); }
-                catch(e){ busy = false; show(drop() + '<div style="margin-top:8px;font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); bindDrop(); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); return; }
+                try { R = await bcProcess(FILES, say); }
+                catch(e){ busy = false; show('<div style="font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); return; }
                 busy = false;
                 if (R && R.err){
                     var extra = (R.errFiles && R.errFiles.length)
                         ? ('<div style="margin-top:6px;font-size:11px;color:#c00">' + R.errFiles.map(function(e){ return esc((e.file || '?') + ' \u2014 ' + e.err); }).join('<br>') + '</div>') : '';
-                    show(drop() + '<div style="margin-top:8px;font-size:12px;color:#c00">' + esc(R.err) + '</div>' + extra);
-                    bindDrop(); say(R.err, '#c00'); return;
+                    show('<div style="font-size:12px;color:#c00">' + esc(R.err) + '</div>' + extra);
+                    say(R.err, '#c00'); return;
                 }
                 LAST = R;
                 var v = bcVerdict(R);
-                show(drop() + '<div style="margin-top:10px">' + bcReportHtml(R) + '</div>');
-                bindDrop(); bindResult();
+                show(bcReportHtml(R));
+                bindResult();
                 say('Sprawdzenie z bankiem: ' + v.t + '.', v.c);
-            }
-            wp.querySelector('#wp-bankchk').onclick = function(){
-                if (box.style.display === 'block' && !box.querySelector('#bc-drop')) { box.style.display = 'none'; return; }
-                if (box.style.display === 'block' && box.innerHTML.indexOf('bc-copy') >= 0) { box.style.display = 'none'; return; }
-                show(drop()); bindDrop();
-                say('Wrzu\u0107 plik Excel i potwierdzenia PDF.', '#666');
-            };
-            inp.onchange = function(){
-                var fl = Array.prototype.slice.call(inp.files || []);
-                inp.value = '';
-                if (fl.length) run(fl);
             };
         })();
         wp.querySelector('#wp-copy-bal').onclick = function(){
