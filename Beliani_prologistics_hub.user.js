@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.84
+// @version      1.85
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11975,6 +11975,7 @@
           + '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           + '<button id="wp-log" class="chn-btn ghost" title="Zapisuje plik .txt z pelnym przebiegiem: wklejone dane, komentarze z zamowien, odczyty z P/I, werdykty i tytuly przelewow. Mozna go wkleic do rozmowy z Claude.">📄 Zapisz log (txt)</button>'
           + '<button id="wp-log-copy" class="chn-btn ghost" title="To samo co log, ale do schowka">📋 Kopiuj log</button>'
+          + '<button id="wp-xlsx" class="chn-btn ghost" title="Zapisuje plik .xlsx z calym przetworzonym widokiem: dostawcy, konta beneficjentow, SWIFT, tytuly przelewow, kwoty i status kazdej platnosci, plus puste kolumny Wprowadzone / Kto / Data / Uwagi. Do wyslania mailem osobom, ktore wklepuja przelewy do banku. Niezalezne od Kopiuj depo i Kopiuj balance.">📊 Excel do banku (xlsx)</button>'
           + '<span id="wp-log-status" style="font-size:11px;color:#666"></span>'
           + '</div>'
           + '</div>';
@@ -12935,6 +12936,403 @@
                 return { name: name, size: txt.length };
             } catch(e){ return null; }
         }
+        // ===== Excel do banku (.xlsx) — wlasny mini-writer =====
+        // SheetJS w wersji community NIE zapisuje stylow (kolor, pogrubienie, ramki) — przezywa
+        // tylko szerokosc kolumn, scalenia i format liczby. Ten plik ma krazyc mailem miedzy
+        // osobami wprowadzajacymi przelewy, wiec czytelnosc jest tu funkcja, nie ozdoba.
+        // Dlatego skladamy .xlsx sami: ZIP bez kompresji (metoda 0, wiec nie potrzeba deflate)
+        // + minimalny OOXML z tekstem wpisanym wprost w komorke (inlineStr). Excel, LibreOffice
+        // i Arkusze Google czytaja taki plik bez zastrzezen.
+        var XL_CRCT = null;
+        function xlCrcTable(){
+            if (XL_CRCT) return XL_CRCT;
+            var t = new Uint32Array(256);
+            for (var n = 0; n < 256; n++){ var c = n; for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+            XL_CRCT = t; return t;
+        }
+        function xlCrc32(buf){
+            var t = xlCrcTable(), c = 0xFFFFFFFF;
+            for (var i = 0; i < buf.length; i++) c = t[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+            return (c ^ 0xFFFFFFFF) >>> 0;
+        }
+        function xlUtf8(str){
+            var s = String(str == null ? '' : str);
+            if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s);
+            var u = unescape(encodeURIComponent(s)), a = new Uint8Array(u.length);
+            for (var i = 0; i < u.length; i++) a[i] = u.charCodeAt(i) & 255;
+            return a;
+        }
+        // files: [{ name, data }] — data jako tekst. Kompresja 0 (stored): plik jest wiekszy,
+        // ale nie wciagamy zadnej biblioteki i nie da sie tu nic zepsuc.
+        function xlZip(files){
+            var enc = files.map(function(f){ var d = xlUtf8(f.data); return { n: xlUtf8(f.name), d: d, crc: xlCrc32(d), off: 0 }; });
+            var total = 22;
+            enc.forEach(function(f){ total += 30 + f.n.length + f.d.length + 46 + f.n.length; });
+            var out = new Uint8Array(total), dv = new DataView(out.buffer), p = 0;
+            function u16(v){ dv.setUint16(p, v & 0xFFFF, true); p += 2; }
+            function u32(v){ dv.setUint32(p, v >>> 0, true); p += 4; }
+            function raw(a){ out.set(a, p); p += a.length; }
+            var now = new Date();
+            var dt = ((now.getHours() & 31) << 11) | ((now.getMinutes() & 63) << 5) | ((now.getSeconds() >> 1) & 31);
+            var dd = (((now.getFullYear() - 1980) & 127) << 9) | (((now.getMonth() + 1) & 15) << 5) | (now.getDate() & 31);
+            enc.forEach(function(f){
+                f.off = p;
+                u32(0x04034b50); u16(20); u16(0x0800); u16(0); u16(dt); u16(dd);
+                u32(f.crc); u32(f.d.length); u32(f.d.length); u16(f.n.length); u16(0);
+                raw(f.n); raw(f.d);
+            });
+            var cdStart = p;
+            enc.forEach(function(f){
+                u32(0x02014b50); u16(20); u16(20); u16(0x0800); u16(0); u16(dt); u16(dd);
+                u32(f.crc); u32(f.d.length); u32(f.d.length); u16(f.n.length); u16(0); u16(0);
+                u16(0); u16(0); u32(0); u32(f.off);
+                raw(f.n);
+            });
+            var cdSize = p - cdStart;
+            u32(0x06054b50); u16(0); u16(0); u16(enc.length); u16(enc.length); u32(cdSize); u32(cdStart); u16(0);
+            return out;
+        }
+        function xlEsc(s){
+            return String(s == null ? '' : s)
+                .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+        function xlColName(n){ var s = ''; while (n > 0){ var m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26; } return s; }
+        function xlNum(v){ var n = Number(v); return isFinite(n) ? (Math.round(n * 100) / 100) : 0; }
+
+        // --- style (indeksy uzywane nizej jako XLS.*) ---
+        var XLS = {
+            DEF: 0, BOLD: 1, TITLE: 2, SECT: 3, GRP: 4, GRPMON: 5, LBL: 6, VAL: 7, VALB: 8,
+            MONEY: 9, MONEYB: 10, TEXT: 11, HDR: 12, WORK: 13, OK: 14, WARN: 15, BAD: 16,
+            CELL: 17, SMALL: 18, DMARK: 19, BMARK: 20, STOK: 21, STWARN: 22, STBAD: 23, VALW: 24,
+            WARNW: 25, BADW: 26
+        };
+        function xlStylesXml(){
+            var F = [
+                '<font><sz val="10"/><name val="Arial"/></font>',
+                '<font><b/><sz val="10"/><name val="Arial"/></font>',
+                '<font><b/><sz val="14"/><color rgb="FF750000"/><name val="Arial"/></font>',
+                '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Arial"/></font>',
+                '<font><b/><sz val="11"/><color rgb="FF750000"/><name val="Arial"/></font>',
+                '<font><sz val="9"/><color rgb="FF666666"/><name val="Arial"/></font>',
+                '<font><b/><sz val="10"/><color rgb="FF007700"/><name val="Arial"/></font>',
+                '<font><b/><sz val="10"/><color rgb="FFC47F00"/><name val="Arial"/></font>',
+                '<font><b/><sz val="10"/><color rgb="FFCC0000"/><name val="Arial"/></font>',
+                '<font><b/><sz val="9"/><color rgb="FF750000"/><name val="Arial"/></font>',
+                '<font><b/><sz val="10"/><color rgb="FFA15C00"/><name val="Arial"/></font>',
+                '<font><b/><sz val="10"/><color rgb="FF00AA66"/><name val="Arial"/></font>'
+            ];
+            function solid(rgb){ return '<fill><patternFill patternType="solid"><fgColor rgb="' + rgb + '"/><bgColor indexed="64"/></patternFill></fill>'; }
+            var FI = [
+                '<fill><patternFill patternType="none"/></fill>',
+                '<fill><patternFill patternType="gray125"/></fill>',
+                solid('FF750000'), solid('FFF6E7E6'), solid('FFFFF7D6'), solid('FFEFEFEF'), solid('FFFDF6F5')
+            ];
+            function thin(rgb){ return '<border><left style="thin"><color rgb="' + rgb + '"/></left><right style="thin"><color rgb="' + rgb + '"/></right><top style="thin"><color rgb="' + rgb + '"/></top><bottom style="thin"><color rgb="' + rgb + '"/></bottom><diagonal/></border>'; }
+            var B = [
+                '<border><left/><right/><top/><bottom/><diagonal/></border>',
+                thin('FFDDDDDD'),
+                thin('FF999999'),
+                '<border><left/><right/><top style="medium"><color rgb="FF750000"/></top><bottom/><diagonal/></border>'
+            ];
+            function xf(o){
+                o = o || {};
+                var a = o.al ? ('<alignment' + (o.al.h ? ' horizontal="' + o.al.h + '"' : '') + (o.al.v ? ' vertical="' + o.al.v + '"' : '') + (o.al.w ? ' wrapText="1"' : '') + '/>') : '';
+                return '<xf numFmtId="' + (o.nf || 0) + '" fontId="' + (o.f || 0) + '" fillId="' + (o.fl || 0) + '" borderId="' + (o.b || 0) + '" xfId="0"'
+                     + ' applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1">' + a + '</xf>';
+            }
+            var X = [];
+            X[XLS.DEF]    = xf({});
+            X[XLS.BOLD]   = xf({ f: 1 });
+            X[XLS.TITLE]  = xf({ f: 2, al: { v: 'center' } });
+            X[XLS.SECT]   = xf({ f: 3, fl: 2, al: { v: 'center' } });
+            X[XLS.GRP]    = xf({ f: 4, fl: 3, b: 3, al: { v: 'center' } });
+            X[XLS.GRPMON] = xf({ f: 4, fl: 3, b: 3, nf: 164, al: { h: 'right', v: 'center' } });
+            X[XLS.LBL]    = xf({ f: 9, fl: 6, al: { h: 'right', v: 'center' } });
+            X[XLS.VAL]    = xf({ fl: 6, nf: 49, al: { v: 'center' } });
+            X[XLS.VALB]   = xf({ f: 1, fl: 6, nf: 49, al: { v: 'center' } });
+            X[XLS.MONEY]  = xf({ nf: 164, b: 1, al: { h: 'right' } });
+            X[XLS.MONEYB] = xf({ f: 1, nf: 164, b: 1, al: { h: 'right' } });
+            X[XLS.TEXT]   = xf({ nf: 49, b: 1 });
+            X[XLS.HDR]    = xf({ f: 1, fl: 5, b: 1, al: { v: 'center' } });
+            X[XLS.WORK]   = xf({ fl: 4, b: 2 });
+            X[XLS.OK]     = xf({ f: 6, b: 1 });
+            X[XLS.WARN]   = xf({ f: 7, b: 1 });
+            X[XLS.BAD]    = xf({ f: 8, b: 1 });
+            X[XLS.CELL]   = xf({ b: 1 });
+            X[XLS.SMALL]  = xf({ f: 5 });
+            X[XLS.DMARK]  = xf({ f: 10, b: 1, al: { h: 'center' } });
+            X[XLS.BMARK]  = xf({ f: 11, b: 1, al: { h: 'center' } });
+            X[XLS.STOK]   = xf({ f: 6, fl: 3, b: 3, al: { v: 'center' } });
+            X[XLS.STWARN] = xf({ f: 7, fl: 3, b: 3, al: { v: 'center' } });
+            X[XLS.STBAD]  = xf({ f: 8, fl: 3, b: 3, al: { v: 'center' } });
+            X[XLS.VALW]   = xf({ fl: 6, nf: 49, al: { v: 'top', w: 1 } });
+            X[XLS.WARNW]  = xf({ f: 7, fl: 6, al: { v: 'top', w: 1 } });
+            X[XLS.BADW]   = xf({ f: 8, fl: 6, al: { v: 'top', w: 1 } });
+            return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                 + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                 + '<numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00"/></numFmts>'
+                 + '<fonts count="' + F.length + '">' + F.join('') + '</fonts>'
+                 + '<fills count="' + FI.length + '">' + FI.join('') + '</fills>'
+                 + '<borders count="' + B.length + '">' + B.join('') + '</borders>'
+                 + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+                 + '<cellXfs count="' + X.length + '">' + X.join('') + '</cellXfs>'
+                 + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+                 + '</styleSheet>';
+        }
+
+        // --- budowanie arkusza ---
+        var XL_NCOL = 12;
+        var XL_COLW = [6, 11, 18, 14, 34, 34, 24, 31, 13, 12, 12, 28];
+        var XL_FREEZE = 8;
+        var XL_ROWS = [], XL_MERGES = [], XL_R = 0;
+        function xlReset(){ XL_ROWS = []; XL_MERGES = []; XL_R = 0; }
+        function xlNewRow(h){ return { h: h || 0, parts: [] }; }
+        function xlAdd(row, c1, c2, v, s, num){ row.parts.push({ c1: c1, c2: c2, v: v, s: s || 0, n: !!num }); return row; }
+        function xlPush(row){
+            XL_R++;
+            var r = XL_R, cells = [];
+            row.parts.forEach(function(p){
+                for (var c = p.c1; c <= p.c2; c++) cells.push({ c: c, v: (c === p.c1 ? p.v : ''), s: p.s, n: (c === p.c1 && p.n) });
+                if (p.c2 > p.c1) XL_MERGES.push(xlColName(p.c1) + r + ':' + xlColName(p.c2) + r);
+            });
+            cells.sort(function(a, b){ return a.c - b.c; });
+            XL_ROWS.push({ r: r, h: row.h, cells: cells });
+            return r;
+        }
+        function xlBand(c1, c2, v, s, h){ var w = xlNewRow(h); xlAdd(w, c1, c2, v, s); return xlPush(w); }
+        function xlBlank(){ return xlPush(xlNewRow()); }
+        function xlSheetXml(){
+            var s = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                  + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                  + '<dimension ref="A1:' + xlColName(XL_NCOL) + Math.max(1, XL_R) + '"/>'
+                  + '<sheetViews><sheetView showGridLines="0" tabSelected="1" workbookViewId="0">'
+                  + '<pane ySplit="' + XL_FREEZE + '" topLeftCell="A' + (XL_FREEZE + 1) + '" activePane="bottomLeft" state="frozen"/>'
+                  + '<selection pane="bottomLeft" activeCell="A' + (XL_FREEZE + 1) + '" sqref="A' + (XL_FREEZE + 1) + '"/>'
+                  + '</sheetView></sheetViews>'
+                  + '<sheetFormatPr defaultRowHeight="13.5"/><cols>';
+            for (var i = 0; i < XL_NCOL; i++) s += '<col min="' + (i + 1) + '" max="' + (i + 1) + '" width="' + (XL_COLW[i] || 12) + '" customWidth="1"/>';
+            s += '</cols><sheetData>';
+            XL_ROWS.forEach(function(R){
+                s += '<row r="' + R.r + '"' + (R.h ? ' ht="' + R.h + '" customHeight="1"' : '') + '>';
+                R.cells.forEach(function(c){
+                    var ref = xlColName(c.c) + R.r;
+                    if (c.n && c.v != null && c.v !== '' && isFinite(c.v)) s += '<c r="' + ref + '" s="' + c.s + '"><v>' + xlNum(c.v) + '</v></c>';
+                    else if (c.v == null || c.v === '') s += '<c r="' + ref + '" s="' + c.s + '"/>';
+                    else s += '<c r="' + ref + '" s="' + c.s + '" t="inlineStr"><is><t xml:space="preserve">' + xlEsc(c.v) + '</t></is></c>';
+                });
+                s += '</row>';
+            });
+            s += '</sheetData>';
+            if (XL_MERGES.length) s += '<mergeCells count="' + XL_MERGES.length + '">' + XL_MERGES.map(function(m){ return '<mergeCell ref="' + m + '"/>'; }).join('') + '</mergeCells>';
+            s += '<pageMargins left="0.3" right="0.3" top="0.5" bottom="0.5" header="0.3" footer="0.3"/>';
+            s += '<pageSetup paperSize="9" orientation="landscape" fitToWidth="1" fitToHeight="0"/>';
+            s += '</worksheet>';
+            return s;
+        }
+        function xlPack(sheetXml){
+            return xlZip([
+                { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                    + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                    + '<Default Extension="xml" ContentType="application/xml"/>'
+                    + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                    + '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                    + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                    + '</Types>' },
+                { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                    + '</Relationships>' },
+                { name: 'xl/workbook.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                    + '<sheets><sheet name="Platnosci" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+                { name: 'xl/_rels/workbook.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                    + '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                    + '</Relationships>' },
+                { name: 'xl/styles.xml', data: xlStylesXml() },
+                { name: 'xl/worksheets/sheet1.xml', data: sheetXml }
+            ]);
+        }
+
+        // --- tresc: te same werdykty co na ekranie, tylko tekstem ---
+        function xlPiTxt(r){ if (!r || !r.pi) return ''; return 'P/I ' + (r.pi.warn ? '⚠' : (r.pi.ok ? '✓' : '✗')) + ' ' + String(r.pi.msg || ''); }
+        function xlPiSt(r){ if (!r || !r.pi) return XLS.CELL; return r.pi.warn ? XLS.WARN : (r.pi.ok ? XLS.OK : XLS.BAD); }
+        function xlOkTxt(r){
+            if (!r || !r.pi) return '';
+            var o = r.pi.depOk;
+            return o ? ('OK od ' + String(o.author || '?') + (o.date ? ' (' + o.date + ')' : '')) : 'Brak OK';
+        }
+        function xlOkSt(r){ return (r && r.pi && r.pi.depOk) ? XLS.OK : XLS.BAD; }
+        function xlBalPiTxt(r){ if (!r || !r.bpi) return ''; return 'P/I ' + (r.bpi.warn ? '⚠' : (r.bpi.ok ? '✓' : '✗')) + ' ' + String(r.bpi.msg || ''); }
+        function xlBalPiSt(r){ if (!r || !r.bpi) return XLS.CELL; return r.bpi.warn ? XLS.WARN : (r.bpi.ok ? XLS.OK : XLS.BAD); }
+        function xlBalComTxt(r){ if (!r || !r.bc) return ''; return (r.bc.ok ? '✓' : (r.bc.warn ? '⚠' : '✗')) + ' ' + String(r.bc.msg || ''); }
+        function xlBalComSt(r){ if (!r || !r.bc) return XLS.CELL; return r.bc.ok ? XLS.OK : (r.bc.warn ? XLS.WARN : XLS.BAD); }
+        // Status calej platnosci — to jest kolumna, ktora decyduje, czy ktos ma to wklepac do banku.
+        function xlStatusOf(pr){
+            if (!pr) return { t: '✗ NIE WPROWADZAĆ', s: 'bad', why: 'nie udało się złożyć danych płatności' };
+            if (!pr.hasBank) return { t: '✗ NIE WPROWADZAĆ', s: 'bad', why: 'brak bloku „Bank information” w P/I — konto, SWIFT i beneficjenta trzeba uzupełnić ręcznie' };
+            var miss = [];
+            if (!pr.name) miss.push('nazwa beneficjenta');
+            if (!pr.acc) miss.push('numer konta');
+            if (!painBicOk(pr.bic)) miss.push('poprawny SWIFT/BIC');
+            if (!pr.town) miss.push('miasto beneficjenta');
+            if (!pr.ctry) miss.push('kraj beneficjenta');
+            if (!(pr.amount > 0)) miss.push('kwota większa od zera');
+            if (miss.length) return { t: '✗ NIE WPROWADZAĆ', s: 'bad', why: 'brakuje: ' + miss.join(', ') };
+            var w = [];
+            if (pr.conflict) w.push('w P/I są ' + pr.nBank + ' różne bloki bankowe — potwierdź, które konto jest właściwe');
+            if (pr.amountEdited) w.push('kwota poprawiona ręcznie (z tabeli wychodziło ' + pr.amountBase.toFixed(2) + ')');
+            if (pr.accWasWrong) w.push('numer konta odtworzony z P/I (pod etykietą konta stało: ' + pr.accWasWrong + ')');
+            if (!pr.verified && pr.why && pr.why.length) w.push(pr.why.join('; '));
+            else if (!pr.verified) w.push('nie wszystkie pozycje przeszły sprawdzenie');
+            if (w.length) return { t: '⚠ SPRAWDŹ PRZED WPROWADZENIEM', s: 'warn', why: w.join(' | ') };
+            return { t: '✓ sprawdzone', s: 'ok', why: '' };
+        }
+        function xlStatusStyle(s){ return s === 'ok' ? XLS.STOK : (s === 'warn' ? XLS.STWARN : XLS.STBAD); }
+
+        function xlBuildBook(){
+            var cfg = painCfg(), MG = pcMergedGroups(), PR = painRows(), prBy = {};
+            PR.forEach(function(p){ prBy[p.key] = p; });
+            var secs = [
+                { t: 'ŁĄCZONE (depo + balance)', g: MG.combined },
+                { t: 'DEPO', g: MG.depoOnly },
+                { t: 'BALANCE', g: MG.balOnly }
+            ];
+            var nOk = 0, nWarn = 0, nBad = 0, nGroups = 0, nRows = 0, sumAll = 0, sumDep = 0, sumBal = 0;
+            secs.forEach(function(S){
+                S.g.forEach(function(G){
+                    var pr = prBy[G.key], st = xlStatusOf(pr);
+                    nGroups++; nRows += G.dep.length + G.bal.length;
+                    sumDep += (pcSumRows(G.dep) || 0); sumBal += (pcBalSum(G.bal) || 0);
+                    sumAll += pr ? pr.amount : ((pcSumRows(G.dep) || 0) + (pcBalSum(G.bal) || 0));
+                    if (st.s === 'ok') nOk++; else if (st.s === 'warn') nWarn++; else nBad++;
+                });
+            });
+
+            xlReset();
+            // 1-8: naglowek dokumentu (zamrozony), 8 = pusty
+            xlBand(1, XL_NCOL, 'BELIANI — płatności do dostawców (depozyty + balance)', XLS.TITLE, 24);
+            xlBand(1, XL_NCOL, 'Zleceniodawca: ' + (cfg.nm || '(nie uzupełniono w panelu)')
+                + (cfg.town ? ('  ·  ' + [cfg.str, cfg.pstCd, cfg.town, cfg.ctry].filter(Boolean).join(' ')) : ''), XLS.BOLD);
+            xlBand(1, XL_NCOL, 'IBAN: ' + (cfg.iban || '—') + '     BIC: ' + (cfg.bic || '—'), XLS.BOLD);
+            xlBand(1, XL_NCOL, 'Data wykonania: ' + (cfg.exec || '—') + '     Waluta: ' + PAIN_CCY
+                + '     Płatności: ' + nGroups + '     Pozycji: ' + nRows + '     Razem: ' + sumAll.toFixed(2) + ' ' + PAIN_CCY, XLS.BOLD);
+            xlBand(1, XL_NCOL, 'Sprawdzone: ' + nOk + '   ·   do sprawdzenia: ' + nWarn + '   ·   NIE wprowadzać: ' + nBad, XLS.SMALL);
+            xlBand(1, XL_NCOL, 'Wygenerowano: ' + pcNow() + '   ·   skrypt hub ' + VER + '   ·   plik roboczy, nie jest to dokument księgowy', XLS.SMALL);
+            xlBand(1, XL_NCOL, 'Żółte kolumny I–L wypełnia osoba wprowadzająca przelew do banku. Jedna płatność = jeden wiersz z nazwą dostawcy (kolorowy pasek).', XLS.SMALL);
+            xlBlank();
+
+            function colhead(){
+                var w = xlNewRow(15);
+                var H = ['Typ', 'Order', 'Kontener', 'Kwota', 'P/I', 'OK depo / komentarz', 'Note', 'Status', 'Wprowadzone', 'Kto', 'Data', 'Uwagi'];
+                for (var i = 0; i < XL_NCOL; i++) xlAdd(w, i + 1, i + 1, H[i], XLS.HDR);
+                xlPush(w);
+            }
+            function labelRow(lbl, val, valStyle, h){
+                var w = xlNewRow(h);
+                xlAdd(w, 1, 3, lbl, XLS.LBL);
+                xlAdd(w, 4, XL_NCOL, val, valStyle == null ? XLS.VAL : valStyle);
+                return xlPush(w);
+            }
+
+            secs.forEach(function(S){
+                if (!S.g.length) return;
+                xlBand(1, XL_NCOL, S.t + '   (' + S.g.length + ')', XLS.SECT, 19);
+                colhead();
+                S.g.forEach(function(G){
+                    var pr = prBy[G.key] || null, st = xlStatusOf(pr);
+                    var ds = pcSumRows(G.dep), bs = pcBalSum(G.bal);
+                    var accErp = G.cid ? (_acc[G.cid] || '') : '';
+                    var accShown = (state.pcAccEdit && state.pcAccEdit[G.key] != null) ? state.pcAccEdit[G.key] : accErp;
+                    var accPay = pr ? pr.acc : '';
+
+                    // pasek dostawcy: nazwa | status | puste kolumny robocze
+                    var hr = xlNewRow(19);
+                    xlAdd(hr, 1, 7, G.sup + '   (' + (G.dep.length + G.bal.length) + ' poz.)', XLS.GRP);
+                    xlAdd(hr, 8, 8, st.t, xlStatusStyle(st.s));
+                    for (var wc = 9; wc <= XL_NCOL; wc++) xlAdd(hr, wc, wc, '', XLS.WORK);
+                    xlPush(hr);
+
+                    if (st.why) labelRow('Uwaga:', st.why, st.s === 'bad' ? XLS.BADW : XLS.WARNW, 30);
+                    labelRow('Konto beneficjenta:', (accPay || '— brak w P/I —')
+                        + ((accPay && accShown && normAcc(accPay) !== normAcc(accShown)) ? ('     ⚠ w prologistics widnieje inne konto: ' + accShown) : ''), XLS.VALB);
+                    labelRow('SWIFT / BIC:', (pr && pr.bic ? pr.bic : '— brak —')
+                        + (pr && pr.bankName ? ('     bank: ' + pr.bankName) : '')
+                        + (pr && pr.bankTown ? (', ' + pr.bankTown) : '')
+                        + (pr && pr.bankCtry ? (' ' + pr.bankCtry) : ''), XLS.VALB);
+                    labelRow('Beneficjent:', (pr && pr.name ? pr.name : '— brak —'), XLS.VAL);
+                    labelRow('Adres beneficjenta:', [pr && pr.addr, pr && pr.town, pr && pr.ctry].filter(Boolean).join(', ') || '— brak —', XLS.VAL);
+                    labelRow('Tytuł przelewu:', (pr && pr.title ? pr.title : '') + (pr && pr.title ? ('     (' + pr.title.length + '/' + PAIN_TITLE_MAX + ' znaków)') : '— brak —'), XLS.VAL);
+
+                    var tr = xlNewRow(17);
+                    xlAdd(tr, 1, 3, 'DO ZAPŁATY:', XLS.LBL);
+                    xlAdd(tr, 4, 4, pr ? pr.amount : ((ds || 0) + (bs || 0)), XLS.GRPMON, true);
+                    xlAdd(tr, 5, XL_NCOL, PAIN_CCY
+                        + (ds != null ? ('     depo ' + ds.toFixed(2)) : '')
+                        + (bs != null ? ('     balance ' + bs.toFixed(2)) : '')
+                        + ((ds != null && bs != null) ? ('     razem ' + ((ds || 0) + (bs || 0)).toFixed(2)) : '')
+                        + ((pr && pr.amountEdited) ? '     ⚠ kwota poprawiona ręcznie' : ''), XLS.GRP);
+                    xlPush(tr);
+
+                    G.dep.forEach(function(r){
+                        var a = pcDepAmt(r), w = xlNewRow();
+                        xlAdd(w, 1, 1, 'D', XLS.DMARK);
+                        xlAdd(w, 2, 2, String(r.order || ''), XLS.TEXT);
+                        xlAdd(w, 3, 3, '', XLS.CELL);
+                        if (a != null && isFinite(a)) xlAdd(w, 4, 4, a, XLS.MONEY, true); else xlAdd(w, 4, 4, '—', XLS.MONEY);
+                        xlAdd(w, 5, 5, xlPiTxt(r), xlPiSt(r));
+                        xlAdd(w, 6, 6, xlOkTxt(r), xlOkSt(r));
+                        xlAdd(w, 7, 7, '', XLS.CELL);
+                        xlAdd(w, 8, 8, '', XLS.CELL);
+                        for (var c = 9; c <= XL_NCOL; c++) xlAdd(w, c, c, '', XLS.CELL);
+                        xlPush(w);
+                    });
+                    G.bal.forEach(function(r){
+                        var a = pcBalAmtVal(r), w = xlNewRow();
+                        xlAdd(w, 1, 1, 'B', XLS.BMARK);
+                        xlAdd(w, 2, 2, String(r.order || ''), XLS.TEXT);
+                        xlAdd(w, 3, 3, String(r.container || ''), XLS.TEXT);
+                        if (a != null && isFinite(a)) xlAdd(w, 4, 4, a, XLS.MONEY, true); else xlAdd(w, 4, 4, '—', XLS.MONEY);
+                        xlAdd(w, 5, 5, xlBalPiTxt(r), xlBalPiSt(r));
+                        xlAdd(w, 6, 6, xlBalComTxt(r), xlBalComSt(r));
+                        xlAdd(w, 7, 7, String(r.note || ''), XLS.CELL);
+                        xlAdd(w, 8, 8, '', XLS.CELL);
+                        for (var c2 = 9; c2 <= XL_NCOL; c2++) xlAdd(w, c2, c2, '', XLS.CELL);
+                        xlPush(w);
+                    });
+                    xlBlank();
+                });
+            });
+
+            var gr = xlNewRow(20);
+            xlAdd(gr, 1, 3, 'RAZEM WSZYSTKO:', XLS.GRP);
+            xlAdd(gr, 4, 4, sumAll, XLS.GRPMON, true);
+            xlAdd(gr, 5, XL_NCOL, PAIN_CCY + '     depo ' + sumDep.toFixed(2) + '     balance ' + sumBal.toFixed(2)
+                + '     płatności: ' + nGroups + '     pozycji: ' + nRows, XLS.GRP);
+            xlPush(gr);
+            if (nBad) xlBand(1, XL_NCOL, '⚠ ' + nBad + ' płatności NIE ma kompletu danych bankowych — tych nie wprowadzać do banku bez uzupełnienia.', XLS.BAD, 18);
+
+            var bytes = xlPack(xlSheetXml());
+            return {
+                bytes: bytes,
+                name: 'platnosci do banku ' + pcToday() + ' ' + PAIN_CCY + '.xlsx',
+                nGroups: nGroups, nRows: nRows, sum: sumAll, nOk: nOk, nWarn: nWarn, nBad: nBad
+            };
+        }
+        function xlSave(bytes, name){
+            try {
+                var blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+                var url = URL.createObjectURL(blob), a = document.createElement('a');
+                a.href = url; a.download = name; a.style.display = 'none';
+                document.body.appendChild(a); a.click();
+                setTimeout(function(){ try { document.body.removeChild(a); URL.revokeObjectURL(url); } catch(e){} }, 1000);
+                return { name: name, size: bytes.length };
+            } catch(e){ return null; }
+        }
+
         function painSelected(rows){ return rows.filter(function(r){ return !!(state.painSel || {})[r.key]; }); }
         function painInp(k, key, val, w, ph, cls){
             return '<input type="text" class="pain-ed ' + (cls || '') + '" data-key="' + pcAttr(key) + '" data-k="' + k + '" value="' + pcAttr(val == null ? '' : String(val)) + '"'
@@ -13999,6 +14397,18 @@
             var txt = pcBuildLog(), ok = pcCopyText(txt);
             st.textContent = ok ? ('Skopiowano log do schowka (' + Math.round(txt.length / 1024) + ' kB).') : 'Nie udało się skopiować.';
             st.style.color = ok ? '#0a0' : '#c00';
+        };
+        wp.querySelector('#wp-xlsx').onclick = function(){
+            var st = wp.querySelector('#wp-log-status');
+            if (!state.dep.order.length && !state.bal.order.length) { st.textContent = 'Najpierw \u201ePrzetw\u00f3rz\u201d \u2014 nie ma czego eksportowa\u0107.'; st.style.color = '#c00'; return; }
+            var b = null;
+            try { b = xlBuildBook(); } catch(e){ st.textContent = 'B\u0142\u0105d budowania pliku: ' + e; st.style.color = '#c00'; return; }
+            if (!b || !b.nGroups) { st.textContent = 'Nie ma \u017cadnej p\u0142atno\u015bci do wyeksportowania.'; st.style.color = '#c00'; return; }
+            var r = xlSave(b.bytes, b.name);
+            if (!r) { st.textContent = 'Nie uda\u0142o si\u0119 zapisa\u0107 pliku.'; st.style.color = '#c00'; return; }
+            st.textContent = 'Zapisano: ' + r.name + ' (' + Math.round(r.size / 1024) + ' kB) \u2014 ' + b.nGroups + ' p\u0142atno\u015bci, ' + b.nRows + ' pozycji, razem ' + b.sum.toFixed(2) + ' ' + PAIN_CCY
+                + '  \u00b7  sprawdzone ' + b.nOk + ', do sprawdzenia ' + b.nWarn + ', NIE wprowadza\u0107 ' + b.nBad + '. Sprawd\u017a folder Pobrane.';
+            st.style.color = b.nBad ? '#c00' : (b.nWarn ? '#c47f00' : '#0a0');
         };
         wp.querySelector('#wp-copy-bal').onclick = function(){
             var status = wp.querySelector('#wp-status');
