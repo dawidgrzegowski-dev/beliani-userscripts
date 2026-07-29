@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.86
+// @version      1.87
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12578,16 +12578,23 @@
             return { combined: combined, depoOnly: depoOnly, balOnly: balOnly };
         }
         var PC_TITLE_MAX = 140;
-        function pcFormatOrders(orders, om){
-            var useRange = (om === 'range' || om === 'rangenospace'), sep = (om === 'nospace' || om === 'rangenospace') ? ',' : ', ';
-            if (!useRange) return orders.join(sep);
-            var out = [], i = 0, n = orders.length;
+        // Zwija ciagi kolejnych liczb w zakres, ale dopiero od TRZECH. Na dwoch nie ma
+        // po co: „100,101" i „100-101" maja tyle samo znakow, a pelne numery czyta sie
+        // pewniej. Wejscie musi byc posortowane rosnaco. Wszystko, co nie jest czysta
+        // liczba, przechodzi bez zmian i przerywa ciag.
+        // Uzywane w dwoch miejscach: przy numerach zamowien i przy numerach penalty.
+        function pcRangeList(list){
+            var out = [], i = 0, n = (list || []).length;
             while (i < n){
                 var j = i;
-                while (j + 1 < n && /^\d+$/.test(orders[j]) && /^\d+$/.test(orders[j + 1]) && (parseInt(orders[j + 1], 10) === parseInt(orders[j], 10) + 1)) j++;
-                if (j - i + 1 >= 3){ out.push(orders[i] + '-' + orders[j]); i = j + 1; } else { out.push(orders[i]); i++; }
+                while (j + 1 < n && /^\d+$/.test(list[j]) && /^\d+$/.test(list[j + 1]) && (parseInt(list[j + 1], 10) === parseInt(list[j], 10) + 1)) j++;
+                if (j - i + 1 >= 3){ out.push(list[i] + '-' + list[j]); i = j + 1; } else { out.push(list[i]); i++; }
             }
-            return out.join(sep);
+            return out;
+        }
+        function pcFormatOrders(orders, om){
+            var useRange = (om === 'range' || om === 'rangenospace'), sep = (om === 'nospace' || om === 'rangenospace') ? ',' : ', ';
+            return (useRange ? pcRangeList(orders) : (orders || [])).join(sep);
         }
         // Ten sam typ roszczenia laczymy w jeden wpis: ['penalty 814','penalty 1021','overpayment 451']
         // -> ['penalty 814,1021', 'overpayment 451']. Kolejnosc typow wg pierwszego wystapienia, numery rosnaco.
@@ -12602,7 +12609,12 @@
             });
             return order.map(function(ty){
                 var nos = byType[ty].slice().sort(function(a, b){ return parseInt(a, 10) - parseInt(b, 10); });
-                return nos.length ? (ty + ' ' + nos.join(',')) : ty;
+                // Numery zwijamy ZAWSZE (nie dopiero przy za dlugim tytule, jak przy
+                // orderach) i OSOBNO dla kazdego rodzaju: „penalty 100,101,102" ->
+                // „penalty 100-102", ale penalty i discount nigdy nie wpadaja do
+                // wspolnego zakresu, bo z „100-102" nie dalo by sie odczytac, ktory
+                // numer jest ktorego rodzaju.
+                return nos.length ? (ty + ' ' + pcRangeList(nos).join(',')) : ty;
             });
         }
         function pcBuildTitle(orders, pcts, conts, pens, cfg){
