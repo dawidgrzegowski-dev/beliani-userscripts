@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.95
+// @version      1.96
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10068,7 +10068,7 @@
     panel.style.cssText = `
         display:none; position:fixed; top:65px; right:20px; z-index:999999;
         background:white; border:1px solid #ccc; border-radius:10px;
-        box-shadow:0 4px 16px rgba(0,0,0,0.15); padding:16px; width:620px;
+        box-shadow:0 4px 16px rgba(0,0,0,0.15); padding:16px; width:760px;
         font-family:sans-serif; max-height:90vh; overflow-y:auto;
     `;
 
@@ -10076,27 +10076,34 @@
         <div style="font-weight:bold;margin-bottom:8px;color:#111;font-size:15px;">
             📦 Auto-księgowanie orderów
         </div>
-        <div id="tm-fmt-depo" style="font-size:11px;color:#666;margin-bottom:8px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:6px 8px;">
-            Wklej <strong>depozyty i balance razem</strong> — format rozpoznawany jest wiersz po wierszu.<br>
-            <span style="color:#0369a1;">depozyt</span>: <code style="background:#f5f5f5;padding:1px 4px;">20730 ⇥ Nazwa ⇥ 2527.5</code>
-            &nbsp;·&nbsp;
-            <span style="color:#7c3aed;">balance</span>: <code style="background:#f5f5f5;padding:1px 4px;">dostawca ⇥ kontener ⇥ 1/sub/- ⇥ order ⇥ kwota ⇥ notatka</code><br>
-            Wiersz, którego nie da się przypisać do żadnego z tych dwóch formatów, blokuje całą wklejkę.
+        <div style="font-size:12px;font-weight:bold;color:#0369a1;margin-bottom:3px;">Depozyty</div>
+        <div id="tm-fmt-depo" style="font-size:11px;color:#666;margin-bottom:4px;">
+            <code style="background:#f5f5f5;padding:1px 4px;">20730 ⇥ nazwa dostawcy ⇥ 2527.5</code>
+            — numer orderu w pierwszej kolumnie, kwota w ostatniej. Opis brany z komentarzy orderu
+            (deposit XX%), po zaksięgowaniu status kontenera zmienia się na „waiting for SM".
         </div>
-        <div id="tm-fmt-bal" style="display:none;font-size:11px;color:#666;margin-bottom:8px;">
-            <strong>Balance:</strong> wiersze puste pomijane, wiersze z sumą grupy sprawdzane. Kwota wpisu = ta z notatki,
+        <textarea id="tm-order-input"
+            placeholder="20730&#9;ZHANGZHOU YOKA&#9;2527.5"
+            style="width:100%;height:90px;padding:8px;border:1px solid #ccc;
+                   border-radius:6px;font-size:12px;resize:vertical;
+                   box-sizing:border-box;font-family:monospace;"></textarea>
+
+        <div style="font-size:12px;font-weight:bold;color:#7c3aed;margin:10px 0 3px;">Balance</div>
+        <div id="tm-fmt-bal" style="font-size:11px;color:#666;margin-bottom:4px;">
+            <code style="background:#f5f5f5;padding:1px 4px;">dostawca ⇥ kontener ⇥ 1/sub/- ⇥ order ⇥ kwota ⇥ notatka</code><br>
+            Wiersze puste pomijane, wiersze z sumą grupy sprawdzane. Kwota wpisu = ta z notatki,
             różnica względem kolumny „kwota" musi być wytłumaczona roszczeniem (penalty, discount,
             overpayment, underpayment). Penalty idzie na konto „Penalty", discount na „Discount".
             Roszczenia „other +" / „other −" nie mają stałego konta — panel pobiera ich treść
-            z prologistics, proponuje konto wg SOP i czeka, aż potwierdzisz je w ramce pod spodem.<br>
-            <strong>Depozyt:</strong> opis brany z komentarzy orderu (deposit XX%), po zaksięgowaniu status
-            kontenera zmienia się na „waiting for SM". W balance status zostaje nietknięty.
+            z prologistics, proponuje konto wg SOP i czeka, aż potwierdzisz je w ramce pod spodem.
+            Status kontenera w balance zostaje nietknięty.
         </div>
-        <textarea id="tm-order-input"
-            placeholder="20730&#9;ZHANGZHOU YOKA&#9;2527.5&#10;Fuzhou Zhonglei&#9;SELU4488110&#9;1&#9;20360&#9;15675.70&#9;15675.70 USD"
-            style="width:100%;height:100px;padding:8px;border:1px solid #ccc;
+        <textarea id="tm-bal-input"
+            placeholder="Fuzhou Zhonglei&#9;SELU4488110&#9;1&#9;20360&#9;15675.70&#9;15675.70 USD"
+            style="width:100%;height:90px;padding:8px;border:1px solid #ccc;
                    border-radius:6px;font-size:12px;resize:vertical;
                    box-sizing:border-box;font-family:monospace;"></textarea>
+
         <div id="tm-parsed-preview" style="margin-top:4px;font-size:11px;color:#555;min-height:16px;"></div>
         <div id="tm-bal-msgs" style="margin-top:4px;font-size:11px;"></div>
         <div id="tm-other-box" style="margin-top:4px;font-size:11px;"></div>
@@ -10114,7 +10121,7 @@
             <input id="tm-debit" value="1270" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
             <label style="font-size:12px;color:#333;">Credit:</label>
             <input id="tm-credit" value="1049" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
-            <span id="tm-pen-wrap" style="display:none;gap:6px;align-items:center;" title="Druga noga korekty: 1270 / to konto, kwota z plusem. Pierwsza noga to ta sama kwota z minusem na Debit/Credit powyżej. Konto zależy od typu roszczenia: discount ma własne, penalty / overpayment / underpayment idą na konto Penalty, a „other +" / „other −" nie ma stałego konta — wybiera się je wg treści roszczenia w ramce pod wklejką.">
+            <span id="tm-pen-wrap" style="display:inline-flex;gap:6px;align-items:center;" title="Druga noga korekty: 1270 / to konto, kwota z plusem. Pierwsza noga to ta sama kwota z minusem na Debit/Credit powyżej. Konto zależy od typu roszczenia: discount ma własne, penalty / overpayment / underpayment idą na konto Penalty, a „other +" / „other −" nie ma stałego konta — wybiera się je wg treści roszczenia w ramce pod wklejką.">
                 <label style="font-size:12px;color:#333;">Penalty:</label>
                 <input id="tm-pen-credit" value="8100" style="width:55px;padding:4px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
                 <label style="font-size:12px;color:#333;">Discount:</label>
@@ -10262,9 +10269,9 @@
     let previewRows = [];
     const formDataCache = {};
 
-    // v1.95: panel nie uzywa juz tej funkcji — wklejke depozytow i balance obsluguje wspolny
-    // parseBookPaste. Zostawiona, bo opisuje (i testy pilnuja) format depozytu, ktory
-    // bookLineKind/bookAmt musza rozpoznawac tak samo jak dawniej.
+    // v1.96: panel nie uzywa juz tej funkcji — pole depozytow obsluguje parseDepoPaste.
+    // Zostawiona, bo opisuje (i testy pilnuja) format depozytu, ktory bookDepoLine/bookAmt
+    // musza rozpoznawac tak samo jak dawniej.
     function parseOrders(raw) {
         return raw.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
             const parts  = line.split(/\t+|\s{2,}/);
@@ -10551,10 +10558,6 @@
         const picks = (opts && opts.picks) || {};
         // opts.pending — lista roszczen wlasnie sie pobiera, wiec „nie znalazlem" byloby klamstwem.
         const pending = !!(opts && opts.pending);
-        // opts.skip — mapa numerow wierszy (1-based), ktore nalezy pominac. Uzywane przez
-        // parseBookPaste we wspolnej wklejce: wiersze depozytowe musimy przeskoczyc, a NIE
-        // zamieniac na puste, bo pusty wiersz zamyka grupe i rozbilby sumy balance.
-        const skip = (opts && opts.skip) || null;
         let cur = null, lostSum = 0;
 
         function closeGroup(declared) {
@@ -10570,7 +10573,6 @@
 
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i], no = i + 1;
-            if (skip && skip[no]) continue;
             const c = line.split('\t'); while (c.length < 6) c.push('');
             const f = c.map(function (x) { return String(x == null ? '' : x).replace(/ /g, ' ').trim(); });
 
@@ -10773,15 +10775,16 @@
                  others: others, needClaims: needClaims };
     }
 
-    // ================= WSPOLNA WKLEJKA: DEPOZYT + BALANCE =================
-    // Jedno pole na obie wklejki. Rozpoznajemy KAZDY wiersz z osobna, bo format jest
-    // jednoznaczny:
-    //   depozyt — w 1. kolumnie numer orderu, w ostatniej kwota:  20730 ⇥ Nazwa ⇥ 2527.5
-    //   balance — w 1. kolumnie dostawca (albo pusto), numer orderu siedzi w 4. kolumnie:
-    //             Dostawca ⇥ kontener ⇥ 1/sub/- ⇥ 20730 ⇥ 2527.5 ⇥ notatka
-    // Wiersza, ktorego nie umiemy zakwalifikowac, NIE pomijamy po cichu — blokujemy cala
-    // wklejke i pokazujemy numer wiersza. Lepiej zeby czlowiek poprawil arkusz, niz zeby
-    // jeden wpis przepadl bez sladu.
+    // ================= DWA POLA WKLEJKI: DEPOZYTY + BALANCE =================
+    // Panel Ksiegowanie ma osobne pole na depozyty i osobne na balance — tak jak Wprowadzanie.
+    // Zadnego zgadywania formatu po tresci wiersza: kazde pole idzie do swojego parsera, a
+    // parseBookPaste sklada wyniki w jedna liste do zaksiegowania. Mozna wkleic obie naraz
+    // albo tylko jedna.
+    //   depozyt — numer orderu w 1. kolumnie, kwota w ostatniej:  20730 ⇥ Nazwa ⇥ 2527.5
+    //   balance — dostawca ⇥ kontener ⇥ 1/sub/- ⇥ order ⇥ kwota ⇥ notatka
+    // Wiersza, ktorego nie umiemy przeczytac, NIE pomijamy po cichu — blokujemy calosc i
+    // pokazujemy numer wiersza. Lepiej zeby czlowiek poprawil arkusz, niz zeby jeden wpis
+    // przepadl bez sladu (tak gubila je wersja do 1.94 wlacznie).
 
     // Rozbicie wiersza na kolumny. Jest tabulator — to wklejka z arkusza i tniemy WYLACZNIE
     // po tabulatorach; pozycja kolumny jest wtedy swieta. Wiersz sumy grupy to cztery puste
@@ -10805,62 +10808,35 @@
         const s = String(raw == null ? '' : raw).replace(/ /g, '').replace(/\s+/g, '').replace(',', '.');
         return /^\d+(\.\d+)?$/.test(s) ? s : null;
     }
-    // Kwalifikacja pojedynczego wiersza: 'blank' | 'sum' | 'depo' | 'bal' | '' (nierozpoznany).
+    // Kwalifikacja wiersza z pola depozytow: 'blank' | 'depo' | '' (nie do przeczytania).
     // Przy '' w „why" siedzi powod po polsku — trafia prosto do komunikatu dla uzytkownika.
-    function bookLineKind(line) {
+    function bookDepoLine(line) {
         const f = bookFields(line);
-        if (!f.join('')) return { kind: 'blank', why: '' };
-        // Wiersz sumy grupy z arkusza balance: cztery pierwsze kolumny puste, kwota w piatej.
-        if (!f[0] && !f[1] && !f[2] && !f[3]) {
-            if (f[4]) return { kind: 'sum', why: '' };
-            return { kind: 'blank', why: '' };
-        }
-        // Numer orderu w 4. kolumnie = balance. Sprawdzamy to PRZED depozytem, bo wiersz
-        // kontynuacji balance ma pusta kolumne dostawcy i inaczej wpadlby w zla galaz.
-        if (/^\d+$/.test(f[3])) return { kind: 'bal', why: '' };
-        if (/^\d+$/.test(f[0])) {
-            const li = bookLastIdx(f);
-            if (li <= 0) return { kind: '', why: 'jest numer orderu, ale w wierszu nie ma kwoty' };
-            if (bookAmt(f[li]) == null) return { kind: '', why: 'wygląda na depozyt, ale w ostatniej kolumnie „' + f[li] + '" nie ma kwoty' };
-            return { kind: 'depo', why: '' };
-        }
-        return { kind: '', why: 'nie rozpoznaję formatu — depozyt ma numer orderu w 1. kolumnie, balance w 4.' };
-    }
-    // Przeglada cala wklejke i mowi, co w niej jest. „kinds" trzyma kwalifikacje wiersz po
-    // wierszu (indeks 0 = wiersz 1), zeby oba parsery dostaly te sama mape.
-    function bookScan(raw) {
-        const lines = String(raw || '').replace(/\r/g, '').split('\n');
-        const kinds = [], bad = [];
-        let depo = 0, bal = 0, sum = 0;
-        lines.forEach(function (line, i) {
-            const k = bookLineKind(line);
-            kinds.push(k.kind);
-            if (k.kind === 'depo') depo++;
-            else if (k.kind === 'bal') bal++;
-            else if (k.kind === 'sum') sum++;
-            else if (!k.kind) bad.push({ line: i + 1, text: line, why: k.why });
-        });
-        return { kinds: kinds, depo: depo, bal: bal, sum: sum, bad: bad, lines: lines };
+        if (!f.join('')) return { kind: 'blank', why: '', f: f, li: -1 };
+        if (!f[0]) return { kind: '', why: 'pierwsza kolumna jest pusta, a depozyt musi mieć w niej numer orderu', f: f, li: -1 };
+        if (!/^\d+$/.test(f[0])) return { kind: '', why: 'w pierwszej kolumnie „' + f[0] + '" nie ma numeru orderu', f: f, li: -1 };
+        const li = bookLastIdx(f);
+        // li === 0 znaczy, ze numer orderu jest jedyna trescia wiersza. Do 1.94 ostatnie pole
+        // bylo brane za kwote, wiec samo „30030" ksiegowalo 30030 USD — teraz to blad.
+        if (li <= 0) return { kind: '', why: 'jest numer orderu, ale w wierszu nie ma kwoty', f: f, li: li };
+        if (bookAmt(f[li]) == null) return { kind: '', why: 'w ostatniej kolumnie „' + f[li] + '" nie ma kwoty', f: f, li: li };
+        return { kind: 'depo', why: '', f: f, li: li };
     }
 
-    // Depozyty w tym samym ksztalcie, co balance: wpisy + bledy zamiast cichego gubienia
-    // wierszy. opts.skip — numery wierszy (1-based) do pominiecia (nalezace do balance).
-    function parseDepoPaste(raw, debit, credit, opts) {
+    // Depozyty w tym samym ksztalcie, co balance: wpisy + bledy zamiast cichego gubienia wierszy.
+    function parseDepoPaste(raw, debit, credit) {
         const lines = String(raw || '').replace(/\r/g, '').split('\n');
-        const skip = (opts && opts.skip) || null;
         const entries = [], errors = [], warns = [], byOrder = {};
         for (let i = 0; i < lines.length; i++) {
             const no = i + 1;
-            if (skip && skip[no]) continue;
             const line = lines[i];
-            const f = bookFields(line);
-            if (!f.join('')) continue;
-            const k = bookLineKind(line);
+            const k = bookDepoLine(line);
+            if (k.kind === 'blank') continue;
             if (k.kind !== 'depo') {
-                errors.push('wiersz ' + no + ': ' + (k.why || 'to nie jest wiersz depozytu') + ' — ' + balShort(line));
+                errors.push('wiersz ' + no + ': ' + k.why + ' — ' + balShort(line));
                 continue;
             }
-            const li = bookLastIdx(f);
+            const f = k.f, li = k.li;
             const id = f[0];
             const amount = bookAmt(f[li]);
             // Wszystko miedzy numerem orderu a kwota to nazwa dostawcy (moze jej nie byc).
@@ -10875,42 +10851,30 @@
         return { entries: entries, errors: errors, warns: warns };
     }
 
-    // Wspolny parser panelu Ksiegowanie. Zwraca to samo, co parseBalancePaste, plus:
-    //   depo/bal — ile wpisow poszlo z ktorego formatu (panel po tym ustawia widok),
-    //   blocked  — wklejka odrzucona w calosci, bo ma nierozpoznany wiersz,
-    //   scan     — surowy wynik bookScan.
-    function parseBookPaste(raw, debit, credit, penCredit, discCredit, opts) {
-        const scan = bookScan(raw);
-        const out = { entries: [], groups: [], errors: [], warns: [], bank: 0, pen: 0, disc: 0,
-                      accs: {}, others: [], needClaims: [], depo: 0, bal: 0, blocked: false, scan: scan };
-        if (scan.bad.length) {
-            out.blocked = true;
-            out.errors = scan.bad.map(function (b) {
-                return 'wiersz ' + b.line + ': ' + b.why + ' — ' + balShort(b.text);
-            });
-            return out;
-        }
-        if (!scan.depo && !scan.bal && !scan.sum) return out;
+    // Wspolny parser panelu Ksiegowanie: bierze OBIE wklejki i sklada jeden wynik w ksztalcie
+    // parseBalancePaste, plus depo/bal — ile wpisow przyszlo z ktorego pola.
+    // Wpisy leca w kolejnosci pol na ekranie: najpierw depozyty, potem balance. NIE sortujemy
+    // ich po numerze wiersza, bo numeracja obu pol zaczyna sie od 1 i wymieszalaby sie.
+    function parseBookPaste(depoRaw, balRaw, debit, credit, penCredit, discCredit, opts) {
+        const depoHas = String(depoRaw || '').trim() !== '';
+        const balHas  = String(balRaw  || '').trim() !== '';
 
-        // Wiersze depozytowe pomijamy w parserze balance przez skip, a NIE przez zamiane na
-        // pusty wiersz — pusty wiersz zamyka grupe i rozwalilby kontrole sum.
-        const skipBal = {}, skipDepo = {};
-        scan.kinds.forEach(function (k, i) {
-            if (k === 'depo') skipBal[i + 1] = 1; else skipDepo[i + 1] = 1;
-        });
+        const d = depoHas ? parseDepoPaste(depoRaw, debit, credit)
+                          : { entries: [], errors: [], warns: [] };
+        const b = balHas ? parseBalancePaste(balRaw, debit, credit, penCredit, discCredit, opts || {})
+                         : { entries: [], groups: [], errors: [], warns: [], others: [], needClaims: [] };
 
-        const b = (scan.bal || scan.sum)
-            ? parseBalancePaste(raw, debit, credit, penCredit, discCredit,
-                Object.assign({}, opts || {}, { skip: skipBal }))
-            : { entries: [], groups: [], errors: [], warns: [], others: [], needClaims: [] };
-        const d = scan.depo ? parseDepoPaste(raw, debit, credit, { skip: skipDepo })
-                            : { entries: [], errors: [], warns: [] };
-
-        // uid musi byc unikalny w calej liscie — balance ma „b0, b1…", depozyty „d0, d1…".
+        // uid musi byc unikalny w calej liscie — depozyty maja „d0, d1…", balance „b0, b1…".
         d.entries.forEach(function (e, i) { e.uid = 'd' + i; });
 
-        const entries = b.entries.concat(d.entries);
-        entries.sort(function (x, y) { return (x.line || 0) - (y.line || 0); });
+        // Numer wiersza sam w sobie nie mowi, z ktorego pola pochodzi — dopisujemy nazwe pola,
+        // ale tylko wtedy, gdy wypelnione sa oba. Przy jednej wklejce to bylby tylko szum.
+        const both = depoHas && balHas;
+        const tag = function (arr, name) {
+            return (arr || []).map(function (t) { return both ? (name + ', ' + t) : t; });
+        };
+
+        const entries = d.entries.concat(b.entries);
 
         // Suma bankowa liczona po CALEJ liscie, zeby depozyty tez sie w niej znalazly.
         let bank = 0; const accs = {};
@@ -10919,19 +10883,20 @@
             if (e.plus) accs[e.credit] = bal2((accs[e.credit] || 0) + v); else bank += v;
         });
 
-        out.entries = entries;
-        out.groups = b.groups || [];
-        out.errors = (b.errors || []).concat(d.errors || []);
-        out.warns = (b.warns || []).concat(d.warns || []);
-        out.others = b.others || [];
-        out.needClaims = b.needClaims || [];
-        out.bank = bal2(bank);
-        out.accs = accs;
-        out.pen = bal2(accs[penCredit] || 0);
-        out.disc = bal2(accs[discCredit] || 0);
-        out.depo = d.entries.length;
-        out.bal = b.entries.length;
-        return out;
+        return {
+            entries: entries,
+            groups: b.groups || [],
+            errors: tag(d.errors, 'depozyty').concat(tag(b.errors, 'balance')),
+            warns:  tag(d.warns,  'depozyty').concat(tag(b.warns,  'balance')),
+            others: b.others || [],
+            needClaims: b.needClaims || [],
+            bank: bal2(bank),
+            accs: accs,
+            pen: bal2(accs[penCredit] || 0),
+            disc: bal2(accs[discCredit] || 0),
+            depo: d.entries.length,
+            bal: b.entries.length
+        };
     }
 
     // Wartosci kont z pol panelu — podglad musi liczyc dokladnie to, co pojdzie w POST.
@@ -10945,7 +10910,10 @@
     }
     function balParseCurrent() {
         const a = balAccounts();
-        return parseBookPaste(document.getElementById('tm-order-input')?.value || '', a.debit, a.credit, a.pen, a.disc,
+        return parseBookPaste(
+            document.getElementById('tm-order-input')?.value || '',
+            document.getElementById('tm-bal-input')?.value || '',
+            a.debit, a.credit, a.pen, a.disc,
             { claims: balClaimStore.byId, picks: balOtherPick, pending: balClaimStore.loading });
     }
     function balEsc(s) {
@@ -11154,39 +11122,29 @@
         });
     }
 
-    // Widok panelu jedzie za TRESCIA wklejki, a nie za przelacznikiem — nie ma juz radia
-    // depo/balance. Pola Penalty/Discount i dluzszy opis balance pokazuja sie dopiero wtedy,
-    // gdy w wklejce naprawde sa wiersze balance.
-    function applyBookView(r) {
-        const bal = !!(r && (r.bal || (r.scan && r.scan.sum)));
-        const set = (id, disp) => { const e = panel.querySelector('#' + id); if (e) e.style.display = disp; };
-        set('tm-fmt-bal',  bal ? 'block' : 'none');
-        set('tm-pen-wrap', bal ? 'inline-flex' : 'none');
-        panel.style.width = bal ? '760px' : '620px';
-    }
-
     function updateTextPreview() {
         const el = document.getElementById('tm-parsed-preview');
         if (!el) return;
-        const raw = document.getElementById('tm-order-input')?.value || '';
+        // Podsumowanie jest wspolne dla obu pol — liczy to, co poszloby do ksiegowania po
+        // kliknieciu „Sprawdz", czyli depozyty i balance razem.
+        const raw = (document.getElementById('tm-order-input')?.value || '') +
+                    (document.getElementById('tm-bal-input')?.value || '');
         const box = document.getElementById('tm-bal-msgs');
         const obox = document.getElementById('tm-other-box');
         if (!raw.trim()) {
             el.innerHTML = '';
             if (box) box.innerHTML = '';
             if (obox) { obox.innerHTML = ''; balOtherSig = ''; }
-            applyBookView(null);
             return;
         }
         const r = balParseCurrent();
-        applyBookView(r);
         const a = balAccounts();
         const orders = {}; r.entries.forEach(function (e) { orders[e.id] = 1; });
         const checked = r.groups.filter(function (g) { return g.declared != null; }).length;
         const bad = r.errors.length;
         const bits = ['<span style="color:' + (bad ? '#dc2626' : '#16a34a') + '">' +
             (bad ? '⚠️' : '✓') + ' ' + Object.keys(orders).length + ' orderów, ' + r.entries.length + ' wpisów</span>'];
-        // Ile wierszy poszlo z ktorego formatu — najwazniejsza informacja przy wspolnej wklejce.
+        // Ile wpisow przyszlo z ktorego pola — od razu widac, czy skrypt czyta obie wklejki.
         if (r.depo && r.bal) bits.push('<span style="color:#374151">depozyty: <strong style="color:#0369a1">' + r.depo +
             '</strong> · balance: <strong style="color:#7c3aed">' + r.bal + '</strong></span>');
         else if (r.depo) bits.push('<span style="color:#0369a1">same depozyty: <strong>' + r.depo + '</strong></span>');
@@ -11845,8 +11803,9 @@
     }
 
     panel.querySelector('#tm-check-btn').onclick = async () => {
-        // Jedna wklejka na depozyty i balance. Kazdy blad parsowania blokuje calosc —
-        // ani jeden zly wiersz nie moze przepuscic reszty (dawniej depozyty gubily go po cichu).
+        // Jeden przycisk czyta OBA pola — depozyty i balance ida do jednej listy. Kazdy blad
+        // parsowania, w ktoryms kolwiek polu, blokuje calosc: ani jeden zly wiersz nie moze
+        // przepuscic reszty (dawniej depozyty gubily go po cichu).
         const r = balParseCurrent();
         updateTextPreview();
         if (r.errors.length || !r.entries.length) {
@@ -12055,8 +12014,15 @@
         const opening = panel.style.display === 'none';
         panel.style.display = opening ? 'block' : 'none';
         if (opening) {
-            document.getElementById('tm-order-input')
-                ?.addEventListener('input', updateTextPreview);
+            // Oba pola odswiezaja to samo wspolne podsumowanie. Flaga pilnuje, zeby przy
+            // kolejnym otwarciu panelu nie dokleic drugiego takiego samego sluchacza.
+            ['tm-order-input', 'tm-bal-input'].forEach(function (id) {
+                const t = document.getElementById(id);
+                if (t && !t.dataset.tmBound) {
+                    t.dataset.tmBound = '1';
+                    t.addEventListener('input', updateTextPreview);
+                }
+            });
         }
     };
 
