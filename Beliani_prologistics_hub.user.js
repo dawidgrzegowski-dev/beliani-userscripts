@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.93
+// @version      1.94
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -1623,7 +1623,18 @@
         });
     }
 
+    // 1.94: co parser ZROBIL z wklejka — zeby podglad nie musial udawac, ze liczba
+    // pozycji to liczba wierszy. bol scala kilka zwrotow tego samego fulfilmentu w
+    // jedna kwote, wiec „115 pozycji” moze pochodzic z 121 wierszy. Osobna zmienna,
+    // a nie wlasciwosc zwracanej tablicy — nikt inny tego nie dotyka.
+    var PARSE_INFO = { fmt: '', rows: 0, items: 0, merged: 0, mergedList: [] };
+    function parseInfoLine(inf) {
+        const i = inf || PARSE_INFO;
+        if (!i || !i.rows || !i.merged) return '';
+        return ` (z ${i.rows} wierszy zwrotów — ${i.merged} ${i.merged === 1 ? 'fulfilment ma' : 'fulfilmentów ma'} po kilka zwrotów, zsumowane)`;
+    }
     function parseExcel(raw) {
+        PARSE_INFO = { fmt: '', rows: 0, items: 0, merged: 0, mergedList: [] };
         const lines = String(raw || '')
             .split(/\r?\n/)
             .map(line => line.trimEnd())
@@ -1707,7 +1718,9 @@
             }
 
             const sums = new Map();      // orderNumber -> suma (float)
+            const cnt = new Map();       // orderNumber -> ile wierszy sie na to zlozylo
             const order = [];            // zachowanie kolejności pojawienia się
+            let nRows = 0;               // wiersze zwrotow wziete pod uwage
             for (const r of rows) {
                 const type = String(r[0] || '').trim().toLowerCase();
                 if (!type.startsWith('correctie verkoopprijs artikel')) continue;
@@ -1715,17 +1728,27 @@
                 const orderNumber = cleanOrder(r[5]);
                 const amount = parseBolAmount(r[9]);
                 if (!orderNumber || amount == null || amount === 0) continue;
+                nRows++;
                 if (!sums.has(orderNumber)) order.push(orderNumber);
                 sums.set(orderNumber, (sums.get(orderNumber) || 0) + amount);
+                cnt.set(orderNumber, (cnt.get(orderNumber) || 0) + 1);
             }
 
-            return order
+            const outBol = order
                 .map(orderNumber => {
                     const total = sums.get(orderNumber);
                     if (total == null || Math.abs(total) === 0) return null;
                     return { orderNumber, amount: total.toFixed(2), source: 'bol' };
                 })
                 .filter(Boolean);
+            // Ile fulfilmentow powstalo ze WIECEJ NIZ jednego wiersza — to jest ta roznica
+            // miedzy liczba wierszy a liczba pozycji, o ktora zawsze pyta ksiegowosc.
+            const mList = outBol
+                .filter(x => (cnt.get(x.orderNumber) || 0) > 1)
+                .map(x => ({ orderNumber: x.orderNumber, rows: cnt.get(x.orderNumber), amount: x.amount }));
+            PARSE_INFO = { fmt: 'bol', rows: nRows, items: outBol.length,
+                merged: mList.length, mergedList: mList };
+            return outBol;
         }
 
         // NOWY FORMAT Allegro CZ/HU/SK/PL: Data | Order number (UUID) | Kwota | Typ (B2B/B2C).
@@ -2340,8 +2363,18 @@
         applyAllegroLock(items);
         const el = document.getElementById('tm-t-parse-preview');
         if (!el) return;
+        // 1.94: liczba pozycji to liczba FULFILMENTOW, nie wierszy. Gdy bol przysyla dwa
+        // zwroty na ten sam numer, skrypt ksieguje ich SUME — i teraz to widac wprost,
+        // razem z lista scalonych numerow, zeby nie trzeba bylo liczyc w Excelu.
+        const inf = PARSE_INFO;
+        const note = parseInfoLine(inf);
+        const mlist = (inf && inf.merged)
+            ? `<div style="color:#c47f00;margin-top:2px">⚠ zsumowane: `
+                + inf.mergedList.slice(0, 12).map(m => `<strong>${m.orderNumber}</strong> ${m.rows}×→${m.amount}`).join(', ')
+                + (inf.mergedList.length > 12 ? '…' : '') + `</div>`
+            : '';
         el.innerHTML = items.length
-            ? `<span style="color:#16a34a">✓ ${items.length} pozycji:</span> ` + items.slice(0, 20).map(i => `<strong>${i.orderNumber}</strong>→${i.amount}`).join(', ') + (items.length > 20 ? '…' : '')
+            ? `<span style="color:#16a34a">✓ ${items.length} pozycji${note}:</span> ` + items.slice(0, 20).map(i => `<strong>${i.orderNumber}</strong>→${i.amount}`).join(', ') + (items.length > 20 ? '…' : '') + mlist
             : '<span style="color:#888">Nie znaleziono pozycji</span>';
     }
 
@@ -13914,19 +13947,28 @@
             return nxt >= 0 ? after.slice(0, 5 + nxt) : after;
         }
         // Zalaczniki w sekcji. Data brana z ogonka za linkiem, ucietego przed kolejnym <a>.
+        // 1.94: atrybuty czytane z poszanowaniem cudzyslowow. Prologistics wiesza na linku
+        // onmouseover="Tip('...<b>...</b>...')", a w tresci podpowiedzi SA znaki ">" —
+        // stare [^>]*> urywalo sie w srodku atrybutu i do nazwy pliku wchodzil ogon HTML
+        // (')" onmouseout="UnTip()">Order 19066, ...pdf). Teraz ">" w cudzyslowach nie konczy tagu.
         function bcDocsIn(sec){
             var s = String(sec == null ? '' : sec), out = [];
-            var re = /<a[^>]*href="([^"]*doc\.php\?[^"]*doc_id=(\d+)[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, m;
+            var re = /<a(?=[\s>])((?:[^>"']|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/a>/gi, m;
             while ((m = re.exec(s))){
-                var href = bcUnent(m[1]);
+                var at = String(m[1] || '');
+                var hm = at.match(/href\s*=\s*"([^"]*)"/i) || at.match(/href\s*=\s*'([^']*)'/i);
+                if (!hm) continue;
+                var href = bcUnent(hm[1]);
+                var im = href.match(/doc\.php\?[^"'\s]*doc_id=(\d+)/i);
+                if (!im) continue;
                 if (/[?&](?:del|delete|remove)\b/i.test(href) || /action=(?:del|remove)/i.test(href)) continue;
-                var name = bcUnent(String(m[3] || '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+                var name = bcUnent(String(m[2] || '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
                 var tail = s.slice(re.lastIndex, re.lastIndex + 400);
                 var cut = tail.search(/<a[\s>]/i); if (cut >= 0) tail = tail.slice(0, cut);
                 tail = bcUnent(tail.replace(/<[^>]*>/g, ' '));
                 var dm = tail.match(/\bon\s+(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/i);
                 var bm = tail.match(/\bby\s+(.+?)\s+on\s+\d{4}-\d{2}-\d{2}/i);
-                out.push({ href: href, id: m[2], name: name,
+                out.push({ href: href, id: im[1], name: name,
                     date: dm ? dm[1] : '', time: (dm && dm[2]) ? dm[2] : '',
                     by: bm ? bm[1].replace(/[(\s]+$/, '').replace(/^[(\s]+/, '').trim() : '' });
             }
@@ -13973,7 +14015,8 @@
         async function bcGrabConfs(orders, day, io, say, workers){
             var IO = io || bcIO(), ord = (orders || []).slice(), errs = [];
             var stat = { orders: ord.length, pages: 0, pageErr: 0, docs: 0, sameDay: 0, noDate: 0,
-                files: 0, got: 0, fail: 0, notPdf: 0, parseErr: 0, pdfs: 0, day: day || '' };
+                files: 0, got: 0, fail: 0, notPdf: 0, parseErr: 0, pdfs: 0, day: day || '',
+                noConf: 0, noConfList: [] };
             if (!ord.length) return { pdfs: [], stat: stat, errs: errs };
             var W = workers || 5, seen = 0;
             if (say) say('Czytam zamówienia: 0/' + ord.length + '…', '#666');
@@ -13984,7 +14027,7 @@
                 if (say) say('Czytam zamówienia: ' + seen + '/' + ord.length + '…', '#666');
                 return { o: o, html: html || '' };
             });
-            var uniq = {}, from = {};
+            var uniq = {}, from = {}, none = [];
             pages.forEach(function(p){
                 if (!p || p.err || !p.html){
                     stat.pageErr++;
@@ -13992,18 +14035,29 @@
                     return;
                 }
                 stat.pages++;
+                // 1.94: liczymy TRAFIENIA dla tego zamowienia. Zero = nikt nie dopial
+                // potwierdzenia z wybranego dnia i trzeba o to kogos poprosic.
+                var hit = 0;
                 var sec = bcDocSection(p.html, BC_DOC_TYPE);
-                if (!sec) return;
-                bcDocsIn(sec).forEach(function(d){
+                if (sec) bcDocsIn(sec).forEach(function(d){
                     stat.docs++;
                     if (!d.date){ stat.noDate++; return; }
                     if (day && d.date !== day) return;
                     stat.sameDay++;
+                    hit++;
                     var k = bcDocKey(d);
                     if (!uniq[k]){ uniq[k] = d; from[k] = []; }
                     if (from[k].indexOf(p.o) < 0) from[k].push(p.o);
                 });
+                if (!hit && p.o != null && String(p.o) !== '' && none.indexOf(p.o) < 0) none.push(p.o);
             });
+            none.sort(function(x, y){
+                var a = Number(x), b = Number(y);
+                if (isFinite(a) && isFinite(b) && a !== b) return a - b;
+                return String(x) < String(y) ? -1 : (String(x) > String(y) ? 1 : 0);
+            });
+            stat.noConfList = none;
+            stat.noConf = none.length;
             var keys = Object.keys(uniq);
             stat.files = keys.length;
             if (!keys.length) return { pdfs: [], stat: stat, errs: errs };
@@ -14134,7 +14188,18 @@
                 + (s.fail ? (', nie pobrano: ' + s.fail) : '')
                 + (s.notPdf ? (', nie PDF: ' + s.notPdf) : '')
                 + (s.parseErr ? (', nie odczytano: ' + s.parseErr) : '')
+                + (s.noConf ? ('  ·  zamówień bez potwierdzenia: ' + s.noConf) : '')
                 + ')';
+        }
+        // 1.94: wprost, KOGO poprosic o dopiecie pliku. Zamowienia, w ktorych sekcja
+        // „Payment conformation” nie ma ani jednego zalacznika z wybranego dnia.
+        // Strona nieodczytana NIE trafia tutaj — tam nie wiemy, czy zalacznik jest.
+        function bcNoConfLine(g){
+            var s = (g || {}).stat;
+            if (!s || !s.noConf) return '';
+            var l = (s.noConfList || []).slice();
+            return 'Zamówienia bez potwierdzenia' + (s.day ? (' z dnia ' + s.day) : '')
+                + ' (' + s.noConf + '): ' + l.join(', ');
         }
         function bcVerdict(R){
             if (R.nErr || R.nMiss || R.nOrphReal) return { t: 'SĄ RÓŻNICE — sprawdź przed zamknięciem dnia', c: '#c00' };
@@ -14153,6 +14218,7 @@
                 + '  ·  zrobiony wersją ' + (R.head.ver || '—') + (R.head.gen ? (' z ' + R.head.gen) : ''));
             L.push('PDF:   ' + R.nPdf + ' potwierdzeń' + (R.nMerged ? ('  ·  scalone kopie tego samego przelewu: ' + R.nMerged) : ''));
             if (R.grab) L.push(bcGrabLine(R.grab));
+            if (R.grab && bcNoConfLine(R.grab)) L.push('!!! ' + bcNoConfLine(R.grab));
             L.push('WYNIK: ' + v.t + '   (zgodne ' + R.nOk + ', uwagi ' + R.nWarn + ', błędy ' + R.nErr
                 + ', bez potwierdzenia ' + R.nMiss + ', w banku bez odpowiednika ' + R.nOrphReal + ')');
             L.push('');
@@ -14252,6 +14318,10 @@
             if (R.grab){
                 h += '<div style="font-size:11px;color:#0a58ca;background:#f2f7ff;border:1px solid #cfe0ff;border-radius:5px;'
                    + 'padding:5px 8px;margin-bottom:8px">⬇ ' + esc(bcGrabLine(R.grab))
+                   + (bcNoConfLine(R.grab)
+                        ? ('<div style="color:#c47f00;margin-top:3px;font-weight:600">⚠ '
+                            + bcLinkOrders(esc(bcNoConfLine(R.grab)), (R.grab.stat || {}).noConfList || []) + '</div>')
+                        : '')
                    + '<div style="color:#888;margin-top:2px">Pliki czytane prosto do pamięci przeglądarki — nic nie zapisuje się na dysku.</div></div>';
             }
             var nAll = 0, nSel = 0;
@@ -15528,6 +15598,10 @@
                 if (!GRAB || !GRAB.stat) return '';
                 return '<div style="margin-top:6px;font-size:11px;color:#0a58ca;background:#f2f7ff;border:1px solid #cfe0ff;'
                     + 'border-radius:6px;padding:5px 8px">⬇ ' + esc(bcGrabLine(GRAB))
+                    + (bcNoConfLine(GRAB)
+                        ? ('<div style="color:#c47f00;margin-top:3px;font-weight:600">⚠ '
+                            + bcLinkOrders(esc(bcNoConfLine(GRAB)), (GRAB.stat || {}).noConfList || []) + '</div>')
+                        : '')
                     + '<div style="color:#888;margin-top:2px">Czytane prosto do pamięci — nic nie zapisuje się na dysku.</div></div>';
             }
             function renderList(){
@@ -15649,12 +15723,13 @@
                 busy = false;
                 GRAB = g; renderList();
                 var st = g.stat;
-                say(st.pdfs
+                var miss = st.noConf ? (' Bez potwierdzenia: ' + st.noConf + ' zamówień — ' + (st.noConfList || []).join(', ') + '.') : '';
+                say((st.pdfs
                     ? ('Dociągnięte: ' + st.pdfs + ' potwierdzeń z ' + st.files + ' plików, z ' + st.pages + '/' + st.orders
                         + ' zamówień' + (day ? (', z dnia ' + day) : ', bez filtra daty') + '.')
                     : ('Nie znalazłem ani jednego potwierdzenia' + (day ? (' z dnia ' + day) : '')
-                        + ' — przejrzane zamówienia: ' + st.pages + '/' + st.orders + ', załączników w sekcji: ' + st.docs + '.'),
-                    st.pdfs ? '#0a0' : '#c47f00');
+                        + ' — przejrzane zamówienia: ' + st.pages + '/' + st.orders + ', załączników w sekcji: ' + st.docs + '.')) + miss,
+                    st.pdfs ? (st.noConf ? '#c47f00' : '#0a0') : '#c47f00');
                 return st.pdfs;
             }
             sp.querySelector('#sp-grab').onclick = function(){ doGrab(); };
