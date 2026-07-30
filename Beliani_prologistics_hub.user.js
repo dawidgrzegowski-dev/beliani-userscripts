@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.97
+// @version      1.98
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -2026,6 +2026,7 @@
     `;
 
     const panel = document.createElement('div');
+    panel.id = 'ksieg-panel';
     panel.style.cssText = `
         display:none; position:fixed; top:204px; right:20px; z-index:999999;
         background:white; border:1px solid #ccc; border-radius:10px;
@@ -2343,6 +2344,8 @@
             dateInp.disabled = true;
             dateInp.placeholder = 'z listy (per wiersz)';
             dateInp.value = '';
+            // Zapamietaj konto sprzed przelaczenia — patrz komentarz w galezi else.
+            if (accInp.dataset.prevAcc === undefined) accInp.dataset.prevAcc = accInp.value;
             const r = document.querySelector('input[name="tm-t-allegro-acc-r"]:checked');
             accInp.value = r ? r.value : '1069';
             accInp.readOnly = true;
@@ -2353,6 +2356,14 @@
             dateInp.disabled = false;
             dateInp.placeholder = 'YYYY-MM-DD';
             accInp.readOnly = false;
+            // Wyjscie z trybu Allegro przywraca konto sprzed przelaczenia. Wczesniej
+            // w polu zostawalo 1069 narzucone przez Allegro i kolejna, zwykla wklejka
+            // szla na to konto — pole bylo juz odblokowane, wiec nic nie ostrzegalo.
+            if (accInp.dataset.prevAcc !== undefined) {
+                accInp.value = accInp.dataset.prevAcc;
+                delete accInp.dataset.prevAcc;
+                updateAccountLabel();
+            }
             if (accToggle) accToggle.style.display = 'none';
             if (note) note.style.display = 'none';
         }
@@ -3478,7 +3489,10 @@
         // 2. Rozbity match: ≥2 wpisy z naszą datą, sumujące się do oczekiwanej kwoty
         const sameDateEntries = entries.filter(e => e.date === expectedDate);
         if (sameDateEntries.length >= 2) {
-            const sum = sameDateEntries.reduce((s, e) => s + e.amount, 0);
+            // e.amount pochodzi z normalizeAmount i jest TEKSTEM ("113.00").
+            // Bez parseFloat "+" sklejal napisy i suma nigdy sie nie zgadzala,
+            // wiec petla ponawiala ksiegowanie -> podwojne wpisy.
+            const sum = sameDateEntries.reduce((s, e) => s + (parseFloat(e.amount) || 0), 0);
             if (Math.abs(sum - expectedAmount) < 0.02) {
                 return {
                     matchType: 'subset',
@@ -5275,29 +5289,49 @@
         for (let w = 1; w <= workersCount; w++) {
             workers.push(workerLoop(w));
         }
-        await Promise.all(workers);
+        // try/finally: to jest przebieg, ktory naprawde ksieguje. Gdyby ktorykolwiek
+        // worker rzucil, panel zostawal zablokowany („⏳") i nie dalo sie ani wyczyscic,
+        // ani powtorzyc — a czesc pozycji byla juz zaksiegowana.
+        try {
+            await Promise.all(workers);
 
-        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-        buildInitialTable(previewRows);
-        if (fail === 0) clearProgress();
+            const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+            buildInitialTable(previewRows);
+            if (fail === 0) clearProgress();
 
-        const summary = document.getElementById('tm-t-summary');
-        const _srvStatsP = formatServerStatsHtml(computeServerStats()); // v3.22
-        summary.innerHTML = (fail === 0
-            ? `🎉 Zaksięgowano teraz: <strong>${ok}</strong>. ℹ️ Już było: <strong>${already}</strong>.${escalated ? ` ⚠️ Eskalacje: <strong>${escalated}</strong>.` : ''} Czas: ${elapsed}s (${workersCount} workerów).`
-            : `✅ Zaksięgowano teraz: <strong>${ok}</strong> &nbsp; ℹ️ Już było: <strong>${already}</strong>${escalated ? ` &nbsp; ⚠️ Eskalacje: <strong>${escalated}</strong>` : ''} &nbsp; ❌ Błędy: <strong>${fail}</strong> &nbsp; Czas: ${elapsed}s (${workersCount} workerów)`) + _srvStatsP;
-        summary.style.color = fail === 0 ? (escalated ? '#d97706' : '#16a34a') : '#b45309';
-        updateIssueReport();
-
-        tmIsBusy = false;
-        parallelBtn.disabled = false;
-        parallelBtn.textContent = '🚀 Sprawdź i zaksięguj RÓWNOLEGLE';
-        checkBtn.disabled = false;
+            const summary = document.getElementById('tm-t-summary');
+            const _srvStatsP = formatServerStatsHtml(computeServerStats()); // v3.22
+            summary.innerHTML = (fail === 0
+                ? `🎉 Zaksięgowano teraz: <strong>${ok}</strong>. ℹ️ Już było: <strong>${already}</strong>.${escalated ? ` ⚠️ Eskalacje: <strong>${escalated}</strong>.` : ''} Czas: ${elapsed}s (${workersCount} workerów).`
+                : `✅ Zaksięgowano teraz: <strong>${ok}</strong> &nbsp; ℹ️ Już było: <strong>${already}</strong>${escalated ? ` &nbsp; ⚠️ Eskalacje: <strong>${escalated}</strong>` : ''} &nbsp; ❌ Błędy: <strong>${fail}</strong> &nbsp; Czas: ${elapsed}s (${workersCount} workerów)`) + _srvStatsP;
+            summary.style.color = fail === 0 ? (escalated ? '#d97706' : '#16a34a') : '#b45309';
+            updateIssueReport();
+        } catch (e) {
+            try { buildInitialTable(previewRows); } catch (e2) {}
+            const summary = document.getElementById('tm-t-summary');
+            if (summary) {
+                summary.textContent = '❌ Przerwane: ' + ((e && e.message) ? e.message : String(e))
+                    + ' — zaksięgowano ' + ok + ', już było ' + already + ', błędy ' + fail
+                    + '. Sprawdź, co przeszło, zanim powtórzysz.';
+                summary.style.color = '#b45309';
+            }
+            try { updateIssueReport(); } catch (e3) {}
+        } finally {
+            tmIsBusy = false;
+            parallelBtn.disabled = false;
+            parallelBtn.textContent = '🚀 Sprawdź i zaksięguj RÓWNOLEGLE';
+            checkBtn.disabled = false;
+        }
     };
 
     panel.querySelector('#tm-t-clear-btn').onclick = () => {
+        // Jak wyzej: dopoki workery chodza, previewRows musi zostac na miejscu.
+        if (tmIsBusy) {
+            const _s = document.getElementById('tm-t-summary');
+            if (_s) { _s.innerHTML = '⏳ Trwa księgowanie — poczekaj do końca albo odśwież stronę.'; _s.style.color = '#b45309'; }
+            return;
+        }
         previewRows = [];
-        tmIsBusy = false;
         clearProgress();
         document.getElementById('tm-t-input').value = '';
         // v3.60: reset blokady trybu Allegro po Wyczysc (inaczej data/konto zostawaly zablokowane na 1069/1071)
@@ -5396,6 +5430,7 @@
     `;
 
     const refundPanel = document.createElement("div");
+    refundPanel.id = 'refund-panel';
     refundPanel.style.cssText = `
         display: none; position: fixed;
         top: 108px; right: 20px;
@@ -5985,6 +6020,10 @@
         dupDiv.innerHTML = '';
         executedDiv.innerHTML = '';
         dupSection.style.display = 'none';
+        // „zaznacz wszystkie" zostawalo zaznaczone po poprzednim przebiegu, choc lista
+        // byla juz pusta — nastepny wynik wygladal jak caly zaznaczony
+        const execAll = document.getElementById('tm-exec-all');
+        if (execAll) execAll.checked = false;
 
         const okList = [];
         const failList = [];
@@ -6188,6 +6227,9 @@
     const CCY = new Set(['EUR','USD','GBP','PLN','CHF','CZK','HUF','SEK','NOK','DKK','RON','BGN','HRK','ISK','TRY','JPY','CAD','AUD','CNY','RSD','UAH','AED']);
     // Zestaw znakow SEPA (EPC) dla nazwy/tytulu.
     const NON_SEPA = /[^A-Za-z0-9\/\-?:().,'+ ]/;
+    // Osobna, globalna kopia do .replace(). Do .test() flaga /g byc NIE moze —
+    // pamieta lastIndex i co drugie sprawdzenie tego samego tekstu klamie.
+    const NON_SEPA_G = /[^A-Za-z0-9\/\-?:().,'+ ]/g;
     // Transliteracja niemiecka (DFÜ Anlage 3) + typowe znaki.
     const TRANSLIT = {
         'ä':'ae','ö':'oe','ü':'ue','Ä':'Ae','Ö':'Oe','Ü':'Ue','ß':'ss',
@@ -6264,7 +6306,7 @@
     function translit(s) {
         let out = String(s || '').split('').map(ch => (ch in TRANSLIT ? TRANSLIT[ch] : ch)).join('');
         out = out.normalize('NFD').replace(/[\u0300-\u036f]/g, '');   // rozklad + usuniecie diakrytykow
-        out = out.replace(NON_SEPA, ' ');                              // cokolwiek zostalo poza SEPA -> spacja
+        out = out.replace(NON_SEPA_G, ' ');                            // cokolwiek zostalo poza SEPA -> spacja (WSZYSTKO, nie pierwszy znak)
         out = out.replace(/\s{2,}/g, ' ').trim();
         return out;
     }
@@ -6533,7 +6575,9 @@
         const fileInput = ov.querySelector('#sepa-file');
         const drop = ov.querySelector('#sepa-drop');
         ov.querySelector('#sepa-pick').onclick = () => fileInput.click();
-        fileInput.onchange = e => { const f = e.target.files[0]; if (f) readFile(f); };
+        // value czyszczone po odczycie — bez tego wybranie DRUGI RAZ tego samego
+        // pliku (np. po poprawce w edytorze) nie odpala zdarzenia change.
+        fileInput.onchange = e => { const f = e.target.files[0]; if (f) readFile(f); e.target.value = ''; };
         drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
         drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
         drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('drag'); const f = e.dataTransfer.files[0]; if (f) readFile(f); });
@@ -6651,11 +6695,23 @@
         inp.value = r[key] == null ? '' : r[key];
         const revalidate = () => {
             r[key] = inp.value;
-            try { validateRow(r); } catch (e) {}
-            const tr = td.parentElement;
-            if (tr) {
-                tr.className = r.errs.length ? 'err' : (r.warns.length ? 'warnrow' : '');
-                const st = tr.querySelector('td.st');
+            // validateAll, nie validateRow: validateRow zeruje r.errs/r.warns, a ostrzezenia
+            // o zdublowanym IBAN/EndToEndId dokleja dopiero markDuplicates. Sama rewalidacja
+            // wiersza kasowala je wiec po cichu — i nie zauwazalaby duplikatu wlasnie utworzonego.
+            try { validateAll(); } catch (e) { try { validateRow(r); } catch (e2) {} }
+            const myTr = td.parentElement;
+            const body = myTr ? myTr.parentElement : null;
+            if (body) {
+                const trs = body.children;
+                for (let i = 0; i < trs.length && i < model.length; i++) {
+                    const rr = model[i], tr = trs[i];
+                    tr.className = rr.errs.length ? 'err' : (rr.warns.length ? 'warnrow' : '');
+                    const st = tr.querySelector('td.st');
+                    if (st) st.innerHTML = statusHtml(rr);
+                }
+            } else if (myTr) {
+                myTr.className = r.errs.length ? 'err' : (r.warns.length ? 'warnrow' : '');
+                const st = myTr.querySelector('td.st');
                 if (st) st.innerHTML = statusHtml(r);
             }
             updateSummary();
@@ -7556,9 +7612,11 @@
         function toIssuePaid(nums){
             var paste = document.getElementById('ilp-paste');
             var loadBtn = document.getElementById('ilp-load');
-            var ilpPanel = document.getElementById('ilp-panel');
+            // Chowana jest naklada #ilp-ov, a nie #ilp-panel. Ustawianie display:block
+            // na #ilp-panel nic nie otwieralo, za to na stale psulo jego uklad (flex).
+            var ilpOv = document.getElementById('ilp-ov');
             var ilpBtn = document.getElementById('ilp-btn');
-            if (ilpPanel) ilpPanel.style.display = 'block'; else if (ilpBtn) ilpBtn.click();
+            if (ilpOv) ilpOv.style.display = 'flex'; else if (ilpBtn) ilpBtn.click();
             if (paste) { paste.value = nums; paste.dispatchEvent(new Event('input', { bubbles:true })); }
             if (loadBtn) setTimeout(function(){ loadBtn.click(); }, 60);
         }
@@ -8045,6 +8103,7 @@
         'position:fixed;top:252px;right:20px;z-index:999999;padding:10px 15px;background:#FF2F00;color:white;border:none;border-radius:8px;cursor:pointer;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.2);';
 
     const panel = document.createElement('div');
+    panel.id = 'klient-panel';
     panel.style.cssText =
         'display:none;position:fixed;top:298px;right:20px;z-index:999999;background:white;border:1px solid #ccc;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:16px;width:min(1100px, calc(100vw - 40px));font-family:sans-serif;max-height:calc(100vh - 320px);overflow-y:auto;';
 
@@ -9187,30 +9246,40 @@
                     await sleep(200);
                     continue;
                 }
-                previewRows[i]._taken = true;
+                // Trzymamy sam WIERSZ, nie indeks. „Wyczysc" w trakcie pracy podmienia
+                // previewRows na pusta tablice i previewRows[i] w finally bylo juz
+                // undefined — worker wywalal sie na .orderNumber i konczyl bez sprzatania.
+                const row = previewRows[i];
+                row._taken = true;
                 if (i === next) { while (next < previewRows.length && previewRows[next]._taken) next++; }
-                activeOrders.add(previewRows[i].orderNumber);
+                activeOrders.add(row.orderNumber);
                 try {
-                    await processRowCheckAndChange(previewRows[i], i, ctx, progressList, counters);
+                    await processRowCheckAndChange(row, i, ctx, progressList, counters);
                 } finally {
-                    activeOrders.delete(previewRows[i].orderNumber);
+                    activeOrders.delete(row.orderNumber);
                 }
             }
         }
 
+        // finally obejmuje TAKZE odblokowanie guzika i tmIsBusy. Wczesniej wyjatek
+        // z ktoregokolwiek workera przelatywal nad tymi liniami i panel zostawal
+        // zablokowany na dobre — pomagalo tylko przeladowanie strony.
         try {
             await Promise.all(ctxs.map(worker));
+            buildTable();
+            summary.innerHTML = '✅ Zmienione: <strong>' + counters.ok + '</strong> &nbsp; ❌ Błędy: <strong>' + counters.fail + '</strong> &nbsp; ⏭️ Pominięte: <strong>' + counters.skipped + '</strong>';
+            summary.style.color = counters.fail === 0 ? '#16a34a' : '#b45309';
+        } catch (e) {
+            try { buildTable(); } catch (e2) {}
+            summary.textContent = '❌ Przerwane: ' + ((e && e.message) ? e.message : String(e))
+                + ' (zmienione ' + counters.ok + ', błędy ' + counters.fail + ', pominięte ' + counters.skipped + ')';
+            summary.style.color = '#b45309';
         } finally {
             ctxs.forEach(destroyFrameCtx);
+            tmIsBusy = false;
+            timeoutMult = 1;
+            b.disabled = false; b.textContent = '🚀 Sprawdź i zmień RÓWNOLEGLE';
         }
-
-        buildTable();
-        summary.innerHTML = '✅ Zmienione: <strong>' + counters.ok + '</strong> &nbsp; ❌ Błędy: <strong>' + counters.fail + '</strong> &nbsp; ⏭️ Pominięte: <strong>' + counters.skipped + '</strong>';
-        summary.style.color = counters.fail === 0 ? '#16a34a' : '#b45309';
-
-        tmIsBusy = false;
-        timeoutMult = 1;
-        b.disabled = false; b.textContent = '🚀 Sprawdź i zmień RÓWNOLEGLE';
     };
 
     panel.querySelector('#tm-c-check-change-btn').onclick = async function () {
@@ -9374,7 +9443,9 @@
                 row.selected = false;
                 row.changed = true;
                 row.skipped = false;
-                row.currentType = result.targetType || 'B2B';
+                // changeCustomerType zwraca confirmedType (targetType nie istnieje
+                // w tym obiekcie) — bez tego kazda udana zmiana na B2C pokazywala sie jako B2B.
+                row.currentType = result.confirmedType || result.targetType || row.targetType || 'B2B';
 
                 if (result.amazonRebooked) {
                     logRow.innerHTML =
@@ -9470,8 +9541,14 @@
     };
 
     panel.querySelector('#tm-c-clear-btn').onclick = function () {
+        // Czyszczenie w trakcie pracy wyrywalo workerom wiersze spod rak i kasowalo
+        // tmIsBusy, wiec dalo sie odpalic drugi przebieg na tych samych orderach.
+        if (tmIsBusy) {
+            const _s = document.getElementById('tm-c-summary');
+            if (_s) { _s.innerHTML = '⏳ Trwa przetwarzanie — poczekaj do końca albo odśwież stronę.'; _s.style.color = '#b45309'; }
+            return;
+        }
         previewRows = [];
-        tmIsBusy = false;
 
         document.getElementById('tm-c-input').value = '';
         document.getElementById('tm-c-parse-preview').innerHTML =
@@ -9587,7 +9664,9 @@
                 var cb = checked[j];
                 var idx = parseInt(cb.getAttribute('data-idx'), 10);
                 var row = fastItems[idx];
-                var cont = cb.closest('[data-idx]');
+                // cb sam ma data-idx, wiec closest('[data-idx]') zwracal checkbox,
+                // a .tm-c-fast-note lezy obok niego — status nigdy sie nie pokazywal.
+                var cont = cb.parentNode;
                 var note = cont ? cont.querySelector('.tm-c-fast-note') : null;
                 if (!row || !row.auction) { err++; if (note) { note.style.color = '#dc2626'; note.textContent = ' \u274C brak __AUCTION'; } continue; }
                 await fastChange(row.auction, row.target);
@@ -9966,6 +10045,7 @@
 
         const panel = document.createElement('div');
         panelEl = panel;
+        panel.id = 'allegro-panel';
         panel.style.cssText =
             'display:' + (openIt ? 'block' : 'none') + ';position:fixed;top:166px;right:20px;z-index:2147483647;background:white;border:1px solid #ccc;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:16px;width:min(720px, calc(100vw - 40px));font-family:sans-serif;max-height:calc(100vh - 190px);overflow-y:auto;';
 
@@ -10944,7 +11024,7 @@
     // liczbe stron) idziemy OD KONCA i przerywamy, gdy mamy juz wszystkie szukane numery —
     // zwykle wystarczaja 2 zapytania zamiast 30.
     const BAL_CLAIM_URL = '/api/rest/penalty/list?log=1&filter[inactive]=0&filter[applied]=1&page=';
-    const balClaimStore = { byId: {}, loading: false, error: null, done: false, pages: 0, fetched: 0 };
+    const balClaimStore = { byId: {}, missed: {}, loading: false, error: null, done: false, pages: 0, fetched: 0 };
     let balOtherPick = {};
 
     async function balClaimPage(page) {
@@ -10972,8 +11052,11 @@
     async function balEnsureClaims(ids) {
         // Po bledzie NIE ponawiamy sami — inaczej kazde przeliczenie podgladu wysylaloby
         // kolejne zapytanie w kolko. Ponowienie jest recznie, linkiem w ramce „other".
-        if (balClaimStore.loading || balClaimStore.done || balClaimStore.error) return;
-        const want = (ids || []).filter(function (id) { return !balClaimStore.byId[id]; });
+        // „done" juz nie blokuje: numer zalozony PO przemiataniu nigdy by sie nie doczytal.
+        // Zamiast tego pamietamy w missed te numery, ktorych w calej liscie nie bylo — o nie
+        // nie pytamy drugi raz, a nowy numer normalnie uruchamia kolejny przebieg.
+        if (balClaimStore.loading || balClaimStore.error) return;
+        const want = (ids || []).filter(function (id) { return !balClaimStore.byId[id] && !balClaimStore.missed[id]; });
         if (!want.length) return;
         balClaimStore.loading = true;
         balClaimStore.error = null;
@@ -10992,7 +11075,10 @@
             }
             // Pelny przemiat = mamy wszystko, wiec nie ma po co pytac drugi raz. Przerwanie
             // w polowie zostawia „done" na false, zeby przy innej wklejce doczytac reszte.
-            if (swept) balClaimStore.done = true;
+            if (swept) {
+                balClaimStore.done = true;
+                want.forEach(function (id) { if (!balClaimStore.byId[id]) balClaimStore.missed[id] = 1; });
+            }
         } catch (e) {
             balClaimStore.error = (e && e.message) ? e.message : String(e);
         }
@@ -11131,6 +11217,8 @@
             a.addEventListener('click', function (ev) {
                 ev.preventDefault();
                 balClaimStore.error = null;
+                balClaimStore.missed = {};   // reczne ponowienie pyta takze o te, ktorych nie znalazl
+                balClaimStore.done = false;
                 balOtherSig = '';
                 updateTextPreview();
             });
@@ -12257,10 +12345,14 @@
                 });
             }
         }
-        await Promise.all(Array.from({ length: Math.min(workersCheck, idQueue.length) }, checkWorker));
-
-        checkBtn.disabled = false;
-        checkBtn.textContent = '🔍 Sprawdź ordery';
+        // finally: gdy ktorykolwiek worker rzuci, guzik musi wrocic do zycia. Bez tego
+        // jedno odrzucone zadanie zostawialo „⏳ Sprawdzam…" na stale i pomagalo tylko F5.
+        try {
+            await Promise.all(Array.from({ length: Math.min(workersCheck, idQueue.length) }, checkWorker));
+        } finally {
+            checkBtn.disabled = false;
+            checkBtn.textContent = '🔍 Sprawdź ordery';
+        }
     };
 
     // Zmiana daty/waluty => przeliczamy ostrzezenia o duplikatach w podgladzie.
@@ -12278,17 +12370,25 @@
     // w ramce pod spodem i odswieza sie potem razem z wklejka.
     {
         const bankInp = panel.querySelector('#tm-bank-file');
+        // Znacznik przebiegu. FileReader konczy sie kiedy chce: duzy plik wybrany jako
+        // pierwszy potrafil dojechac PO malym wybranym jako drugi i nadpisac go swoim
+        // wynikiem. Odpowiedz starsza niz ostatni wybor jest teraz wyrzucana.
+        let bankGen = 0;
         if (bankInp) bankInp.addEventListener('change', function () {
             const f = this.files && this.files[0];
+            const gen = ++bankGen;
             // updateTextPreview rysuje ramke w obu swoich sciezkach — takze przy pustej
             // wklejce — wiec wystarczy jedno wywolanie.
             if (!f) { bankFile = null; try { updateTextPreview(); } catch(e) {} return; }
             const box = document.getElementById('tm-bank-box');
             if (box) box.innerHTML = '<div style="color:#6b7280;margin-top:4px;">⏳ czytam plik…</div>';
             bankReadFile(f, function (parsed) {
+                if (gen !== bankGen) return;
                 bankFile = parsed;
                 try { updateTextPreview(); } catch(e) {}
             });
+            // Ten sam plik wybrany drugi raz nie odpalal zdarzenia change.
+            try { this.value = ''; } catch (e) {}
         });
         const bankClr = panel.querySelector('#tm-bank-clear');
         if (bankClr) bankClr.addEventListener('click', function () {
@@ -12406,19 +12506,26 @@
                 await new Promise(r => setTimeout(r, 150));
             }
         }
-        await Promise.all(Array.from({ length: Math.min(workers, groups.length) }, (_, k) => worker(k + 1)));
+        // finally: przy wyjatku w ktorymkolwiek workerze guzik zostawal na zawsze
+        // wyszarzony („⏳ Księguję…") i nie dalo sie dokonczyc reszty bez przeladowania.
+        try {
+            await Promise.all(Array.from({ length: Math.min(workers, groups.length) }, (_, k) => worker(k + 1)));
+        } catch (e) {
+            fail++;
+            try { logLine('❌ przerwane: ' + ((e && e.message) ? e.message : String(e))); } catch (e2) {}
+        } finally {
+            const parts = [`✅ OK: <strong>${ok - already}</strong>`];
+            if (already)    parts.push(`⛔ już było: <strong>${already}</strong>`);
+            if (dupSkipped) parts.push(`🛡 duplikaty pominięte: <strong>${dupSkipped}</strong>`);
+            if (fail)       parts.push(`❌ błędy: <strong>${fail}</strong>`);
+            summary.innerHTML = (fail === 0 && dupSkipped === 0 && already === 0)
+                ? `🎉 Zaksięgowano wszystkie <strong>${ok}</strong> ordery poprawnie!`
+                : parts.join(' &nbsp; ');
+            summary.style.color = fail===0 ? '#16a34a' : '#b45309';
 
-        const parts = [`✅ OK: <strong>${ok - already}</strong>`];
-        if (already)    parts.push(`⛔ już było: <strong>${already}</strong>`);
-        if (dupSkipped) parts.push(`🛡 duplikaty pominięte: <strong>${dupSkipped}</strong>`);
-        if (fail)       parts.push(`❌ błędy: <strong>${fail}</strong>`);
-        summary.innerHTML = (fail === 0 && dupSkipped === 0 && already === 0)
-            ? `🎉 Zaksięgowano wszystkie <strong>${ok}</strong> ordery poprawnie!`
-            : parts.join(' &nbsp; ');
-        summary.style.color = fail===0 ? '#16a34a' : '#b45309';
-
-        bookBtn.disabled = false;
-        bookBtn.textContent = '🚀 Zaksięguj wszystkie w tle';
+            bookBtn.disabled = false;
+            bookBtn.textContent = '🚀 Zaksięguj wszystkie w tle';
+        }
     };
 
     btn.onclick = () => {
@@ -12771,32 +12878,38 @@
             var ctl = new AbortController(); var t = setTimeout(function(){ try { ctl.abort(); } catch(e){} }, ms || 20000);
             try { var r = await fetch(url, { credentials: 'same-origin', signal: ctl.signal }); clearTimeout(t); return await r.text(); } catch(e){ clearTimeout(t); return null; }
         }
+        // Nieudany fetch (timeout, chwilowy blad sieci) to NIE jest odpowiedz
+        // „firma nie ma konta". Wpisany do cache i zapisany przez saveCache
+        // zostawialby „Konto: —" na zawsze, takze po restarcie przegladarki.
+        // Dlatego pusta odpowiedz nie trafia do cache — nastepne wejscie sprobuje jeszcze raz.
         async function orderToCompany(o){
             if (_cid[o] !== undefined) return _cid[o];
-            var v = null, h = await fetchT('/op_order.php?id=' + encodeURIComponent(o));
-            if (h) { var m = h.match(/op_suppliers\.php\?company_id=(\d+)/); v = m ? m[1] : null; }
+            var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o));
+            if (h == null) return null;
+            var m = h.match(/op_suppliers\.php\?company_id=(\d+)/), v = m ? m[1] : null;
             _cid[o] = v; saveCache(); return v;
         }
         async function fetchCompany(c){
             if (_sup[c] !== undefined) return _sup[c];
             var acc = null, info = '';
             var h = await fetchT('/op_suppliers.php?company_id=' + encodeURIComponent(c));
-            if (h) {
-                var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); acc = m ? m[1].trim() : null;
-                var mi = h.match(/name="document_information"[^>]*>([\s\S]*?)<\/textarea>/i); info = mi ? mi[1].trim() : '';
-            }
+            if (h == null) return { acc: null, info: '', failed: true };
+            var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); acc = m ? m[1].trim() : null;
+            var mi = h.match(/name="document_information"[^>]*>([\s\S]*?)<\/textarea>/i); info = mi ? mi[1].trim() : '';
             _sup[c] = { acc: acc, info: info }; return _sup[c];
         }
         async function companyToAcc(c){
             if (!c) return null;
             if (_acc[c] !== undefined) return _acc[c];
             var r = await fetchCompany(c);
+            if (r.failed) return null;
             _acc[c] = r.acc; _info[c] = r.info; saveCache(); return r.acc;
         }
         async function companyToInfo(c){
             if (!c) return '';
             if (_info[c] !== undefined) return _info[c];
             var r = await fetchCompany(c);
+            if (r.failed) return '';
             if (_acc[c] === undefined) { _acc[c] = r.acc; saveCache(); }
             _info[c] = r.info; return r.info;
         }
@@ -12865,14 +12978,16 @@
         function pcCombinedKeys(){ var MG = pcMergedGroups(), set = {}; MG.combined.forEach(function(G){ set[G.key] = 1; }); return set; }
         var PC_PALETTE = ['#FFF2CC', '#00ff00', '#00ffff', '#ffff00', '#ff00ff', '#34a853', '#ffe599', '#93c47d', '#3d85c6', '#c27ba0'];
         function pcCombinedColorMap(){ var MG = pcMergedGroups(), map = {}; MG.combined.forEach(function(G, i){ map[G.key] = PC_PALETTE[i % PC_PALETTE.length]; }); return map; }
-        function pcBalAmtVal(r){ if (r && r._editAmt != null && isFinite(r._editAmt)) return r._editAmt; if (!r || r.amount == null || r.amount === '') return null; var a = parseAmount(r.amount); return isFinite(a) ? a : null; }
+        // parseMoney, nie parseAmount: parseAmount z "283'128.38" robil 283, a z
+        // "1.250,00" 1.25 — i suma grupy (liczona parseMoney) nigdy sie nie zgadzala.
+        function pcBalAmtVal(r){ if (r && r._editAmt != null && isFinite(r._editAmt)) return r._editAmt; if (!r || r.amount == null || r.amount === '') return null; var a = parseMoney(r.amount); return isFinite(a) ? a : null; }
         function pcBeginEdit(el){
             var rid = el.getAttribute('data-row'), typ = el.getAttribute('data-type'), r = state._rowMap ? state._rowMap[rid] : null;
             if (!r) return; var td = el.closest ? el.closest('td') : null; if (!td) return;
             var cur = (r._editAmt != null && isFinite(r._editAmt)) ? r._editAmt : (typ === 'd' ? pcDepAmt(r) : pcBalAmtVal(r));
             var inp = document.createElement('input'); inp.type = 'text'; inp.value = (cur == null ? '' : String(cur)); inp.style.cssText = 'width:88px;font-size:11px;padding:1px 3px';
             td.innerHTML = ''; td.appendChild(inp); inp.focus(); inp.select();
-            function done(){ var v = inp.value.trim(); if (v === '') { delete r._editAmt; } else { var n = parseAmount(v); if (isFinite(n)) r._editAmt = n; } td.innerHTML = (typ === 'd' ? pcAmtCellHtml(r, rid) : pcBalCellHtml(r, rid)); pcRefreshSums(); }
+            function done(){ var v = inp.value.trim(); if (v === '') { delete r._editAmt; } else { var n = parseMoney(v); if (isFinite(n)) r._editAmt = n; } td.innerHTML = (typ === 'd' ? pcAmtCellHtml(r, rid) : pcBalCellHtml(r, rid)); pcRefreshSums(); }
             inp.onblur = done;
             inp.onkeydown = function(e){ if (e.key === 'Enter'){ e.preventDefault(); inp.blur(); } else if (e.key === 'Escape'){ td.innerHTML = (typ === 'd' ? pcAmtCellHtml(r, rid) : pcBalCellHtml(r, rid)); } };
         }
@@ -12950,8 +13065,8 @@
                     if (pcHasChoice(r)) {
                         var chosenPi = !!(state.pcAmt && state.pcAmt[r.order] === 'pi');
                         amtCell = '<span style="white-space:nowrap">'
-                            + '<label style="cursor:pointer" title="Kwota z komentarza / systemu"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
-                            + ' <label style="cursor:pointer;color:#c47f00" title="Kwota z P/I"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="pi"' + (chosenPi ? ' checked' : '') + '> P/I ' + esc(r.pi.piAmount.toFixed(2)) + '</label>'
+                            + '<label style="cursor:pointer" title="Kwota z komentarza / systemu"><input type="radio" class="pc-amt" name="pc-amt-d-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
+                            + ' <label style="cursor:pointer;color:#c47f00" title="Kwota z P/I"><input type="radio" class="pc-amt" name="pc-amt-d-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="pi"' + (chosenPi ? ' checked' : '') + '> P/I ' + esc(r.pi.piAmount.toFixed(2)) + '</label>'
                             + '</span>';
                     } else {
                         var a = pcDepAmt(r);
@@ -13557,7 +13672,14 @@
             return L.join('\n') + '\n';
         }
         function painCfg(){
-            if (state._painCfg) return state._painCfg;
+            if (state._painCfg) {
+                // Karta zostawiona na noc trzymalaby wczorajsza date wykonania — bank
+                // odrzuca pain.001 z data z przeszlosci. Swiezosc sprawdzamy przy kazdym
+                // wejsciu, nie tylko przy pierwszym.
+                var c = state._painCfg;
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(c.exec) || c.exec < painDt(new Date())) c.exec = painDt(painNextBizDay(new Date()));
+                return c;
+            }
             // 'agt' zniknal w 1.84 — nazwa/adres banku beneficjenta nigdy nie ida obok BIC-u.
             var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, exec: '' };
             try { var raw = GM_getValue(PAIN_CFG_KEY, ''); if (raw) { var o = JSON.parse(raw); for (var k in o) if (o[k] != null) d[k] = o[k]; } } catch(e){}
@@ -14021,7 +14143,11 @@
             if (typeof x === 'number') return isFinite(x) ? Math.round(x * 100) : null;
             var s = String(x).replace(/['’  ]/g, '');
             var nc = (s.match(/,/g) || []).length, nd = (s.match(/\./g) || []).length;
-            s = (nc === 1 && nd === 0) ? s.replace(',', '.') : s.replace(/,/g, '');
+            // Jeden przecinek i DOKLADNIE trzy cyfry za nim to tysiace ("1,234" = 1234),
+            // nie czesc dziesietna — ta sama zasada co w normalizeAmount. Wczesniej
+            // "1,234" schodzilo do 123 groszy i kazda taka kwota byla „roznica".
+            var after = (nc === 1) ? (s.length - s.lastIndexOf(',') - 1) : -1;
+            s = (nc === 1 && nd === 0 && after !== 3) ? s.replace(',', '.') : s.replace(/,/g, '');
             var m = s.match(/-?\d+(?:\.\d+)?/);
             return m ? Math.round(parseFloat(m[0]) * 100) : null;
         }
@@ -14072,7 +14198,11 @@
         function bcParsePdfText(txt, fname){
             var lines = String(txt || '').split('\n'), fields = {}, cur = null;
             for (var i = 0; i < lines.length; i++){
-                var raw = lines[i].replace(/\s+$/, ''), ln = raw.trim();
+                // PDF-y z e-finance przychodza raz z apostrofem prostym ('), raz
+                // z typograficznym (’). BC_LBL trzyma prosty, wiec zamieniamy w locie —
+                // inaczej „Recipient’s account" nie trafialo w zadna etykiete i caly plik
+                // byl odrzucany jako „to nie wyglada na potwierdzenie".
+                var raw = lines[i].replace(/[‘’ʼ]/g, "'").replace(/\s+$/, ''), ln = raw.trim();
                 if (!ln) continue;
                 var hit = null;
                 for (var j = 0; j < BC_LBL.length; j++){
@@ -15052,8 +15182,8 @@
             if (!edited && pcHasChoice(r)){
                 var chosenPi = !!(state.pcAmt && state.pcAmt[r.order] === 'pi');
                 return val + '<br><span style="white-space:nowrap;font-size:10px">'
-                    + '<label style="cursor:pointer" title="Kwota z systemu"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
-                    + ' <label style="cursor:pointer;color:#c47f00" title="Kwota z P/I"><input type="radio" class="pc-amt" name="pc-amt-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="pi"' + (chosenPi ? ' checked' : '') + '> P/I ' + esc(r.pi.piAmount.toFixed(2)) + '</label>'
+                    + '<label style="cursor:pointer" title="Kwota z systemu"><input type="radio" class="pc-amt" name="pc-amt-m-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="com"' + (chosenPi ? '' : ' checked') + '> ' + esc(r.pi.comAmount.toFixed(2)) + '</label>'
+                    + ' <label style="cursor:pointer;color:#c47f00" title="Kwota z P/I"><input type="radio" class="pc-amt" name="pc-amt-m-' + esc(r.order) + '" data-order="' + esc(r.order) + '" value="pi"' + (chosenPi ? ' checked' : '') + '> P/I ' + esc(r.pi.piAmount.toFixed(2)) + '</label>'
                     + '</span>';
             }
             return val;
@@ -15954,6 +16084,14 @@
                 + (extra.length ? ' — ' + extra.join('; ') : '') + '. Teraz kliknij „Przetwórz”.';
         };
         wp.querySelector('#wp-go').onclick = async function(){
+            // Blokada powtornego kliknieca. mergeByAccount() zmienia state.bal/state.dep
+            // W MIEJSCU, wiec drugi przebieg wystartowany w trakcie pierwszego scalalby
+            // juz scalone grupy jeszcze raz — kwoty i konta rozjezdzaly sie po cichu.
+            if (state._wpBusy) return;
+            state._wpBusy = true;
+            var goBtn = this, goLbl = goBtn ? goBtn.textContent : '';
+            if (goBtn) { goBtn.disabled = true; goBtn.textContent = '⏳ Przetwarzam…'; }
+            try {
             var status = wp.querySelector('#wp-status');
             // Nowy przebieg = czysty log. Zapisujemy tez surowe wklejki, zeby dalo sie odtworzyc wejscie.
             state.diag = { bal: {}, dep: {}, raw: { bal: pcPasteTxt('#wp-balance'), dep: pcPasteTxt('#wp-depo'), depSrc: state.depoSrc || 'wklejone ręcznie' }, started: pcNow(), log: [] };
@@ -16013,6 +16151,15 @@
                 + ' | BAL komentarze \u2713' + _bc.ok + ' \u26a0' + _bc.warn + ' \u2717' + _bc.bad
                 + (_bpi ? (' | BAL P/I \u2713' + _bc.piOk + ' \u2717' + _bc.piBad) : '')
                 + (_bs.n ? (' | sumy z wklejki \u2713' + _bs.ok + '/' + _bs.n + (_bs.bad.length ? (' \u26a0 rozjazd: ' + _bs.bad.map(function(b){ return b.sup; }).join(', ')) : '')) : '') + '.';
+            } catch (e) {
+                // Wyjatek w srodku (np. zerwana siec) nie moze zostawic guzika martwego.
+                var _m = (e && e.message) ? e.message : String(e);
+                try { dlog('\u274c Przerwane: ' + _m); } catch (_e) {}
+                var _st = wp.querySelector('#wp-status'); if (_st) _st.textContent = 'Przerwane: ' + _m;
+            } finally {
+                state._wpBusy = false;
+                if (goBtn) { goBtn.disabled = false; goBtn.textContent = goLbl; }
+            }
         };
         // --- pain.001: pokaz/ukryj panel + obsluga (listener na kontenerze, bo innerHTML wymieniamy) ---
         wp.querySelector('#wp-pain').onclick = function(){
@@ -16035,7 +16182,7 @@
                 if (t.classList.contains('pain-cfg')) { painCfg()[t.getAttribute('data-k')] = t.value.trim(); painCfgSave(); renderPain(); return; }
                 if (t.classList.contains('pain-ed')) {
                     var k = t.getAttribute('data-k'), key = t.getAttribute('data-key'), val = t.value.trim();
-                    if (k === 'amount') { var n = parseAmount(val); setEd(key, 'amount', (val === '' || !isFinite(n)) ? '' : n); }
+                    if (k === 'amount') { var n = parseMoney(val); setEd(key, 'amount', (val === '' || !isFinite(n)) ? '' : n); }
                     else setEd(key, k, val);
                     renderPain(); return;
                 }
@@ -16209,14 +16356,22 @@
                 FILES = []; LAST = null; GRAB = null; SEL = {}; renderList(); box.style.display = 'none'; box.innerHTML = '';
                 say('Wyczyszczone. Wrzu\u0107 pliki jeszcze raz.', '#666');
             };
+            // Flaga „busy" nalezy do calego okna, wiec doGrab pilnuje jej tylko wtedy,
+            // gdy klika sie sam guzik dociagania. Wolanie ze srodka #sp-run musi omijac
+            // ten zamek, bo tam flaga stoi juz od wejscia w handler — inaczej doGrab
+            // wychodzil na pierwszej linii przez „return 0" i dociaganie po cichu nie
+            // ruszalo, a panel mowil, ze nie ma ani jednego potwierdzenia.
             async function doGrab(){
                 if (busy) return 0;
                 busy = true;
+                try { return await doGrabInner(); }
+                finally { busy = false; }
+            }
+            async function doGrabInner(){
                 say('Szukam numerów zamówień…', '#666');
                 var book = null;
                 try { book = await bcBookOf(FILES); } catch (e){ book = null; }
                 if (!book || !book.pays || !book.pays.length){
-                    busy = false;
                     say('Nie mam skąd wziąć numerów zamówień — wrzuć „Excel do banku” albo otwórz Wprowadzanie i kliknij Przetwórz.', '#c00');
                     return 0;
                 }
@@ -16224,11 +16379,10 @@
                 var day = String((dayEl && dayEl.value) || '').trim();
                 if (!day){ day = bcDayOf(book.head); if (dayEl && day) dayEl.value = day; }
                 var orders = bcAllOrders(book);
-                if (!orders.length){ busy = false; say('W tym Excelu nie ma numerów zamówień.', '#c00'); return 0; }
+                if (!orders.length){ say('W tym Excelu nie ma numerów zamówień.', '#c00'); return 0; }
                 var g = null;
                 try { g = await bcGrabConfs(orders, day, null, say, 5); }
-                catch (e){ busy = false; say('Dociąganie nie doszło do skutku: ' + String((e && e.message) || e), '#c00'); return 0; }
-                busy = false;
+                catch (e){ say('Dociąganie nie doszło do skutku: ' + String((e && e.message) || e), '#c00'); return 0; }
                 GRAB = g; renderList();
                 var st = g.stat;
                 var miss = st.noConf ? (' Bez potwierdzenia: ' + st.noConf + ' zamówień — ' + (st.noConfList || []).join(', ') + '.') : '';
@@ -16243,21 +16397,24 @@
             sp.querySelector('#sp-grab').onclick = function(){ doGrab(); };
             sp.querySelector('#sp-run').onclick = async function(){
                 if (busy) return;
+                // busy PRZED bcProcess(). Wczesniej flaga stawala sie dopiero w doGrab,
+                // wiec przy WLASNYCH pdf-ach (gdy doGrab w ogole nie jest wolany) drugie
+                // kliniecie startowalo rownolegly przebieg i oba pisaly do LAST/SEL naraz.
+                busy = true;
+                try {
                 // Osoba sprawdzajaca zwykle NIE ma potwierdzen u siebie — wgrywaja je
                 // osoby wprowadzajace, wprost do zamowien. Gdy nie ma ani jednego PDF-a,
                 // sciagamy je same, zamiast odsylac z bledem.
                 if (!nPdf() && !nGrab()){
                     say('Nie ma żadnego pliku .pdf — dociągam potwierdzenia z zamówień…', '#666');
-                    var g = await doGrab();
+                    var g = await doGrabInner();
                     if (!g){ say('Nie mam ani jednego potwierdzenia — ani wgranego, ani w zamówieniach.', '#c00'); return; }
                 }
                 if (!FILES.length && !nGrab()){ say('Najpierw dodaj potwierdzenia PDF (i opcjonalnie plik Excel).', '#c00'); return; }
-                busy = true;
                 show('<div style="font-size:12px;color:#666">Czytam ' + (FILES.length + nGrab()) + ' plik(\u00f3w)\u2026</div>');
                 var R = null;
                 try { R = await bcProcess(FILES, say, GRAB); }
-                catch(e){ busy = false; show('<div style="font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); return; }
-                busy = false;
+                catch(e){ show('<div style="font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); return; }
                 if (R && R.err){
                     var extra = (R.errFiles && R.errFiles.length)
                         ? ('<div style="margin-top:6px;font-size:11px;color:#c00">' + R.errFiles.map(function(e){ return esc((e.file || '?') + ' \u2014 ' + e.err); }).join('<br>') + '</div>') : '';
@@ -16270,6 +16427,7 @@
                 show(bcReportHtml(R, SEL));
                 bindResult();
                 say('Sprawdzenie z bankiem: ' + v.t + '.', v.c);
+                } finally { busy = false; }
             };
         })();
         wp.querySelector('#wp-copy-bal').onclick = function(){
@@ -16291,8 +16449,12 @@
             return out;
         }
         function pcSetMark(order, txt, color){
-            var st = wp.querySelector('#wp-out-merged .pc-st[data-order="' + order + '"]');
-            if (st){ st.textContent = ' ' + txt; st.style.color = color || ''; }
+            // querySelectorAll, nie querySelector: to samo zamowienie potrafi stac
+            // jednoczesnie w tabeli DEPO i w BALANCE. Przy querySelector druga linijka
+            // zostawala z „⏳" na zawsze, chociaz komentarz poszedl.
+            wp.querySelectorAll('#wp-out-merged .pc-st[data-order="' + order + '"]').forEach(function(st){
+                st.textContent = ' ' + txt; st.style.color = color || '';
+            });
         }
         async function pcUploadFile(orderId, file){
             var fd = new FormData();
@@ -16323,7 +16485,16 @@
                 var gi = t.getAttribute('data-sup');
                 wp.querySelectorAll('#wp-out-merged .pc-chk[data-sup="' + gi + '"]').forEach(function(b){ b.checked = t.checked; });
             } else if (t.classList.contains('pc-amt')){
-                var o = t.getAttribute('data-order'); if (o){ if (!state.pcAmt) state.pcAmt = {}; state.pcAmt[o] = t.value; pcRefreshSums(); }
+                var o = t.getAttribute('data-order');
+                if (o){
+                    if (!state.pcAmt) state.pcAmt = {};
+                    state.pcAmt[o] = t.value;
+                    // To samo zamowienie stoi w tabeli DEPO i w scalonej. Grupy radio maja
+                    // teraz rozne name (-d-/-m-), zeby sie nie kasowaly nawzajem, wiec
+                    // druga trzeba dociagnac recznie, inaczej pokazywalaby stary wybor.
+                    wp.querySelectorAll('.pc-amt[data-order="' + o + '"]').forEach(function(b){ b.checked = (b.value === t.value); });
+                    pcRefreshSums();
+                }
             }
         });
         wp.addEventListener('click', function(e){
@@ -16331,7 +16502,8 @@
             if (t.classList.contains('pc-amt-val')){ pcBeginEdit(t); }
             else if (t.classList.contains('pc-amt-reset')){ var r = state._rowMap ? state._rowMap[t.getAttribute('data-row')] : null; if (r){ delete r._editAmt; var td = t.closest ? t.closest('td') : null; if (td) td.innerHTML = (t.getAttribute('data-type') === 'd' ? pcAmtCellHtml(r, t.getAttribute('data-row')) : pcBalCellHtml(r, t.getAttribute('data-row'))); pcRefreshSums(); } }
             else if (t.classList.contains('pc-acc')){ pcBeginEditAcc(t); }
-            else if (t.classList.contains('pc-title-copy')){ var tr = t.closest ? t.closest('tr') : null, sp = tr ? tr.querySelector('.pc-title-txt') : null; if (sp){ var ok = pcCopyText(sp.textContent || ''); var st = wp.querySelector('#wp-status'); if (st) st.textContent = ok ? 'Skopiowano tytuł przelewu.' : 'Nie udało się skopiować.'; } }
+            // Zmienna nazywala sie „sp" i przykrywala panel Sprawdzania o tej samej nazwie.
+            else if (t.classList.contains('pc-title-copy')){ var tr = t.closest ? t.closest('tr') : null, ttx = tr ? tr.querySelector('.pc-title-txt') : null; if (ttx){ var ok = pcCopyText(ttx.textContent || ''); var st = wp.querySelector('#wp-status'); if (st) st.textContent = ok ? 'Skopiowano tytuł przelewu.' : 'Nie udało się skopiować.'; } }
             else if (t.id === 'wp-copy-titles'){ var ts = pcTransferTitles(); var ok2 = pcCopyText(ts.map(function(x){ return x.title; }).join('\n')); var st2 = wp.querySelector('#wp-status'); if (st2) st2.textContent = ok2 ? ('Skopiowano ' + ts.length + ' tytułów.') : 'Nie udało się skopiować.'; }
         });
         wp.querySelector('#wp-pc-all').onclick = function(){
@@ -16373,21 +16545,30 @@
             if (!orders.length){ status.textContent = 'Zaznacz zamówienia (ostatnia kolumna w tabeli DEPO).'; return; }
             var text = (wp.querySelector('#wp-pc-comment-text').value || '').trim();
             if (!text){ status.textContent = 'Wpisz treść komentarza.'; return; }
-            this.disabled = true;
+            var cBtn = this;
+            cBtn.disabled = true;
             var okc = 0, warnc = 0, badc = 0;
             orders.forEach(function(o){ pcSetMark(o, '⏳', '#888'); });
-            for (var i = 0; i < orders.length; i++){
-                var o = orders[i];
-                status.textContent = 'Dodaję komentarz ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
-                var before = await pcOrderHtml(o);
-                var cm = await pcPostComment(o, text);
-                if (!cm.ok){ badc++; pcSetMark(o, '✗ błąd komentarza (sprawdź)', '#c00'); continue; }
-                var after = await pcOrderHtml(o);
-                if (pcCountOcc(after, text) > pcCountOcc(before, text)){ okc++; pcSetMark(o, '✓ komentarz dodany', '#0a0'); }
-                else { warnc++; pcSetMark(o, '⚠ Wysłany; nie potwierdzono (sprawdź)', '#c47f00'); }
+            // try/finally: bez tego wyjatek w petli (zerwana siec) zostawial guzik
+            // na zawsze wygaszony — trzeba bylo przeladowac strone.
+            try {
+                for (var i = 0; i < orders.length; i++){
+                    var o = orders[i];
+                    status.textContent = 'Dodaję komentarz ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
+                    var before = await pcOrderHtml(o);
+                    var cm = await pcPostComment(o, text);
+                    if (!cm.ok){ badc++; pcSetMark(o, '✗ błąd komentarza (sprawdź)', '#c00'); continue; }
+                    var after = await pcOrderHtml(o);
+                    if (pcCountOcc(after, text) > pcCountOcc(before, text)){ okc++; pcSetMark(o, '✓ komentarz dodany', '#0a0'); }
+                    else { warnc++; pcSetMark(o, '⚠ Wysłany; nie potwierdzono (sprawdź)', '#c47f00'); }
+                }
+                status.textContent = 'Komentarz „' + text + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + '.';
+            } catch (e) {
+                var _cm = (e && e.message) ? e.message : String(e);
+                status.textContent = 'Przerwane po ' + (okc + warnc + badc) + '/' + orders.length + ': ' + _cm;
+            } finally {
+                cBtn.disabled = false;
             }
-            this.disabled = false;
-            status.textContent = 'Komentarz „' + text + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + '.';
         };
     })();
 })();
@@ -16427,8 +16608,9 @@
 
         GM_addStyle(`
             #beliani-launcher{position:fixed;top:70px;right:12px;z-index:2147483647;font-family:Arial,Helvetica,sans-serif;}
-            #beliani-launch-btn{height:44px;padding:0 16px;border:none;border-radius:22px;background:#FF2F00;color:#fff;font-size:15px;font-weight:bold;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.3);white-space:nowrap;display:flex;align-items:center;gap:8px;}
+            #beliani-launch-btn{height:44px;padding:0 16px;border:none;border-radius:22px;background:#FF2F00;color:#fff;font-size:15px;font-weight:bold;cursor:grab;box-shadow:0 2px 10px rgba(0,0,0,.3);white-space:nowrap;display:flex;align-items:center;gap:8px;touch-action:none;user-select:none;-webkit-user-select:none;}
             #beliani-launch-btn:hover{background:#cc2600;}
+            #beliani-launch-btn:active{cursor:grabbing;}
             #beliani-launch-panel{margin-top:8px;width:252px;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);overflow:hidden;}
             #beliani-launcher .bl-row{display:flex;align-items:center;gap:10px;width:100%;padding:11px 14px;border:none;background:#fff;font-size:14px;color:#1a1a1a;cursor:pointer;text-align:left;box-sizing:border-box;}
             #beliani-launcher .bl-row:hover{background:#F6E7E6;}
@@ -16437,6 +16619,12 @@
             #beliani-launcher .bl-gear{color:#750000;font-weight:bold;}
             #beliani-launcher .bl-set-row{display:block;width:100%;padding:9px 14px 9px 34px;border:none;background:#faf7f6;font-size:13px;color:#333;cursor:pointer;text-align:left;box-sizing:border-box;}
             #beliani-launcher .bl-set-row:hover{background:#F6E7E6;}
+            /* Krzyzyk wstrzykiwany do paneli, ktore nie mialy wlasnego zamkniecia.
+               sticky + height:0 => nie zajmuje miejsca w ukladzie i nie odjezdza przy
+               przewijaniu dlugiego panelu. */
+            .bl-x-wrap{position:sticky;top:0;height:0;z-index:9;overflow:visible;pointer-events:none;}
+            .bl-x{pointer-events:auto;position:absolute;right:-6px;top:-8px;width:26px;height:26px;line-height:22px;padding:0;border:1px solid #e5d5d3;border-radius:13px;background:#fff;color:#750000;font-size:14px;font-weight:bold;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.15);font-family:Arial,Helvetica,sans-serif;}
+            .bl-x:hover{background:#F6E7E6;}
         `);
 
         function svgIco(p){ return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#FF2F00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + p + '</svg>'; }
@@ -16454,6 +16642,69 @@
 
         function hideBtns(){ LAUNCH_TOOLS.forEach(function(t){ const b = document.querySelector(t.sel); if (b) b.style.display = 'none'; }); }
 
+        // ===== Zamykanie paneli =====
+        // Launcher chowa wszystkie plywajace guziki (hideBtns), a czesc paneli nie miala
+        // zadnego wlasnego zamkniecia — jedynym przelacznikiem byl wlasnie ten schowany
+        // guzik. Stad „otworze i nie moge zamknac, musze znowu wyklikac z menu".
+        // Kazdy taki panel dostaje wiec swoj krzyzyk, a Escape zamyka ten, ktory jest
+        // na wierzchu. Panele z needX:false maja krzyzyk od dawna — tam nic nie
+        // wstrzykujemy, ale Escape dziala i na nie.
+        const HUB_PANELS = [
+            { sel: '#ksieg-panel',      needX: true },
+            { sel: '#refund-panel',     needX: true },
+            { sel: '#klient-panel',     needX: true },
+            { sel: '#allegro-panel',    needX: true },
+            { sel: '#deposit-panel',    needX: true },
+            { sel: '#ilp-search-panel', needX: true },
+            { sel: '#chinskie-chooser', needX: false },
+            { sel: '#oandaKursPanel',   needX: false },
+            { sel: '#viesPanel',        needX: false },
+            { sel: '#sepa-overlay',     needX: false },
+            { sel: '#ilp-ov',           needX: false },
+            { sel: '#chinskie-wprow',   needX: false },
+            { sel: '#chinskie-sprawdz', needX: false },
+        ];
+        function panelOpen(el) {
+            if (!el) return false;
+            if (el.style && el.style.display === 'none') return false;
+            try { return getComputedStyle(el).display !== 'none'; } catch (e) { return true; }
+        }
+        function ensureClosers() {
+            HUB_PANELS.forEach(function (p) {
+                if (!p.needX) return;
+                const el = document.querySelector(p.sel);
+                if (!el || el.querySelector('.bl-x-wrap')) return;
+                const w = document.createElement('div');
+                w.className = 'bl-x-wrap';
+                const x = document.createElement('button');
+                x.type = 'button'; x.className = 'bl-x'; x.title = 'Zamknij (Esc)';
+                x.textContent = '✕';
+                x.addEventListener('click', function (ev) {
+                    ev.preventDefault(); ev.stopPropagation();
+                    el.style.display = 'none';
+                });
+                w.appendChild(x);
+                el.insertBefore(w, el.firstChild);
+            });
+        }
+        function topmostOpenPanel() {
+            let best = null, bz = -1;
+            HUB_PANELS.forEach(function (p) {
+                const el = document.querySelector(p.sel);
+                if (!panelOpen(el)) return;
+                let z = 0;
+                try { z = parseInt(getComputedStyle(el).zIndex, 10); } catch (e) { z = 0; }
+                if (!isFinite(z)) z = 0;
+                if (z >= bz) { bz = z; best = el; }
+            });
+            return best;
+        }
+        function inEditor(t) {
+            if (!t || !t.tagName) return false;
+            const n = String(t.tagName).toUpperCase();
+            return n === 'INPUT' || n === 'TEXTAREA' || n === 'SELECT' || t.isContentEditable === true;
+        }
+
         const wrap = document.createElement('div'); wrap.id = 'beliani-launcher';
         const btn = document.createElement('button'); btn.id = 'beliani-launch-btn';
         btn.innerHTML = '<span>\u2630</span><span>Narzędzia</span>';
@@ -16464,7 +16715,20 @@
             try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) RAW = GM_info.script.downloadURL; } catch(e){}
             var copied = false;
             try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(RAW, 'text'); copied = true; } } catch(e){}
-            if (!copied) { try { navigator.clipboard.writeText(RAW); copied = true; } catch(e){} }
+            // navigator.clipboard.writeText zwraca Promise — samo wejscie do try NIE znaczy,
+            // ze skopiowalo (bez fokusu na karcie odrzuca sie pozniej). Wczesniej copied
+            // robilo sie true zawsze i okienko klamalo, ze link jest w schowku.
+            if (!copied) {
+                try {
+                    var ta = document.createElement('textarea');
+                    ta.value = RAW; ta.setAttribute('readonly', '');
+                    ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0';
+                    document.body.appendChild(ta); ta.select();
+                    copied = !!document.execCommand('copy');
+                    document.body.removeChild(ta);
+                } catch(e){ copied = false; }
+            }
+            if (!copied) { try { var pr = navigator.clipboard.writeText(RAW); if (pr && pr.catch) pr.catch(function(){}); } catch(e){} }
             var tip = copied
                 ? '\n\n\ud83d\udccb Link RAW skopiowany do schowka.\n\u2022 ScriptCat: Link Import \u2192 wklej (Ctrl+V) \u2192 OK  (albo przy skrypcie: Sprawd\u017a aktualizacje)\n\u2022 Tampermonkey: potwierd\u017a poni\u017cej, aby otworzy\u0107 stron\u0119 instalacji'
                 : '\n\nLink RAW: ' + RAW;
@@ -16504,18 +16768,142 @@
         MODULES.forEach(function(m){
             html += '<button class="bl-set-row" data-id="' + m.id + '">' + (isOn(m.id) ? '\u2705' : '\u2B1C') + ' ' + m.name + '</button>';
         });
+        html += '<button class="bl-set-row" id="bl-pos-reset">\u21BA Przywr\u00F3\u0107 pozycj\u0119 guzika</button>';
         html += '</div>';
         panel.innerHTML = html;
 
         wrap.appendChild(btn); wrap.appendChild(panel);
         document.body.appendChild(wrap);
 
-        btn.addEventListener('click', function(){ panel.style.display = (panel.style.display === 'none') ? 'block' : 'none'; });
+        // ===== Przeciaganie guzika i zapamietanie pozycji =====
+        // Pozycja trzymana jest jako {left, top} w GM_setValue. Domyslnie (brak
+        // wpisu) guzik stoi tam gdzie dotad: top:70px, right:12px — dzieki temu
+        // stara instalacja niczego nie zauwazy.
+        const POS_KEY = HUB + 'launch_pos';
+        function readPos() {
+            try {
+                const raw = GM_getValue(POS_KEY, '');
+                if (!raw) return null;
+                const p = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+                if (!p || typeof p.left !== 'number' || typeof p.top !== 'number') return null;
+                if (!isFinite(p.left) || !isFinite(p.top)) return null;
+                return { left: p.left, top: p.top };
+            } catch (e) { return null; }
+        }
+        function savePos(p) { try { GM_setValue(POS_KEY, JSON.stringify({ left: p.left, top: p.top })); } catch (e) {} }
+        function clearPos() { try { GM_setValue(POS_KEY, ''); } catch (e) {} }
+        // Zapisana pozycja moze byc poza ekranem, gdy nastepnym razem okno jest
+        // mniejsze (inny monitor, podzielony ekran) — wtedy guzik bylby nie do
+        // odzyskania. Dlatego kazde uzycie pozycji przechodzi przez clampPos.
+        function clampPos(p) {
+            const w = btn.offsetWidth || wrap.offsetWidth || 140;
+            const h = btn.offsetHeight || 44;
+            const maxL = Math.max(0, (window.innerWidth || 0) - w);
+            const maxT = Math.max(0, (window.innerHeight || 0) - h);
+            return {
+                left: Math.min(Math.max(0, p.left), maxL),
+                top: Math.min(Math.max(0, p.top), maxT)
+            };
+        }
+        function applyPos(p) {
+            if (!p) {
+                wrap.style.left = ''; wrap.style.bottom = '';
+                wrap.style.top = '70px'; wrap.style.right = '12px';
+                return;
+            }
+            const c = clampPos(p);
+            wrap.style.right = 'auto'; wrap.style.bottom = '';
+            wrap.style.left = c.left + 'px';
+            wrap.style.top = c.top + 'px';
+        }
+        // Menu rozwija sie pod guzikiem, ale przy dolnej krawedzi wyszloby poza
+        // ekran — wtedy otwiera sie do gory. Tak samo z bokiem: guzik przy prawej
+        // krawedzi ma menu wyrownane do prawej.
+        function placePanel() {
+            let r;
+            try { r = btn.getBoundingClientRect(); } catch (e) { return; }
+            const pw = panel.offsetWidth || 252;
+            const ph = panel.offsetHeight || 0;
+            const vw = window.innerWidth || 0;
+            const vh = window.innerHeight || 0;
+            panel.style.position = 'absolute';
+            panel.style.marginTop = '0';
+            const below = vh - r.bottom;
+            if (ph && below < ph + 12 && r.top > below) {
+                panel.style.top = 'auto'; panel.style.bottom = 'calc(100% + 8px)';
+            } else {
+                panel.style.bottom = 'auto'; panel.style.top = 'calc(100% + 8px)';
+            }
+            if (r.left + pw > vw - 4) {
+                panel.style.left = 'auto'; panel.style.right = '0';
+            } else {
+                panel.style.right = 'auto'; panel.style.left = '0';
+            }
+        }
+        applyPos(readPos());
+
+        // Klik konczacy przeciagniecie nie moze otwierac menu. Znacznik czasu jest
+        // pewniejszy niz flaga: gdy przegladarka nie wysle click po pointerup,
+        // sam wygasa i nie zjada nastepnego kliku.
+        let dragEndAt = 0;
+        (function () {
+            let dragging = false, moved = false, startX = 0, startY = 0, baseL = 0, baseT = 0, pid = null;
+            function stop() {
+                if (!dragging) return;
+                dragging = false;
+                if (pid !== null) { try { btn.releasePointerCapture(pid); } catch (e) {} pid = null; }
+                if (!moved) return;
+                moved = false;
+                dragEndAt = Date.now();
+                let r;
+                try { r = wrap.getBoundingClientRect(); } catch (e) { return; }
+                const c = clampPos({ left: r.left, top: r.top });
+                applyPos(c); savePos(c);
+                if (panel.style.display !== 'none') placePanel();
+            }
+            btn.addEventListener('pointerdown', function (e) {
+                if (e.button !== undefined && e.button !== null && e.button !== 0) return;
+                let r;
+                try { r = wrap.getBoundingClientRect(); } catch (err) { return; }
+                dragging = true; moved = false;
+                startX = e.clientX; startY = e.clientY;
+                baseL = r.left; baseT = r.top;
+                pid = (e.pointerId === undefined) ? null : e.pointerId;
+                if (pid !== null) { try { btn.setPointerCapture(pid); } catch (err) {} }
+            });
+            btn.addEventListener('pointermove', function (e) {
+                if (!dragging) return;
+                const dx = e.clientX - startX, dy = e.clientY - startY;
+                if (!moved && (Math.abs(dx) + Math.abs(dy)) < 5) return;
+                moved = true;
+                if (e.preventDefault) e.preventDefault();
+                applyPos({ left: baseL + dx, top: baseT + dy });
+                if (panel.style.display !== 'none') placePanel();
+            });
+            btn.addEventListener('pointerup', stop);
+            btn.addEventListener('pointercancel', stop);
+            btn.addEventListener('lostpointercapture', stop);
+        })();
+
+        btn.addEventListener('click', function(e){
+            if (Date.now() - dragEndAt < 300) {
+                if (e.preventDefault) e.preventDefault();
+                if (e.stopPropagation) e.stopPropagation();
+                return;
+            }
+            const open = (panel.style.display === 'none');
+            panel.style.display = open ? 'block' : 'none';
+            if (open) placePanel();
+            ensureClosers();
+        });
         panel.querySelectorAll('.bl-row[data-sel]').forEach(function(r){
             r.addEventListener('click', function(){
                 const sel = r.getAttribute('data-sel');
                 panel.style.display = 'none';
                 setTimeout(function(){ const b = document.querySelector(sel); if (b) b.click(); }, 0);
+                // panel powstaje dopiero po kliknieciu w schowany guzik, wiec krzyzyk
+                // wstrzykujemy chwile pozniej
+                [20, 200, 600].forEach(function(ms){ setTimeout(ensureClosers, ms); });
             });
         });
         const gear = panel.querySelector('#bl-gear');
@@ -16523,19 +16911,57 @@
             e.stopPropagation();
             const s = panel.querySelector('#bl-settings');
             s.style.display = (s.style.display === 'none') ? 'block' : 'none';
+            placePanel();
         });
         const upd = panel.querySelector('#bl-update');
         if (upd) upd.addEventListener('click', function(){ panel.style.display = 'none'; checkUpdate(); });
-        panel.querySelectorAll('.bl-set-row').forEach(function(r){
+        panel.querySelectorAll('.bl-set-row[data-id]').forEach(function(r){
             r.addEventListener('click', function(){
                 const id = r.getAttribute('data-id');
                 try { GM_setValue(HUB + id, !isOn(id)); } catch(e){}
                 location.reload();
             });
         });
+        const posReset = panel.querySelector('#bl-pos-reset');
+        if (posReset) posReset.addEventListener('click', function(e){
+            e.stopPropagation();
+            clearPos(); applyPos(null); placePanel();
+        });
 
-        hideBtns();
-        [600, 1500, 3000].forEach(function(ms){ setTimeout(hideBtns, ms); });
+        // Escape i klik obok — rejestrowane raz. buildLauncher i tak konczy sie od
+        // razu, gdy #beliani-launcher juz stoi, ale atrybut jest tanszy niz zaufanie.
+        const root = document.documentElement;
+        if (root && !root.hasAttribute('data-beliani-hub-close')) {
+            root.setAttribute('data-beliani-hub-close', '1');
+            document.addEventListener('keydown', function (e) {
+                if (e.key !== 'Escape' && e.keyCode !== 27) return;
+                if (e.defaultPrevented) return;
+                // pola tekstowe maja wlasne Escape (czyszczenie szukajki itp.) —
+                // nie odbieramy im go
+                if (inEditor(e.target)) return;
+                if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+                const top = topmostOpenPanel();
+                if (top) { top.style.display = 'none'; if (e.preventDefault) e.preventDefault(); }
+            }, true);
+            document.addEventListener('click', function (e) {
+                const t = e.target;
+                if (panel.style.display !== 'none' && !wrap.contains(t)) panel.style.display = 'none';
+                // maly wybierak „Chińskie" zachowuje sie jak rozwijana lista
+                const ch = document.getElementById('chinskie-chooser');
+                if (ch && panelOpen(ch) && !ch.contains(t)) {
+                    const cb = document.getElementById('chinskie-btn');
+                    if (!(cb && (cb === t || cb.contains(t)))) ch.style.display = 'none';
+                }
+            }, true);
+            window.addEventListener('resize', function () {
+                const p = readPos();
+                if (p) applyPos(p);
+                if (panel.style.display !== 'none') placePanel();
+            });
+        }
+
+        hideBtns(); ensureClosers();
+        [600, 1500, 3000].forEach(function(ms){ setTimeout(hideBtns, ms); setTimeout(ensureClosers, ms); });
     }
     buildLauncher();
     [500, 1500].forEach(function(ms){ setTimeout(buildLauncher, ms); });
