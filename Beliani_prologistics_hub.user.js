@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.96
+// @version      1.97
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10108,6 +10108,21 @@
         <div id="tm-bal-msgs" style="margin-top:4px;font-size:11px;"></div>
         <div id="tm-other-box" style="margin-top:4px;font-size:11px;"></div>
 
+        <div style="font-size:12px;font-weight:bold;color:#047857;margin:10px 0 3px;">Plik z banku (nieobowiązkowy)</div>
+        <div id="tm-bank-fmt" style="font-size:11px;color:#666;margin-bottom:4px;">
+            Eksport przelewów z banku w CSV. Sprawdzam, czy każda firma z wklejki ma w pliku
+            przelew na właściwą kwotę — depozyt i balance do tej samej firmy liczone razem,
+            bo bank dostaje na nią jeden przelew. Pozycje spoza wklejki (przelewy dla
+            developerów i inne) wypisuję osobno i niczego nie blokują. Plik zostaje
+            w przeglądarce — nigdzie go nie wysyłam.
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;">
+            <input id="tm-bank-file" type="file" accept=".csv,.txt,text/csv,text/plain" style="font-size:11px;flex:1;min-width:0;">
+            <button id="tm-bank-clear" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;
+                background:#f9fafb;cursor:pointer;font-size:11px;white-space:nowrap;">Wyczyść</button>
+        </div>
+        <div id="tm-bank-box" style="font-size:11px;"></div>
+
         <div style="margin-top:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
             <label style="font-size:12px;color:#333;">Waluta:</label>
             <select id="tm-currency" style="padding:4px 6px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
@@ -11122,6 +11137,368 @@
         });
     }
 
+    // ---- Kontrola z plikiem z banku -------------------------------------------------------
+    // Plik eksportu z banku nie zawiera ani numeru orderu, ani numeru kontenera — jedynym
+    // wspolnym punktem z wklejka jest NAZWA dostawcy, ktora bank wpisuje w tresc przelewu
+    // razem z adresem, nazwa banku i numerem konta. SWIFT lamie te tresc co 35 znakow, wiec
+    // w srodku slowa potrafi wpasc spacja („CO.,LT D."). Dlatego nie probujemy wycinac nazwy
+    // z tresci: normalizujemy CALA tresc i szukamy w niej znormalizowanego poczatku naszej
+    // nazwy. Plik czyta FileReader w przegladarce — nigdzie nie jest wysylany ani zapisywany.
+    let bankFile = null;   // ostatnio wczytany plik: { rows, currency, error, name, sum, debits }
+
+    function bankNameNorm(s) {
+        return String(s == null ? '' : s)
+            .toUpperCase()
+            .replace(/&/g, 'AND')
+            .replace(/[^A-Z0-9]+/g, '')
+            .replace(/LIMITED/g, 'LTD');
+    }
+
+    // Nazwa z arkusza bywa zlozona z dwoch firm rozdzielonych „/" (jeden przelew za obie) —
+    // kazda czesc daje osobny klucz. Klucz krotszy niz 8 znakow odpada, bo trafialby
+    // przypadkiem. Pierwsze 20 znakow wystarcza: dalej zaczynaja sie „CO LTD", ktore ma
+    // polowa Chin, a przed nimi nazwa jest juz unikalna.
+    function bankNameKeys(name) {
+        const out = [];
+        String(name == null ? '' : name).split('/').forEach(function (part) {
+            const k = bankNameNorm(part);
+            if (k.length < 8) return;
+            const key = k.slice(0, 20);
+            if (out.indexOf(key) < 0) out.push(key);
+        });
+        return out;
+    }
+
+    // CSV z banku: BOM na poczatku, srednik jako separator, CRLF, cudzyslowy podwajane w polu.
+    function bankCsvRows(text, sep) {
+        const s = String(text == null ? '' : text).replace(/^\uFEFF/, '');
+        const d = sep || ';';
+        const rows = [];
+        let f = '', row = [], q = false;
+        for (let i = 0; i < s.length; i++) {
+            const c = s.charAt(i);
+            if (q) {
+                if (c !== '"') f += c;
+                else if (s.charAt(i + 1) === '"') { f += '"'; i++; }
+                else q = false;
+            }
+            else if (c === '"') q = true;
+            else if (c === d) { row.push(f); f = ''; }
+            else if (c === '\r') { /* CRLF — koniec wiersza lapie dopiero \n */ }
+            else if (c === '\n') { row.push(f); rows.push(row); row = []; f = ''; }
+            else f += c;
+        }
+        if (f !== '' || row.length) { row.push(f); rows.push(row); }
+        return rows;
+    }
+
+    // Separator zgadujemy z poczatku pliku — PostFinance daje srednik, ale eksport z innego
+    // banku albo przy innych ustawieniach regionalnych moze dac przecinek lub tabulator.
+    function bankGuessSep(text) {
+        // Nie sumujemy wystapien, tylko szukamy REGULARNOSCI: prawdziwy separator stoi w kazdym
+        // wierszu tyle samo razy, a przecinki z adresu („SHENZHEN, GUANGDONG, CHINA") czy z kwoty
+        // („1.234,50") rozkladaja sie nierowno. Wynik to najczestsza liczba wystapien razy liczba
+        // wierszy, ktore ja maja.
+        const lines = String(text == null ? '' : text).split('\n').slice(0, 20)
+            .filter(function (l) { return l.replace(/\s/g, '') !== ''; });
+        let best = ';', bestScore = 0, bestLines = 0;
+        [';', ',', '\t'].forEach(function (d) {
+            const freq = {};
+            lines.forEach(function (l) {
+                const n = l.split(d).length - 1;
+                if (n > 0) freq[n] = (freq[n] || 0) + 1;
+            });
+            Object.keys(freq).forEach(function (n) {
+                const score = Number(n) * freq[n];
+                // Przy remisie wygrywa ten, ktory trzyma sie rowno w wiekszej liczbie wierszy —
+                // separator stoi w kazdym wierszu, przecinek z adresu tylko w czesci.
+                if (score > bestScore || (score === bestScore && freq[n] > bestLines)) {
+                    bestScore = score; bestLines = freq[n]; best = d;
+                }
+            });
+        });
+        return best;
+    }
+
+    // Kwoty z banku: „-22832.53", „1'234.50", „1.234,50", „(120.00)". Ostatni separator, za
+    // ktorym stoja jedna lub dwie cyfry, jest przecinkiem dziesietnym — reszta to tysiace.
+    function bankAmt(v) {
+        const raw = String(v == null ? '' : v).trim();
+        if (!raw) return null;
+        const neg = /^-/.test(raw) || /^\(.*\)$/.test(raw);
+        let s = raw.replace(/[^0-9.,]/g, '');
+        if (!s) return null;
+        const dec  = Math.max(s.lastIndexOf('.'), s.lastIndexOf(','));
+        const tail = dec < 0 ? -1 : s.length - dec - 1;
+        if (tail >= 1 && tail <= 2) s = s.slice(0, dec).replace(/[.,]/g, '') + '.' + s.slice(dec + 1);
+        else s = s.replace(/[.,]/g, '');
+        const n = parseFloat(s);
+        if (!isFinite(n)) return null;
+        return neg ? -Math.abs(n) : n;
+    }
+
+    // Zamiana pliku na liste przelewow. Naglowka szukamy po kolumnie „Debit" — wiersze nad nim
+    // (Date from, Entry type, Account, Currency…) sa pomijane. Numeru konta z pliku skrypt nie
+    // czyta i nigdzie go nie pokazuje. Kwota wychodzaca jest dodatnia, wplywy licza sie na
+    // minus, zeby zwrot od dostawcy sam zmniejszyl jego sume.
+    function bankParseCsv(text) {
+        const out = { rows: [], currency: '', error: '', debits: 0, credits: 0, sum: 0 };
+        const raw = String(text == null ? '' : text);
+        if (!raw.replace(/\s/g, '')) { out.error = 'plik jest pusty'; return out; }
+        const rows = bankCsvRows(raw, bankGuessSep(raw));
+        let hi = -1;
+        for (let i = 0; i < rows.length && hi < 0; i++) {
+            const has = function (re) {
+                return rows[i].some(function (c) { return re.test(String(c == null ? '' : c).trim()); });
+            };
+            if (has(/^debit\b/i) && (has(/^date$/i) || has(/notification|text|description|details/i))) hi = i;
+        }
+        if (hi < 0) {
+            out.error = 'nie znalazłem nagłówka z kolumną „Debit" — czy to na pewno eksport przelewów z banku?';
+            return out;
+        }
+        const hdr  = rows[hi].map(function (c) { return String(c == null ? '' : c).trim(); });
+        const find = function (re) { for (let i = 0; i < hdr.length; i++) if (re.test(hdr[i])) return i; return -1; };
+        const iDeb = find(/^debit\b/i);
+        const iCrd = find(/^credit\b/i);
+        let   iTxt = find(/notification|text|description|details/i);
+        let  iDate = find(/^date$/i);
+        if (iDate < 0) iDate = find(/date|datum/i);
+        if (iTxt  < 0) iTxt  = (iDate === 0 ? 1 : 0);
+
+        // Waluta: najpierw z naglowka („Debit in USD"), potem z wiersza „Currency:" nad nim.
+        const m = (hdr[iDeb] || '').match(/([A-Z]{3})\s*$/);
+        if (m) out.currency = m[1];
+        for (let i = 0; i < hi && !out.currency; i++) {
+            const r = rows[i] || [];
+            for (let j = 0; j < r.length - 1; j++) {
+                if (!/^currency/i.test(String(r[j] == null ? '' : r[j]).trim())) continue;
+                const c = String(r[j + 1] == null ? '' : r[j + 1]).match(/[A-Z]{3}/);
+                if (c) { out.currency = c[0]; break; }
+            }
+        }
+
+        for (let i = hi + 1; i < rows.length; i++) {
+            const r = rows[i];
+            if (!r || !r.join('').trim()) continue;
+            const d = iDeb >= 0 ? bankAmt(r[iDeb]) : null;
+            const c = iCrd >= 0 ? bankAmt(r[iCrd]) : null;
+            let amt = null;
+            if (d != null && d !== 0) amt = Math.abs(d);
+            else if (c != null && c !== 0) amt = -Math.abs(c);
+            if (amt == null) continue;
+            const txt = String(r[iTxt] == null ? '' : r[iTxt]).replace(/\s+/g, ' ').trim();
+            out.rows.push({
+                date: String(r[iDate] == null ? '' : r[iDate]).trim(),
+                txt: txt, amt: bal2(amt), norm: bankNameNorm(txt)
+            });
+            if (amt > 0) out.debits++; else out.credits++;
+            out.sum = bal2(out.sum + amt);
+        }
+        if (!out.rows.length) out.error = 'w pliku nie ma ani jednego wiersza z kwotą';
+        return out;
+    }
+
+    // Jednostka porownania to DOSTAWCA, nie order: bank dostaje jeden przelew na firme, a my
+    // mamy dla niej osobno depozyty i osobno sume grupy balance. Przypadki „laczone" z arkusza
+    // (depozyt i balance do tej samej firmy) skladaja sie wiec same.
+    // Z balance bierzemy SUME GRUPY, czyli kolumne „kwota" — to ona faktycznie schodzi z konta.
+    // Kwota ksiegowana bywa inna (penalty, discount), a suma grupy obejmuje takze wiersze,
+    // ktore nie przeszly parsera — z banku one i tak zeszly.
+    function bankExpected(parsed) {
+        const map = {}, out = [];
+        function keyOf(name) {
+            const ks = bankNameKeys(name);
+            return { ks: ks, key: ks.length ? ks[0] : ('#' + bankNameNorm(name)) };
+        }
+        function add(name, amt, src, id) {
+            if (!isFinite(amt)) return;
+            const k = keyOf(name);
+            let e = map[k.key];
+            if (!e) {
+                e = map[k.key] = { key: k.key, keys: k.ks, name: String(name == null ? '' : name),
+                                   depo: 0, bal: 0, ids: [] };
+                out.push(e);
+            }
+            e[src] = bal2(e[src] + amt);
+            if (id && e.ids.indexOf(id) < 0) e.ids.push(id);
+            // Przy przelewie zbiorczym nazwa grupy bywa dluzsza niz nazwa z wiersza depozytu —
+            // do pokazania bierzemy dluzsza, zeby bylo widac obie firmy.
+            const nm = String(name == null ? '' : name);
+            if (nm.length > e.name.length) { e.name = nm; e.keys = k.ks; }
+        }
+        ((parsed && parsed.groups) || []).forEach(function (g) { add(g.name, Number(g.sum) || 0, 'bal'); });
+        ((parsed && parsed.entries) || []).forEach(function (e) {
+            if (e.src === 'depo') { add(e.supplier, parseFloat(e.amount), 'depo', e.id); return; }
+            // Balance: kwota jest juz w sumie grupy, tu dopisujemy tylko numer orderu.
+            const e2 = map[keyOf(e.supplier).key];
+            if (e2 && e.id && e2.ids.indexOf(e.id) < 0) e2.ids.push(e.id);
+        });
+        return out;
+    }
+
+    // Dopasowanie: znormalizowany klucz nazwy musi wystapic w znormalizowanej tresci przelewu.
+    // Kilka przelewow do jednej firmy sumuje sie — bank czasem dzieli platnosc na dwa zlecenia.
+    function bankMatch(expected, tx) {
+        const list = [], used = [];
+        (expected || []).forEach(function (e) {
+            const hits = [];
+            (tx || []).forEach(function (t, i) {
+                const hit = e.keys.some(function (k) { return String(t.norm || '').indexOf(k) >= 0; });
+                if (!hit) return;
+                hits.push(i);
+                used[i] = (used[i] || []).concat([e.key]);
+            });
+            let bank = 0;
+            hits.forEach(function (i) { bank = bal2(bank + tx[i].amt); });
+            const total = bal2(e.depo + e.bal);
+            const diff  = bal2(bank - total);
+            let state;
+            if (!e.keys.length)                 state = 'nokey';
+            else if (!hits.length)              state = 'missing';
+            else if (Math.abs(diff) >= 0.005)   state = 'diff';
+            else                                state = 'ok';
+            list.push(Object.assign({}, e, { hits: hits, bank: bank, total: total, diff: diff, state: state }));
+        });
+        const orphans = [], shared = [];
+        (tx || []).forEach(function (t, i) {
+            if (!used[i]) orphans.push(t);
+            else if (used[i].length > 1) shared.push(Object.assign({ keys: used[i] }, t));
+        });
+        let orphanSum = 0, expSum = 0, hitSum = 0;
+        orphans.forEach(function (t) { orphanSum = bal2(orphanSum + t.amt); });
+        const cnt = { ok: 0, diff: 0, missing: 0, nokey: 0 };
+        list.forEach(function (e) { cnt[e.state]++; expSum = bal2(expSum + e.total); hitSum = bal2(hitSum + e.bank); });
+        // Kolejnosc: najpierw to, co wymaga reakcji, potem reszta alfabetycznie.
+        const rank = { diff: 0, missing: 1, nokey: 2, ok: 3 };
+        list.sort(function (a, b) {
+            if (rank[a.state] !== rank[b.state]) return rank[a.state] - rank[b.state];
+            return String(a.name).localeCompare(String(b.name));
+        });
+        return { list: list, orphans: orphans, shared: shared, orphanSum: orphanSum,
+                 expSum: expSum, hitSum: hitSum,
+                 ok: cnt.ok, diff: cnt.diff, missing: cnt.missing, nokey: cnt.nokey,
+                 bad: cnt.diff + cnt.missing + cnt.nokey };
+    }
+
+    function bankRowHtml(e) {
+        const parts = [];
+        if (e.depo) parts.push('depozyt ' + balFix(e.depo));
+        if (e.bal)  parts.push('balance ' + balFix(e.bal));
+        const src = parts.length > 1 ? ' <span style="color:#6b7280">(' + parts.join(' + ') + ')</span>' : '';
+        let tail;
+        if (e.state === 'ok') {
+            tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
+                (e.hits.length > 1 ? ' w ' + e.hits.length + ' przelewach' : '') + '</span>';
+        } else if (e.state === 'missing') {
+            tail = '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
+        } else if (e.state === 'nokey') {
+            tail = '<span style="color:#92400e">nazwa za krótka, żeby jej szukać w pliku — sprawdź ręcznie</span>';
+        } else {
+            tail = '<span style="color:#991b1b">bank ' + balFix(e.bank) + ', różnica ' +
+                (e.diff > 0 ? '+' : '') + balFix(e.diff) + '</span>';
+        }
+        const ids = e.ids.length
+            ? ' <span style="color:#9ca3af">' + balEsc(e.ids.slice(0, 8).join(', ')) +
+              (e.ids.length > 8 ? '…' : '') + '</span>'
+            : '';
+        return '<div style="padding:1px 0;"><strong>' + balEsc(e.name) + '</strong> — ' +
+            balFix(e.total) + src + ' → ' + tail + ids + '</div>';
+    }
+
+    function bankTxHtml(t) {
+        // Prefiks „INTERNATIONAL PAYMENT" ma kazdy wiersz, a numer referencyjny nic tu nie wnosi.
+        const txt = String(t.txt || '')
+            .replace(/^INTERNATIONAL PAYMENT\s*/i, '')
+            .replace(/\s*SENDER'?S REFERENCE:.*$/i, '');
+        return '<div style="padding:1px 0;color:#374151;"><span style="font-family:monospace;">' +
+            balFix(t.amt) + '</span> — ' + balEsc(txt.slice(0, 110)) + (txt.length > 110 ? '…' : '') + '</div>';
+    }
+
+    function renderBankBox(r) {
+        const box = document.getElementById('tm-bank-box');
+        if (!box) return;
+        if (!bankFile) { box.innerHTML = ''; return; }
+        if (bankFile.error) {
+            box.innerHTML = '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:6px;' +
+                'padding:6px 8px;color:#991b1b;margin-top:4px;">Plik z banku: ' + balEsc(bankFile.error) + '</div>';
+            return;
+        }
+        const head = 'Plik <strong>' + balEsc(bankFile.name || 'CSV') + '</strong>: ' +
+            bankFile.rows.length + ' pozycji' + (bankFile.currency ? ' w ' + balEsc(bankFile.currency) : '') +
+            ', razem ' + balFix(bankFile.sum);
+
+        const expected = bankExpected(r);
+        if (!expected.length) {
+            box.innerHTML = '<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:6px;' +
+                'padding:6px 8px;color:#075985;margin-top:4px;">' + head +
+                '. Wklej depozyty albo balance, a porównam je z tym plikiem.</div>';
+            return;
+        }
+
+        const m = bankMatch(expected, bankFile.rows);
+        const cur = (document.getElementById('tm-currency')?.value || '').trim();
+        let warn = '';
+        if (bankFile.currency && cur && bankFile.currency !== cur) {
+            warn = '<div style="color:#92400e;margin-top:2px;">⚠ plik jest w ' + balEsc(bankFile.currency) +
+                ', a panel księguje w ' + balEsc(cur) + ' — kwoty nie są porównywalne.</div>';
+        }
+        if (m.shared.length) {
+            warn += '<div style="color:#92400e;margin-top:2px;">⚠ ' + m.shared.length +
+                ' przelew(y) pasują do więcej niż jednej firmy z wklejki — ich kwota liczy się ' +
+                'każdej z nich, więc sprawdź te pozycje ręcznie.</div>';
+        }
+
+        const bad  = m.list.filter(function (e) { return e.state !== 'ok'; });
+        const good = m.list.filter(function (e) { return e.state === 'ok'; });
+        const okAll = !bad.length;
+        const title = okAll
+            ? '✓ Wszystkie ' + m.ok + ' firm(y) z wklejki mają w pliku przelew na właściwą kwotę (' + balFix(m.expSum) + ')'
+            : '⚠ ' + bad.length + ' z ' + m.list.length + ' firm nie zgadza się z plikiem' +
+              (m.ok ? ' (pozostałe ' + m.ok + ' OK)' : '');
+
+        let html = '<div style="background:' + (okAll ? '#f0fdf4' : '#fffbeb') + ';border:1px solid ' +
+            (okAll ? '#bbf7d0' : '#fde68a') + ';border-radius:6px;padding:6px 8px;margin-top:4px;color:' +
+            (okAll ? '#166534' : '#92400e') + ';">' +
+            '<div style="color:#6b7280;">' + head + '</div>' +
+            '<strong>' + title + '</strong>' + warn;
+
+        if (bad.length) {
+            html += '<div style="margin-top:4px;">' + bad.map(bankRowHtml).join('') + '</div>';
+        }
+        if (good.length) {
+            html += '<details style="margin-top:4px;"><summary style="cursor:pointer;color:#6b7280;">' +
+                'zgodne firmy (' + good.length + ')</summary><div style="margin-top:2px;">' +
+                good.map(bankRowHtml).join('') + '</div></details>';
+        }
+        if (m.orphans.length) {
+            html += '<details style="margin-top:4px;"><summary style="cursor:pointer;color:#6b7280;">' +
+                'w pliku, poza wklejką: ' + m.orphans.length + ' pozycji na ' + balFix(m.orphanSum) +
+                ' — przelewy dla developerów i inne, niczego nie blokują</summary><div style="margin-top:2px;">' +
+                m.orphans.map(bankTxHtml).join('') + '</div></details>';
+        }
+        html += '<div style="color:#6b7280;margin-top:3px;">Ta kontrola tylko informuje — księgowania nie blokuje.</div>';
+        box.innerHTML = html + '</div>';
+    }
+
+    // Wczytanie pliku. Czytamy jako UTF-8; jesli w tekscie wyladuja znaki zastepcze (stary
+    // eksport w windows-1252), probujemy jeszcze raz w tym kodowaniu.
+    function bankReadFile(file, done) {
+        function attempt(enc, next) {
+            const rd = new FileReader();
+            rd.onerror = function () { done({ rows: [], error: 'nie udało się odczytać pliku', name: file.name }); };
+            rd.onload  = function () {
+                const txt = String(rd.result == null ? '' : rd.result);
+                if (txt.indexOf('\uFFFD') >= 0 && next) { attempt(next, null); return; }
+                const p = bankParseCsv(txt);
+                p.name = file.name;
+                done(p);
+            };
+            try { rd.readAsText(file, enc); } catch (e) { rd.readAsText(file); }
+        }
+        attempt('utf-8', 'windows-1252');
+    }
+
     function updateTextPreview() {
         const el = document.getElementById('tm-parsed-preview');
         if (!el) return;
@@ -11135,6 +11512,9 @@
             el.innerHTML = '';
             if (box) box.innerHTML = '';
             if (obox) { obox.innerHTML = ''; balOtherSig = ''; }
+            // Plik z banku zostaje wczytany — samo skasowanie wklejki go nie wyrzuca, wiec
+            // ramka pokazuje, ze plik czeka gotowy.
+            renderBankBox(null);
             return;
         }
         const r = balParseCurrent();
@@ -11171,6 +11551,9 @@
         el.innerHTML = html;
         if (box) box.innerHTML = balMsgHtml(r);
         renderOtherBox(r);
+        // Kontrola z bankiem odswieza sie razem z podgladem — widac ja juz przy wklejaniu,
+        // bez klikania „Sprawdz". Jest informacyjna: zadnej blokady ksiegowania nie zaklada.
+        renderBankBox(r);
         // Roszczenia z prologistics doczytujemy dopiero wtedy, gdy sa naprawde potrzebne:
         // przy „other" po opis i konto, a przy wierszu z kilkoma rodzajami po KWOTY, bez
         // ktorych nie ma jak rozdzielic roznicy. Przy zwyklych penalty — zero zapytan.
@@ -11890,6 +12273,34 @@
         const el = panel.querySelector('#' + id);
         if (el) el.addEventListener('input', () => { try { updateTextPreview(); } catch(e) {} });
     });
+
+    // Plik z banku: wczytujemy od razu po wybraniu, bez osobnego przycisku — wynik pojawia sie
+    // w ramce pod spodem i odswieza sie potem razem z wklejka.
+    {
+        const bankInp = panel.querySelector('#tm-bank-file');
+        if (bankInp) bankInp.addEventListener('change', function () {
+            const f = this.files && this.files[0];
+            // updateTextPreview rysuje ramke w obu swoich sciezkach — takze przy pustej
+            // wklejce — wiec wystarczy jedno wywolanie.
+            if (!f) { bankFile = null; try { updateTextPreview(); } catch(e) {} return; }
+            const box = document.getElementById('tm-bank-box');
+            if (box) box.innerHTML = '<div style="color:#6b7280;margin-top:4px;">⏳ czytam plik…</div>';
+            bankReadFile(f, function (parsed) {
+                bankFile = parsed;
+                try { updateTextPreview(); } catch(e) {}
+            });
+        });
+        const bankClr = panel.querySelector('#tm-bank-clear');
+        if (bankClr) bankClr.addEventListener('click', function () {
+            bankFile = null;
+            if (bankInp) bankInp.value = '';
+            try { updateTextPreview(); } catch(e) {}
+        });
+        // Waluta zmienia tylko ostrzezenie „plik jest w innej walucie", ale bez tego zostaloby
+        // ono na ekranie po przelaczeniu.
+        const curSel = panel.querySelector('#tm-currency');
+        if (curSel) curSel.addEventListener('change', function () { try { updateTextPreview(); } catch(e) {} });
+    }
 
     panel.querySelector('#tm-book-btn').onclick = async () => {
         if (!previewRows.length) return;
