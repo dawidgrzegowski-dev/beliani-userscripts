@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.03
+// @version      2.05
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12942,9 +12942,25 @@
         // Zmiane konta tez bierzemy z dwoch zrodel: z logu „Log" przy polu Bank account number
         // u dostawcy (zrodlo rozstrzygajace, ma dokladna date) oraz z komentarza o zmianie
         // danych bankowych (przycisk „bi_change" u dostawcy dopisuje taki komentarz do zamowien).
+        // „Tomato 130" / „tomato 331" — wewnetrzny znacznik weryfikacji dostawcy. Wg ustalen
+        // z uzytkownikiem taki wpis liczy sie jak potwierdzenie danych firmy (razem z bankiem).
+        // Numer jest wymagany, zeby nie lapac przypadkowego slowa w zdaniu.
+        function pcIsTomato(t){ return /\btomato\s*(?:no\.?|nr\.?|#)?\s*\d+/i.test(String(t == null ? '' : t)); }
+        // Czego dotyczy komentarz. Potwierdzenie konta bywa zapisane wprost („Bank details
+        // confirmed"), ale rownie czesto ogolnie o firmie („All new company information
+        // confirmed at the fair") — a to obejmuje takze konto. Komentarze o ZAMOWIENIU
+        // odsiewamy, zeby „order details confirmed" nie udawalo potwierdzenia konta.
+        function pcConfSubject(s){
+            if (/\border\b[\s\S]{0,15}?\b(?:details|information|data)\b/i.test(s)) return false;
+            if (/bank|account|konto|iban|swift|beneficiar/i.test(s)) return true;
+            if (/\b(?:company|firm|supplier|contact|dostawc[ayi]|firm[ay])\b[\s\S]{0,30}?\b(?:information|informations|details|data|dane)\b/i.test(s)) return true;
+            if (/\b(?:information|informations|details|data|dane)\b[\s\S]{0,20}?\b(?:company|firm|supplier|contact|firmy|dostawc[ayi])\b/i.test(s)) return true;
+            return false;
+        }
         function pcIsBankConfText(t){
             var s = String(t == null ? '' : t);
-            if (!/bank|account|konto|iban|swift|beneficiar/i.test(s)) return false;
+            if (pcIsTomato(s)) return true;
+            if (!pcConfSubject(s)) return false;
             // prosba albo zaprzeczenie — to NIE jest potwierdzenie
             if (/\b(?:please|pls|kindly)\s+(?:re-?)?(?:confirm|verify|check)/i.test(s)) return false;
             if (/\b(?:not|never|un)\s*-?\s*confirm/i.test(s)) return false;
@@ -12983,7 +12999,10 @@
             var s = String(t == null ? '' : t);
             if (!/bank|account|konto|iban/i.test(s)) return false;
             if (pcIsBankConfText(s)) return false;   // „confirmed" wygrywa nad „changed"
-            return /\b(?:chang|updat|modif)[a-z]*\b/i.test(s) || /\bnew\s+(?:bank|account)/i.test(s)
+            // „merg/marg" — fuzja firm ze zmiana konta; w bazie trafia sie literowka „marged".
+            // „NEW ... BANK ACCOUNT" z tekstem posrodku: „NEW NAME, CONTACT DETAILS AND BANK ACCOUNT".
+            return /\b(?:chang|updat|modif|merg|marg)[a-z]*\b/i.test(s)
+                || /\bnew\b[\s\S]{0,40}?\b(?:bank|account|konto)\b/i.test(s)
                 || /zmian[a-zćęłńóśźż]*/i.test(s) || /\bnowy\s+(?:numer\s+)?(?:konta|rachunk)/i.test(s);
         }
         // „nowszy niz" odporne na komentarz bez daty (ts = NaN)
@@ -15410,7 +15429,11 @@
         }
         function pcBalCellHtml(r, rid){ var a = pcBalAmtVal(r), edited = (r._editAmt != null && isFinite(r._editAmt)); return pcAmtValSpan(rid, 'b', (a != null && isFinite(a)) ? a.toFixed(2) : '', edited); }
         function pcPiTitle(r){ if (!r || !r.pi) return ''; var b = []; if (r.pi.piSheet) b.push('Arkusz P/I: ' + r.pi.piSheet); if (r.pi.piAmount != null) b.push('kwota P/I: ' + r.pi.piAmount.toFixed(2)); if (r.pi.piAcc) b.push('konto P/I: ' + r.pi.piAcc); if (!b.length) return ''; return ' title="' + esc(b.join(' | ')) + '"'; }
-        function pcPiCellHtml(r){ if (!r.pi) return ''; var t = pcPiTitle(r); if (r.pi.warn) return '<span' + t + ' style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; if (r.pi.ok) return '<span' + t + ' style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; return '<span' + t + ' style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; }
+        // ⚠ czerwone, nie bursztynowe: wiersze balance przejmuja tlo z wklejki (r.bg), a na
+        // pomaranczowym tle z arkusza #c47f00 zlewalo sie z tlem i ostrzezenia bylo nie widac.
+        // Warn od bledu odroznia teraz sam znak ⚠ / ✗ i tresc komunikatu.
+        var PC_WARN_COL = '#c00';
+        function pcPiCellHtml(r){ if (!r.pi) return ''; var t = pcPiTitle(r); if (r.pi.warn) return '<span' + t + ' style="color:' + PC_WARN_COL + ';font-weight:700">P/I ⚠ ' + esc(r.pi.msg) + '</span>'; if (r.pi.ok) return '<span' + t + ' style="color:#0a0;font-weight:700">P/I ✓ ' + esc(r.pi.msg) + '</span>'; return '<span' + t + ' style="color:#c00;font-weight:700">P/I ✗ ' + esc(r.pi.msg) + '</span>'; }
         function pcOkCellHtml(r){
             if (!r || !r.pi) return '';
             var o = r.pi.depOk;
@@ -15427,7 +15450,7 @@
         function pcBalPiCellHtml(r){
             if (!r || !r.bpi) return '';
             var v = r.bpi, t = v.title ? ' title="' + pcAttr(v.title) + '"' : '';
-            if (v.warn) return '<span' + t + ' style="color:#c47f00;font-weight:700">P/I ⚠ ' + esc(v.msg) + '</span>';
+            if (v.warn) return '<span' + t + ' style="color:' + PC_WARN_COL + ';font-weight:700">P/I ⚠ ' + esc(v.msg) + '</span>';
             if (v.ok) return '<span' + t + ' style="color:#0a0;font-weight:700">P/I ✓ ' + esc(v.msg) + '</span>';
             return '<span' + t + ' style="color:#c00;font-weight:700">P/I ✗ ' + esc(v.msg) + '</span>';
         }
@@ -15435,7 +15458,7 @@
             if (!r || !r.bc) return '';
             var v = r.bc, t = v.title ? ' title="' + pcAttr(v.title) + '"' : '';
             if (v.ok) return '<span' + t + ' style="color:#0a0;font-weight:700">✓ ' + esc(v.msg) + '</span>';
-            if (v.warn) return '<span' + t + ' style="color:#c47f00;font-weight:700">⚠ ' + esc(v.msg) + '</span>';
+            if (v.warn) return '<span' + t + ' style="color:' + PC_WARN_COL + ';font-weight:700">⚠ ' + esc(v.msg) + '</span>';
             return '<span' + t + ' style="color:#c00;font-weight:700">✗ ' + esc(v.msg) + '</span>';
         }
         function pcRowBal(r, gi, rid, bgo){
@@ -15548,13 +15571,23 @@
         // ===== balance: dopasowanie wklejonych wierszy do komentarzy (kontener + kwota) =====
         var PC_CUR_RE = "(?:usd|eur|cny|rmb|chf|pln|\\$|€)";
         var PC_NUM_RE = "\\d{1,3}(?:[ '’,]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?";
+        // Kwota BEZ waluty — „Container: KOCU4515675 21578.00". Zeby nie brac za kwote numeru
+        // roszczenia („penalty 1068"), numeru artykulu czy sztuk („2 szt”), wymagamy, zeby
+        // liczba wygladala jak pieniadze: musi miec grosze albo separator tysiecy i grosze.
+        // Ta sama zasada dziala od dawna po stronie DEPO (pcDepoAmt) — tu tylko ja powtarzamy.
+        var PC_BARE_RE = "\\d{1,3}(?:[ '’,]\\d{3})+[.,]\\d{1,2}|\\d+[.,]\\d{1,2}";
         function pcNormCont(s){ return String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
         function pcMoneyTokens(text){
-            var out = [], re = new RegExp('(?:' + PC_CUR_RE + ')\\s*(' + PC_NUM_RE + ')|(' + PC_NUM_RE + ')\\s*(?:' + PC_CUR_RE + ')', 'gi'), m;
-            while ((m = re.exec(String(text == null ? '' : text))) !== null){
-                var v = parseMoney(m[1] != null ? m[1] : m[2]);
-                if (isFinite(v) && v > 0 && out.indexOf(v) === -1) out.push(v);
-            }
+            var s = String(text == null ? '' : text), out = [];
+            function add(raw){ var v = parseMoney(raw); if (isFinite(v) && v > 0 && out.indexOf(v) === -1) out.push(v); }
+            var re = new RegExp('(?:' + PC_CUR_RE + ')\\s*(' + PC_NUM_RE + ')|(' + PC_NUM_RE + ')\\s*(?:' + PC_CUR_RE + ')', 'gi'), m;
+            while ((m = re.exec(s)) !== null) add(m[1] != null ? m[1] : m[2]);
+            // Drugie przejscie: liczby bez waluty. Procenty wycinamy, zeby „deposit 30%" nie
+            // wchodzilo jako kwota. Osloniecie z obu stron pilnuje, zeby nie wyciac kawalka
+            // dluzszej liczby ani nie zlapac cyfr wklejonych w numer kontenera.
+            var b = new RegExp("(?:^|[^\\d.,'’-])(" + PC_BARE_RE + ")(?![\\d.,]*\\d)", 'g'), bm;
+            var t = s.replace(/\d+(?:[.,]\d+)?\s*%/g, ' ');
+            while ((bm = b.exec(t)) !== null) add(bm[1]);
             return out;
         }
         // Komentarz z prosba o depozyt — procent bywa pominiety ("please pay deposit 2886.40 USD").
