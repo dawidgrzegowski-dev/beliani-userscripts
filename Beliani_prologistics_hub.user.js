@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.08
+// @version      2.09
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13639,8 +13639,35 @@
         }
         function painBicOk(s){ return /^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(painNorm(s)); }
         // Adres hybrydowy: TwnNm i Ctry osobno, cala reszta w max 2 x 70 znakow AdrLine.
-        function painSplitAddr(addr, strict){
-            var t = painTxt(pbStripCtry(addr), 0, strict);
+        // Usuwa nazwe miasta z tekstu adresu — tylko jako cala fraze, razem z osieroconym
+        // przecinkiem. Miasto i tak idzie w TwnNm, a powtorzone w AdrLine robilo z adresu
+        // „QUANG THIEN, NINH BINH" obok <TwnNm>NINH BINH</TwnNm>. Gdy po usunieciu nic nie
+        // zostaje, AdrLine po prostu nie powstaje.
+        function painDropTown(t, town){
+            var s = String(t == null ? '' : t), w = String(town == null ? '' : town).trim();
+            if (!s || !w) return s;
+            var rx = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+            s = s.replace(new RegExp('(^|[^A-Za-z0-9])' + rx + '(?![A-Za-z0-9])', 'gi'), '$1');
+            return s.replace(/\s*,(\s*,)+/g, ',').replace(/^[\s,]+/, '').replace(/[\s,]+$/, '').replace(/\s+/g, ' ').trim();
+        }
+        // AdrLine: SPS dopuszcza najwyzej 2 linie po 70 znakow. Doklejamy kolejne czlony do
+        // ostatniej linii, dopoki sie miesza, a nadmiar ucinamy — lepiej skrocic ogon adresu
+        // niz wypuscic trzecia linie, ktorej bank nie przyjmie.
+        function painAdrPack(parts){
+            var out = [];
+            (parts || []).forEach(function(p){
+                var t = String(p == null ? '' : p).trim();
+                if (!t) return;
+                if (!out.length) { out.push(t.slice(0, 70)); return; }
+                var i = out.length - 1, merged = out[i] + ', ' + t;
+                if (merged.length <= 70) { out[i] = merged; return; }
+                if (out.length < 2) { out.push(t.slice(0, 70)); return; }
+                out[1] = merged.slice(0, 70).replace(/[\s,]+$/, '');
+            });
+            return out.slice(0, 2);
+        }
+        function painSplitAddr(addr, strict, town){
+            var t = painDropTown(painTxt(pbStripCtry(addr), 0, strict), town);
             if (!t) return [];
             if (t.length <= 70) return [t];
             var cut = -1, i;
@@ -13651,11 +13678,11 @@
             if (b.length > 70) b = b.slice(0, 70).replace(/[\s,]+$/, '');
             return b ? [a, b] : [a];
         }
+        // Sama ulica. Linia „6340 Baar" wypadla: miasto dublowalo <TwnNm>, a kod pocztowy
+        // idzie teraz wlasnym elementem <PstCd>, wiec nic sie nie gubi.
         function painDbtrLines(cfg, strict){
             var out = [], s = painTxt(cfg.str, 70, strict);
             if (s) out.push(s);
-            var pc = painTxt(cfg.pstCd, 16, strict), tw = painTxt(cfg.town, 35, strict);
-            if (pc && tw) out.push(painTxt(pc + ' ' + tw, 70, strict));
             return out;
         }
         // Blok bankowy grupy: zbieramy z P/I depo (r.pi.piBank) i z P/I balance (r.bpi.bank).
@@ -13746,6 +13773,9 @@
             if (!/^[A-Z]{2}$/.test(String(cfg.ctry || '').toUpperCase())) errs.push('Zleceniodawca: brak kraju (2 litery, np. CH).');
             if (!/^\d{4}-\d{2}-\d{2}$/.test(String(cfg.exec || ''))) errs.push('Data wykonania: wymagany format RRRR-MM-DD.');
             if (!rows.length) errs.push('Nie zaznaczono żadnej płatności.');
+            // Tryb testowy nie moze cicho zostac na stale — od 14.11.2026 plik bez TwnNm/Ctry
+            // przestanie byc przyjmowany.
+            if (cfg.flatAdr) warns.push('Włączony tryb testowy „adres tylko w AdrLine” — plik pójdzie bez TwnNm, PstCd i Ctry. Do porównania w e-finance; po teście wyłącz.');
             var e2e = {};
             rows.forEach(function(r){
                 var p = '„' + r.sup + '”: ';
@@ -13786,11 +13816,24 @@
             function o(t, a){ L.push(sp() + '<' + t + (a || '') + '>'); d++; }
             function c(t){ d--; L.push(sp() + '</' + t + '>'); }
             function e(t, v, a){ L.push(sp() + '<' + t + (a || '') + '>' + painEsc(v) + '</' + t + '>'); }
-            function pstlAdr(town, ctry, lines){
+            // cfg.flatAdr — wariant diagnostyczny. PostFinance przy zleceniu BEL-21535-1
+            // zinterpretowal konto beneficjenta jak szwajcarskie konto pocztowe (48810370004074
+            // -> „37-407-4"), a jedynym odstepstwem od Swiss Payment Standards w tamtym pliku
+            // byl adres hybrydowy: TwnNm/Ctry razem z AdrLine. Wlaczony przelacznik wypuszcza
+            // adres czysto nieustrukturyzowany, zeby dalo sie porownac oba pliki w e-finance.
+            // Domyslnie WYLACZONY — od 14.11.2026 TwnNm i Ctry sa obowiazkowe.
+            function pstlAdr(town, ctry, lines, pstCd){
                 o('PstlAdr');
-                if (town) e('TwnNm', town);
-                if (ctry) e('Ctry', ctry);
-                (lines || []).forEach(function(x){ if (x) e('AdrLine', x); });
+                if (cfg.flatAdr){
+                    painAdrPack((lines || []).concat([[pstCd, town].filter(Boolean).join(' '), ctry]))
+                        .forEach(function(x){ e('AdrLine', x); });
+                } else {
+                    // Kolejnosc wg PostalAddress24: PstCd -> TwnNm -> Ctry -> AdrLine.
+                    if (pstCd) e('PstCd', pstCd);
+                    if (town) e('TwnNm', town);
+                    if (ctry) e('Ctry', ctry);
+                    (lines || []).forEach(function(x){ if (x) e('AdrLine', x); });
+                }
                 c('PstlAdr');
             }
             now = now || new Date();
@@ -13820,7 +13863,7 @@
             o('ReqdExctnDt'); e('Dt', cfg.exec); c('ReqdExctnDt');
             o('Dbtr');
             e('Nm', dbtrNm);
-            pstlAdr(painTxt(cfg.town, 35, strict), dbtrCtry, painDbtrLines(cfg, strict));
+            pstlAdr(painTxt(cfg.town, 35, strict), dbtrCtry, painDbtrLines(cfg, strict), painTxt(cfg.pstCd, 16, strict));
             c('Dbtr');
             o('DbtrAcct'); o('Id'); e('IBAN', painNorm(cfg.iban)); c('Id'); c('DbtrAcct');
             o('DbtrAgt'); o('FinInstnId'); e('BICFI', painNorm(cfg.bic)); c('FinInstnId'); c('DbtrAgt');
@@ -13852,7 +13895,7 @@
                 }
                 o('Cdtr');
                 e('Nm', painTxt(r.name, 140, strict));
-                pstlAdr(painTxt(r.town, 35, strict), r.ctry, painSplitAddr(r.addr, strict));
+                pstlAdr(painTxt(r.town, 35, strict), r.ctry, painSplitAddr(r.addr, strict, r.town));
                 c('Cdtr');
                 o('CdtrAcct'); o('Id');
                 if (painIbanOk(r.acc)) e('IBAN', painNorm(r.acc));
@@ -13877,7 +13920,7 @@
                 return c;
             }
             // 'agt' zniknal w 1.84 — nazwa/adres banku beneficjenta nigdy nie ida obok BIC-u.
-            var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, exec: '' };
+            var d = { nm: '', iban: '', bic: '', str: '', pstCd: '', town: '', ctry: 'CH', chrgBr: 'SHAR', batch: true, strict: false, flatAdr: false, exec: '' };
             try { var raw = GM_getValue(PAIN_CFG_KEY, ''); if (raw) { var o = JSON.parse(raw); for (var k in o) if (o[k] != null) d[k] = o[k]; } } catch(e){}
             if (!/^\d{4}-\d{2}-\d{2}$/.test(d.exec) || d.exec < painDt(new Date())) d.exec = painDt(painNextBizDay(new Date()));
             state._painCfg = d;
@@ -15333,7 +15376,9 @@
                + '</select></label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="BtchBookg=true: bank księguje paczkę jedną zbiorczą pozycją na wyciągu."><input type="checkbox" class="pain-cfgb" data-k="batch"' + (cfg.batch === false ? '' : ' checked') + '> księgowanie zbiorcze</label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="Domyślnie WYŁĄCZONE — Swiss Payment Standards 2025 (pkt 3.1) dopuszcza cały Basic Latin, więc „%” i „&” są legalne. Włącz tylko, jeśli bank odrzuci plik z powodu znaków: tekst zostanie ograniczony do zestawu SWIFT (a-z A-Z 0-9 . , : ’ + - / ( ) ?), „%” → „pct”, „&” → „+”."><input type="checkbox" class="pain-cfgb" data-k="strict"' + (cfg.strict ? ' checked' : '') + '> ścisły zestaw znaków</label>'
-               + '</div></div>';
+               + '<label style="font-size:11px;color:' + (cfg.flatAdr ? '#c00;font-weight:700' : '#555') + ';cursor:pointer" title="DIAGNOSTYKA — domyślnie WYŁĄCZONE. Włączone wypuszcza adres zleceniodawcy i beneficjenta wyłącznie w AdrLine, bez TwnNm, PstCd i Ctry. Do porównania dwóch plików w e-finance, gdy PostFinance źle odczytuje numer konta beneficjenta. Uwaga: od 14.11.2026 TwnNm i Ctry są obowiązkowe, więc to ustawienie jest tymczasowe — po teście wyłącz."><input type="checkbox" class="pain-cfgb" data-k="flatAdr"' + (cfg.flatAdr ? ' checked' : '') + '> adres tylko w AdrLine (test)</label>'
+               + '</div></div>'
+               + (cfg.flatAdr ? '<div style="margin-top:-4px;margin-bottom:8px;background:#FFF6E0;border:1px solid #f0d59a;border-radius:6px;padding:5px 9px;font-size:11px;color:#7a5300"><b>⚠ Tryb testowy adresu WŁĄCZONY</b> — plik pójdzie z adresem wyłącznie w AdrLine, bez TwnNm / PstCd / Ctry. Po sprawdzeniu w e-finance wyłącz go z powrotem.</div>' : '');
 
             h += '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;width:100%">';
             h += '<tr style="color:#999;font-size:10px"><td style="padding:1px 4px"></td><td style="padding:1px 4px">Dostawca</td><td style="padding:1px 4px;text-align:right">Kwota ' + PAIN_CCY + '</td><td style="padding:1px 4px">Beneficjent (Nm)</td><td style="padding:1px 4px">Konto</td><td style="padding:1px 4px">BIC</td><td style="padding:1px 4px">Miasto</td><td style="padding:1px 4px">Kraj</td><td style="padding:1px 4px">Status</td></tr>';
@@ -16534,7 +16579,9 @@
                     if (v.errs.length) { say('Popraw najpierw ' + v.errs.length + ' błędów.', '#c00'); return; }
                     var xml = painBuild(cfg, sel, strict);
                     if (t.id === 'pain-copy'){ var okc = pcCopyText(xml); say(okc ? ('Skopiowano XML (' + sel.length + ' przelewów).') : 'Nie udało się skopiować.', okc ? '#0a0' : '#c00'); return; }
-                    var r2 = painSave(xml, 'pain001 ' + pcToday() + ' chinskie ' + PAIN_CCY + '.xml');
+                    // Znacznik w nazwie, zeby dalo sie odroznic plik testowy od zwyklego —
+                    // przy porownywaniu dwoch wersji w e-finance to jedyne, co je rozroznia.
+                    var r2 = painSave(xml, 'pain001 ' + pcToday() + ' chinskie ' + PAIN_CCY + (cfg.flatAdr ? ' adrline' : '') + '.xml');
                     say(r2 ? ('Zapisano: ' + r2.name + ' — ' + sel.length + ' przelewów, ' + Math.round(r2.size / 1024) + ' kB. Sprawdź folder Pobrane.') : 'Nie udało się zapisać pliku.', r2 ? '#0a0' : '#c00');
                     return;
                 }
