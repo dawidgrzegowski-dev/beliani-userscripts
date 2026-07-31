@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.19
+// @version      2.20
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5553,6 +5553,17 @@
         return Number(amount).toFixed(2);
     }
 
+    // Numer auftraga jako klikalny link. W tym module numer z wklejki jest wprost numerem
+    // dla auction.php (checkRefund pobiera `/auction.php?number=${auftragNumber}&txnid=3`),
+    // wiec nie trzeba go nigdzie szukac. Nowa karta — zeby lista wynikow nie znikala.
+    function auLink(n) {
+        const s = String(n == null ? '' : n).trim();
+        if (!/^\d+$/.test(s)) return `<strong>${s}</strong>`;
+        return `<a href="/auction.php?number=${s}&txnid=3" target="_blank" rel="noopener"`
+            + ` style="font-weight:bold;color:inherit;text-decoration:underline"`
+            + ` title="Otwórz auftrag ${s} w nowej karcie">${s}</a>`;
+    }
+
     function normalizeText(text) {
         return String(text || '')
             .replace(/&nbsp;/gi, ' ')
@@ -6065,11 +6076,11 @@
                     auftrag: result.auftragNumber,
                     duplicates: result.internalDuplicates
                 });
-                failList.push(`${result.auftragNumber} — ${result.error}`);
+                failList.push(`${auLink(result.auftragNumber)} — ${result.error}`);
             } else if (result.ok) {
-                okList.push(`${result.auftragNumber} (${result.refundAmount.toFixed(2)})`);
+                okList.push(`${auLink(result.auftragNumber)} (${result.refundAmount.toFixed(2)})`);
             } else {
-                failList.push(`${result.auftragNumber} — ${result.error}`);
+                failList.push(`${auLink(result.auftragNumber)} — ${result.error}`);
             }
         }
 
@@ -6081,7 +6092,7 @@
         if (inputDuplicates.length > 0) {
             dupHtml += '<div style="font-weight:bold; margin-bottom:4px;">Z listy wejściowej:</div>';
             dupHtml += inputDuplicates
-                .map(n => `<div>⚠️ <strong>${n}</strong> — pojawia się ${counts[n]}x</div>`)
+                .map(n => `<div>⚠️ ${auLink(n)} — pojawia się ${counts[n]}x</div>`)
                 .join('');
         }
 
@@ -6091,7 +6102,7 @@
             dupHtml += '<div style="font-weight:bold; margin-bottom:4px;">Zduplikowane refundy approved:</div>';
             dupHtml += internalDupList
                 .map(d => {
-                    let h = `<div style="margin-bottom:4px;">⚠️ <strong>${d.auftrag}</strong>:</div>`;
+                    let h = `<div style="margin-bottom:4px;">⚠️ ${auLink(d.auftrag)}:</div>`;
                     d.duplicates.forEach(x => {
                         const boxes = (x.items || []).map(it => `<label style="margin-right:12px;white-space:nowrap;"><input type="checkbox" class="tm-deact-cb" data-logid="${it.logId}"> deaktywuj #${it.logId}${it.bankName ? ' — <b>' + it.bankName + '</b>' : ''}</label>`).join('');
                         h += `<div style="margin-left:14px;">${formatAmount(x.amount)} ×${x.count} → ${boxes}</div>`;
@@ -6119,7 +6130,7 @@
                 const links = (e.logIds || []).map(id => `<a href="/react/settings_page/import_payments/${id}/" target="_blank">${id}</a>`).join(', ') || '—';
                 return `<div style="display:flex;align-items:flex-start;gap:6px;padding:3px 0;" data-logids="${(e.logIds||[]).join(',')}">`
                     + `<input type="checkbox" class="tm-exec-cb" style="margin-top:2px;">`
-                    + `<span><strong>${e.auftrag}</strong> — ${e.amount.toFixed(2)} — status: <b>Refund approved</b> — import: ${links}<span class="tm-exec-note" style="color:#16a34a;"></span></span></div>`;
+                    + `<span>${auLink(e.auftrag)} — ${e.amount.toFixed(2)} — status: <b>Refund approved</b> — import: ${links}<span class="tm-exec-note" style="color:#16a34a;"></span></span></div>`;
               }).join('')
             : '<div style="color:#888">Brak</div>';
 
