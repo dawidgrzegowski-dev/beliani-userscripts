@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.06
+// @version      2.07
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -14114,15 +14114,23 @@
         function xlConfTxt(cf){
             if (!cf) return '? nie sprawdzone — potwierdzenia konta nie znam, sprawdź ręcznie';
             var zrod = cf.src ? ('  [' + cf.src + ']') : '';
-            var zm = cf.chDate ? (cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '') + (cf.chSrc ? ' (' + cf.chSrc + ')' : '')) : '';
+            var zm = cf.chDate ? (cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '') + (cf.chSrc ? ' (' + cf.chSrc + ')' : '')
+                + ((cf.chFrom && cf.chTo) ? (', z ' + cf.chFrom + ' na ' + cf.chTo) : '')) : '';
             if (cf.st === 'ok') return '✓ potwierdzone ' + (cf.date || '?') + (cf.author ? ', ' + cf.author : '') + '  —  „' + (cf.text || '') + '"' + zrod
                 + (zm ? ('     ·     ostatnia zmiana danych bankowych: ' + zm) : '');
+            if (cf.st === 'nochg') return 'sam balance — potwierdzenie konta niewymagane (depozyt na ten numer już poszedł), numer konta nie był zmieniany';
+            if (cf.st === 'chg') return '⚠ sam balance, ale NUMER KONTA ZOSTAŁ ZMIENIONY: ' + (zm || '?')
+                + ' — po zmianie nikt konta nie potwierdził, sprawdź przed wysłaniem balance';
             if (cf.st === 'old') return '⚠ potwierdzenie z ' + (cf.date || '?') + zrod + ' jest STARSZE niż zmiana danych bankowych z ' + (zm || '?')
                 + ' — dotyczy poprzedniego numeru, potwierdź konto przed przelewem';
-            return '✗ BRAK potwierdzenia danych bankowych — ani u dostawcy, ani w komentarzach zamówień'
+            return '✗ BRAK potwierdzenia danych bankowych — w grupie jest depozyt, więc potwierdzenie jest wymagane'
                 + (zm ? ('  —  ostatnia zmiana: ' + zm) : '');
         }
-        function xlConfSt(cf){ return (cf && cf.st === 'ok') ? XLS.VALB : ((cf && cf.st === 'old') ? XLS.WARNW : XLS.BADW); }
+        function xlConfSt(cf){
+            if (cf && (cf.st === 'ok' || cf.st === 'nochg')) return XLS.VALB;
+            if (cf && (cf.st === 'old' || cf.st === 'chg')) return XLS.WARNW;
+            return XLS.BADW;
+        }
         // Status calej platnosci — to jest kolumna, ktora decyduje, czy ktos ma to wklepac do banku.
         function xlStatusOf(pr){
             if (!pr) return { t: '✗ NIE WPROWADZAĆ', s: 'bad', why: 'nie udało się złożyć danych płatności' };
@@ -14163,8 +14171,7 @@
                     sumDep += (pcSumRows(G.dep) || 0); sumBal += (pcBalSum(G.bal) || 0);
                     sumAll += pr ? pr.amount : ((pcSumRows(G.dep) || 0) + (pcBalSum(G.bal) || 0));
                     if (st.s === 'ok') nOk++; else if (st.s === 'warn') nWarn++; else nBad++;
-                    var _cf = pcConfEval(G);
-                    if (!_cf || _cf.st !== 'ok') nNoConf++;
+                    if (pcConfNeedsEye(pcConfEval(G))) nNoConf++;
                 });
             });
 
@@ -14178,7 +14185,7 @@
                 + '     Płatności: ' + nGroups + '     Pozycji: ' + nRows + '     Razem: ' + sumAll.toFixed(2) + ' ' + PAIN_CCY, XLS.BOLD);
             var bsc = state.balSumChk || null;
             xlBand(1, XL_NCOL, 'Sprawdzone: ' + nOk + '   ·   do sprawdzenia: ' + nWarn + '   ·   NIE wprowadzać: ' + nBad
-                + (nNoConf ? ('   ·   bez potwierdzenia konta u dostawcy: ' + nNoConf) : '')
+                + (nNoConf ? ('   ·   konto do sprawdzenia: ' + nNoConf) : '')
                 + ((bsc && bsc.n) ? ('   ·   sumy kontrolne z wklejki: ' + bsc.ok + '/' + bsc.n + ' zgodnych'
                     + (bsc.bad.length ? ('   ⚠ ROZJAZD: ' + bsc.bad.map(function(b){ return b.sup + ' (wklejka ' + b.declared.toFixed(2) + ', wiersze ' + b.got.toFixed(2) + ')'; }).join('; ')) : '')) : ''), XLS.SMALL);
             xlBand(1, XL_NCOL, 'Wygenerowano: ' + pcNow() + '   ·   skrypt hub ' + VER + '   ·   plik roboczy, nie jest to dokument księgowy', XLS.SMALL);
@@ -15393,13 +15400,25 @@
                 chTs = chg.ts; out.chDate = chg.date; out.chBy = chg.author; out.chFrom = ''; out.chTo = '';
                 out.chSrc = chg.src || 'komentarz'; out.chText = chg.text || '';
             }
-            if (!conf) return out;
+            // DEPO wymaga potwierdzenia konta — to pierwszy przelew do tego dostawcy w tej
+            // sprawie. BALANCE juz nie: skoro depozyt na to konto przeszedl, konto jest
+            // sprawdzone w praktyce. Przy samym balance patrzymy WYLACZNIE na to, czy numer
+            // konta w miedzyczasie sie nie zmienil.
+            out.needConf = (G.dep || []).length > 0;
+            if (!conf){
+                if (out.needConf) return out;             // st = 'none' — czerwone ✗
+                out.st = isFinite(chTs) ? 'chg' : 'nochg';
+                return out;
+            }
             out.date = conf.date; out.author = conf.author; out.text = conf.text; out.src = conf.src;
             // Brak daty po ktorejkolwiek stronie = nie ma czego porownac; wtedy nie strasz
-            out.st = (isFinite(chTs) && isFinite(conf.ts) && conf.ts < chTs) ? 'old' : 'ok';
+            var stale = isFinite(chTs) && isFinite(conf.ts) && conf.ts < chTs;
+            out.st = stale ? (out.needConf ? 'old' : 'chg') : 'ok';
             return out;
         }
         function pcConfG(G){ return pcConfEval(G); }
+        // Stany wymagajace uwagi czlowieka. 'nochg' (balance bez zmiany konta) i 'ok' sa czyste.
+        function pcConfNeedsEye(cf){ return !cf || cf.st === 'none' || cf.st === 'old' || cf.st === 'chg'; }
         // Wspolny opis zmiany konta do dymka i do Excela.
         function pcConfChgTxt(cf){
             if (!cf || !cf.chDate) return '';
@@ -15416,10 +15435,17 @@
             var ch = pcConfChgTxt(cf), zm = ch ? ('\n\nOstatnia zmiana danych bankowych: ' + ch) : '';
             if (cf.st === 'ok') return pcConfPill('✓ konto potwierdzone', '#0a7a2f',
                 'Komentarz potwierdza dane bankowe.\n\n' + kto + '\n„' + (cf.text || '') + '"' + zm);
+            // Sam balance: potwierdzenia nie wymagamy (depozyt na to konto juz poszedl),
+            // wiec jedyne, co moze tu zapalic lampke, to zmiana numeru konta.
+            if (cf.st === 'nochg') return pcConfPill('konto bez zmian', '#777',
+                'Sam balance — potwierdzenia konta nie wymagamy, bo depozyt na ten numer już poszedł.\nW logu dostawcy ani w komentarzach nie ma śladu zmiany numeru konta.');
+            if (cf.st === 'chg') return pcConfPill('⚠ zmiana numeru konta', '#c47f00',
+                'Sam balance — potwierdzenia konta nie wymagamy, ale numer konta ZOSTAŁ ZMIENIONY i nikt tego po zmianie nie potwierdził.\nSprawdź, zanim wyślesz balance.'
+                + (cf.date ? ('\n\nOstatnie potwierdzenie (starsze niż zmiana): ' + kto + '\n„' + (cf.text || '') + '"') : '') + zm);
             if (cf.st === 'old') return pcConfPill('⚠ potwierdzenie sprzed zmiany konta', '#c47f00',
                 'Potwierdzenie jest STARSZE niż ostatnia zmiana danych bankowych — dotyczy poprzedniego numeru.\n\nPotwierdzenie: ' + kto + '\n„' + (cf.text || '') + '"' + zm);
             return pcConfPill('✗ konto niepotwierdzone', '#c00',
-                'Ani na stronie dostawcy, ani w komentarzach zamówień nie ma potwierdzenia danych bankowych.' + zm);
+                'W tej grupie jest depozyt, więc potwierdzenie konta jest wymagane — a ani na stronie dostawcy, ani w komentarzach zamówień go nie ma.' + zm);
         }
         function pcChkHtml(r, gi){ return /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz do payment confirmation / komentarza"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : ''; }
         function pcAmtValSpan(rid, typ, txt, edited){ return '<span class="pc-amt-val" data-row="' + rid + '" data-type="' + typ + '" title="Kliknij, aby edytowac kwote" style="cursor:text;border-bottom:1px dashed #bbb;font-weight:600' + (edited ? ';color:#0a58ca' : '') + '">' + (txt || '—') + '</span>' + (edited ? ' <span class="pc-amt-reset" data-row="' + rid + '" data-type="' + typ + '" title="Cofnij edycje" style="cursor:pointer;color:#c00;font-size:10px">✕</span>' : ''); }
