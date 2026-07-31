@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.15
+// @version      2.16
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13505,6 +13505,18 @@
             return { combined: combined, depoOnly: depoOnly, balOnly: balOnly };
         }
         var PC_TITLE_MAX = 140;
+        // ===== Zakazane przedrostki kontenerow =====
+        // MAGU… i HDMU… — same litery przedrostka cos znacza po stronie odbiorcy i tytul
+        // przelewu z nimi potrafi zostac odrzucony. W tytule idzie wiec sam numer, bez tych
+        // czterech liter. W tabeli przedrostek zostaje widoczny, ale przekreslony na czerwono,
+        // zeby bylo od razu wiadomo, dlaczego tytul wyglada inaczej niz kolumna Kontener.
+        var PC_CONT_BAN = /^(?:MAGU|HDMU)/i;
+        function pcContForTitle(c){ return String(c == null ? '' : c).replace(PC_CONT_BAN, '').trim(); }
+        function pcContHtml(c){
+            var s = String(c == null ? '' : c);
+            if (!s) return '';
+            return esc(s).replace(/(MAGU|HDMU)/gi, '<span style="color:#c00;font-weight:700;text-decoration:line-through" title="Zakazany przedrostek — do tytułu przelewu trafia sam numer kontenera, bez tych liter.">$1</span>');
+        }
         // Zwija ciagi kolejnych liczb w zakres, ale dopiero od TRZECH. Na dwoch nie ma
         // po co: „100,101" i „100-101" maja tyle samo znakow, a pelne numery czyta sie
         // pewniej. Wejscie musi byc posortowane rosnaco. Wszystko, co nie jest czysta
@@ -13566,7 +13578,7 @@
             var orders = [], pcts = [], conts = [], pens = [];
             function addOrder(o){ o = String(o || '').trim(); if (o && orders.indexOf(o) === -1) orders.push(o); }
             (G.dep || []).forEach(function(r){ addOrder(r.order); var pp = (r.pi && r.pi.comPct != null) ? Math.round(r.pi.comPct) : null; if (pp != null && pcts.indexOf(pp) === -1) pcts.push(pp); });
-            (G.bal || []).forEach(function(r){ addOrder(r.order); String(r.container || '').split(/[\s,;]+/).forEach(function(tok){ var c = tok.replace(/[()]/g, '').trim(); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); }); pcParsePenalties(r.note).forEach(function(v){ if (pens.indexOf(v) === -1) pens.push(v); }); });
+            (G.bal || []).forEach(function(r){ addOrder(r.order); String(r.container || '').split(/[\s,;]+/).forEach(function(tok){ var c = pcContForTitle(tok.replace(/[()]/g, '').trim()); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); }); pcParsePenalties(r.note).forEach(function(v){ if (pens.indexOf(v) === -1) pens.push(v); }); });
             if (!orders.length) return '';
             orders.sort(function(a, b){ var na = parseInt(a, 10), nb = parseInt(b, 10); if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb; return String(a).localeCompare(String(b)); });
             var cfgs = [
@@ -14339,6 +14351,10 @@
                     for (var wc = 9; wc <= XL_NCOL; wc++) xlAdd(hr, wc, wc, '', XLS.WORK);
                     xlPush(hr);
 
+                    // Ten plik idzie do osoby wklepujacej przelew recznie — zastrzezenie
+                    // o przewalutowaniu musi tam byc, i to nad reszta danych.
+                    var nfx = pcNoFxCtry(G);
+                    if (nfx) labelRow('UWAGA (' + PC_NOFX[nfx] + '):', PC_NOFX_TXT + '  —  wpisz to w tytule/uwagach przelewu, żeby bank pośredniczący nie przewalutował USD', XLS.BADW, 30);
                     if (st.why) labelRow('Uwaga:', st.why, st.s === 'bad' ? XLS.BADW : XLS.WARNW, 30);
                     labelRow('Konto beneficjenta:', (accPay || '— brak w P/I —')
                         + ((accPay && accShown && normAcc(accPay) !== normAcc(accShown)) ? ('     ⚠ w prologistics widnieje inne konto: ' + accShown) : ''), XLS.VALB);
@@ -15650,7 +15666,29 @@
             if (du) A = '<span title="' + pcAttr(pcDupTitle(ord, du)) + '">' + A + '</span>';
             return '<tr>' + cel('<b style="color:#0a6">B</b>', bg)
                  + cel(A, du ? du.bg : bg, false, (du && du.warn) ? ';border:2px solid #c00' : '')
-                 + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel(pcBalPiCellHtml(r), bg) + cel(pcBalComCellHtml(r), bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>';
+                 + cel(pcContHtml(r.container), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel(pcBalPiCellHtml(r), bg) + cel(pcBalComCellHtml(r), bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>';
+        }
+        // ===== Przelewy, przy ktorych bank nie moze przewalutowac USD =====
+        // Hongkong, Singapur i Brazylia: przy wprowadzaniu przelewu recznie trzeba dopisac
+        // zastrzezenie, inaczej bank posrednik potrafi przewalutowac kwote. Kraj bierzemy
+        // z bloku bankowego P/I — z adresu, nazwy albo z kodu kraju w BIC-u.
+        var PC_NOFX = { HK: 'Hongkong', SG: 'Singapur', BR: 'Brazylia' };
+        var PC_NOFX_TXT = 'DO NOT EXCHANGE OR CONVERT THE USD';
+        function pcNoFxCtry(G){
+            try {
+                var bk = painBankOfG(G), b = bk && bk.bank;
+                if (!b) return '';
+                var cc = String((piBankGeo(b) || {}).ctry || '').toUpperCase();
+                return PC_NOFX[cc] ? cc : '';
+            } catch (e){ return ''; }
+        }
+        function pcNoFxBar(G){
+            var cc = pcNoFxCtry(G);
+            if (!cc) return '';
+            return '<div style="margin-top:5px;display:inline-flex;align-items:center;gap:8px;background:#c00;color:#fff;border-radius:6px;padding:3px 8px;font-size:11px;font-weight:700">'
+                 + '<span>⚠ ' + esc(PC_NOFX[cc]) + ' — przy ręcznym przelewie dopisz:</span>'
+                 + '<span class="pc-nofx-txt" style="font-family:ui-monospace,monospace;background:#fff;color:#c00;padding:1px 6px;border-radius:4px">' + esc(PC_NOFX_TXT) + '</span>'
+                 + '<button class="chn-btn ghost pc-nofx-copy" style="padding:1px 8px" title="Kopiuj ten tekst do schowka">📋</button></div>';
         }
         function pcGroupHeader(G, gi, gcol){
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
@@ -15667,6 +15705,7 @@
                 + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
                 + (pcHasInfoG(G) ? '<span class="pc-infobadge" title="' + pcAttr(pcDecodeInfo(pcInfoG(G))) + '" style="margin-left:12px;background:#c00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">! Info box</span>' : '');
             var t = pcTitleFor(G); if (t){ var _ov = t.length > PC_TITLE_MAX; h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button> <span style="font-size:10px;color:' + (_ov ? '#c00;font-weight:700' : '#888') + '">(' + t.length + '/' + PC_TITLE_MAX + ')</span></div>'; }
+            h += pcNoFxBar(G);
             return h + '</td></tr>';
         }
         function renderMerged(){
@@ -17014,6 +17053,7 @@
             else if (t.classList.contains('pc-acc')){ pcBeginEditAcc(t); }
             // Zmienna nazywala sie „sp" i przykrywala panel Sprawdzania o tej samej nazwie.
             else if (t.classList.contains('pc-title-copy')){ var tr = t.closest ? t.closest('tr') : null, ttx = tr ? tr.querySelector('.pc-title-txt') : null; if (ttx){ var ok = pcCopyText(ttx.textContent || ''); var st = wp.querySelector('#wp-status'); if (st) st.textContent = ok ? 'Skopiowano tytuł przelewu.' : 'Nie udało się skopiować.'; } }
+            else if (t.classList.contains('pc-nofx-copy')){ var nb = t.parentNode, ntx = nb ? nb.querySelector('.pc-nofx-txt') : null; if (ntx){ var okn = pcCopyText(ntx.textContent || ''); var stn = wp.querySelector('#wp-status'); if (stn) stn.textContent = okn ? ('Skopiowano: ' + ntx.textContent) : 'Nie udało się skopiować.'; } }
             else if (t.id === 'wp-copy-titles'){ var ts = pcTransferTitles(); var ok2 = pcCopyText(ts.map(function(x){ return x.title; }).join('\n')); var st2 = wp.querySelector('#wp-status'); if (st2) st2.textContent = ok2 ? ('Skopiowano ' + ts.length + ' tytułów.') : 'Nie udało się skopiować.'; }
         });
         wp.querySelector('#wp-pc-all').onclick = function(){
