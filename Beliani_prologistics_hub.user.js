@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.99
+// @version      2.00
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12995,12 +12995,13 @@
             return out;
         }
         // Ramki: na ekranie #eee (delikatna siatka na szarym panelu), ale po wklejeniu do
-        // Docs/Sheets jasnoszare linie na bialej kartce praktycznie znikaly — w kopii ida czarne.
+        // Docs/Sheets jasnoszare linie na bialej kartce praktycznie znikaly — w kopii ida #999.
+        // Czysta czern przy tej gestosci wierszy przytlaczala tresc, stad szarosc.
         function pcArial(html){
             return String(html)
                 .replace(/<table style="/g, '<table style="font-family:Arial,sans-serif;font-size:10pt;')
                 .replace(/<td style="/g, '<td style="font-family:Arial,sans-serif;font-size:10pt;')
-                .replace(/border:1px solid #eee/g, 'border:1px solid #000');
+                .replace(/border:1px solid #eee/g, 'border:1px solid #999');
         }
         function parsePenalties(html, maxAgeDays){
             var days = maxAgeDays || PENALTY_DAYS, cutoff = Date.now() - days * 86400000, out = [], sawRows = false;
@@ -13106,11 +13107,15 @@
         function renderDepo(forCopy){
             var g = state.dep, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             if (forCopy){
-                // Format do Sheets: A=nr(link) B=dostawca(link) C=puste D=kwota depo E=suma grupy (ostatni wiersz, gdy >1). Białe tło.
+                // Format do Sheets: A=nr(link) B=dostawca(link) C=puste D=kwota depo E=suma grupy (ostatni wiersz, gdy >1).
+                // Tlo wypisujemy TYLKO dla grup laczonych (kolor z palety). Dawniej reszta szla
+                // na sztywno '#fff' i kazda wklejka DEPO zamalowywala na bialo kolory, ktore
+                // ktos wczesniej nalozyl w arkuszu. Puste tlo = cel() nie wypisuje background,
+                // czyli wklejka zostawia wypelnienie komorek takie, jakie w arkuszu bylo.
                 var CKd = pcCombinedColorMap();
                 g.order.forEach(function(sup){
                     var rows = g.groups[sup] || [], sum = 0, cnt = 0;
-                    var bgc = CKd[pcKeyOf(state.depCid, sup)] || '#fff';
+                    var bgc = CKd[pcKeyOf(state.depCid, sup)] || '';
                     rows.forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { sum += a; cnt++; } });
                     rows.forEach(function(r, ri){
                         var a = pcDepAmt(r), aTxt = (a != null && isFinite(a)) ? a.toFixed(2) : '';
@@ -13119,7 +13124,8 @@
                         html += '<tr>' + cel(esc(A), bgc) + cel(esc(B), bgc) + cel('', bgc) + cel(esc(aTxt), bgc, true) + cel(eTxt ? '<b>' + esc(eTxt) + '</b>' : '', bgc, true) + '</tr>';
                         lines.push([A, B, '', aTxt, eTxt].join('\t'));
                     });
-                    html += '<tr>' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + '</tr>';
+                    // wiersz rozdzielajacy grupy — tez bez wypisywania tla, z tego samego powodu
+                    html += '<tr>' + cel('', '') + cel('', '') + cel('', '') + cel('', '') + cel('', '') + '</tr>';
                     lines.push('');
                 });
                 return { html: html + '</table>', lines: lines };
