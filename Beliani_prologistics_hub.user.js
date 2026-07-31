@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      1.98
+// @version      1.99
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12869,7 +12869,10 @@
             return false;
         }
 
-        var _cid = {}, _acc = {}, _info = {}, _sup = {};
+        // _conf: potwierdzenie konta bankowego u dostawcy. Jak _info i _sup — tylko na czas
+        // sesji, bez GM_setValue: potwierdzenie moze przyjsc w kazdej chwili, a zapisane „brak"
+        // zostawaloby na ekranie po tym, jak ktos juz komentarz dopisal.
+        var _cid = {}, _acc = {}, _info = {}, _sup = {}, _conf = {};
         try { _cid = JSON.parse(GM_getValue('chn_order_cid', '{}')) || {}; } catch(e){ _cid = {}; }
         try { _acc = JSON.parse(GM_getValue('chn_cid_acc', '{}')) || {}; } catch(e){ _acc = {}; }
         var _saveT = null;
@@ -12893,17 +12896,17 @@
             if (_sup[c] !== undefined) return _sup[c];
             var acc = null, info = '';
             var h = await fetchT('/op_suppliers.php?company_id=' + encodeURIComponent(c));
-            if (h == null) return { acc: null, info: '', failed: true };
+            if (h == null) return { acc: null, info: '', conf: null, failed: true };
             var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); acc = m ? m[1].trim() : null;
             var mi = h.match(/name="document_information"[^>]*>([\s\S]*?)<\/textarea>/i); info = mi ? mi[1].trim() : '';
-            _sup[c] = { acc: acc, info: info }; return _sup[c];
+            _sup[c] = { acc: acc, info: info, conf: pcBankConf(h) }; return _sup[c];
         }
         async function companyToAcc(c){
             if (!c) return null;
             if (_acc[c] !== undefined) return _acc[c];
             var r = await fetchCompany(c);
             if (r.failed) return null;
-            _acc[c] = r.acc; _info[c] = r.info; saveCache(); return r.acc;
+            _acc[c] = r.acc; _info[c] = r.info; _conf[c] = r.conf; saveCache(); return r.acc;
         }
         async function companyToInfo(c){
             if (!c) return '';
@@ -12911,7 +12914,73 @@
             var r = await fetchCompany(c);
             if (r.failed) return '';
             if (_acc[c] === undefined) { _acc[c] = r.acc; saveCache(); }
-            _info[c] = r.info; return r.info;
+            _info[c] = r.info; _conf[c] = r.conf; return r.info;
+        }
+        // Osobne wejscie na potwierdzenie konta. Numer konta bywa w cache z poprzedniej sesji
+        // (_acc leci przez GM_setValue), wiec companyToAcc potrafi wrocic bez pobierania strony —
+        // wtedy dopiero to wywolanie ja sciaga. fetchCompany trzyma strone w _sup, wiec przy
+        // companyToInfo/companyToAcc w tym samym przebiegu to juz nie jest drugi fetch.
+        async function companyToConf(c){
+            if (!c) return null;
+            if (_conf[c] !== undefined) return _conf[c];
+            var r = await fetchCompany(c);
+            if (r.failed) return null;
+            _conf[c] = r.conf; return _conf[c];
+        }
+
+        // ===== Potwierdzenie danych bankowych dostawcy =====
+        // Prologistics nie ma pola „konto potwierdzone" — jedynym sladem jest komentarz na
+        // stronie dostawcy, np. „Bank details confirmed via telephone". Samo istnienie takiego
+        // komentarza nie wystarcza: liczy sie tylko potwierdzenie MLODSZE niz ostatnia zmiana
+        // numeru konta (log „Log" przy polu Bank account number) — starsze potwierdza konto,
+        // ktorego juz tam nie ma, czyli dokladnie ten przypadek, ktory ma zlapac ta kontrola.
+        function pcIsBankConfText(t){
+            var s = String(t == null ? '' : t);
+            if (!/bank|account|konto|iban|swift|beneficiar/i.test(s)) return false;
+            // prosba albo zaprzeczenie — to NIE jest potwierdzenie
+            if (/\b(?:please|pls|kindly)\s+(?:re-?)?(?:confirm|verify|check)/i.test(s)) return false;
+            if (/\b(?:not|never|un)\s*-?\s*confirm/i.test(s)) return false;
+            if (/\bto\s+be\s+confirmed\b/i.test(s) || /\bneeds?\s+(?:to\s+be\s+)?(?:confirm|verif)/i.test(s)) return false;
+            if (/\bwait(?:ing)?\s+for\s+(?:the\s+)?confirm/i.test(s)) return false;
+            if (/nie\s+(?:jest\s+|zosta[lł][oa]?\s+)?potwierdz/i.test(s) || /do\s+potwierdzenia/i.test(s) || /prosz[eę]\s+o\s+potwierdz/i.test(s)) return false;
+            // tylko formy dokonane — samo „confirm" w trybie rozkazujacym nic nie potwierdza
+            return /\bconfirmed\b/i.test(s) || /\bverified\b/i.test(s) || /\b(?:double-?)?checked\b/i.test(s) || /potwierdz(?:one|ono|am|ony|ona|i[lł][ay]?)/i.test(s);
+        }
+        // „2023-12-19 08:54:11" i „2023-12-19 08:52" (log konta nie ma sekund) -> ms
+        function pcTs(s){
+            var m = String(s == null ? '' : s).match(/(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)/);
+            if (!m) return NaN;
+            var t = Date.parse(m[1] + 'T' + (m[2].length === 5 ? m[2] + ':00' : m[2]));
+            return isFinite(t) ? t : NaN;
+        }
+        // Ostatnia zmiana numeru konta z rozwijanego logu przy polu Bank account number.
+        function pcAccChange(html){
+            var dm = String(html == null ? '' : html).match(/data-handler-button="bank_account"[^>]*>([\s\S]*?)<\/div>/i);
+            if (!dm) return null;
+            var re = /Changed\s+from\s+"([^"]*)"\s+to\s+"([^"]*)"\s+by\s+([^\s<]+)\s+on\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)/gi, m, last = null;
+            while ((m = re.exec(dm[1])) !== null){
+                // wpisy „to ''" to wyczyszczenie pola, a nie numer, ktory trzeba potwierdzac
+                if (!String(m[2]).trim()) continue;
+                var ts = pcTs(m[4]);
+                if (!isFinite(ts)) continue;
+                if (!last || ts > last.ts) last = { ts: ts, from: m[1].trim(), to: m[2].trim(), by: m[3], date: m[4] };
+            }
+            return last;
+        }
+        // -> { st: 'ok' | 'old' | 'none', date, author, text, chDate, chBy, chTo }
+        function pcBankConf(html){
+            var ch = pcAccChange(html), best = null;
+            pcComments(html).forEach(function(c){
+                if (!pcIsBankConfText(c.text)) return;
+                var ts = pcTs(c.date);
+                if (!best || (isFinite(ts) && (!isFinite(best.ts) || ts > best.ts))) best = { ts: ts, date: c.date, author: c.author, text: c.text };
+            });
+            var out = { st: 'none', date: '', author: '', text: '', chDate: ch ? ch.date : '', chBy: ch ? ch.by : '', chTo: ch ? ch.to : '' };
+            if (!best) return out;
+            out.date = best.date; out.author = best.author; out.text = best.text;
+            // Brak daty po ktorejkolwiek stronie = nie ma czego porownac; wtedy nie strasz
+            out.st = (ch && isFinite(best.ts) && isFinite(ch.ts) && best.ts < ch.ts) ? 'old' : 'ok';
+            return out;
         }
         var PENALTY_DAYS = 7;
         // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
@@ -12925,7 +12994,14 @@
             }
             return out;
         }
-        function pcArial(html){ return String(html).replace(/<table style="/g, '<table style="font-family:Arial,sans-serif;font-size:10pt;').replace(/<td style="/g, '<td style="font-family:Arial,sans-serif;font-size:10pt;'); }
+        // Ramki: na ekranie #eee (delikatna siatka na szarym panelu), ale po wklejeniu do
+        // Docs/Sheets jasnoszare linie na bialej kartce praktycznie znikaly — w kopii ida czarne.
+        function pcArial(html){
+            return String(html)
+                .replace(/<table style="/g, '<table style="font-family:Arial,sans-serif;font-size:10pt;')
+                .replace(/<td style="/g, '<td style="font-family:Arial,sans-serif;font-size:10pt;')
+                .replace(/border:1px solid #eee/g, 'border:1px solid #000');
+        }
         function parsePenalties(html, maxAgeDays){
             var days = maxAgeDays || PENALTY_DAYS, cutoff = Date.now() - days * 86400000, out = [], sawRows = false;
             var rowRe = /<tr[^>]*(?:class="[^"]*comment-row[^"]*"|data-role="article-comment")[^>]*>([\s\S]*?)<\/tr>/gi, rm;
@@ -13932,6 +14008,16 @@
         function xlBalPiSt(r){ if (!r || !r.bpi) return XLS.CELL; return r.bpi.warn ? XLS.WARN : (r.bpi.ok ? XLS.OK : XLS.BAD); }
         function xlBalComTxt(r){ if (!r || !r.bc) return ''; return (r.bc.ok ? '✓' : (r.bc.warn ? '⚠' : '✗')) + ' ' + String(r.bc.msg || ''); }
         function xlBalComSt(r){ if (!r || !r.bc) return XLS.CELL; return r.bc.ok ? XLS.OK : (r.bc.warn ? XLS.WARN : XLS.BAD); }
+        // Potwierdzenie konta u dostawcy — osoba wklepujaca przelew widzi to obok numeru konta.
+        function xlConfTxt(cf){
+            if (!cf) return '? nie udało się odczytać strony dostawcy — sprawdź ręcznie';
+            if (cf.st === 'ok') return '✓ potwierdzone ' + (cf.date || '?') + (cf.author ? ', ' + cf.author : '') + '  —  „' + (cf.text || '') + '"';
+            if (cf.st === 'old') return '⚠ potwierdzenie z ' + (cf.date || '?') + ' jest STARSZE niż zmiana numeru konta z ' + (cf.chDate || '?')
+                + (cf.chBy ? ' (' + cf.chBy + ')' : '') + ' — dotyczy poprzedniego numeru, potwierdź konto przed przelewem';
+            return '✗ BRAK potwierdzenia danych bankowych w komentarzach dostawcy'
+                + (cf.chDate ? ('  —  numer konta ustawiony ' + cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '')) : '');
+        }
+        function xlConfSt(cf){ return (cf && cf.st === 'ok') ? XLS.VALB : ((cf && cf.st === 'old') ? XLS.WARNW : XLS.BADW); }
         // Status calej platnosci — to jest kolumna, ktora decyduje, czy ktos ma to wklepac do banku.
         function xlStatusOf(pr){
             if (!pr) return { t: '✗ NIE WPROWADZAĆ', s: 'bad', why: 'nie udało się złożyć danych płatności' };
@@ -13964,7 +14050,7 @@
                 { t: 'DEPO', g: MG.depoOnly },
                 { t: 'BALANCE', g: MG.balOnly }
             ];
-            var nOk = 0, nWarn = 0, nBad = 0, nGroups = 0, nRows = 0, sumAll = 0, sumDep = 0, sumBal = 0;
+            var nOk = 0, nWarn = 0, nBad = 0, nGroups = 0, nRows = 0, sumAll = 0, sumDep = 0, sumBal = 0, nNoConf = 0;
             secs.forEach(function(S){
                 S.g.forEach(function(G){
                     var pr = prBy[G.key], st = xlStatusOf(pr);
@@ -13972,6 +14058,8 @@
                     sumDep += (pcSumRows(G.dep) || 0); sumBal += (pcBalSum(G.bal) || 0);
                     sumAll += pr ? pr.amount : ((pcSumRows(G.dep) || 0) + (pcBalSum(G.bal) || 0));
                     if (st.s === 'ok') nOk++; else if (st.s === 'warn') nWarn++; else nBad++;
+                    var _cf = G.cid ? (_conf[G.cid] || null) : null;
+                    if (!_cf || _cf.st !== 'ok') nNoConf++;
                 });
             });
 
@@ -13985,6 +14073,7 @@
                 + '     Płatności: ' + nGroups + '     Pozycji: ' + nRows + '     Razem: ' + sumAll.toFixed(2) + ' ' + PAIN_CCY, XLS.BOLD);
             var bsc = state.balSumChk || null;
             xlBand(1, XL_NCOL, 'Sprawdzone: ' + nOk + '   ·   do sprawdzenia: ' + nWarn + '   ·   NIE wprowadzać: ' + nBad
+                + (nNoConf ? ('   ·   bez potwierdzenia konta u dostawcy: ' + nNoConf) : '')
                 + ((bsc && bsc.n) ? ('   ·   sumy kontrolne z wklejki: ' + bsc.ok + '/' + bsc.n + ' zgodnych'
                     + (bsc.bad.length ? ('   ⚠ ROZJAZD: ' + bsc.bad.map(function(b){ return b.sup + ' (wklejka ' + b.declared.toFixed(2) + ', wiersze ' + b.got.toFixed(2) + ')'; }).join('; ')) : '')) : ''), XLS.SMALL);
             xlBand(1, XL_NCOL, 'Wygenerowano: ' + pcNow() + '   ·   skrypt hub ' + VER + '   ·   plik roboczy, nie jest to dokument księgowy', XLS.SMALL);
@@ -14025,6 +14114,8 @@
                     if (st.why) labelRow('Uwaga:', st.why, st.s === 'bad' ? XLS.BADW : XLS.WARNW, 30);
                     labelRow('Konto beneficjenta:', (accPay || '— brak w P/I —')
                         + ((accPay && accShown && normAcc(accPay) !== normAcc(accShown)) ? ('     ⚠ w prologistics widnieje inne konto: ' + accShown) : ''), XLS.VALB);
+                    var cfG = G.cid ? (_conf[G.cid] || null) : null;
+                    labelRow('Potwierdzenie konta:', xlConfTxt(cfG), xlConfSt(cfG), 30);
                     labelRow('SWIFT / BIC:', (pr && pr.bic ? pr.bic : '— brak —')
                         + (pr && pr.bankName ? ('     bank: ' + pr.bankName) : '')
                         + (pr && pr.bankTown ? (', ' + pr.bankTown) : '')
@@ -15174,6 +15265,20 @@
         }
         function pcInfoG(G){ return G && G.cid ? (_info[G.cid] || '') : ''; }
         function pcHasInfoG(G){ var t = pcInfoG(G); return !!(t && t.replace(/\s|&nbsp;/gi, '').length); }
+        function pcConfG(G){ return (G && G.cid) ? (_conf[G.cid] || null) : null; }
+        // Plakietka „konto potwierdzone" obok numeru konta w naglowku grupy.
+        function pcConfPill(txt, bg, title){ return '<span class="pc-confbadge" title="' + pcAttr(title) + '" style="margin-left:10px;background:' + bg + ';color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">' + txt + '</span>'; }
+        function pcConfBadge(cf){
+            if (!cf) return '<span class="pc-confbadge" title="Nie udało się odczytać strony dostawcy — potwierdzenia konta nie znam. Sprawdź ręcznie w prologistics." style="margin-left:10px;background:#888;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">? konto</span>';
+            var kto = (cf.date || '?') + (cf.author ? ' — ' + cf.author : '');
+            var zm = cf.chDate ? ('\n\nOstatnia zmiana numeru konta: ' + cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '') + (cf.chTo ? ('\nna: ' + cf.chTo) : '')) : '';
+            if (cf.st === 'ok') return pcConfPill('✓ konto potwierdzone', '#0a7a2f',
+                'Komentarz u dostawcy potwierdza dane bankowe.\n\n' + kto + '\n„' + (cf.text || '') + '"' + zm);
+            if (cf.st === 'old') return pcConfPill('⚠ potwierdzenie sprzed zmiany konta', '#c47f00',
+                'Potwierdzenie jest STARSZE niż ostatnia zmiana numeru konta — dotyczy poprzedniego numeru.\n\nPotwierdzenie: ' + kto + '\n„' + (cf.text || '') + '"' + zm);
+            return pcConfPill('✗ konto niepotwierdzone', '#c00',
+                'Na stronie dostawcy nie ma komentarza potwierdzającego dane bankowe.' + zm);
+        }
         function pcChkHtml(r, gi){ return /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz do payment confirmation / komentarza"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : ''; }
         function pcAmtValSpan(rid, typ, txt, edited){ return '<span class="pc-amt-val" data-row="' + rid + '" data-type="' + typ + '" title="Kliknij, aby edytowac kwote" style="cursor:text;border-bottom:1px dashed #bbb;font-weight:600' + (edited ? ';color:#0a58ca' : '') + '">' + (txt || '—') + '</span>' + (edited ? ' <span class="pc-amt-reset" data-row="' + rid + '" data-type="' + typ + '" title="Cofnij edycje" style="cursor:pointer;color:#c00;font-size:10px">✕</span>' : ''); }
         function pcAmtCellHtml(r, rid){
@@ -15222,6 +15327,7 @@
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
                 + '<span style="font-weight:400;margin-left:12px">Konto: <span class="pc-acc" data-key="' + esc(G.key) + '" title="Kliknij, aby edytowac konto" style="cursor:text;font-weight:700;border-bottom:1px dashed #999">' + esc(accShown || '—') + '</span></span>'
+                + pcConfBadge(pcConfG(G))
                 + (hasDep ? '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (depSum != null ? esc(depSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b class="pc-balsum" data-sup="' + gi + '">' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
@@ -15259,8 +15365,8 @@
             var depoAcc = {}, total = state.dep.order.length + state.bal.order.length, done = 0;
             function prog(){ if (status) status.textContent = 'Sprawdzam konta: ' + (total ? Math.round(done / total * 100) : 100) + '%'; }
             prog();
-            await runPool(state.dep.order, async function(sup){ var cid = await depGroupCid(sup); state.depCid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (cid) await companyToInfo(cid); if (acc) depoAcc[acc] = 1; done++; prog(); });
-            await runPool(state.bal.order, async function(sup){ var cid = await groupCid(sup); state.sup2cid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (cid) await companyToInfo(cid); if (acc && depoAcc[acc]) state.matched[sup] = 1; done++; prog(); });
+            await runPool(state.dep.order, async function(sup){ var cid = await depGroupCid(sup); state.depCid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (cid) { await companyToInfo(cid); await companyToConf(cid); } if (acc) depoAcc[acc] = 1; done++; prog(); });
+            await runPool(state.bal.order, async function(sup){ var cid = await groupCid(sup); state.sup2cid[sup] = cid; var acc = cid ? await companyToAcc(cid) : null; if (cid) { await companyToInfo(cid); await companyToConf(cid); } if (acc && depoAcc[acc]) state.matched[sup] = 1; done++; prog(); });
             state.resolved = true;
         }
         function mergeSide(side, cidMap, matchedIn){
