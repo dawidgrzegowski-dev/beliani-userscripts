@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.00
+// @version      2.03
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12869,10 +12869,12 @@
             return false;
         }
 
-        // _conf: potwierdzenie konta bankowego u dostawcy. Jak _info i _sup — tylko na czas
-        // sesji, bez GM_setValue: potwierdzenie moze przyjsc w kazdej chwili, a zapisane „brak"
-        // zostawaloby na ekranie po tym, jak ktos juz komentarz dopisal.
-        var _cid = {}, _acc = {}, _info = {}, _sup = {}, _conf = {};
+        // _conf: potwierdzenie konta ze strony dostawcy (klucz: company_id).
+        // _ordConf: to samo z komentarzy pojedynczego ZAMOWIENIA (klucz: numer orderu).
+        // Jak _info i _sup — tylko na czas sesji, bez GM_setValue: potwierdzenie moze przyjsc
+        // w kazdej chwili, a zapisane „brak" zostawaloby na ekranie po tym, jak ktos juz
+        // komentarz dopisal.
+        var _cid = {}, _acc = {}, _info = {}, _sup = {}, _conf = {}, _ordConf = {};
         try { _cid = JSON.parse(GM_getValue('chn_order_cid', '{}')) || {}; } catch(e){ _cid = {}; }
         try { _acc = JSON.parse(GM_getValue('chn_cid_acc', '{}')) || {}; } catch(e){ _acc = {}; }
         var _saveT = null;
@@ -12929,11 +12931,17 @@
         }
 
         // ===== Potwierdzenie danych bankowych dostawcy =====
-        // Prologistics nie ma pola „konto potwierdzone" — jedynym sladem jest komentarz na
-        // stronie dostawcy, np. „Bank details confirmed via telephone". Samo istnienie takiego
-        // komentarza nie wystarcza: liczy sie tylko potwierdzenie MLODSZE niz ostatnia zmiana
-        // numeru konta (log „Log" przy polu Bank account number) — starsze potwierdza konto,
-        // ktorego juz tam nie ma, czyli dokladnie ten przypadek, ktory ma zlapac ta kontrola.
+        // Prologistics nie ma pola „konto potwierdzone" — jedynym sladem jest komentarz
+        // („Bank details confirmed via telephone" / „...by the phone"). Komentarz taki potrafi
+        // wisiec w DWOCH miejscach i oba licza sie tak samo:
+        //   * strona dostawcy op_suppliers.php  -> czytane w fetchCompany
+        //   * komentarze konkretnego ZAMOWIENIA -> czytane w checkOnePI / checkOneBal, czyli
+        //     przy okazji stron, ktore skrypt i tak juz pobiera (zero dodatkowych zapytan)
+        // Samo istnienie potwierdzenia nie wystarcza: liczy sie tylko potwierdzenie MLODSZE
+        // niz ostatnia zmiana numeru konta — starsze potwierdza konto, ktorego juz tam nie ma.
+        // Zmiane konta tez bierzemy z dwoch zrodel: z logu „Log" przy polu Bank account number
+        // u dostawcy (zrodlo rozstrzygajace, ma dokladna date) oraz z komentarza o zmianie
+        // danych bankowych (przycisk „bi_change" u dostawcy dopisuje taki komentarz do zamowien).
         function pcIsBankConfText(t){
             var s = String(t == null ? '' : t);
             if (!/bank|account|konto|iban|swift|beneficiar/i.test(s)) return false;
@@ -12967,20 +12975,35 @@
             }
             return last;
         }
-        // -> { st: 'ok' | 'old' | 'none', date, author, text, chDate, chBy, chTo }
-        function pcBankConf(html){
-            var ch = pcAccChange(html), best = null;
-            pcComments(html).forEach(function(c){
-                if (!pcIsBankConfText(c.text)) return;
-                var ts = pcTs(c.date);
-                if (!best || (isFinite(ts) && (!isFinite(best.ts) || ts > best.ts))) best = { ts: ts, date: c.date, author: c.author, text: c.text };
+        // Komentarz o ZMIANIE danych bankowych. Tresci, ktora dopisuje „bi_change", nie widac
+        // nigdzie w kodzie strony (leci z js_backend.php), wiec lapiemy typowe warianty.
+        // Log konta u dostawcy zostaje zrodlem rozstrzygajacym — to jest tylko uzupelnienie
+        // na wypadek, gdy zmiane widac wylacznie w komentarzu zamowienia.
+        function pcIsBankChgText(t){
+            var s = String(t == null ? '' : t);
+            if (!/bank|account|konto|iban/i.test(s)) return false;
+            if (pcIsBankConfText(s)) return false;   // „confirmed" wygrywa nad „changed"
+            return /\b(?:chang|updat|modif)[a-z]*\b/i.test(s) || /\bnew\s+(?:bank|account)/i.test(s)
+                || /zmian[a-zćęłńóśźż]*/i.test(s) || /\bnowy\s+(?:numer\s+)?(?:konta|rachunk)/i.test(s);
+        }
+        // „nowszy niz" odporne na komentarz bez daty (ts = NaN)
+        function pcNewer(a, b){ return isFinite(a) && (!isFinite(b) || a > b); }
+        // Z listy komentarzy (dostawca albo zamowienie) — najnowsze potwierdzenie i najnowsza
+        // wzmianka o zmianie. src trafia do dymka, zeby bylo widac, SKAD to potwierdzenie.
+        function pcScanBankComments(cs, src){
+            var conf = null, chg = null;
+            (cs || []).forEach(function(c){
+                var rec = { ts: pcTs(c.date), date: c.date || '', author: c.author || '', text: c.text || '', src: src || '' };
+                if (pcIsBankConfText(c.text)) { if (!conf || pcNewer(rec.ts, conf.ts)) conf = rec; }
+                else if (pcIsBankChgText(c.text)) { if (!chg || pcNewer(rec.ts, chg.ts)) chg = rec; }
             });
-            var out = { st: 'none', date: '', author: '', text: '', chDate: ch ? ch.date : '', chBy: ch ? ch.by : '', chTo: ch ? ch.to : '' };
-            if (!best) return out;
-            out.date = best.date; out.author = best.author; out.text = best.text;
-            // Brak daty po ktorejkolwiek stronie = nie ma czego porownac; wtedy nie strasz
-            out.st = (ch && isFinite(best.ts) && isFinite(ch.ts) && best.ts < ch.ts) ? 'old' : 'ok';
-            return out;
+            return { conf: conf, chg: chg };
+        }
+        // Surowe dane ze strony dostawcy: potwierdzenie, wzmianka o zmianie, log zmiany konta.
+        // Ocene (ok/old/none) robi dopiero pcConfEval, bo potrzebuje jeszcze komentarzy zamowien.
+        function pcBankConf(html){
+            var s = pcScanBankComments(pcComments(html), 'strona dostawcy');
+            return { conf: s.conf, chg: s.chg, acc: pcAccChange(html) };
         }
         var PENALTY_DAYS = 7;
         // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
@@ -12994,14 +13017,15 @@
             }
             return out;
         }
-        // Ramki: na ekranie #eee (delikatna siatka na szarym panelu), ale po wklejeniu do
-        // Docs/Sheets jasnoszare linie na bialej kartce praktycznie znikaly — w kopii ida #999.
-        // Czysta czern przy tej gestosci wierszy przytlaczala tresc, stad szarosc.
+        // Ramki: na ekranie #eee (delikatna siatka na szarym panelu) praktycznie znikalo po
+        // wklejeniu. W kopii idzie #ccc — to swatch „gray" ze standardowej palety Google
+        // (ten sam rzad co #999 „dark gray 2"), grubosc w sam raz pod natywna siatke Sheets.
+        // Czern i #999 przy tej gestosci wierszy przytlaczaly tresc.
         function pcArial(html){
             return String(html)
                 .replace(/<table style="/g, '<table style="font-family:Arial,sans-serif;font-size:10pt;')
                 .replace(/<td style="/g, '<td style="font-family:Arial,sans-serif;font-size:10pt;')
-                .replace(/border:1px solid #eee/g, 'border:1px solid #999');
+                .replace(/border:1px solid #eee/g, 'border:1px solid #ccc');
         }
         function parsePenalties(html, maxAgeDays){
             var days = maxAgeDays || PENALTY_DAYS, cutoff = Date.now() - days * 86400000, out = [], sawRows = false;
@@ -13032,16 +13056,60 @@
         async function groupCid(sup){ var c = balCid(sup); if (c) return c; var g = state.bal.groups[sup] || []; for (var i = 0; i < g.length; i++){ if (/^\d+$/.test(g[i].order)) return await orderToCompany(g[i].order); } return null; }
         async function depGroupCid(sup){ var g = state.dep.groups[sup] || []; for (var i = 0; i < g.length; i++){ if (g[i].cid) return g[i].cid; } for (var j = 0; j < g.length; j++){ if (/^\d+$/.test(g[j].order)) return await orderToCompany(g[j].order); } return null; }
 
-        function cel(content, bg, right){ return '<td style="border:1px solid #eee;padding:2px 5px' + (right ? ';text-align:right' : '') + (bg ? ';background:' + bg : '') + '">' + content + '</td>'; }
+        // extra = surowe CSS doklejane na koncu (musi zaczynac sie od ';'). Stoi PO deklaracji
+        // border, wiec przy powtorzonej wlasciwosci wygrywa — tak dostajemy czerwona ramke
+        // na jednej wybranej kratce, nie ruszajac reszty siatki.
+        function cel(content, bg, right, extra){ return '<td style="border:1px solid #eee;padding:2px 5px' + (right ? ';text-align:right' : '') + (bg ? ';background:' + bg : '') + (extra || '') + '">' + content + '</td>'; }
+        // ===== Ten sam numer zamowienia w kilku wierszach jednej wklejki =====
+        // Przy BALANCE to normalne: jedno zamowienie rozbite na dwa kontenery (albo wiersz
+        // glowny + „sub"). Dlatego nie straszymy — dajemy tylko wspolny kolor kratki z numerem,
+        // zeby od razu bylo widac, ktore wiersze sie paruja. Czerwona ramka leci dopiero wtedy,
+        // gdy powtarza sie CALA tozsamosc wiersza (order + kontener + „1"/„sub") — tego juz
+        // zaden kontener nie tlumaczy i to prawie zawsze podwojna wklejka.
+        // DEPO i BALANCE liczone osobno: depozyt i balance do tego samego zamowienia to
+        // normalny uklad, a nie duplikat. W DEPO nie ma kolumny kontenera, wiec tam zostaje
+        // sam kolor — nie ma na czym oprzec ostrzezenia.
+        var PC_DUP_PALETTE = ['#ffff00', '#00ff00', '#00ffff', '#ff9900', '#ff99cc', '#b7e1cd', '#d9d2e9', '#fce5cd'];
+        function pcDupOrderMap(side){
+            var S = (side === 'dep') ? state.dep : state.bal, isDep = (side === 'dep');
+            var cnt = {}, keys = {}, out = {};
+            (S.order || []).forEach(function(sup){
+                (S.groups[sup] || []).forEach(function(r){
+                    var o = String((r && r.order) || '');
+                    if (!/^\d+$/.test(o)) return;
+                    cnt[o] = (cnt[o] || 0) + 1;
+                    (keys[o] = keys[o] || []).push(pcNormCont(r.container || '') + '|' + String(r.seq || '').trim().toLowerCase());
+                });
+            });
+            Object.keys(cnt).filter(function(o){ return cnt[o] > 1; })
+                .sort(function(a, b){ return Number(a) - Number(b); })
+                .forEach(function(o, i){
+                    var seen = {}, same = false;
+                    (keys[o] || []).forEach(function(k){ if (seen[k]) same = true; seen[k] = 1; });
+                    out[o] = { bg: PC_DUP_PALETTE[i % PC_DUP_PALETTE.length], warn: !isDep && same, n: cnt[o] };
+                });
+            return out;
+        }
+        function pcDupTitle(ord, du){
+            if (!du) return '';
+            return du.warn
+                ? ('Order ' + ord + ' powtarza się ' + du.n + '× przy tym samym kontenerze i tej samej pozycji — sprawdź, czy to nie podwójna wklejka.')
+                : ('Order ' + ord + ' jest w ' + du.n + ' wierszach — kratki o tym samym kolorze należą do tego samego zamówienia.');
+        }
         function renderBal(forCopy){
             var g = state.bal, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">', CMb = pcCombinedColorMap();
+            var DUP = pcDupOrderMap('bal');
             g.order.forEach(function(sup){
                 var rows = g.groups[sup], isDepo = !!state.matched[sup];
                 rows.forEach(function(r){
                     var bg = isDepo ? (CMb[pcKeyOf(state.sup2cid, sup)] || PC_COMBINED_BG) : (r.bg || '');
                     var supC = forCopy ? esc(cellHL(r.supplierUrl, r.supplier)) : (aLink(r.supplierUrl, r.supplier, '#750000') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : ''));
                     var ordC = forCopy ? esc(cellHL(r.orderUrl, r.order)) : aLink(r.orderUrl, r.order);
-                    html += '<tr>' + cel(supC, bg) + cel(esc(r.container), bg) + cel(esc(r.seq), bg) + cel(ordC, bg) + cel(esc(pcBalAmtVal(r) != null ? pcBalAmtVal(r).toFixed(2) : (r.amount || '')), bg, true) + cel(esc(r.note), bg) + '</tr>';
+                    // Kolor duplikatu dotyczy TYLKO kratki z numerem \u2014 tlo grupy zostaje w reszcie kolumn.
+                    var du = DUP[String(r.order || '')] || null;
+                    html += '<tr>' + cel(supC, bg) + cel(esc(r.container), bg) + cel(esc(r.seq), bg)
+                          + cel(ordC, du ? du.bg : bg, false, (du && du.warn) ? ';border:2px solid #c00' : '')
+                          + cel(esc(pcBalAmtVal(r) != null ? pcBalAmtVal(r).toFixed(2) : (r.amount || '')), bg, true) + cel(esc(r.note), bg) + '</tr>';
                     lines.push([cellHL(r.supplierUrl, r.supplier), r.container, r.seq, cellHL(r.orderUrl, r.order), (pcBalAmtVal(r) != null ? pcBalAmtVal(r).toFixed(2) : (r.amount || '')), r.note].join('\t'));
                 });
                 if (rows.length > 1) { var sum = 0; rows.forEach(function(r){ sum += (pcBalAmtVal(r) || 0); }); var s = sum.toFixed(2); html += '<tr style="font-weight:bold">' + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel('', '#fff') + cel(esc(s), '#fff', true) + cel('', '#fff') + '</tr>'; lines.push(['', '', '', '', s, ''].join('\t')); }
@@ -13112,7 +13180,7 @@
                 // na sztywno '#fff' i kazda wklejka DEPO zamalowywala na bialo kolory, ktore
                 // ktos wczesniej nalozyl w arkuszu. Puste tlo = cel() nie wypisuje background,
                 // czyli wklejka zostawia wypelnienie komorek takie, jakie w arkuszu bylo.
-                var CKd = pcCombinedColorMap();
+                var CKd = pcCombinedColorMap(), DUP = pcDupOrderMap('dep');
                 g.order.forEach(function(sup){
                     var rows = g.groups[sup] || [], sum = 0, cnt = 0;
                     var bgc = CKd[pcKeyOf(state.depCid, sup)] || '';
@@ -13121,7 +13189,8 @@
                         var a = pcDepAmt(r), aTxt = (a != null && isFinite(a)) ? a.toFixed(2) : '';
                         var eTxt = (ri === rows.length - 1 && rows.length > 1) ? sum.toFixed(2) : '';
                         var A = cellHL(r.orderUrl, r.order), B = cellHL(r.supplierUrl, r.supplier);
-                        html += '<tr>' + cel(esc(A), bgc) + cel(esc(B), bgc) + cel('', bgc) + cel(esc(aTxt), bgc, true) + cel(eTxt ? '<b>' + esc(eTxt) + '</b>' : '', bgc, true) + '</tr>';
+                        var du = DUP[String(r.order || '')] || null;
+                        html += '<tr>' + cel(esc(A), du ? du.bg : bgc) + cel(esc(B), bgc) + cel('', bgc) + cel(esc(aTxt), bgc, true) + cel(eTxt ? '<b>' + esc(eTxt) + '</b>' : '', bgc, true) + '</tr>';
                         lines.push([A, B, '', aTxt, eTxt].join('\t'));
                     });
                     // wiersz rozdzielajacy grupy — tez bez wypisywania tla, z tego samego powodu
@@ -14016,12 +14085,15 @@
         function xlBalComSt(r){ if (!r || !r.bc) return XLS.CELL; return r.bc.ok ? XLS.OK : (r.bc.warn ? XLS.WARN : XLS.BAD); }
         // Potwierdzenie konta u dostawcy — osoba wklepujaca przelew widzi to obok numeru konta.
         function xlConfTxt(cf){
-            if (!cf) return '? nie udało się odczytać strony dostawcy — sprawdź ręcznie';
-            if (cf.st === 'ok') return '✓ potwierdzone ' + (cf.date || '?') + (cf.author ? ', ' + cf.author : '') + '  —  „' + (cf.text || '') + '"';
-            if (cf.st === 'old') return '⚠ potwierdzenie z ' + (cf.date || '?') + ' jest STARSZE niż zmiana numeru konta z ' + (cf.chDate || '?')
-                + (cf.chBy ? ' (' + cf.chBy + ')' : '') + ' — dotyczy poprzedniego numeru, potwierdź konto przed przelewem';
-            return '✗ BRAK potwierdzenia danych bankowych w komentarzach dostawcy'
-                + (cf.chDate ? ('  —  numer konta ustawiony ' + cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '')) : '');
+            if (!cf) return '? nie sprawdzone — potwierdzenia konta nie znam, sprawdź ręcznie';
+            var zrod = cf.src ? ('  [' + cf.src + ']') : '';
+            var zm = cf.chDate ? (cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '') + (cf.chSrc ? ' (' + cf.chSrc + ')' : '')) : '';
+            if (cf.st === 'ok') return '✓ potwierdzone ' + (cf.date || '?') + (cf.author ? ', ' + cf.author : '') + '  —  „' + (cf.text || '') + '"' + zrod
+                + (zm ? ('     ·     ostatnia zmiana danych bankowych: ' + zm) : '');
+            if (cf.st === 'old') return '⚠ potwierdzenie z ' + (cf.date || '?') + zrod + ' jest STARSZE niż zmiana danych bankowych z ' + (zm || '?')
+                + ' — dotyczy poprzedniego numeru, potwierdź konto przed przelewem';
+            return '✗ BRAK potwierdzenia danych bankowych — ani u dostawcy, ani w komentarzach zamówień'
+                + (zm ? ('  —  ostatnia zmiana: ' + zm) : '');
         }
         function xlConfSt(cf){ return (cf && cf.st === 'ok') ? XLS.VALB : ((cf && cf.st === 'old') ? XLS.WARNW : XLS.BADW); }
         // Status calej platnosci — to jest kolumna, ktora decyduje, czy ktos ma to wklepac do banku.
@@ -14064,7 +14136,7 @@
                     sumDep += (pcSumRows(G.dep) || 0); sumBal += (pcBalSum(G.bal) || 0);
                     sumAll += pr ? pr.amount : ((pcSumRows(G.dep) || 0) + (pcBalSum(G.bal) || 0));
                     if (st.s === 'ok') nOk++; else if (st.s === 'warn') nWarn++; else nBad++;
-                    var _cf = G.cid ? (_conf[G.cid] || null) : null;
+                    var _cf = pcConfEval(G);
                     if (!_cf || _cf.st !== 'ok') nNoConf++;
                 });
             });
@@ -14120,7 +14192,7 @@
                     if (st.why) labelRow('Uwaga:', st.why, st.s === 'bad' ? XLS.BADW : XLS.WARNW, 30);
                     labelRow('Konto beneficjenta:', (accPay || '— brak w P/I —')
                         + ((accPay && accShown && normAcc(accPay) !== normAcc(accShown)) ? ('     ⚠ w prologistics widnieje inne konto: ' + accShown) : ''), XLS.VALB);
-                    var cfG = G.cid ? (_conf[G.cid] || null) : null;
+                    var cfG = pcConfEval(G);
                     labelRow('Potwierdzenie konta:', xlConfTxt(cfG), xlConfSt(cfG), 30);
                     labelRow('SWIFT / BIC:', (pr && pr.bic ? pr.bic : '— brak —')
                         + (pr && pr.bankName ? ('     bank: ' + pr.bankName) : '')
@@ -15271,19 +15343,56 @@
         }
         function pcInfoG(G){ return G && G.cid ? (_info[G.cid] || '') : ''; }
         function pcHasInfoG(G){ var t = pcInfoG(G); return !!(t && t.replace(/\s|&nbsp;/gi, '').length); }
-        function pcConfG(G){ return (G && G.cid) ? (_conf[G.cid] || null) : null; }
+        // Ocena laczna dla grupy. Potwierdzenie moze wisiec na stronie dostawcy ALBO
+        // w komentarzu dowolnego zamowienia z tej grupy — bierzemy najnowsze z obu zrodel.
+        // Tak samo zmiana konta: log u dostawcy albo komentarz „bank details changed".
+        // -> { st: 'ok'|'old'|'none', date, author, text, src, chDate, chBy, chTo, chSrc, chText }
+        function pcConfEval(G){
+            if (!G) return null;
+            var sup = G.cid ? (_conf[G.cid] || null) : null;
+            var seen = !!sup, conf = sup ? sup.conf : null, chg = sup ? sup.chg : null, acc = sup ? sup.acc : null;
+            (G.dep || []).concat(G.bal || []).forEach(function(r){
+                var o = _ordConf[String(r && r.order)];
+                if (!o) return;
+                seen = true;
+                if (o.conf && (!conf || pcNewer(o.conf.ts, conf.ts))) conf = o.conf;
+                if (o.chg  && (!chg  || pcNewer(o.chg.ts,  chg.ts)))  chg  = o.chg;
+            });
+            if (!seen) return null;   // nic jeszcze nie pobrane — plakietka „? konto"
+            var chTs = NaN, out = { st: 'none', date: '', author: '', text: '', src: '',
+                                    chDate: '', chBy: '', chTo: '', chSrc: '', chText: '' };
+            if (acc){ chTs = acc.ts; out.chDate = acc.date; out.chBy = acc.by; out.chTo = acc.to; out.chSrc = 'log konta u dostawcy'; }
+            if (chg && (!isFinite(chTs) || pcNewer(chg.ts, chTs))){
+                chTs = chg.ts; out.chDate = chg.date; out.chBy = chg.author; out.chTo = '';
+                out.chSrc = chg.src || 'komentarz'; out.chText = chg.text || '';
+            }
+            if (!conf) return out;
+            out.date = conf.date; out.author = conf.author; out.text = conf.text; out.src = conf.src;
+            // Brak daty po ktorejkolwiek stronie = nie ma czego porownac; wtedy nie strasz
+            out.st = (isFinite(chTs) && isFinite(conf.ts) && conf.ts < chTs) ? 'old' : 'ok';
+            return out;
+        }
+        function pcConfG(G){ return pcConfEval(G); }
+        // Wspolny opis zmiany konta do dymka i do Excela.
+        function pcConfChgTxt(cf){
+            if (!cf || !cf.chDate) return '';
+            return cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '')
+                + (cf.chSrc ? ' (' + cf.chSrc + ')' : '')
+                + (cf.chTo ? ('\nna numer: ' + cf.chTo) : '')
+                + (cf.chText ? ('\n„' + cf.chText + '"') : '');
+        }
         // Plakietka „konto potwierdzone" obok numeru konta w naglowku grupy.
         function pcConfPill(txt, bg, title){ return '<span class="pc-confbadge" title="' + pcAttr(title) + '" style="margin-left:10px;background:' + bg + ';color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">' + txt + '</span>'; }
         function pcConfBadge(cf){
-            if (!cf) return '<span class="pc-confbadge" title="Nie udało się odczytać strony dostawcy — potwierdzenia konta nie znam. Sprawdź ręcznie w prologistics." style="margin-left:10px;background:#888;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">? konto</span>';
-            var kto = (cf.date || '?') + (cf.author ? ' — ' + cf.author : '');
-            var zm = cf.chDate ? ('\n\nOstatnia zmiana numeru konta: ' + cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '') + (cf.chTo ? ('\nna: ' + cf.chTo) : '')) : '';
+            if (!cf) return '<span class="pc-confbadge" title="Jeszcze nie sprawdzone albo nie udało się odczytać strony dostawcy — potwierdzenia konta nie znam. Sprawdź ręcznie w prologistics." style="margin-left:10px;background:#888;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">? konto</span>';
+            var kto = (cf.date || '?') + (cf.author ? ' — ' + cf.author : '') + (cf.src ? ' [' + cf.src + ']' : '');
+            var ch = pcConfChgTxt(cf), zm = ch ? ('\n\nOstatnia zmiana danych bankowych: ' + ch) : '';
             if (cf.st === 'ok') return pcConfPill('✓ konto potwierdzone', '#0a7a2f',
-                'Komentarz u dostawcy potwierdza dane bankowe.\n\n' + kto + '\n„' + (cf.text || '') + '"' + zm);
+                'Komentarz potwierdza dane bankowe.\n\n' + kto + '\n„' + (cf.text || '') + '"' + zm);
             if (cf.st === 'old') return pcConfPill('⚠ potwierdzenie sprzed zmiany konta', '#c47f00',
-                'Potwierdzenie jest STARSZE niż ostatnia zmiana numeru konta — dotyczy poprzedniego numeru.\n\nPotwierdzenie: ' + kto + '\n„' + (cf.text || '') + '"' + zm);
+                'Potwierdzenie jest STARSZE niż ostatnia zmiana danych bankowych — dotyczy poprzedniego numeru.\n\nPotwierdzenie: ' + kto + '\n„' + (cf.text || '') + '"' + zm);
             return pcConfPill('✗ konto niepotwierdzone', '#c00',
-                'Na stronie dostawcy nie ma komentarza potwierdzającego dane bankowe.' + zm);
+                'Ani na stronie dostawcy, ani w komentarzach zamówień nie ma potwierdzenia danych bankowych.' + zm);
         }
         function pcChkHtml(r, gi){ return /^\d+$/.test(String(r.order || '')) ? '<label style="white-space:nowrap;cursor:pointer" title="Zaznacz do payment confirmation / komentarza"><input type="checkbox" class="pc-chk" data-sup="' + gi + '" data-order="' + esc(r.order) + '"><span class="pc-st" data-order="' + esc(r.order) + '" style="font-weight:700"></span></label>' : ''; }
         function pcAmtValSpan(rid, typ, txt, edited){ return '<span class="pc-amt-val" data-row="' + rid + '" data-type="' + typ + '" title="Kliknij, aby edytowac kwote" style="cursor:text;border-bottom:1px dashed #bbb;font-weight:600' + (edited ? ';color:#0a58ca' : '') + '">' + (txt || '—') + '</span>' + (edited ? ' <span class="pc-amt-reset" data-row="' + rid + '" data-type="' + typ + '" title="Cofnij edycje" style="cursor:pointer;color:#c00;font-size:10px">✕</span>' : ''); }
@@ -15308,7 +15417,13 @@
             if (o) return '<span style="color:#0a0;font-weight:700;white-space:nowrap" title="' + pcAttr('Komentarz „ok" po prośbie o depozyt' + (o.date ? ' — ' + o.date : '')) + '">OK od ' + esc(o.author) + '</span>';
             return '<span style="color:#c00;font-weight:700;white-space:nowrap" title="Po komentarzu z prośbą o depozyt nie ma potwierdzenia „ok"">Brak OK</span>';
         }
-        function pcRowDepo(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel(pcOkCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcRowDepo(r, gi, rid, bgo){
+            var bg = bgo || r.bg || '', ord = String(r.order || '');
+            var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord);
+            var du = (state._dupDep || {})[ord] || null;
+            if (du) A = '<span title="' + pcAttr(pcDupTitle(ord, du)) + '">' + A + '</span>';
+            return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, du ? du.bg : bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel(pcOkCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>';
+        }
         function pcBalPiCellHtml(r){
             if (!r || !r.bpi) return '';
             var v = r.bpi, t = v.title ? ' title="' + pcAttr(v.title) + '"' : '';
@@ -15323,7 +15438,15 @@
             if (v.warn) return '<span' + t + ' style="color:#c47f00;font-weight:700">⚠ ' + esc(v.msg) + '</span>';
             return '<span' + t + ' style="color:#c00;font-weight:700">✗ ' + esc(v.msg) + '</span>';
         }
-        function pcRowBal(r, gi, rid, bgo){ var bg = bgo || r.bg || '', ord = String(r.order || ''); var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord); return '<tr>' + cel('<b style="color:#0a6">B</b>', bg) + cel(A, bg) + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel(pcBalPiCellHtml(r), bg) + cel(pcBalComCellHtml(r), bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>'; }
+        function pcRowBal(r, gi, rid, bgo){
+            var bg = bgo || r.bg || '', ord = String(r.order || '');
+            var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord);
+            var du = (state._dupBal || {})[ord] || null;
+            if (du) A = '<span title="' + pcAttr(pcDupTitle(ord, du)) + '">' + A + '</span>';
+            return '<tr>' + cel('<b style="color:#0a6">B</b>', bg)
+                 + cel(A, du ? du.bg : bg, false, (du && du.warn) ? ';border:2px solid #c00' : '')
+                 + cel(esc(r.container || ''), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel(pcBalPiCellHtml(r), bg) + cel(pcBalComCellHtml(r), bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>';
+        }
         function pcGroupHeader(G, gi, gcol){
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
@@ -15344,6 +15467,8 @@
         function renderMerged(){
             var el = wp.querySelector('#wp-out-merged'); if (!el) return;
             var MG = pcMergedGroups(); state._groups = []; state._rowMap = {}; var CM = pcCombinedColorMap();
+            // Mapy duplikatow liczone raz na render — pcRowDepo/pcRowBal tylko z nich czytaja.
+            state._dupDep = pcDupOrderMap('dep'); state._dupBal = pcDupOrderMap('bal');
             var gi = 0, html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
             function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">OK depo / komentarz</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
             function section(title, groups){
@@ -16067,6 +16192,9 @@
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
             if (!h) { dlog('DEPO ' + order + ': nie otwarto ordera'); return { ok: false, msg: 'nie otwarto ordera' }; }
             var cs = pcComments(h);
+            // Potwierdzenie / zmiana danych bankowych z komentarzy tego zamowienia — czytamy
+            // z juz pobranego HTML-a, wiec nie kosztuje to ani jednego zapytania wiecej.
+            _ordConf[String(order)] = pcScanBankComments(cs, 'zamówienie ' + order);
             var com = extractDepoComment(h, cs), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
             dg.cs = pcDiagCs(cs); dg.com = com; dg.banks = banks; dg.piUrl = piUrl || '';
             if (!piUrl) dg.piRaw = pcPiSecDump(h);
@@ -16110,6 +16238,7 @@
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
             if (!h) { dlog('BALANCE ' + order + ': nie otwarto ordera'); return { cands: [], pens: [], pi: { ok: false, msg: 'nie otwarto ordera' }, err: 1 }; }
             var cs = pcComments(h), cands = pcBalCands(cs), pens = pcPenComments(cs);
+            _ordConf[String(order)] = pcScanBankComments(cs, 'zamówienie ' + order);
             dg.cs = pcDiagCs(cs); dg.cands = cands; dg.pens = pens;
             if (!doPI) return { cands: cands, pens: pens, pi: null };
             var banks = extractBankAccts(h), piUrl = extractLatestPI(h);
@@ -16259,10 +16388,15 @@
             dlog('Koniec przetwarzania.');
             var c = state.bal.order.filter(function(s){ return !!state.matched[s]; }).length;
             var _bs = state.balSumChk || { n: 0, ok: 0, bad: [] };
+            // Powtorzone numery zamowien \u2014 kolorowane kratki. Osobno te, ktorych kontener nie tlumaczy.
+            var _dk = Object.keys(state._dupBal || {}).concat(Object.keys(state._dupDep || {}));
+            var _dw = Object.keys(state._dupBal || {}).filter(function(o){ return state._dupBal[o].warn; });
+            if (_dk.length) dlog('Powtorzone numery zamowien: ' + _dk.length + (_dw.length ? ('; z tym samym kontenerem i pozycja: ' + _dw.join(', ')) : ''));
             status.textContent = 'Gotowe. Dostawcy: ' + state.bal.order.length + ' | \u017c\u00f3\u0142te: ' + c + ' | penalties: ' + _pen + ' | P/I \u2713' + _pi.ok + ' \u2717' + _pi.bad
                 + ' | BAL komentarze \u2713' + _bc.ok + ' \u26a0' + _bc.warn + ' \u2717' + _bc.bad
                 + (_bpi ? (' | BAL P/I \u2713' + _bc.piOk + ' \u2717' + _bc.piBad) : '')
-                + (_bs.n ? (' | sumy z wklejki \u2713' + _bs.ok + '/' + _bs.n + (_bs.bad.length ? (' \u26a0 rozjazd: ' + _bs.bad.map(function(b){ return b.sup; }).join(', ')) : '')) : '') + '.';
+                + (_bs.n ? (' | sumy z wklejki \u2713' + _bs.ok + '/' + _bs.n + (_bs.bad.length ? (' \u26a0 rozjazd: ' + _bs.bad.map(function(b){ return b.sup; }).join(', ')) : '')) : '')
+                + (_dk.length ? (' | powt\u00f3rzone ordery: ' + _dk.length + (_dw.length ? (' \u26a0 ten sam kontener: ' + _dw.join(', ')) : '')) : '') + '.';
             } catch (e) {
                 // Wyjatek w srodku (np. zerwana siec) nie moze zostawic guzika martwego.
                 var _m = (e && e.message) ? e.message : String(e);
