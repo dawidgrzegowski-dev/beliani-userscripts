@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.12
+// @version      2.13
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17059,6 +17059,23 @@
     function pad2(n){ return (n < 10 ? '0' : '') + n; }
     function today(){ var d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
     function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+    // Pula robocza: N zadan naraz. „Przerwij" zatrzymuje wypuszczanie kolejnych, a te
+    // juz w locie dokanczaja sie normalnie — przerwanie w polowie POST-a zostawiloby
+    // ksiegowanie, o ktorym skrypt nic by nie wiedzial.
+    async function pool(items, workers, worker){
+        var idx = 0, N = items.length;
+        async function one(){
+            while (idx < N){
+                if (S.abort) return;
+                var i = idx++;
+                try { await worker(items[i], i); } catch (e){ /* worker sam opisuje blad w wierszu */ }
+            }
+        }
+        var ps = [];
+        for (var w = 0; w < Math.max(1, Math.min(workers, N)); w++) ps.push(one());
+        await Promise.all(ps);
+    }
+    function parN(){ var v = parseInt(($('#au-par') || {}).value, 10); return (isFinite(v) && v >= 1 && v <= 8) ? v : 5; }
 
     // ===== wklejka =====
     // Kolumny rozpoznajemy po naglowku, gdy jest wklejony; inaczej po pozycji.
@@ -17213,6 +17230,8 @@
       +       '<select id="au-acc" disabled style="font-size:12px;padding:3px 5px;border:1px solid #cfe3d5;border-radius:5px;min-width:320px"><option value="">— najpierw „Sprawdź” —</option></select></label>'
       +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666">Komentarz (opcjonalny)'
       +       '<input type="text" id="au-com" placeholder="trafia do pola paycomment" style="font-size:12px;padding:3px 5px;border:1px solid #cfe3d5;border-radius:5px;min-width:240px"></label>'
+      +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666" title="Ile zamówień obsługiwać naraz — dotyczy i sprawdzania, i księgowania. Zmniejsz, jeśli system zacznie odrzucać zapytania.">Równolegle'
+      +       '<input type="number" id="au-par" min="1" max="8" value="5" style="font-size:12px;padding:3px 5px;border:1px solid #cfe3d5;border-radius:5px;width:60px"></label>'
       +   '</div>'
       +   '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">'
       +     '<button id="au-check" style="padding:7px 14px;border:none;border-radius:7px;background:#0a5a2f;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
@@ -17283,31 +17302,32 @@
         S.rows = p.rows; S.busy = true; S.abort = false;
         $('#au-check').disabled = true; $('#au-book').disabled = true; $('#au-stop').disabled = false;
         render();
-        var done = 0;
+        var done = 0, tot = S.rows.length, par = parN();
+        function tick(){ done++; say('Sprawdzone ' + done + '/' + tot + '…'); render(); }
+        async function checkRow(r){
+            var fa = await findAuftrag(r.ff);
+            if (fa.err && !fa.nums.length){ r.st = (fa.err === 'nie znaleziono auftraga') ? 'none' : 'err'; r.msg = fa.err; tick(); return; }
+            if (fa.nums.length > 1){ r.st = 'many'; r.msg = 'numer FF wskazuje ' + fa.nums.length + ' auftragów (' + fa.nums.join(', ') + ') — rozstrzygnij ręcznie'; tick(); return; }
+            r.num = fa.nums[0];
+            if (fa.used !== r.ff) r.msg = 'znaleziony po obcięciu sufiksu („' + fa.used + '")';
+            var a = await readAuftrag(r.num);
+            if (!a.ok){ r.st = 'err'; r.msg = a.err; tick(); return; }
+            if (!S.accs.length && a.accs.length){ S.accs = a.accs; S.pre = a.pre; fillAcc(); }
+            r.open = a.open; r.nPay = a.nPay;
+            if (a.deleted){ r.st = 'err'; r.msg = 'auftrag skasowany'; tick(); return; }
+            if (a.open == null){ r.st = 'err'; r.msg = 'nie odczytałem „Auftrag value - Total of Payments"'; tick(); return; }
+            if (eq(a.open, r.amount)){ r.st = 'ok'; r.sel = true; }
+            else { r.st = 'diff'; r.sel = false; r.msg = (r.msg ? r.msg + '; ' : '') + 'różnica ' + f2(r.amount - a.open) + ' — zaznacz ręcznie, jeśli mimo to ma iść'; }
+            tick();
+        }
         try {
-            for (var i = 0; i < S.rows.length; i++){
-                if (S.abort){ say('Przerwane po ' + done + '/' + S.rows.length + '.', '#c47f00'); break; }
-                var r = S.rows[i];
-                say('Sprawdzam ' + (i + 1) + '/' + S.rows.length + ' — ' + r.ff + '…');
-                var fa = await findAuftrag(r.ff);
-                if (fa.err && !fa.nums.length){ r.st = fa.err === 'nie znaleziono auftraga' ? 'none' : 'err'; r.msg = fa.err; done++; render(); continue; }
-                if (fa.nums.length > 1){ r.st = 'many'; r.msg = 'numer FF wskazuje ' + fa.nums.length + ' auftragów (' + fa.nums.join(', ') + ') — rozstrzygnij ręcznie'; done++; render(); continue; }
-                r.num = fa.nums[0];
-                if (fa.used !== r.ff) r.msg = 'znaleziony po obcięciu sufiksu („' + fa.used + '")';
-                var a = await readAuftrag(r.num);
-                if (!a.ok){ r.st = 'err'; r.msg = a.err; done++; render(); continue; }
-                if (!S.accs.length && a.accs.length){ S.accs = a.accs; S.pre = a.pre; fillAcc(); }
-                r.open = a.open; r.nPay = a.nPay;
-                if (a.deleted){ r.st = 'err'; r.msg = 'auftrag skasowany'; done++; render(); continue; }
-                if (a.open == null){ r.st = 'err'; r.msg = 'nie odczytałem „Auftrag value - Total of Payments"'; done++; render(); continue; }
-                if (eq(a.open, r.amount)){ r.st = 'ok'; r.sel = true; }
-                else { r.st = 'diff'; r.sel = false; r.msg = (r.msg ? r.msg + '; ' : '') + 'różnica ' + f2(r.amount - a.open) + ' — zaznacz ręcznie, jeśli mimo to ma iść'; }
-                done++; render();
-            }
+            say('Sprawdzam ' + tot + ' pozycji, po ' + par + ' naraz…');
+            await pool(S.rows, par, checkRow);
         } finally {
             S.busy = false; $('#au-check').disabled = false; $('#au-stop').disabled = true;
             var n = S.rows.filter(function(r){ return r.sel; }).length;
             $('#au-book').disabled = !n;
+            if (S.abort) say('Przerwane po ' + done + '/' + tot + '. Wiersze bez statusu nie zostały sprawdzone.', '#c47f00');
             if (!S.abort){
                 var ok = S.rows.filter(function(r){ return r.st === 'ok'; }).length;
                 var df = S.rows.filter(function(r){ return r.st === 'diff'; }).length;
@@ -17349,30 +17369,45 @@
             + (diffs ? ('\n\nUWAGA: ' + diffs + ' z nich ma kwotę różną od open amount.') : '') + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
         S.busy = true; S.abort = false;
         $('#au-check').disabled = true; $('#au-book').disabled = true; $('#au-stop').disabled = false;
-        var ok = 0, part = 0, fail = 0;
-        try {
-            for (var i = 0; i < todo.length; i++){
-                if (S.abort){ say('Przerwane po ' + (ok + part + fail) + '/' + todo.length + '.', '#c47f00'); break; }
-                var r = todo[i];
-                say('Księguję ' + (i + 1) + '/' + todo.length + ' — auftrag ' + r.num + '…');
-                var b = await book(r.num, date, acc, r.amount, com);
-                if (!b.ok){ r.st = 'fail'; r.msg = b.err || 'nie wysłano'; fail++; render(); continue; }
-                await sleep(300);
-                // Weryfikacja: platnosc ma sie pojawic w tabeli Payments, a open amount zejsc do zera.
-                var a = await readAuftrag(r.num);
-                r.booked = true; r.sel = false;
-                if (!a.ok){ r.st = 'part'; r.msg = 'wysłane, ale nie udało się odczytać auftraga do weryfikacji'; part++; render(); continue; }
+        var ok = 0, part = 0, fail = 0, done = 0, par = parN();
+        // Wiersze celujace w TEN SAM auftrag ida po kolei, nie rownolegle. Weryfikacja po
+        // ksiegowaniu czyta stan strony („czy przybylo ksiegowanie", „czy open = 0") —
+        // dwa rownolegle zapisy do jednego auftraga daly by odczyt w polowie cudzej zmiany.
+        var byNum = {}, groups = [];
+        todo.forEach(function(r){ if (!byNum[r.num]) { byNum[r.num] = []; groups.push(byNum[r.num]); } byNum[r.num].push(r); });
+        var multi = groups.filter(function(g){ return g.length > 1; }).length;
+        async function bookOne(r){
+            var b = await book(r.num, date, acc, r.amount, com);
+            done++;
+            if (!b.ok){ r.st = 'fail'; r.msg = b.err || 'nie wysłano'; fail++; say('Zaksięgowane ' + done + '/' + todo.length + '…'); render(); return; }
+            await sleep(300);
+            // Weryfikacja: platnosc ma sie pojawic w tabeli Payments, a open amount zejsc do zera.
+            var a = await readAuftrag(r.num);
+            r.booked = true; r.sel = false;
+            if (!a.ok){ r.st = 'part'; r.msg = 'wysłane, ale nie udało się odczytać auftraga do weryfikacji'; part++; }
+            else {
                 var grew = a.nPay > r.nPay;
                 r.open = a.open; r.nPay = a.nPay;
                 if (!grew){ r.st = 'fail'; r.msg = 'w tabeli Payments nie przybyło księgowania — sprawdź ręcznie'; fail++; }
                 else if (eq(a.open, 0)){ r.st = 'done'; r.msg = ''; ok++; }
                 else { r.st = 'part'; r.msg = 'zaksięgowane, ale open amount = ' + f2(a.open) + ' (nie 0)'; part++; }
-                render();
             }
+            say('Zaksięgowane ' + done + '/' + todo.length + '…');
+            render();
+        }
+        try {
+            say('Księguję ' + todo.length + ' płatności, po ' + par + ' naraz' + (multi ? (' (w tym ' + multi + ' auftrag(ów) z kilkoma wierszami — te po kolei)') : '') + '…');
+            await pool(groups, par, async function(g){
+                for (var i = 0; i < g.length; i++){
+                    if (S.abort) return;
+                    await bookOne(g[i]);
+                }
+            });
         } finally {
             S.busy = false; $('#au-check').disabled = false; $('#au-stop').disabled = true;
             $('#au-book').disabled = !S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
-            say('Zaksięgowane: ✓ ' + ok + (part ? ('  ·  ⚠ do sprawdzenia ' + part) : '') + (fail ? ('  ·  ✗ nieudane ' + fail) : '') + '.',
+            say((S.abort ? ('Przerwane po ' + done + '/' + todo.length + '. ') : '')
+                + 'Zaksięgowane: ✓ ' + ok + (part ? ('  ·  ⚠ do sprawdzenia ' + part) : '') + (fail ? ('  ·  ✗ nieudane ' + fail) : '') + '.',
                 fail ? '#c00' : (part ? '#c47f00' : '#0a7a2f'));
             render();
         }
