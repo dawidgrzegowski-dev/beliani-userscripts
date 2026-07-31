@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.07
+// @version      2.08
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10697,8 +10697,12 @@
             const base = { id: order, debit: debit, credit: credit, comment: '', loading: false, error: null, line: no, supplier: f[0], noStatus: true, sub: isSub, cont: hasCont ? cont : '', src: 'bal' };
 
             addPaid(f[0], paid);
+            // Tozsamosc wiersza do wykrywania podwojnej wklejki: kontener + „1"/„sub".
+            // Ten sam order na DWOCH roznych kontenerach — albo wiersz glowny i jego „sub" —
+            // to normalny uklad, nie pomylka, wiec sama powtorka numeru orderu nie wystarczy.
+            const dupKey = cont.toUpperCase().replace(/[^A-Z0-9]/g, '') + '|' + (isSub ? 'sub' : '1');
             if (!byOrder[order]) byOrder[order] = [];
-            if (byOrder[order].indexOf(no) < 0) byOrder[order].push(no);
+            if (!byOrder[order].some(function (x) { return x.no === no; })) byOrder[order].push({ no: no, key: dupKey });
 
             if (!diff) {
                 const desc = hasCont ? cont : label;
@@ -10849,10 +10853,24 @@
         });
         if (lostSum) warns.push('w wklejce jest ' + lostSum + ' wiersz(y) z sumą grupy, nad którymi nie ma żadnych wierszy — ta suma nie została z niczym porównana.');
 
-        // Ten sam order w dwoch roznych wierszach arkusza to prawie zawsze pomylka przy wklejaniu.
-        // Wpisy z jednego wiersza (pelna kwota + dwie nogi penalty) sa oczywiscie w porzadku.
+        // Do 2.07 ostrzegalismy o KAZDYM powtorzonym numerze orderu — zalozenie „to prawie
+        // zawsze pomylka przy wklejaniu" okazalo sie falszywe: jedno zamowienie rozbite na dwa
+        // kontenery (albo wiersz glowny + jego „sub") to codziennosc i lista „Do sprawdzenia"
+        // puchla od uwag, ktore za kazdym razem konczyly sie „tak, celowe".
+        // Teraz alarmujemy dopiero wtedy, gdy powtarza sie CALA tozsamosc wiersza — ten sam
+        // order przy tym samym kontenerze i tej samej pozycji. Tego zaden kontener nie tlumaczy.
+        // Wpisy z jednego wiersza (pelna kwota + nogi penalty) maja ten sam numer wiersza,
+        // wiec i tak nie licza sie podwojnie.
         Object.keys(byOrder).forEach(function (id) {
-            if (byOrder[id].length > 1) warns.push('order ' + id + ' występuje w ' + byOrder[id].length + ' wierszach (' + byOrder[id].join(', ') + ') — sprawdź, czy to celowe.');
+            const rows = byOrder[id];
+            if (rows.length < 2) return;
+            const byKey = {};
+            rows.forEach(function (r) { (byKey[r.key] = byKey[r.key] || []).push(r.no); });
+            Object.keys(byKey).forEach(function (k) {
+                const ln = byKey[k];
+                if (ln.length > 1) warns.push('order ' + id + ' powtarza się w wierszach ' + ln.join(', ') +
+                    ' przy tym samym kontenerze i tej samej pozycji — sprawdź, czy to nie podwójna wklejka.');
+            });
         });
 
         entries.forEach(function (e, i) { e.uid = 'b' + i; });
