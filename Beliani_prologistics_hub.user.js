@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.13
+// @version      2.14
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17266,6 +17266,16 @@
     // Do zaksiegowania nadaja sie tylko wiersze z odnalezionym auftragiem, ktore nie zostaly
     // jeszcze zaksiegowane. Rozjazd kwoty NIE blokuje — tylko odznacza (patrz renderTbl).
     function bookable(r){ return !!r.num && !r.booked && r.st !== 'many' && r.st !== 'none' && r.st !== 'err'; }
+    function aLnk(n, title){ return '<a href="/auction.php?number=' + esc(n) + '&txnid=3" target="_blank" style="color:#0a5a2f;font-weight:600"' + (title ? (' title="' + att(title) + '"') : '') + '>' + esc(n) + '</a>'; }
+    // Gdy auftrag jest jeden — jeden link. Gdy nierozstrzygniete — wszyscy kandydaci jako
+    // linki, z open amount w dymku, zeby dalo sie kliknac i sprawdzic bez szukania od nowa.
+    function auCell(r){
+        if (r.num) return aLnk(r.num);
+        if (r.cands && r.cands.length) return r.cands.map(function(c){
+            return aLnk(c.num, 'open amount: ' + (c.err ? c.err : f2(c.open)) + (c.deleted ? '  [auftrag skasowany]' : ''));
+        }).join(' <span style="color:#bbb">·</span> ');
+        return '—';
+    }
     function render(){
         var el = $('#au-out');
         if (!S.rows.length){ el.innerHTML = '<div style="color:#888;padding:8px">Wklej dane i kliknij „Sprawdź”.</div>'; return; }
@@ -17282,7 +17292,7 @@
               +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + (can ? '<input type="checkbox" class="au-chk" data-i="' + i + '"' + (r.sel ? ' checked' : '') + '>' : '') + '</td>'
               +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + esc(r.no || r.line) + '</td>'
               +  '<td style="padding:2px 5px;border-top:1px solid #eee;font-family:monospace">' + esc(r.ff) + '</td>'
-              +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + (r.num ? '<a href="/auction.php?number=' + esc(r.num) + '&txnid=3" target="_blank" style="color:#0a5a2f">' + esc(r.num) + '</a>' : '—') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;white-space:nowrap">' + auCell(r) + '</td>'
               +  '<td style="padding:2px 5px;border-top:1px solid #eee;text-align:right;font-weight:600">' + f2(r.amount) + '</td>'
               +  '<td style="padding:2px 5px;border-top:1px solid #eee;text-align:right">' + f2(r.open) + '</td>'
               +  '<td style="padding:2px 5px;border-top:1px solid #eee;white-space:nowrap">' + stTxt(r) + '</td>'
@@ -17307,7 +17317,35 @@
         async function checkRow(r){
             var fa = await findAuftrag(r.ff);
             if (fa.err && !fa.nums.length){ r.st = (fa.err === 'nie znaleziono auftraga') ? 'none' : 'err'; r.msg = fa.err; tick(); return; }
-            if (fa.nums.length > 1){ r.st = 'many'; r.msg = 'numer FF wskazuje ' + fa.nums.length + ' auftragów (' + fa.nums.join(', ') + ') — rozstrzygnij ręcznie'; tick(); return; }
+            if (fa.nums.length > 1){
+                // Kilka auftragow na jeden numer FF. Zamiast od razu odsylac do recznej roboty
+                // czytamy open amount kazdego kandydata — zwykle tylko jeden zgadza sie z kwota
+                // z wklejki i wtedy wybor jest jednoznaczny. Dopiero gdy pasuje zero albo wiecej
+                // niz jeden, zostawiamy decyzje czlowiekowi i pokazujemy wszystkie jako linki.
+                var cands = [];
+                for (var k = 0; k < fa.nums.length; k++){
+                    var ax = await readAuftrag(fa.nums[k]);
+                    cands.push({ num: fa.nums[k], open: ax.ok ? ax.open : null, nPay: ax.ok ? ax.nPay : 0,
+                                 deleted: !!(ax.ok && ax.deleted), err: ax.ok ? '' : ax.err });
+                    if (!S.accs.length && ax.ok && ax.accs && ax.accs.length){ S.accs = ax.accs; S.pre = ax.pre; fillAcc(); }
+                }
+                r.cands = cands;
+                var hit = cands.filter(function(c){ return !c.deleted && !c.err && eq(c.open, r.amount); });
+                function opis(c){ return c.num + ' → ' + (c.err ? c.err : f2(c.open)) + (c.deleted ? ' [skasowany]' : ''); }
+                if (hit.length === 1){
+                    r.num = hit[0].num; r.open = hit[0].open; r.nPay = hit[0].nPay;
+                    r.st = 'ok'; r.sel = true;
+                    r.msg = 'numer FF wskazywał ' + cands.length + ' auftragi — wybrany ' + hit[0].num
+                          + ', bo jego open amount zgadza się z kwotą; pozostałe: '
+                          + cands.filter(function(c){ return c.num !== hit[0].num; }).map(opis).join(', ');
+                    tick(); return;
+                }
+                r.st = 'many';
+                r.msg = (hit.length > 1)
+                    ? ('kilka auftragów ma taki sam open amount ' + f2(r.amount) + ' — rozstrzygnij ręcznie: ' + cands.map(opis).join(', '))
+                    : ('żaden z ' + cands.length + ' auftragów nie ma open amount = ' + f2(r.amount) + ': ' + cands.map(opis).join(', '));
+                tick(); return;
+            }
             r.num = fa.nums[0];
             if (fa.used !== r.ff) r.msg = 'znaleziony po obcięciu sufiksu („' + fa.used + '")';
             var a = await readAuftrag(r.num);
