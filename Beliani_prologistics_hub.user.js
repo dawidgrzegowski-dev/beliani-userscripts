@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.17
+// @version      2.18
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18,7 +18,6 @@
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -7229,17 +7228,108 @@
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
         return true;
     }
-    async function zipFiles(list, zipName) {
-        if (typeof JSZip === 'undefined') { toast('Brak biblioteki JSZip — odśwież stronę.'); return; }
-        if (!list.length) { toast('Brak plików.'); return; }
-        toast('Buduję ZIP…');
-        const zip = new JSZip();
-        for (const f of list) {
-            try { const r = await fetch(location.origin + f.url, { credentials: 'same-origin' }); if (r.ok) zip.file(f.folder ? `${f.folder}/${f.name}` : f.name, await r.blob()); } catch (e) {}
+    // ===== Wlasny pisarz ZIP (metoda 0 = bez kompresji) =====
+    // Do 2.17 bylo tu JSZip — ale biblioteka nigdzie nie byla ladowana (brak @require),
+    // wiec guzik „ZIP plikow zaznaczonych" zawsze konczyl sie komunikatem o jej braku.
+    // Zamiast dociagac 95 KB z cdnjs (co firmowe proxy potrafi zablokowac) skladamy ZIP
+    // sami — tym samym sposobem, ktorym modul Chinskie sklada pliki .xlsx. JSZip domyslnie
+    // TEZ nie kompresuje (generateAsync bez „compression" uzywa STORE), wiec wynik jest
+    // identyczny. Flaga 0x0800 ustawia UTF-8 w nazwach — bez niej polskie znaki
+    // w nazwach zalacznikow rozjezdzaja sie po rozpakowaniu.
+    let IL_CRCT = null;
+    function ilCrcTable() {
+        if (IL_CRCT) return IL_CRCT;
+        const t = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+        IL_CRCT = t; return t;
+    }
+    function ilCrc32(buf) {
+        const t = ilCrcTable(); let c = 0xFFFFFFFF;
+        for (let i = 0; i < buf.length; i++) c = t[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+        return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+    function ilUtf8(str) {
+        const s = String(str == null ? '' : str);
+        if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s);
+        const u = unescape(encodeURIComponent(s)), a = new Uint8Array(u.length);
+        for (let i = 0; i < u.length; i++) a[i] = u.charCodeAt(i) & 255;
+        return a;
+    }
+    // files: [{ name, data: Uint8Array }]
+    function ilZip(files) {
+        const enc = files.map(f => { const d = (f.data instanceof Uint8Array) ? f.data : ilUtf8(f.data); return { n: ilUtf8(f.name), d, crc: ilCrc32(d), off: 0 }; });
+        let total = 22;
+        enc.forEach(f => { total += 30 + f.n.length + f.d.length + 46 + f.n.length; });
+        const out = new Uint8Array(total), dv = new DataView(out.buffer);
+        let p = 0;
+        const u16 = v => { dv.setUint16(p, v & 0xFFFF, true); p += 2; };
+        const u32 = v => { dv.setUint32(p, v >>> 0, true); p += 4; };
+        const raw = a => { out.set(a, p); p += a.length; };
+        const now = new Date();
+        const dt = ((now.getHours() & 31) << 11) | ((now.getMinutes() & 63) << 5) | ((now.getSeconds() >> 1) & 31);
+        const dd = (((now.getFullYear() - 1980) & 127) << 9) | (((now.getMonth() + 1) & 15) << 5) | (now.getDate() & 31);
+        enc.forEach(f => {
+            f.off = p;
+            u32(0x04034b50); u16(20); u16(0x0800); u16(0); u16(dt); u16(dd);
+            u32(f.crc); u32(f.d.length); u32(f.d.length); u16(f.n.length); u16(0);
+            raw(f.n); raw(f.d);
+        });
+        const cdStart = p;
+        enc.forEach(f => {
+            u32(0x02014b50); u16(20); u16(20); u16(0x0800); u16(0); u16(dt); u16(dd);
+            u32(f.crc); u32(f.d.length); u32(f.d.length); u16(f.n.length); u16(0); u16(0);
+            u16(0); u16(0); u32(0); u32(f.off);
+            raw(f.n);
+        });
+        const cdSize = p - cdStart;
+        u32(0x06054b50); u16(0); u16(0); u16(enc.length); u16(enc.length); u32(cdSize); u32(cdStart); u16(0);
+        return out;
+    }
+    function ilSaveBytes(bytes, name) {
+        const blob = new Blob([bytes], { type: 'application/zip' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    }
+    // Ta sama nazwa w jednym folderze nadpisalaby wpis — dokladamy licznik przed rozszerzeniem.
+    function ilUniqName(used, path) {
+        if (!used[path]) { used[path] = 1; return path; }
+        const m = path.match(/^(.*?)(\.[^.\/]+)?$/), base = m[1], ext = m[2] || '';
+        let i = 2;
+        while (used[base + ' (' + i + ')' + ext]) i++;
+        const out = base + ' (' + i + ')' + ext;
+        used[out] = 1; return out;
+    }
+    // Pobiera pula po 6 (odczyt, wiec rownoleglosc jest bezpieczna), potem sklada ZIP.
+    async function ilFetchZip(jobs, onProg, isAbort) {
+        const got = new Array(jobs.length);
+        let ok = 0, bad = 0, idx = 0, done = 0;
+        async function one() {
+            while (idx < jobs.length) {
+                if (isAbort && isAbort()) return;
+                const i = idx++, j = jobs[i];
+                try {
+                    const r = await fetch(j.url && j.url.charAt(0) === '/' ? (location.origin + j.url) : j.url, { credentials: 'same-origin' });
+                    if (r.ok) { got[i] = { path: (j.folder ? j.folder + '/' : '') + j.name, data: new Uint8Array(await r.arrayBuffer()) }; ok++; }
+                    else bad++;
+                } catch (e) { bad++; }
+                done++; if (onProg) onProg(done, jobs.length);
+            }
         }
-        const blob = await zip.generateAsync({ type: 'blob' });
-        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = zipName;
-        document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+        const ps = [];
+        for (let w = 0; w < Math.min(6, jobs.length); w++) ps.push(one());
+        await Promise.all(ps);
+        const used = {}, files = [];
+        got.forEach(g => { if (g) files.push({ name: ilUniqName(used, g.path), data: g.data }); });
+        return { ok, bad, bytes: files.length ? ilZip(files) : null };
+    }
+    async function zipFiles(list, zipName) {
+        if (!list.length) { toast('Brak plików.'); return; }
+        const jobs = list.map(f => ({ url: f.url, name: f.name, folder: f.folder || '' }));
+        const r = await ilFetchZip(jobs, (d, t) => toast('Pobieram ' + d + '/' + t + '…'), null);
+        if (!r.bytes) { toast('Nie pobrano żadnego pliku' + (r.bad ? (' (' + r.bad + ' błędów)') : '') + '.'); return; }
+        ilSaveBytes(r.bytes, zipName);
+        toast('ZIP gotowy: ' + r.ok + ' plików' + (r.bad ? (', ' + r.bad + ' nieudanych') : '') + '.');
     }
     async function toggleFiles(r, tr, btn) {
         const nx = tr.nextElementSibling;
@@ -7632,11 +7722,6 @@
             await Promise.all(ps);
             return out;
         }
-        function exSaveBlob(blob, name){
-            var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
-            document.body.appendChild(a); a.click(); a.remove();
-            setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
-        }
         async function exExcel(list, statusEl, withFiles){
             if (typeof XLSX === 'undefined'){ statusEl.textContent = 'Brak biblioteki XLSX — odśwież stronę.'; return; }
             var fetched = null;
@@ -7658,7 +7743,6 @@
             statusEl.textContent = 'Zapisano Excel: ' + list.length + ' issue.';
         }
         async function exZip(list, statusEl){
-            if (typeof JSZip === 'undefined'){ statusEl.textContent = 'Brak biblioteki JSZip — odśwież stronę (Tampermonkey musi dociągnąć @require).'; return; }
             exAbort = false;
             statusEl.textContent = 'Dociągam listy plików…';
             var fetched = await exCollectFiles(list, function(d, t){ statusEl.textContent = 'Listy plików: ' + d + '/' + t + '…'; });
@@ -7672,21 +7756,14 @@
             if (!jobs.length){ statusEl.textContent = 'Żadne z ' + list.length + ' issue nie ma plików.'; return; }
             if (jobs.length > 200 && !confirm('Do pobrania jest ' + jobs.length + ' plików z ' + (list.length - noFiles) + ' issue.\n\n'
                 + 'ZIP powstaje w pamięci przeglądarki — przy tej liczbie może to potrwać kilka minut i zająć sporo RAM-u.\n\nPobierać?')) { statusEl.textContent = 'Anulowane.'; return; }
-            var zip = new JSZip(), ok = 0, bad = 0;
-            for (var i = 0; i < jobs.length; i++){
-                if (exAbort){ statusEl.textContent = 'Przerwane po ' + (ok + bad) + '/' + jobs.length + '.'; break; }
-                var j = jobs[i];
-                statusEl.textContent = 'Pobieram ' + (i + 1) + '/' + jobs.length + ' (issue ' + j.folder + ')…';
-                try {
-                    var r = await fetch(j.url.charAt(0) === '/' ? (ORIGIN + j.url) : j.url, { credentials: 'same-origin' });
-                    if (r.ok){ zip.file(j.folder + '/' + j.name, await r.blob()); ok++; } else bad++;
-                } catch (e){ bad++; }
-            }
-            if (!ok){ statusEl.textContent = 'Nie pobrano żadnego pliku (' + bad + ' błędów).'; return; }
-            statusEl.textContent = 'Buduję ZIP z ' + ok + ' plików…';
-            var blob = await zip.generateAsync({ type: 'blob' });
-            exSaveBlob(blob, 'Issue_pliki_' + exStamp() + '.zip');
-            statusEl.textContent = 'ZIP gotowy: ' + ok + ' plików' + (bad ? (', ' + bad + ' nieudanych') : '')
+            var res = await ilFetchZip(jobs,
+                function(d, t){ statusEl.textContent = 'Pobieram ' + d + '/' + t + ' plików…'; },
+                function(){ return exAbort; });
+            if (!res.bytes){ statusEl.textContent = 'Nie pobrano żadnego pliku' + (res.bad ? (' (' + res.bad + ' błędów)') : '') + '.'; return; }
+            statusEl.textContent = 'Składam ZIP…';
+            ilSaveBytes(res.bytes, 'Issue_pliki_' + exStamp() + '.zip');
+            statusEl.textContent = (exAbort ? 'Przerwane — ' : 'ZIP gotowy: ') + res.ok + ' plików'
+                + (res.bad ? (', ' + res.bad + ' nieudanych') : '')
                 + (noFiles ? ('  ·  bez plików: ' + noFiles + ' issue') : '') + '.';
         }
 
