@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.18
+// @version      2.19
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -7742,7 +7742,11 @@
             XLSX.writeFile(wb, 'Issue_Log_' + exStamp() + '.xlsx');
             statusEl.textContent = 'Zapisano Excel: ' + list.length + ' issue.';
         }
-        async function exZip(list, statusEl){
+        // useFolders = false: wszystkie pliki plasko, pod oryginalnymi nazwami. Kolizje nazw
+        // miedzy issue nie nadpisuja sie — ilUniqName dokleja „ (2)" przed rozszerzeniem —
+        // ale zgubiona jest informacja, z ktorego issue plik pochodzi. Kto tego potrzebuje,
+        // wlacza foldery albo bierze przyporzadkowanie z kolumny Files w Excelu.
+        async function exZip(list, statusEl, useFolders){
             exAbort = false;
             statusEl.textContent = 'Dociągam listy plików…';
             var fetched = await exCollectFiles(list, function(d, t){ statusEl.textContent = 'Listy plików: ' + d + '/' + t + '…'; });
@@ -7751,7 +7755,7 @@
             list.forEach(function(it){
                 var id = String(it.id || it.organization_issue_number || ''), fs = fetched[id] || [];
                 if (!fs.length){ noFiles++; return; }
-                fs.forEach(function(f){ jobs.push({ folder: id, name: exSafe(f.name || 'plik'), url: f.url }); });
+                fs.forEach(function(f){ jobs.push({ folder: useFolders ? id : '', name: exSafe(f.name || 'plik'), url: f.url }); });
             });
             if (!jobs.length){ statusEl.textContent = 'Żadne z ' + list.length + ' issue nie ma plików.'; return; }
             if (jobs.length > 200 && !confirm('Do pobrania jest ' + jobs.length + ' plików z ' + (list.length - noFiles) + ' issue.\n\n'
@@ -7881,6 +7885,8 @@
                     + '<button id="ilp-s-stop" style="padding:5px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;">\u26d4 Przerwij</button>'
                     + '<label style="font-size:11px;color:#666;display:flex;align-items:center;gap:3px;cursor:pointer" title="Kolumna Files zostanie wype\u0142niona nazwami za\u0142\u0105cznik\u00f3w. Kosztuje jedno zapytanie na issue.">'
                     + '<input type="checkbox" id="ilp-s-wfiles" checked> nazwy plik\u00f3w w Excelu</label>'
+                    + '<label style="font-size:11px;color:#666;display:flex;align-items:center;gap:3px;cursor:pointer" title="Wy\u0142\u0105czone: wszystkie pliki le\u017c\u0105 w ZIP-ie p\u0142asko, pod oryginalnymi nazwami. W\u0142\u0105czone: ka\u017cde issue dostaje w\u0142asny folder nazwany swoim numerem.">'
+                    + '<input type="checkbox" id="ilp-s-zipfold"> foldery per issue</label>'
                     + '</div>';
                 rh += list.map(function(it){
                     var id = it.id || it.organization_issue_number;
@@ -7903,8 +7909,9 @@
                 };
                 var bz = results.querySelector('#ilp-s-zip');
                 if (bz) bz.onclick = async function(){
+                    var zf = results.querySelector('#ilp-s-zipfold');
                     bz.disabled = true;
-                    try { await exZip(list, status); }
+                    try { await exZip(list, status, !!(zf && zf.checked)); }
                     catch(e){ status.textContent = 'Błąd ZIP-a: ' + ((e && e.message) || e); }
                     finally { bz.disabled = false; }
                 };
