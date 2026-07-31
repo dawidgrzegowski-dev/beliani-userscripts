@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.09
+// @version      2.11
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13033,22 +13033,54 @@
         }
         // „nowszy niz" odporne na komentarz bez daty (ts = NaN)
         function pcNewer(a, b){ return isFinite(a) && (!isFinite(b) || a > b); }
+        // ===== Komentarz wskazujacy KONKRETNY numer konta do zaplaty =====
+        // „Please pay total balance to the old bank account: 101670241991" — to nie jest ani
+        // potwierdzenie, ani zmiana danych w karcie dostawcy. To polecenie zaplaty na numer
+        // INNY niz ten, ktory ERP poda sam z siebie, i przy balансie potrafi byc jedynym
+        // sladem, ze pieniadze maja pojsc gdzie indziej. Slownik zmiany tego nie lapal, bo
+        // pada tam „old"/„stare", a nie „changed"/„new".
+        var PC_OLDACC_RE = /\b(?:old|previous|former|stare|stary|starego|starym|poprzedni[a-ząęó]*)\b/i;
+        // Numer konta: min. 8 cyfr, rozdzielone najwyzej spacja/apostrofem. Myslnik, dwukropek
+        // i kropka NIE sa separatorem — dzieki temu „2026-04-29", „10:02:34" i „3312.72"
+        // rozpadaja sie na krotkie kawalki i nie udaja numeru konta.
+        function pcAcctFromText(t){
+            var s = String(t == null ? '' : t);
+            if (!new RegExp(PC_ACC_RE, 'i').test(s)) return null;
+            var out = [], re = /\d[\d '’]*\d/g, m;
+            while ((m = re.exec(s)) !== null){
+                var d = m[0].replace(/\D+/g, '');
+                if (d.length >= 8 && d.length <= 34 && out.indexOf(d) === -1) out.push(d);
+            }
+            return out.length ? { accs: out, old: PC_OLDACC_RE.test(s) } : null;
+        }
+        // Czy ktorykolwiek numer z komentarza to konto, na ktore faktycznie idzie przelew.
+        function pcHintMatches(hint, acc){
+            if (!hint || !hint.accs || !hint.accs.length) return true;
+            var a = normAcc(acc || '');
+            if (!a) return false;
+            for (var i = 0; i < hint.accs.length; i++){ if (normAcc(hint.accs[i]) === a) return true; }
+            return false;
+        }
         // Z listy komentarzy (dostawca albo zamowienie) — najnowsze potwierdzenie i najnowsza
         // wzmianka o zmianie. src trafia do dymka, zeby bylo widac, SKAD to potwierdzenie.
         function pcScanBankComments(cs, src){
-            var conf = null, chg = null;
+            var conf = null, chg = null, hint = null;
+            function rec(c){ return { ts: pcTs(c.date), date: c.date || '', author: c.author || '', text: c.text || '', src: src || '' }; }
             (cs || []).forEach(function(c){
-                var rec = { ts: pcTs(c.date), date: c.date || '', author: c.author || '', text: c.text || '', src: src || '' };
-                if (pcIsBankConfText(c.text)) { if (!conf || pcNewer(rec.ts, conf.ts)) conf = rec; }
-                else if (pcIsBankChgText(c.text)) { if (!chg || pcNewer(rec.ts, chg.ts)) chg = rec; }
+                // Wskazanie numeru konta jest NIEZALEZNE od potwierdzenia/zmiany — ten sam
+                // komentarz moze byc jednym i drugim, wiec nie wchodzi do tego samego else-if.
+                var a = pcAcctFromText(c.text);
+                if (a){ var h = rec(c); h.accs = a.accs; h.old = a.old; if (!hint || pcNewer(h.ts, hint.ts)) hint = h; }
+                if (pcIsBankConfText(c.text)) { var r1 = rec(c); if (!conf || pcNewer(r1.ts, conf.ts)) conf = r1; }
+                else if (pcIsBankChgText(c.text)) { var r2 = rec(c); if (!chg || pcNewer(r2.ts, chg.ts)) chg = r2; }
             });
-            return { conf: conf, chg: chg };
+            return { conf: conf, chg: chg, hint: hint };
         }
         // Surowe dane ze strony dostawcy: potwierdzenie, wzmianka o zmianie, log zmiany konta.
         // Ocene (ok/old/none) robi dopiero pcConfEval, bo potrzebuje jeszcze komentarzy zamowien.
         function pcBankConf(html){
             var s = pcScanBankComments(pcComments(html), 'strona dostawcy');
-            return { conf: s.conf, chg: s.chg, acc: pcAccChange(html) };
+            return { conf: s.conf, chg: s.chg, hint: s.hint, acc: pcAccChange(html) };
         }
         var PENALTY_DAYS = 7;
         // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
@@ -13740,12 +13772,22 @@
                 function V(k, d){ return (ed[k] != null && String(ed[k]) !== '') ? ed[k] : d; }
                 var amtBase = (ds || 0) + (bs || 0);
                 var amt = (ed.amount != null && ed.amount !== '' && isFinite(Number(ed.amount))) ? Number(ed.amount) : amtBase;
+                // Konto, ktore FAKTYCZNIE pojdzie do pliku — z nim porownujemy numer z komentarza.
+                var accV = String(V('acc', b.acc || ''));
+                var _cf = pcConfEval(G), hint = (_cf && _cf.hint) || null;
+                var hintBad = !!(hint && hint.accs && hint.accs.length && !pcHintMatches(hint, accV));
+                // Rozjazd z komentarzem idzie na POCZATEK listy powodow — to on ma byc widoczny
+                // w dymku statusu i w ostrzezeniach, a nie ginac pod uwagami o P/I.
+                if (hintBad) st.why = ['komentarz z ' + (hint.date || '?') + (hint.author ? ' (' + hint.author + ')' : '')
+                    + ' każe zapłacić na konto ' + hint.accs.join(' / ') + (hint.old ? ' (STARE konto)' : '')
+                    + ', a przelew jest złożony na ' + (accV || '—')].concat(st.why || []);
                 out.push({
+                    acctHint: hint, acctHintBad: hintBad,
                     key: G.key, gi: i, sup: G.sup,
                     amount: amt, amountBase: amtBase, amountEdited: amt !== amtBase,
                     title: String(V('title', pcTitleFor(G)) || ''),
                     name: String(V('name', b.name || '')),
-                    acc: String(V('acc', b.acc || '')),
+                    acc: accV,
                     bic: painNorm(V('bic', b.swift || '')),
                     town: String(V('town', geo.town || '')),
                     ctry: String(V('ctry', geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2),
@@ -13757,7 +13799,7 @@
                     accWasWrong: b.accWasWrong || '', accFix: !!b.accFix, accBad: b.accBad || '',
                     geoSrc: geo.src || '', geoWeak: !!(geo.weak && geo.ctry),
                     hasBank: bk.n > 0, bankWhy: bk.why || '', conflict: bk.conflict, nBank: bk.n,
-                    verified: st.ok, why: st.why,
+                    verified: st.ok && !hintBad, why: st.why,
                     nDep: (G.dep || []).length, nBal: (G.bal || []).length,
                     e2e: painFirstOrder(G)
                 });
@@ -13773,9 +13815,9 @@
             if (!/^[A-Z]{2}$/.test(String(cfg.ctry || '').toUpperCase())) errs.push('Zleceniodawca: brak kraju (2 litery, np. CH).');
             if (!/^\d{4}-\d{2}-\d{2}$/.test(String(cfg.exec || ''))) errs.push('Data wykonania: wymagany format RRRR-MM-DD.');
             if (!rows.length) errs.push('Nie zaznaczono żadnej płatności.');
-            // Tryb testowy nie moze cicho zostac na stale — od 14.11.2026 plik bez TwnNm/Ctry
-            // przestanie byc przyjmowany.
-            if (cfg.flatAdr) warns.push('Włączony tryb testowy „adres tylko w AdrLine” — plik pójdzie bez TwnNm, PstCd i Ctry. Do porównania w e-finance; po teście wyłącz.');
+            // Tryb testowy nie moze cicho zostac na stale — plik bez TwnNm/Ctry jest niezgodny
+            // z SPS i bank ma prawo go odrzucic.
+            if (cfg.flatAdr) warns.push('Włączony tryb testowy „adres tylko w AdrLine” — plik pójdzie bez TwnNm, PstCd i Ctry, czyli NIEZGODNIE ze Swiss Payment Standards (TwnNm i Ctry są wymagane w obu dopuszczonych wariantach adresu). Bank może go odrzucić. Używaj wyłącznie do porównania w e-finance i zaraz potem wyłącz.');
             var e2e = {};
             rows.forEach(function(r){
                 var p = '„' + r.sup + '”: ';
@@ -13784,8 +13826,9 @@
                 if (!painTxt(r.name, 140, strict)) errs.push(p + 'brak nazwy beneficjenta.');
                 if (!painNorm(r.acc)) errs.push(p + 'brak numeru konta beneficjenta.');
                 if (!painBicOk(r.bic)) errs.push(p + 'BIC „' + r.bic + '” niepoprawny.');
-                if (!painTxt(r.town, 35, strict)) errs.push(p + 'brak miasta beneficjenta — TwnNm obowiązkowe od 14.11.2026.');
-                if (!/^[A-Z]{2}$/.test(r.ctry)) errs.push(p + 'brak kraju beneficjenta — Ctry obowiązkowe od 14.11.2026.');
+                if (r.acctHintBad) warns.push(p + '⛔ ' + (r.why[0] || 'komentarz wskazuje inne konto') + ' — wiersz jest ODZNACZONY; zaznacz go ręcznie dopiero po sprawdzeniu, na który numer ma iść przelew.');
+                if (!painTxt(r.town, 35, strict)) errs.push(p + 'brak miasta beneficjenta — TwnNm obowiązkowe w obu wariantach adresu SPS (strukturalnym i hybrydowym).');
+                if (!/^[A-Z]{2}$/.test(r.ctry)) errs.push(p + 'brak kraju beneficjenta — Ctry obowiązkowe w obu wariantach adresu SPS (strukturalnym i hybrydowym).');
                 var t = painChars(r.title, strict);
                 if (!t.txt) errs.push(p + 'pusty tytuł przelewu.');
                 if (t.txt.length > PAIN_TITLE_MAX) warns.push(p + 'tytuł ma ' + t.txt.length + ' znaków — zostanie przycięty do ' + PAIN_TITLE_MAX + '.');
@@ -13816,12 +13859,13 @@
             function o(t, a){ L.push(sp() + '<' + t + (a || '') + '>'); d++; }
             function c(t){ d--; L.push(sp() + '</' + t + '>'); }
             function e(t, v, a){ L.push(sp() + '<' + t + (a || '') + '>' + painEsc(v) + '</' + t + '>'); }
-            // cfg.flatAdr — wariant diagnostyczny. PostFinance przy zleceniu BEL-21535-1
-            // zinterpretowal konto beneficjenta jak szwajcarskie konto pocztowe (48810370004074
-            // -> „37-407-4"), a jedynym odstepstwem od Swiss Payment Standards w tamtym pliku
-            // byl adres hybrydowy: TwnNm/Ctry razem z AdrLine. Wlaczony przelacznik wypuszcza
-            // adres czysto nieustrukturyzowany, zeby dalo sie porownac oba pliki w e-finance.
-            // Domyslnie WYLACZONY — od 14.11.2026 TwnNm i Ctry sa obowiazkowe.
+            // cfg.flatAdr — wariant WYLACZNIE diagnostyczny, NIEZGODNY ze standardem.
+            // SPS 2026 (IG Credit Transfer 2.3, rozdz. o danych adresowych) dopuszcza dwa
+            // warianty adresu — strukturalny i hybrydowy — i w OBU „Town Name" i „Country"
+            // musza byc podane zawsze. Ten przelacznik je pomija, wiec plik moze zostac
+            // odrzucony. Zostawiony tylko po to, by przy zleceniu BEL-21535-1 (konto
+            // 48810370004074 pokazane w e-finance jako „37-407-4") dalo sie porownac dwa
+            // pliki i sprawdzic, czy adres ma z tym cokolwiek wspolnego.
             function pstlAdr(town, ctry, lines, pstCd){
                 o('PstlAdr');
                 if (cfg.flatAdr){
@@ -14289,6 +14333,14 @@
                         + ((accPay && accShown && normAcc(accPay) !== normAcc(accShown)) ? ('     ⚠ w prologistics widnieje inne konto: ' + accShown) : ''), XLS.VALB);
                     var cfG = pcConfEval(G);
                     labelRow('Potwierdzenie konta:', xlConfTxt(cfG), xlConfSt(cfG), 30);
+                    var hG = cfG && cfG.hint;
+                    if (hG && hG.accs && hG.accs.length){
+                        var zgodne = pcHintMatches(hG, accPay || accShown);
+                        labelRow('Konto z komentarza:', (zgodne ? '✓ zgodne — ' : '⛔ INNE NIŻ W PRZELEWIE — ')
+                            + hG.accs.join(' / ') + (hG.old ? ' (komentarz mówi o STARYM koncie)' : '')
+                            + '  ·  ' + (hG.date || '?') + (hG.author ? ', ' + hG.author : '')
+                            + '  ·  „' + (hG.text || '') + '"', zgodne ? XLS.VALB : XLS.BADW, 30);
+                    }
                     labelRow('SWIFT / BIC:', (pr && pr.bic ? pr.bic : '— brak —')
                         + (pr && pr.bankName ? ('     bank: ' + pr.bankName) : '')
                         + (pr && pr.bankTown ? (', ' + pr.bankTown) : '')
@@ -15376,9 +15428,9 @@
                + '</select></label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="BtchBookg=true: bank księguje paczkę jedną zbiorczą pozycją na wyciągu."><input type="checkbox" class="pain-cfgb" data-k="batch"' + (cfg.batch === false ? '' : ' checked') + '> księgowanie zbiorcze</label>'
                + '<label style="font-size:11px;color:#555;cursor:pointer" title="Domyślnie WYŁĄCZONE — Swiss Payment Standards 2025 (pkt 3.1) dopuszcza cały Basic Latin, więc „%” i „&” są legalne. Włącz tylko, jeśli bank odrzuci plik z powodu znaków: tekst zostanie ograniczony do zestawu SWIFT (a-z A-Z 0-9 . , : ’ + - / ( ) ?), „%” → „pct”, „&” → „+”."><input type="checkbox" class="pain-cfgb" data-k="strict"' + (cfg.strict ? ' checked' : '') + '> ścisły zestaw znaków</label>'
-               + '<label style="font-size:11px;color:' + (cfg.flatAdr ? '#c00;font-weight:700' : '#555') + ';cursor:pointer" title="DIAGNOSTYKA — domyślnie WYŁĄCZONE. Włączone wypuszcza adres zleceniodawcy i beneficjenta wyłącznie w AdrLine, bez TwnNm, PstCd i Ctry. Do porównania dwóch plików w e-finance, gdy PostFinance źle odczytuje numer konta beneficjenta. Uwaga: od 14.11.2026 TwnNm i Ctry są obowiązkowe, więc to ustawienie jest tymczasowe — po teście wyłącz."><input type="checkbox" class="pain-cfgb" data-k="flatAdr"' + (cfg.flatAdr ? ' checked' : '') + '> adres tylko w AdrLine (test)</label>'
+               + '<label style="font-size:11px;color:' + (cfg.flatAdr ? '#c00;font-weight:700' : '#555') + ';cursor:pointer" title="DIAGNOSTYKA — domyślnie WYŁĄCZONE. Włączone wypuszcza adres wyłącznie w AdrLine, bez TwnNm, PstCd i Ctry. UWAGA: taki plik jest NIEZGODNY ze Swiss Payment Standards — TwnNm i Ctry są wymagane w obu dopuszczonych wariantach adresu (strukturalnym i hybrydowym), więc bank ma prawo go odrzucić. Służy tylko do porównania dwóch plików w e-finance, gdy PostFinance źle odczytuje numer konta beneficjenta. Po teście wyłącz."><input type="checkbox" class="pain-cfgb" data-k="flatAdr"' + (cfg.flatAdr ? ' checked' : '') + '> adres tylko w AdrLine (test)</label>'
                + '</div></div>'
-               + (cfg.flatAdr ? '<div style="margin-top:-4px;margin-bottom:8px;background:#FFF6E0;border:1px solid #f0d59a;border-radius:6px;padding:5px 9px;font-size:11px;color:#7a5300"><b>⚠ Tryb testowy adresu WŁĄCZONY</b> — plik pójdzie z adresem wyłącznie w AdrLine, bez TwnNm / PstCd / Ctry. Po sprawdzeniu w e-finance wyłącz go z powrotem.</div>' : '');
+               + (cfg.flatAdr ? '<div style="margin-top:-4px;margin-bottom:8px;background:#FFF6E0;border:1px solid #f0d59a;border-radius:6px;padding:5px 9px;font-size:11px;color:#7a5300"><b>⚠ Tryb testowy adresu WŁĄCZONY</b> — plik pójdzie bez TwnNm / PstCd / Ctry, czyli <b>niezgodnie ze Swiss Payment Standards</b> (oba te pola są wymagane w każdym dopuszczonym wariancie adresu). Bank może go odrzucić. Po sprawdzeniu w e-finance wyłącz z powrotem.</div>' : '');
 
             h += '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;width:100%">';
             h += '<tr style="color:#999;font-size:10px"><td style="padding:1px 4px"></td><td style="padding:1px 4px">Dostawca</td><td style="padding:1px 4px;text-align:right">Kwota ' + PAIN_CCY + '</td><td style="padding:1px 4px">Beneficjent (Nm)</td><td style="padding:1px 4px">Konto</td><td style="padding:1px 4px">BIC</td><td style="padding:1px 4px">Miasto</td><td style="padding:1px 4px">Kraj</td><td style="padding:1px 4px">Status</td></tr>';
@@ -15386,11 +15438,15 @@
             rows.forEach(function(r){
                 var on = !!state.painSel[r.key];
                 var bg = on ? (r.verified ? '#EAF7EA' : '#FFF6E0') : '#fff';
+                if (r.acctHintBad) bg = on ? '#FDECEC' : '#FFF5F5';
                 var st = r.verified
                     ? '<span style="color:#0a0;font-weight:700">✓ sprawdzone</span>'
                     : '<span style="color:#c47f00;font-weight:700" title="' + pcAttr(r.why.join('\n')) + '">⚠ ' + esc(r.why.length) + ' uwag</span>';
                 if (!r.hasBank) st = '<span style="color:#c00;font-weight:700">✗ brak danych bankowych w P/I</span>';
                 else if (r.conflict) st += ' <span style="color:#c00;font-weight:700" title="P/I wskazują różne konta">✗ konflikt kont</span>';
+                // Rozjazd z komentarzem stoi NAD reszta statusu — to jedyna uwaga, ktora moze
+                // skonczyc sie wyslaniem pieniedzy pod zly numer.
+                if (r.acctHintBad) st = '<span style="color:#a10000;font-weight:700" title="' + pcAttr(r.why[0] || '') + '">⛔ komentarz: konto ' + esc(r.acctHint.accs.join(' / ')) + (r.acctHint.old ? ' (STARE)' : '') + '</span><br>' + st;
                 if (r.geoWeak) st += ' <span style="color:#c47f00" title="Kraj wyprowadzony ' + (r.geoSrc === 'bic' ? 'z BIC banku' : 'z nazwy firmy') + ', nie z adresu">(kraj: ' + esc(r.geoSrc) + ')</span>';
                 var tl = painChars(r.title, strict).txt.length;
                 h += '<tr style="background:' + bg + '">'
@@ -15448,16 +15504,18 @@
             if (!G) return null;
             var sup = G.cid ? (_conf[G.cid] || null) : null;
             var seen = !!sup, conf = sup ? sup.conf : null, chg = sup ? sup.chg : null, acc = sup ? sup.acc : null;
+            var hint = sup ? sup.hint : null;
             (G.dep || []).concat(G.bal || []).forEach(function(r){
                 var o = _ordConf[String(r && r.order)];
                 if (!o) return;
                 seen = true;
                 if (o.conf && (!conf || pcNewer(o.conf.ts, conf.ts))) conf = o.conf;
                 if (o.chg  && (!chg  || pcNewer(o.chg.ts,  chg.ts)))  chg  = o.chg;
+                if (o.hint && (!hint || pcNewer(o.hint.ts, hint.ts))) hint = o.hint;
             });
             if (!seen) return null;   // nic jeszcze nie pobrane — plakietka „? konto"
             var chTs = NaN, out = { st: 'none', date: '', author: '', text: '', src: '',
-                                    chDate: '', chBy: '', chFrom: '', chTo: '', chSrc: '', chText: '' };
+                                    chDate: '', chBy: '', chFrom: '', chTo: '', chSrc: '', chText: '', hint: hint };
             if (acc){ chTs = acc.ts; out.chDate = acc.date; out.chBy = acc.by; out.chFrom = acc.from; out.chTo = acc.to; out.chSrc = 'log konta u dostawcy'; }
             if (chg && (!isFinite(chTs) || pcNewer(chg.ts, chTs))){
                 chTs = chg.ts; out.chDate = chg.date; out.chBy = chg.author; out.chFrom = ''; out.chTo = '';
@@ -15489,6 +15547,22 @@
                 + (cf.chSrc ? ' (' + cf.chSrc + ')' : '')
                 + ((cf.chFrom && cf.chTo) ? ('\nz konta ' + cf.chFrom + ' na ' + cf.chTo) : (cf.chTo ? ('\nna numer: ' + cf.chTo) : ''))
                 + (cf.chText ? ('\n„' + cf.chText + '"') : '');
+        }
+        // Osobna plakietka: komentarz podaje konkretny numer konta. Stoi obok „konto
+        // potwierdzone", bo to inna informacja — nie „czy dane sa sprawdzone", tylko
+        // „gdzie te pieniadze faktycznie maja pojsc".
+        function pcHintBadge(cf, accUsed){
+            var h = cf && cf.hint;
+            if (!h || !h.accs || !h.accs.length) return '';
+            var zgodne = pcHintMatches(h, accUsed);
+            var opis = 'Komentarz z ' + (h.date || '?') + (h.author ? ' (' + h.author + ')' : '') + (h.src ? ' [' + h.src + ']' : '')
+                + ' wskazuje konto: ' + h.accs.join(', ')
+                + (h.old ? '\nKomentarz mówi o KONCIE STARYM / poprzednim.' : '')
+                + '\n\n„' + (h.text || '') + '"'
+                + '\n\nPrzelew jest złożony na konto: ' + (accUsed || '—');
+            if (zgodne) return pcConfPill('✓ konto z komentarza', '#0a7a2f', opis + '\nTo ten sam numer.');
+            return pcConfPill('⛔ komentarz wskazuje INNE konto', '#a10000',
+                opis + '\nTO NIE JEST TEN SAM NUMER — sprawdź, zanim wyślesz.');
         }
         // Plakietka „konto potwierdzone" obok numeru konta w naglowku grupy.
         function pcConfPill(txt, bg, title){ return '<span class="pc-confbadge" title="' + pcAttr(title) + '" style="margin-left:10px;background:' + bg + ';color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">' + txt + '</span>'; }
@@ -15576,7 +15650,7 @@
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
                 + '<span style="font-weight:400;margin-left:12px">Konto: <span class="pc-acc" data-key="' + esc(G.key) + '" title="Kliknij, aby edytowac konto" style="cursor:text;font-weight:700;border-bottom:1px dashed #999">' + esc(accShown || '—') + '</span></span>'
-                + pcConfBadge(pcConfG(G))
+                + pcConfBadge(pcConfG(G)) + pcHintBadge(pcConfG(G), accShown)
                 + (hasDep ? '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (depSum != null ? esc(depSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b class="pc-balsum" data-sup="' + gi + '">' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
