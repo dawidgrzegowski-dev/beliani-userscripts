@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.05
+// @version      2.06
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12983,11 +12983,15 @@
             if (!dm) return null;
             var re = /Changed\s+from\s+"([^"]*)"\s+to\s+"([^"]*)"\s+by\s+([^\s<]+)\s+on\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)/gi, m, last = null;
             while ((m = re.exec(dm[1])) !== null){
-                // wpisy „to ''" to wyczyszczenie pola, a nie numer, ktory trzeba potwierdzac
-                if (!String(m[2]).trim()) continue;
+                var from = String(m[1]).trim(), to = String(m[2]).trim();
+                // Liczy sie WYLACZNIE zmiana z jednego konta na inne. Pierwsze wpisanie numeru
+                // (from "") ani wyczyszczenie pola (to "") nie uniewazniaja potwierdzenia —
+                // nie ma tam „starego konta", ktorego potwierdzenie mogloby dotyczyc.
+                if (!from || !to) continue;
+                if (normAcc(from) === normAcc(to)) continue;   // poprawka zapisu, nie zmiana konta
                 var ts = pcTs(m[4]);
                 if (!isFinite(ts)) continue;
-                if (!last || ts > last.ts) last = { ts: ts, from: m[1].trim(), to: m[2].trim(), by: m[3], date: m[4] };
+                if (!last || ts > last.ts) last = { ts: ts, from: from, to: to, by: m[3], date: m[4] };
             }
             return last;
         }
@@ -12995,15 +12999,19 @@
         // nigdzie w kodzie strony (leci z js_backend.php), wiec lapiemy typowe warianty.
         // Log konta u dostawcy zostaje zrodlem rozstrzygajacym — to jest tylko uzupelnienie
         // na wypadek, gdy zmiane widac wylacznie w komentarzu zamowienia.
+        // Slowo o koncie musi stac BLISKO slowa o zmianie, i to slowo o koncie musi naprawde
+        // dotyczyc danych bankowych. Luzniejszy warunek unieważnial potwierdzenie na komentarzach
+        // typu „NEW FACTORY ADRESS ... SUPPLIER DETAILS UPDATED" albo „bank holiday, details
+        // updated" — a to nie sa zmiany konta. „merg/marg" zostaje: fuzja firm zmienia konto,
+        // a w bazie trafia sie literowka „marged".
+        var PC_ACC_RE = "(?:bank\\s*(?:account|accounts|details|information|info|data)|\\baccount\\b|\\biban\\b|\\bswift\\b|\\bkont(?:o|a|em)\\b|\\bkoncie\\b|rachunk[a-z]*|rachunek)";
+        var PC_CHG_RE = "(?:chang[a-z]*|updat[a-z]*|modif[a-z]*|merg[a-z]*|marg[a-z]*|replac[a-z]*|\\bnew\\b|\\bnowy\\b|\\bnowe\\b|zmian[a-zćęłńóśźż]*|zmieni[a-zćęłńóśźż]*)";
         function pcIsBankChgText(t){
             var s = String(t == null ? '' : t);
-            if (!/bank|account|konto|iban/i.test(s)) return false;
             if (pcIsBankConfText(s)) return false;   // „confirmed" wygrywa nad „changed"
-            // „merg/marg" — fuzja firm ze zmiana konta; w bazie trafia sie literowka „marged".
-            // „NEW ... BANK ACCOUNT" z tekstem posrodku: „NEW NAME, CONTACT DETAILS AND BANK ACCOUNT".
-            return /\b(?:chang|updat|modif|merg|marg)[a-z]*\b/i.test(s)
-                || /\bnew\b[\s\S]{0,40}?\b(?:bank|account|konto)\b/i.test(s)
-                || /zmian[a-zćęłńóśźż]*/i.test(s) || /\bnowy\s+(?:numer\s+)?(?:konta|rachunk)/i.test(s);
+            var near = "[\\s\\S]{0,40}?";
+            return new RegExp(PC_ACC_RE + near + PC_CHG_RE, 'i').test(s)
+                || new RegExp(PC_CHG_RE + near + PC_ACC_RE, 'i').test(s);
         }
         // „nowszy niz" odporne na komentarz bez daty (ts = NaN)
         function pcNewer(a, b){ return isFinite(a) && (!isFinite(b) || a > b); }
@@ -15379,10 +15387,10 @@
             });
             if (!seen) return null;   // nic jeszcze nie pobrane — plakietka „? konto"
             var chTs = NaN, out = { st: 'none', date: '', author: '', text: '', src: '',
-                                    chDate: '', chBy: '', chTo: '', chSrc: '', chText: '' };
-            if (acc){ chTs = acc.ts; out.chDate = acc.date; out.chBy = acc.by; out.chTo = acc.to; out.chSrc = 'log konta u dostawcy'; }
+                                    chDate: '', chBy: '', chFrom: '', chTo: '', chSrc: '', chText: '' };
+            if (acc){ chTs = acc.ts; out.chDate = acc.date; out.chBy = acc.by; out.chFrom = acc.from; out.chTo = acc.to; out.chSrc = 'log konta u dostawcy'; }
             if (chg && (!isFinite(chTs) || pcNewer(chg.ts, chTs))){
-                chTs = chg.ts; out.chDate = chg.date; out.chBy = chg.author; out.chTo = '';
+                chTs = chg.ts; out.chDate = chg.date; out.chBy = chg.author; out.chFrom = ''; out.chTo = '';
                 out.chSrc = chg.src || 'komentarz'; out.chText = chg.text || '';
             }
             if (!conf) return out;
@@ -15397,7 +15405,7 @@
             if (!cf || !cf.chDate) return '';
             return cf.chDate + (cf.chBy ? ' przez ' + cf.chBy : '')
                 + (cf.chSrc ? ' (' + cf.chSrc + ')' : '')
-                + (cf.chTo ? ('\nna numer: ' + cf.chTo) : '')
+                + ((cf.chFrom && cf.chTo) ? ('\nz konta ' + cf.chFrom + ' na ' + cf.chTo) : (cf.chTo ? ('\nna numer: ' + cf.chTo) : ''))
                 + (cf.chText ? ('\n„' + cf.chText + '"') : '');
         }
         // Plakietka „konto potwierdzone" obok numeru konta w naglowku grupy.
