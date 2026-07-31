@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.11
+// @version      2.12
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17026,8 +17026,365 @@
 })();
     }
 
+    // ===================== Ksiegowanie w auftragu =====================
+    // Wklejka z raportu (TSV) -> dla kazdego wiersza szukamy auftraga po numerze FF,
+    // porownujemy kwote z „Auftrag value - Total of Payments" i ksiegujemy.
+    //
+    // Wszystko idzie zwyklym fetch-em, bez iframe. Formularz #book na auction.php nie ma
+    // tokenu CSRF ani onsubmit, wiec POST z osmioma polami odtwarza dokladnie to, co
+    // wysyla przegladarka po kliknieciu „Make payment":
+    //   number, txnid, Date_Month (01-12), Date_Day (1-31 BEZ zera wiodacego),
+    //   Date_Year (RRRR), account, amount, paycomment
+    // Przyciskow „safer" i „paypal" NIE wolno dosylac — one maja atrybut name i oznaczaja
+    // platnosc karta/PayPalem. „make-payment" name-a nie ma, wiec nic dodatkowego nie trzeba.
+    function init_auftrag() {
+(function () {
+    'use strict';
+    if (!/(^|\.)prologistics\.info$/i.test(location.hostname)) return;
+
+    var AU_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
+
+    function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function att(s){ return esc(s).replace(/\n/g, '&#10;'); }
+    function dom(html){ return new DOMParser().parseFromString(String(html || ''), 'text/html'); }
+    function money(s){
+        var t = String(s == null ? '' : s).replace(/[\s'’ ]/g, '').replace(/[^\d.,+-]/g, '');
+        if (!t || !/\d/.test(t)) return null;
+        if (t.indexOf('.') === -1 && /,\d{1,2}$/.test(t)) t = t.replace(',', '.'); else t = t.replace(/,/g, '');
+        var v = parseFloat(t);
+        return isFinite(v) ? v : null;
+    }
+    function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
+    function eq(a, b){ return a != null && b != null && isFinite(a) && isFinite(b) && Math.abs(a - b) < 0.005; }
+    function pad2(n){ return (n < 10 ? '0' : '') + n; }
+    function today(){ var d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+    function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+    // ===== wklejka =====
+    // Kolumny rozpoznajemy po naglowku, gdy jest wklejony; inaczej po pozycji.
+    // Uwaga: pierwsza komorka naglowka to tez slowo „false", wiec naglowka NIE poznajemy
+    // po niej, tylko po nazwach „Description" i „Amount".
+    function parsePaste(raw){
+        var lines = String(raw || '').split(/\r?\n/), rows = [], errs = [], hdr = false;
+        var ix = { row: 1, date: 2, ff: 4, amt: 5, auc: 6 };
+        lines.forEach(function(line, i){
+            if (!String(line).trim()) return;
+            var f = line.split('\t');
+            if (f.length < 6){ errs.push('wiersz ' + (i + 1) + ': tylko ' + f.length + ' kolumn — skopiuj cały wiersz z arkusza (rozdzielany tabulatorem).'); return; }
+            var low = f.map(function(x){ return String(x == null ? '' : x).trim().toLowerCase(); });
+            if (!hdr && low.indexOf('description') >= 0 && low.indexOf('amount') >= 0){
+                hdr = true;
+                ix.ff = low.indexOf('description'); ix.amt = low.indexOf('amount');
+                var d = low.indexOf('payment date'); if (d >= 0) ix.date = d;
+                var a = low.indexOf('auction'); if (a >= 0) ix.auc = a;
+                for (var k = 0; k < low.length; k++){ if (/^row/.test(low[k])) { ix.row = k; break; } }
+                return;
+            }
+            var ff = String(f[ix.ff] == null ? '' : f[ix.ff]).trim();
+            var amtRaw = String(f[ix.amt] == null ? '' : f[ix.amt]).trim();
+            if (!ff){ errs.push('wiersz ' + (i + 1) + ': pusta kolumna Description — nie ma czego szukać.'); return; }
+            var amt = money(amtRaw);
+            if (amt == null){ errs.push('wiersz ' + (i + 1) + ' (' + ff + '): nie umiem odczytać kwoty „' + amtRaw + '".'); return; }
+            rows.push({ line: i + 1, no: String(f[ix.row] == null ? '' : f[ix.row]).trim(), ff: ff, amount: amt,
+                        payDate: String(f[ix.date] == null ? '' : f[ix.date]).trim(),
+                        auc: String(f[ix.auc] == null ? '' : f[ix.auc]).trim(),
+                        st: 'new', msg: '', num: '', open: null, nPay: 0, booked: false });
+        });
+        return { rows: rows, errs: errs };
+    }
+
+    // ===== szukanie auftraga po numerze FF =====
+    async function searchOne(ff){
+        var res, html = '';
+        try {
+            res = await fetch('/search.php?what=ff_number&ff_number=' + encodeURIComponent(ff), { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { nums: [], err: 'brak połączenia' }; }
+        var nums = [], m = String((res && res.url) || '').match(/auction\.php\?number=(\d+)/i);
+        if (m) nums.push(m[1]);
+        if (!nums.length){
+            var as = dom(html).querySelectorAll('a[href*="auction.php?number="]');
+            for (var i = 0; i < as.length; i++){
+                var h = as[i].getAttribute('href') || '';
+                if (h.indexOf('shipping_auction.php') >= 0) continue;
+                var mm = h.match(/number=(\d+)/);
+                if (mm && nums.indexOf(mm[1]) === -1) nums.push(mm[1]);
+            }
+        }
+        return { nums: nums, err: '' };
+    }
+    // Sufiks literowy („82639331-A") bywa dopiskiem raportu, a nie czescia numeru FF —
+    // dlatego przy pustym wyniku probujemy jeszcze raz bez niego i mowimy o tym wprost.
+    async function findAuftrag(ff){
+        var tries = [ff], bare = ff.replace(/-[A-Za-z]$/, '');
+        if (bare && bare !== ff) tries.push(bare);
+        for (var i = 0; i < tries.length; i++){
+            var r = await searchOne(tries[i]);
+            if (r.err) return { nums: [], used: tries[i], err: r.err };
+            if (r.nums.length) return { nums: r.nums, used: tries[i], err: '' };
+        }
+        return { nums: [], used: ff, err: 'nie znaleziono auftraga' };
+    }
+
+    // ===== czytanie auftraga =====
+    // „Auftrag value - Total of Payments" pojawia sie na stronie DWA razy: w podsumowaniu
+    // tabeli Payments (w <b>) i jako zwykly tekst w kolumnie Comment wczesniejszego
+    // ksiegowania. Bierzemy wylacznie ten z <b>, i to ostatni — komentarz nie ma <b>.
+    function openAmt(d){
+        var bs = d.querySelectorAll('b'), node = null;
+        for (var i = 0; i < bs.length; i++){ if (/Auftrag value\s*-\s*Total of Payments/i.test(bs[i].textContent || '')) node = bs[i]; }
+        if (!node) return null;
+        var box = (node.closest && node.closest('td')) || node.parentNode;
+        var t = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
+        var m = t.match(/-?\s*\d[\d'’\s]*(?:[.,]\d{1,2})?/);
+        return m ? money(m[0]) : null;
+    }
+    function accOptions(d){
+        var sel = d.querySelector('select[name="account"]'), out = [], pre = '';
+        if (!sel) return { list: out, pre: pre };
+        var os = sel.querySelectorAll('option');
+        for (var i = 0; i < os.length; i++){
+            var v = os[i].getAttribute('value') || '';
+            if (!v) continue;
+            out.push({ v: v, t: String(os[i].textContent || v).replace(/\s+/g, ' ').trim() });
+            if (os[i].hasAttribute('selected')) pre = v;
+        }
+        return { list: out, pre: pre };
+    }
+    function nPayments(d){ return d.querySelectorAll('a[href*="delpay="]').length; }
+    async function readAuftrag(num){
+        var html = '';
+        try {
+            var res = await fetch('/auction.php?number=' + encodeURIComponent(num) + '&txnid=3', { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { ok: false, err: 'nie otwarto auftraga' }; }
+        var d = dom(html);
+        if (!d.querySelector('form#book')) return { ok: false, err: 'na stronie auftraga nie ma formularza płatności' };
+        var a = accOptions(d);
+        return { ok: true, open: openAmt(d), nPay: nPayments(d), accs: a.list, pre: a.pre,
+                 deleted: !!d.querySelector('.auftrag-status--deleted') };
+    }
+
+    // ===== ksiegowanie =====
+    async function book(num, dateISO, account, amount, comment){
+        var m = String(dateISO || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!m) return { ok: false, err: 'zła data księgowania' };
+        var b = [];
+        function add(k, v){ b.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); }
+        add('number', String(num));
+        add('txnid', '3');
+        add('Date_Month', m[2]);
+        add('Date_Day', String(parseInt(m[3], 10)));   // select ma wartosci 1..31, bez zera wiodacego
+        add('Date_Year', m[1]);
+        add('account', String(account));
+        add('amount', Number(amount).toFixed(2));
+        add('paycomment', String(comment || ''));
+        try {
+            var res = await fetch('/auction.php', { method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: b.join('&') });
+            if (!res || !res.ok) return { ok: false, err: 'HTTP ' + (res ? res.status : '?') };
+            return { ok: true };
+        } catch (e){ return { ok: false, err: (e && e.message) || 'błąd wysyłki' }; }
+    }
+
+    // ===== stan + UI =====
+    var S = { rows: [], accs: [], pre: '', busy: false, abort: false };
+
+    var btn = document.createElement('button');
+    btn.id = 'auftrag-btn';
+    btn.textContent = '📗 Księgowanie w auftragu';
+    btn.style.cssText = 'position:fixed;top:250px;right:12px;z-index:2147483000;padding:9px 14px;border:none;border-radius:8px;background:#0a5a2f;color:#fff;font:bold 13px Arial,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)';
+
+    var panel = document.createElement('div');
+    panel.id = 'auftrag-panel';
+    panel.style.cssText = 'display:none;position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:2147483001;width:min(1180px,96vw);max-height:88vh;overflow:auto;background:#fff;border:1px solid #cfe3d5;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.28);font:13px Arial,sans-serif;flex-direction:column';
+    panel.innerHTML =
+        '<div style="display:flex;justify-content:space-between;align-items:center;background:#E8F3EC;padding:12px 16px;border-bottom:1px solid #cfe3d5">'
+      +   '<div style="font-weight:700;color:#0a5a2f">Księgowanie w auftragu <span style="font-weight:400;font-size:11px;opacity:.6">v' + AU_VER + '</span></div>'
+      +   '<button id="au-close" style="padding:4px 12px;border:1px solid #cfe3d5;border-radius:6px;background:#fff;cursor:pointer">✕</button>'
+      + '</div>'
+      + '<div style="padding:12px 16px">'
+      +   '<div style="font-size:11px;color:#666;margin-bottom:4px">Wklej wiersze z raportu (z nagłówkiem albo bez). Numer szukany jest z kolumny <b>Description</b>, kwota z <b>Amount</b>.</div>'
+      +   '<textarea id="au-paste" spellcheck="false" style="width:100%;height:130px;font:11px monospace;border:1px solid #cfe3d5;border-radius:6px;padding:6px;box-sizing:border-box"></textarea>'
+      +   '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">'
+      +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666">Data księgowania (cała paczka)'
+      +       '<input type="date" id="au-date" value="' + today() + '" style="font-size:12px;padding:3px 5px;border:1px solid #cfe3d5;border-radius:5px"></label>'
+      +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666">Konto (cała paczka)'
+      +       '<select id="au-acc" disabled style="font-size:12px;padding:3px 5px;border:1px solid #cfe3d5;border-radius:5px;min-width:320px"><option value="">— najpierw „Sprawdź” —</option></select></label>'
+      +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666">Komentarz (opcjonalny)'
+      +       '<input type="text" id="au-com" placeholder="trafia do pola paycomment" style="font-size:12px;padding:3px 5px;border:1px solid #cfe3d5;border-radius:5px;min-width:240px"></label>'
+      +   '</div>'
+      +   '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">'
+      +     '<button id="au-check" style="padding:7px 14px;border:none;border-radius:7px;background:#0a5a2f;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
+      +     '<button id="au-book" disabled style="padding:7px 14px;border:none;border-radius:7px;background:#0a5a2f;color:#fff;font-weight:700;cursor:pointer">💾 Księguj zaznaczone</button>'
+      +     '<button id="au-stop" disabled style="padding:7px 14px;border:1px solid #cfe3d5;border-radius:7px;background:#fff;cursor:pointer">⛔ Przerwij</button>'
+      +     '<button id="au-all" style="padding:7px 12px;border:1px solid #cfe3d5;border-radius:7px;background:#fff;cursor:pointer">☑ Zaznacz / odznacz</button>'
+      +     '<span id="au-status" style="font-size:11px;color:#666"></span>'
+      +   '</div>'
+      +   '<div id="au-out" style="margin-top:12px;overflow-x:auto"></div>'
+      + '</div>';
+
+    function $(s){ return panel.querySelector(s); }
+    function say(t, c){ var e = $('#au-status'); if (e){ e.textContent = t; e.style.color = c || '#666'; } }
+    // Launcher chowa ten guzik i „klika" go za nas (data-sel -> b.click()), wiec przelacznik
+    // musi dzialac tak samo z ukrytego guzika jak z widocznego.
+    btn.onclick = function(){ panel.style.display = (panel.style.display === 'none' ? 'flex' : 'none'); };
+    (document.body || document.documentElement).appendChild(btn);
+    (document.body || document.documentElement).appendChild(panel);
+    $('#au-close').onclick = function(){ panel.style.display = 'none'; };
+
+    function stTxt(r){
+        if (r.st === 'ok')    return '<span style="color:#0a7a2f;font-weight:700">✓ zgodne</span>';
+        if (r.st === 'diff')  return '<span style="color:#c00;font-weight:700">⚠ kwota ≠ open amount</span>';
+        if (r.st === 'many')  return '<span style="color:#c00;font-weight:700">✗ kilka auftragów</span>';
+        if (r.st === 'none')  return '<span style="color:#c00;font-weight:700">✗ nie znaleziono</span>';
+        if (r.st === 'err')   return '<span style="color:#c00;font-weight:700">✗ błąd</span>';
+        if (r.st === 'done')  return '<span style="color:#0a7a2f;font-weight:700">✓ zaksięgowane, open 0.00</span>';
+        if (r.st === 'part')  return '<span style="color:#c47f00;font-weight:700">⚠ zaksięgowane, open ≠ 0</span>';
+        if (r.st === 'fail')  return '<span style="color:#c00;font-weight:700">✗ nie zaksięgowano</span>';
+        return '<span style="color:#888">—</span>';
+    }
+    // Do zaksiegowania nadaja sie tylko wiersze z odnalezionym auftragiem, ktore nie zostaly
+    // jeszcze zaksiegowane. Rozjazd kwoty NIE blokuje — tylko odznacza (patrz renderTbl).
+    function bookable(r){ return !!r.num && !r.booked && r.st !== 'many' && r.st !== 'none' && r.st !== 'err'; }
+    function render(){
+        var el = $('#au-out');
+        if (!S.rows.length){ el.innerHTML = '<div style="color:#888;padding:8px">Wklej dane i kliknij „Sprawdź”.</div>'; return; }
+        var h = '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+              + '<tr style="color:#999;font-size:10px"><td style="padding:2px 5px"></td><td style="padding:2px 5px">Wiersz</td>'
+              + '<td style="padding:2px 5px">Numer FF</td><td style="padding:2px 5px">Auftrag</td>'
+              + '<td style="padding:2px 5px;text-align:right">Kwota z wklejki</td><td style="padding:2px 5px;text-align:right">Open amount</td>'
+              + '<td style="padding:2px 5px">Status</td><td style="padding:2px 5px">Uwagi</td></tr>';
+        S.rows.forEach(function(r, i){
+            var bad = (r.st === 'diff' || r.st === 'many' || r.st === 'none' || r.st === 'err' || r.st === 'fail');
+            var bg = r.booked ? (r.st === 'done' ? '#EAF7EA' : '#FFF6E0') : (bad ? '#FDECEC' : '#fff');
+            var can = bookable(r);
+            h += '<tr style="background:' + bg + '">'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + (can ? '<input type="checkbox" class="au-chk" data-i="' + i + '"' + (r.sel ? ' checked' : '') + '>' : '') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + esc(r.no || r.line) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;font-family:monospace">' + esc(r.ff) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + (r.num ? '<a href="/auction.php?number=' + esc(r.num) + '&txnid=3" target="_blank" style="color:#0a5a2f">' + esc(r.num) + '</a>' : '—') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;text-align:right;font-weight:600">' + f2(r.amount) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;text-align:right">' + f2(r.open) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;white-space:nowrap">' + stTxt(r) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;color:#666">' + esc(r.msg || '') + '</td></tr>';
+        });
+        el.innerHTML = h + '</table>';
+        el.querySelectorAll('.au-chk').forEach(function(c){
+            c.onchange = function(){ S.rows[parseInt(c.getAttribute('data-i'), 10)].sel = c.checked; };
+        });
+    }
+
+    $('#au-check').onclick = async function(){
+        if (S.busy) return;
+        var p = parsePaste($('#au-paste').value);
+        if (p.errs.length && !p.rows.length){ say(p.errs[0], '#c00'); S.rows = []; render(); return; }
+        if (!p.rows.length){ say('Nie znalazłem ani jednego wiersza do sprawdzenia.', '#c00'); return; }
+        S.rows = p.rows; S.busy = true; S.abort = false;
+        $('#au-check').disabled = true; $('#au-book').disabled = true; $('#au-stop').disabled = false;
+        render();
+        var done = 0;
+        try {
+            for (var i = 0; i < S.rows.length; i++){
+                if (S.abort){ say('Przerwane po ' + done + '/' + S.rows.length + '.', '#c47f00'); break; }
+                var r = S.rows[i];
+                say('Sprawdzam ' + (i + 1) + '/' + S.rows.length + ' — ' + r.ff + '…');
+                var fa = await findAuftrag(r.ff);
+                if (fa.err && !fa.nums.length){ r.st = fa.err === 'nie znaleziono auftraga' ? 'none' : 'err'; r.msg = fa.err; done++; render(); continue; }
+                if (fa.nums.length > 1){ r.st = 'many'; r.msg = 'numer FF wskazuje ' + fa.nums.length + ' auftragów (' + fa.nums.join(', ') + ') — rozstrzygnij ręcznie'; done++; render(); continue; }
+                r.num = fa.nums[0];
+                if (fa.used !== r.ff) r.msg = 'znaleziony po obcięciu sufiksu („' + fa.used + '")';
+                var a = await readAuftrag(r.num);
+                if (!a.ok){ r.st = 'err'; r.msg = a.err; done++; render(); continue; }
+                if (!S.accs.length && a.accs.length){ S.accs = a.accs; S.pre = a.pre; fillAcc(); }
+                r.open = a.open; r.nPay = a.nPay;
+                if (a.deleted){ r.st = 'err'; r.msg = 'auftrag skasowany'; done++; render(); continue; }
+                if (a.open == null){ r.st = 'err'; r.msg = 'nie odczytałem „Auftrag value - Total of Payments"'; done++; render(); continue; }
+                if (eq(a.open, r.amount)){ r.st = 'ok'; r.sel = true; }
+                else { r.st = 'diff'; r.sel = false; r.msg = (r.msg ? r.msg + '; ' : '') + 'różnica ' + f2(r.amount - a.open) + ' — zaznacz ręcznie, jeśli mimo to ma iść'; }
+                done++; render();
+            }
+        } finally {
+            S.busy = false; $('#au-check').disabled = false; $('#au-stop').disabled = true;
+            var n = S.rows.filter(function(r){ return r.sel; }).length;
+            $('#au-book').disabled = !n;
+            if (!S.abort){
+                var ok = S.rows.filter(function(r){ return r.st === 'ok'; }).length;
+                var df = S.rows.filter(function(r){ return r.st === 'diff'; }).length;
+                var bd = S.rows.filter(function(r){ return r.st === 'none' || r.st === 'many' || r.st === 'err'; }).length;
+                say('Sprawdzone: ' + S.rows.length + ' — zgodnych ' + ok + ', z rozjazdem kwoty ' + df + ', bez auftraga ' + bd
+                    + (p.errs.length ? ('  ·  pominięte wiersze wklejki: ' + p.errs.length) : '')
+                    + '. Zaznaczonych do księgowania: ' + n + '.', bd ? '#c00' : (df ? '#c47f00' : '#0a7a2f'));
+            }
+            render();
+        }
+    };
+
+    function fillAcc(){
+        var sel = $('#au-acc');
+        if (!S.accs.length){ return; }
+        var h = '<option value="">— wybierz konto —</option>';
+        S.accs.forEach(function(o){ h += '<option value="' + att(o.v) + '"' + (o.v === S.pre ? ' selected' : '') + '>' + esc(o.t) + '</option>'; });
+        sel.innerHTML = h; sel.disabled = false;
+    }
+
+    $('#au-all').onclick = function(){
+        var any = S.rows.some(function(r){ return bookable(r) && !r.sel; });
+        S.rows.forEach(function(r){ if (bookable(r)) r.sel = any; });
+        render();
+        $('#au-book').disabled = !S.rows.filter(function(r){ return r.sel; }).length;
+    };
+    $('#au-stop').onclick = function(){ S.abort = true; say('Przerywam po bieżącym wierszu…', '#c47f00'); };
+
+    $('#au-book').onclick = async function(){
+        if (S.busy) return;
+        var date = $('#au-date').value, acc = $('#au-acc').value, com = $('#au-com').value;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)){ say('Ustaw datę księgowania.', '#c00'); return; }
+        if (!acc){ say('Wybierz konto dla całej paczki.', '#c00'); return; }
+        var todo = S.rows.filter(function(r){ return r.sel && bookable(r); });
+        if (!todo.length){ say('Nie ma zaznaczonych wierszy.', '#c00'); return; }
+        var diffs = todo.filter(function(r){ return r.st === 'diff'; }).length;
+        var accTxt = ($('#au-acc').selectedOptions[0] || {}).textContent || acc;
+        if (!confirm('Zaksięgować ' + todo.length + ' płatności?\n\nData: ' + date + '\nKonto: ' + accTxt
+            + (diffs ? ('\n\nUWAGA: ' + diffs + ' z nich ma kwotę różną od open amount.') : '') + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+        S.busy = true; S.abort = false;
+        $('#au-check').disabled = true; $('#au-book').disabled = true; $('#au-stop').disabled = false;
+        var ok = 0, part = 0, fail = 0;
+        try {
+            for (var i = 0; i < todo.length; i++){
+                if (S.abort){ say('Przerwane po ' + (ok + part + fail) + '/' + todo.length + '.', '#c47f00'); break; }
+                var r = todo[i];
+                say('Księguję ' + (i + 1) + '/' + todo.length + ' — auftrag ' + r.num + '…');
+                var b = await book(r.num, date, acc, r.amount, com);
+                if (!b.ok){ r.st = 'fail'; r.msg = b.err || 'nie wysłano'; fail++; render(); continue; }
+                await sleep(300);
+                // Weryfikacja: platnosc ma sie pojawic w tabeli Payments, a open amount zejsc do zera.
+                var a = await readAuftrag(r.num);
+                r.booked = true; r.sel = false;
+                if (!a.ok){ r.st = 'part'; r.msg = 'wysłane, ale nie udało się odczytać auftraga do weryfikacji'; part++; render(); continue; }
+                var grew = a.nPay > r.nPay;
+                r.open = a.open; r.nPay = a.nPay;
+                if (!grew){ r.st = 'fail'; r.msg = 'w tabeli Payments nie przybyło księgowania — sprawdź ręcznie'; fail++; }
+                else if (eq(a.open, 0)){ r.st = 'done'; r.msg = ''; ok++; }
+                else { r.st = 'part'; r.msg = 'zaksięgowane, ale open amount = ' + f2(a.open) + ' (nie 0)'; part++; }
+                render();
+            }
+        } finally {
+            S.busy = false; $('#au-check').disabled = false; $('#au-stop').disabled = true;
+            $('#au-book').disabled = !S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
+            say('Zaksięgowane: ✓ ' + ok + (part ? ('  ·  ⚠ do sprawdzenia ' + part) : '') + (fail ? ('  ·  ✗ nieudane ' + fail) : '') + '.',
+                fail ? '#c00' : (part ? '#c47f00' : '#0a7a2f'));
+            render();
+        }
+    };
+
+    render();
+})();
+    }
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
+        { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
         { id: 'refund',   name: 'Refund Checker',            test: onProlo,   init: init_refund },
         { id: 'sepa',     name: 'SEPA Walidator IBAN',       test: onProlo,   init: init_sepa },
@@ -17082,6 +17439,7 @@
         function svgIco(p){ return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#FF2F00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + p + '</svg>'; }
         const LAUNCH_TOOLS = [
             { id:'ksieg',    icon:svgIco('<path d="M15 5v2"/><path d="M15 11v2"/><path d="M15 17v2"/><path d="M5 5h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-3a2 2 0 0 0 0 -4v-3a2 2 0 0 1 2 -2"/>'), label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
+            { id:'auftrag',  icon:svgIco('<path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie w auftragu', sel:'#auftrag-btn' },
             { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
             { id:'vies',     icon:svgIco('<path d="M17.2 7a6 7 0 1 0 0 10"/><path d="M4 10h9"/><path d="M4 14h9"/>'), label:'Kurs walut', sel:'#oandaKursBtn' },
             { id:'vies',     icon:svgIco('<path d="M11.46 20.85a12 12 0 0 1 -7.96 -14.85a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3a12 12 0 0 1 -.09 7.06"/><path d="M15 19l2 2l4 -4"/>'), label:'VIES / KRS / GUS', sel:'#viesBtn' },
@@ -17103,6 +17461,7 @@
         // wstrzykujemy, ale Escape dziala i na nie.
         const HUB_PANELS = [
             { sel: '#ksieg-panel',      needX: true },
+            { sel: '#auftrag-panel',    needX: false },
             { sel: '#refund-panel',     needX: true },
             { sel: '#klient-panel',     needX: true },
             { sel: '#allegro-panel',    needX: true },
