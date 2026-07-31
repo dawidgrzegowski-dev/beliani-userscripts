@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.20
+// @version      2.21
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -6637,7 +6637,7 @@
               <thead><tr>
                 <th style="width:28px"><input type="checkbox" id="sepa-all"></th>
                 <th style="width:34px">#</th>
-                <th style="width:110px">E2E / ref</th>
+                <th style="width:132px">E2E / ref</th>
                 <th>Odbiorca</th>
                 <th style="width:290px">IBAN</th>
                 <th style="width:90px">Kwota</th>
@@ -6730,7 +6730,30 @@
         inp.oninput = revalidate;   // rewalidacja na biezaco (nie tylko po blur)
         inp.onchange = revalidate;
         td.appendChild(inp);
+        // E2E/ref niesie numer auftraga (np. „Refund_ 14548371"). Pole zostaje edytowalne —
+        // obok dochodzi tylko ikonka otwierajaca auftrag w nowej karcie, zeby nie trzeba
+        // bylo przepisywac numeru recznie. Ikonka znika, gdy w polu nie ma numeru.
+        if (key === 'e2e') {
+            const a = document.createElement('a');
+            a.target = '_blank'; a.rel = 'noopener'; a.textContent = '↗';
+            a.style.cssText = 'margin-left:4px;text-decoration:none;font-weight:bold;color:#0a58ca';
+            const sync = () => {
+                const n = auftragFromRef(inp.value);
+                if (n) { a.href = '/auction.php?number=' + n + '&txnid=3'; a.title = 'Otwórz auftrag ' + n + ' w nowej karcie'; a.style.display = ''; }
+                else { a.removeAttribute('href'); a.style.display = 'none'; }
+            };
+            sync();
+            inp.addEventListener('input', sync);
+            td.appendChild(a);
+        }
         return td;
+    }
+    // Numer auftraga z pola E2E/ref: najdluzszy ciag co najmniej 6 cyfr. Krotsze pomijamy,
+    // zeby „Refund_2" albo koncowka „-1" nie robily linku prowadzacego donikad.
+    function auftragFromRef(v) {
+        const m = String(v == null ? '' : v).match(/\d{6,}/g);
+        if (!m) return '';
+        return m.sort((a, b) => b.length - a.length)[0];
     }
 
     function updateSummary() {
