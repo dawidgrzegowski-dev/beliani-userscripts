@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.16
+// @version      2.17
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18,6 +18,7 @@
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -7537,8 +7538,34 @@
         const ORIGIN = location.origin;
         const VIEW = '93';
         const PAID_FID = '561';
+        const COMPANY_FID = '556';
         const PAID = { yes:'521', no:'522', dash:'894' };
         function api(url){ return fetch(url, { credentials:'same-origin' }).then(function(r){ return r.json(); }); }
+        // ===== Pola wlasne z listy issue =====
+        // Company, PAID - Finance, Amount, Approval, Currency, Invoices no. NIE przychodza
+        // jako plaskie klucze obiektu — siedza w additional_fields jako tablice wpisow
+        // { name, field_id, value, text_value }. Filtry czytaly it['Company'] i
+        // it['PAID - Finance'], czyli zawsze undefined: wykluczanie firm nie robilo nic,
+        // a wybor konkretnej wartosci PAID zwracal pusta liste (porownanie '' === '521').
+        function afList(it){
+            var af = (it && it.additional_fields) || {}, out = [];
+            Object.keys(af).forEach(function(k){ if (Array.isArray(af[k])) out = out.concat(af[k]); });
+            return out;
+        }
+        function afByFid(it, fid){
+            var l = afList(it);
+            for (var i = 0; i < l.length; i++){ if (String(l[i].field_id) === String(fid)) return l[i]; }
+            return null;
+        }
+        function afByRe(it, re){
+            var l = afList(it);
+            for (var i = 0; i < l.length; i++){ if (re.test(String(l[i].name || ''))) return l[i]; }
+            return null;
+        }
+        // Do pokazania czlowiekowi: etykieta opcji, a gdy jej brak — surowa wartosc.
+        function afTxt(f){ if (!f) return ''; var t = (f.text_value == null ? '' : String(f.text_value)).trim(); return t !== '' ? t : (f.value == null ? '' : String(f.value)).trim(); }
+        // Do porownan w filtrach: identyfikator opcji.
+        function afId(f){ return f ? String(f.value == null ? '' : f.value).trim() : ''; }
         async function loadFields(){ try { const d = await api(ORIGIN + '/api/issueFieldTypeValue/getAdditionalFieldsList?view_id=' + VIEW); return d.fields || {}; } catch(e){ return {}; } }
         async function fetchAll(baseParams, statusEl){
             var all = [], page = 1, total = 0;
@@ -7553,6 +7580,116 @@
             }
             return all;
         }
+        // ===== Eksport wynikow wyszukiwania: xlsx wg wzoru + ZIP plikow =====
+        // Naglowki 1:1 ze wzoru Issue_Log_polaczony.xlsx — razem z „Amount " (spacja na
+        // koncu jest w oryginale; zostawiamy ja, zeby plik wchodzil w te same formuly).
+        var EX_COLS = ['id', 'Date and time', 'Subject', 'Tag', 'Reporting user', 'Solving user',
+                       'Days since the last viewed', 'Files', 'Company', 'Invoices no.',
+                       'Amount ', 'Approval', 'PAID - Finance', 'Currency', 'Priority'];
+        function exTag(it){ return (Array.isArray(it.issue_type) ? it.issue_type : []).map(function(t){ return String((t && t.name) || '').trim(); }).filter(Boolean).join(', '); }
+        // „last_viewed" ma postac „3 by Jan Kowalski" — do kolumny idzie sama liczba dni.
+        function exViewed(it){ var m = String(it.last_viewed == null ? '' : it.last_viewed).match(/^\s*(\d+)/); return m ? m[1] : ''; }
+        function exFilesTxt(it, fetched){
+            if (fetched && fetched[String(it.id)]) return fetched[String(it.id)].map(function(f){ return f.name; }).join(', ');
+            var f = it.files;
+            if (Array.isArray(f)) return f.map(function(x){ return (x && (x.name || x.file_name)) || String(x || ''); }).filter(Boolean).join(', ');
+            return '';
+        }
+        function exRow(it, fetched){
+            return [
+                String(it.id || it.organization_issue_number || ''),
+                String(it.added_time || ''),
+                String(it.issue || ''),
+                exTag(it),
+                String(it.added_person || it.user_name || ''),
+                String(it.solving_user_name || it.solving_resp_username || ''),
+                exViewed(it),
+                exFilesTxt(it, fetched),
+                afTxt(afByRe(it, /issuer|company/i)),
+                afTxt(afByRe(it, /invoice.{0,4}no|\bnumber\b/i)),
+                afTxt(afByRe(it, /value|amount/i)),
+                afTxt(afByRe(it, /approval/i)),
+                afTxt(afByRe(it, /paid/i)),
+                afTxt(afByRe(it, /currency/i)),
+                String(it.issue_priority || '')
+            ];
+        }
+        function exStamp(){ var d = new Date(), p = function(n){ return (n < 10 ? '0' : '') + n; }; return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); }
+        function exSafe(s){ return String(s || '').replace(/[\/\\:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim(); }
+        var exAbort = false;
+        // Listy plikow ciagniemy pula po 6 — przy kilkuset issue sekwencyjnie trwaloby to minuty.
+        async function exCollectFiles(list, onProg){
+            var out = {}, idx = 0, done = 0;
+            async function one(){
+                while (idx < list.length){
+                    if (exAbort) return;
+                    var it = list[idx++], id = String(it.id || it.organization_issue_number || '');
+                    try { out[id] = await fetchFiles(id); } catch (e){ out[id] = []; }
+                    done++; if (onProg) onProg(done, list.length);
+                }
+            }
+            var ps = []; for (var w = 0; w < Math.min(6, list.length); w++) ps.push(one());
+            await Promise.all(ps);
+            return out;
+        }
+        function exSaveBlob(blob, name){
+            var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
+        }
+        async function exExcel(list, statusEl, withFiles){
+            if (typeof XLSX === 'undefined'){ statusEl.textContent = 'Brak biblioteki XLSX — odśwież stronę.'; return; }
+            var fetched = null;
+            if (withFiles){
+                exAbort = false;
+                statusEl.textContent = 'Dociągam listy plików…';
+                fetched = await exCollectFiles(list, function(d, t){ statusEl.textContent = 'Listy plików: ' + d + '/' + t + '…'; });
+                if (exAbort){ statusEl.textContent = 'Przerwane.'; return; }
+            }
+            var aoa = [EX_COLS.slice()];
+            list.forEach(function(it){ aoa.push(exRow(it, fetched)); });
+            var ws = XLSX.utils.aoa_to_sheet(aoa);
+            ws['!cols'] = [{ wch: 9 }, { wch: 19 }, { wch: 44 }, { wch: 28 }, { wch: 18 }, { wch: 16 },
+                           { wch: 10 }, { wch: 28 }, { wch: 34 }, { wch: 16 }, { wch: 11 }, { wch: 10 },
+                           { wch: 14 }, { wch: 9 }, { wch: 9 }];
+            var wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'Worksheet');
+            XLSX.writeFile(wb, 'Issue_Log_' + exStamp() + '.xlsx');
+            statusEl.textContent = 'Zapisano Excel: ' + list.length + ' issue.';
+        }
+        async function exZip(list, statusEl){
+            if (typeof JSZip === 'undefined'){ statusEl.textContent = 'Brak biblioteki JSZip — odśwież stronę (Tampermonkey musi dociągnąć @require).'; return; }
+            exAbort = false;
+            statusEl.textContent = 'Dociągam listy plików…';
+            var fetched = await exCollectFiles(list, function(d, t){ statusEl.textContent = 'Listy plików: ' + d + '/' + t + '…'; });
+            if (exAbort){ statusEl.textContent = 'Przerwane.'; return; }
+            var jobs = [], noFiles = 0;
+            list.forEach(function(it){
+                var id = String(it.id || it.organization_issue_number || ''), fs = fetched[id] || [];
+                if (!fs.length){ noFiles++; return; }
+                fs.forEach(function(f){ jobs.push({ folder: id, name: exSafe(f.name || 'plik'), url: f.url }); });
+            });
+            if (!jobs.length){ statusEl.textContent = 'Żadne z ' + list.length + ' issue nie ma plików.'; return; }
+            if (jobs.length > 200 && !confirm('Do pobrania jest ' + jobs.length + ' plików z ' + (list.length - noFiles) + ' issue.\n\n'
+                + 'ZIP powstaje w pamięci przeglądarki — przy tej liczbie może to potrwać kilka minut i zająć sporo RAM-u.\n\nPobierać?')) { statusEl.textContent = 'Anulowane.'; return; }
+            var zip = new JSZip(), ok = 0, bad = 0;
+            for (var i = 0; i < jobs.length; i++){
+                if (exAbort){ statusEl.textContent = 'Przerwane po ' + (ok + bad) + '/' + jobs.length + '.'; break; }
+                var j = jobs[i];
+                statusEl.textContent = 'Pobieram ' + (i + 1) + '/' + jobs.length + ' (issue ' + j.folder + ')…';
+                try {
+                    var r = await fetch(j.url.charAt(0) === '/' ? (ORIGIN + j.url) : j.url, { credentials: 'same-origin' });
+                    if (r.ok){ zip.file(j.folder + '/' + j.name, await r.blob()); ok++; } else bad++;
+                } catch (e){ bad++; }
+            }
+            if (!ok){ statusEl.textContent = 'Nie pobrano żadnego pliku (' + bad + ' błędów).'; return; }
+            statusEl.textContent = 'Buduję ZIP z ' + ok + ' plików…';
+            var blob = await zip.generateAsync({ type: 'blob' });
+            exSaveBlob(blob, 'Issue_pliki_' + exStamp() + '.zip');
+            statusEl.textContent = 'ZIP gotowy: ' + ok + ' plików' + (bad ? (', ' + bad + ' nieudanych') : '')
+                + (noFiles ? ('  ·  bez plików: ' + noFiles + ' issue') : '') + '.';
+        }
+
         const sbtn = document.createElement('button');
         sbtn.id = 'ilp-search-btn';
         sbtn.textContent = '\ud83d\udd0e Szukaj issue';
@@ -7585,7 +7722,7 @@
                 h += '<select class="ilp-s-field" data-fid="' + fid + '" style="width:100%;padding:6px;">' + opts + '</select>';
             });
             var comp = null;
-            Object.keys(FIELDS).forEach(function(n){ if (FIELDS[n].id === '556' || n === 'Company') comp = FIELDS[n]; });
+            Object.keys(FIELDS).forEach(function(n){ if (FIELDS[n].id === COMPANY_FID || n === 'Company') comp = FIELDS[n]; });
             if (comp && comp.values) {
                 var pre = ['dkv','chronopost','postnl','hoyer'];
                 h += '<label style="display:block;margin:12px 0 2px;font-weight:600;">Wyklucz firmy (Company):</label>';
@@ -7643,14 +7780,16 @@
                 var list = await fetchAll(parts.join('&'), status);
                 if (paidMode) {
                     list = list.filter(function(it){
-                        var v = String(it['PAID - Finance'] == null ? '' : it['PAID - Finance']);
+                        var v = afId(afByFid(it, PAID_FID));
                         if (paidMode === '__EMPTY__') return v !== PAID.yes && v !== PAID.no && v !== PAID.dash;
                         if (paidMode === '__ABROAD__') return v !== PAID.yes;
                         return v === paidMode;
                     });
                 }
                 if (Object.keys(exclSet).length) {
-                    list = list.filter(function(it){ return !exclSet[String(it['Company'] == null ? '' : it['Company'])]; });
+                    // data-cid to identyfikator opcji z listy Company, wiec porownujemy do value,
+                    // a nie do etykiety.
+                    list = list.filter(function(it){ return !exclSet[afId(afByFid(it, COMPANY_FID))]; });
                 }
                 status.textContent = 'Znaleziono: ' + list.length;
                 if (!list.length) { results.innerHTML = '<div style="color:#888">Brak.</div>'; return; }
@@ -7660,6 +7799,11 @@
                     + '<button id="ilp-s-copy" style="padding:5px 9px;border:1px solid #ccc;border-radius:6px;background:#f6e7e6;cursor:pointer;">\ud83d\udccb Numery</button>'
                     + '<button id="ilp-s-copylinks" style="padding:5px 9px;border:1px solid #ccc;border-radius:6px;background:#f6e7e6;cursor:pointer;">\ud83d\udd17 Linki</button>'
                     + '<button id="ilp-s-toissue" style="padding:5px 9px;border:none;border-radius:6px;background:#FF2F00;color:#fff;cursor:pointer;font-weight:bold;">\u2192 Wczytaj w Issue/PAID</button>'
+                    + '<button id="ilp-s-xlsx" style="padding:5px 9px;border:none;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;font-weight:bold;" title="Zapisz wyniki jako .xlsx w uk\u0142adzie wzoru Issue_Log">\ud83d\udcca Excel</button>'
+                    + '<button id="ilp-s-zip" style="padding:5px 9px;border:none;border-radius:6px;background:#750000;color:#fff;cursor:pointer;font-weight:bold;" title="Pobierz wszystkie pliki z wyfiltrowanych issue \u2014 folder na ka\u017cde issue">\ud83d\udce6 ZIP plik\u00f3w</button>'
+                    + '<button id="ilp-s-stop" style="padding:5px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;">\u26d4 Przerwij</button>'
+                    + '<label style="font-size:11px;color:#666;display:flex;align-items:center;gap:3px;cursor:pointer" title="Kolumna Files zostanie wype\u0142niona nazwami za\u0142\u0105cznik\u00f3w. Kosztuje jedno zapytanie na issue.">'
+                    + '<input type="checkbox" id="ilp-s-wfiles" checked> nazwy plik\u00f3w w Excelu</label>'
                     + '</div>';
                 rh += list.map(function(it){
                     var id = it.id || it.organization_issue_number;
@@ -7672,6 +7816,23 @@
                 var cl = results.querySelector('#ilp-s-copylinks'); if (cl) cl.onclick = function(){ copyText(links.join('\n'), 'Skopiowano ' + links.length + ' link\u00f3w.'); };
                 var ti = results.querySelector('#ilp-s-toissue'); if (ti) ti.onclick = function(){ toIssuePaid(nums.join('\n')); status.textContent = 'Przekazano ' + nums.length + ' do Issue/PAID.'; };
                 var tb = results.querySelector('#ilp-s-top'); if (tb) tb.onclick = function(){ sp.scrollTop = 0; };
+                var bx = results.querySelector('#ilp-s-xlsx');
+                if (bx) bx.onclick = async function(){
+                    var wf = results.querySelector('#ilp-s-wfiles');
+                    bx.disabled = true;
+                    try { await exExcel(list, status, !!(wf && wf.checked)); }
+                    catch(e){ status.textContent = 'Błąd Excela: ' + ((e && e.message) || e); }
+                    finally { bx.disabled = false; }
+                };
+                var bz = results.querySelector('#ilp-s-zip');
+                if (bz) bz.onclick = async function(){
+                    bz.disabled = true;
+                    try { await exZip(list, status); }
+                    catch(e){ status.textContent = 'Błąd ZIP-a: ' + ((e && e.message) || e); }
+                    finally { bz.disabled = false; }
+                };
+                var bs = results.querySelector('#ilp-s-stop');
+                if (bs) bs.onclick = function(){ exAbort = true; status.textContent = 'Przerywam po bieżącym pliku…'; };
             } catch(e){ status.textContent = 'B\u0142\u0105d: ' + e.message; }
         }
         buildFilters();
