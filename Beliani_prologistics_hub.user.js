@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.14
+// @version      2.15
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12624,7 +12624,11 @@
           +   '<div id="wp-depo" contenteditable="true" style="width:100%;height:140px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff;margin-top:4px"></div>'
           + '</div>'
           + '</div>'
-          + '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+          // Pasek przyklejony do gory panelu: przy dlugiej tabeli nie trzeba juz wracac
+          // na sam poczatek, zeby cokolwiek kliknac. Ujemne marginesy wychodza poza padding
+          // kontenera, dzieki czemu tlo paska zaslania przewijana tresc na calej szerokosci.
+          + '<div id="wp-bar" style="position:sticky;top:0;z-index:6;background:#fff;margin:12px -16px 0;padding:8px 16px 0;border-bottom:1px solid #FFCCB7">'
+          + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
           + '<button id="wp-go" class="chn-btn red">Przetwórz</button>'
           + '<button id="wp-copy-bal" class="chn-btn ghost">\ud83d\udccb Kopiuj Balance</button>'
           + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
@@ -12633,10 +12637,15 @@
           + '<button id="wp-pc-all" class="chn-btn ghost" title="Zaznacz/odznacz wszystkie w tabeli DEPO">\u2611 Zaznacz wszystkie</button>'
           + '<button id="wp-upload-pc" class="chn-btn maroon" title="Wgraj wybrany plik jako Payment conformation do zaznaczonych zamowien">\u2b06 Wgraj payment confirmation</button>'
           + '<button id="wp-add-comment" class="chn-btn maroon" title="Dodaj komentarz do zaznaczonych zamowien">\ud83d\udcac Dodaj komentarz</button>'
-          + '<input type="text" id="wp-pc-comment-text" value="Please confirm payment." style="width:190px;font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:6px">'
+          + '<input type="text" id="wp-pc-comment-text" value="Payment confirmation attached." style="width:220px;font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:6px">'
           + '<input type="file" id="wp-pc-file" style="display:none">'
           + '<label style="font-size:11px;color:#666;white-space:nowrap;cursor:pointer" title="Sprawdzaj też ostatni P/I dla wierszy BALANCE — tylko numer konta (bez kwoty i %). Wyłącz, żeby Przetwórz działało szybciej."><input type="checkbox" id="wp-bal-pi" checked> P/I dla balance</label>'
           + '<span id="wp-status" style="font-size:12px;color:#666"></span></div>'
+          // Kopia poziomego suwaka tabeli, przyklejona razem z paskiem. Dotad jedyny suwak
+          // byl na samym dole tabeli — zeby przewinac w bok, trzeba bylo najpierw zjechac
+          // na koniec listy. Ten jest zawsze pod guzikami i chodzi w obie strony.
+          + '<div id="wp-out-top" style="display:none;overflow-x:auto;overflow-y:hidden;margin-top:6px"><div id="wp-out-top-in" style="height:1px"></div></div>'
+          + '</div>'
           + '<div id="wp-out-merged" style="overflow-x:auto;margin-top:14px"></div>'
           + '<div id="wp-pain-box" style="display:none;margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
           + '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
@@ -12679,7 +12688,9 @@
         sp.querySelector('#sp-close').onclick = function(){ sp.style.display = 'none'; };
 
         chooser.querySelector('#ch-ksieg').onclick = function(){ chooser.style.display = 'none'; wp.style.display = 'none'; sp.style.display = 'none'; var b = document.getElementById('deposit-btn'); if (b) { b.style.display = ''; setTimeout(function(){ b.click(); b.style.display = 'none'; }, 0); } };
-        chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); sp.style.display = 'none'; wp.style.display = 'flex'; };
+        // pcSyncScroll po pokazaniu panelu: przy display:none clientWidth wynosi 0, wiec
+        // gorny suwak policzony wczesniej mialby zla szerokosc.
+        chooser.querySelector('#ch-wprow').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); sp.style.display = 'none'; wp.style.display = 'flex'; setTimeout(function(){ try { pcSyncScroll(); } catch(e){} }, 0); };
         chooser.querySelector('#ch-sprawdz').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); wp.style.display = 'none'; sp.style.display = 'flex'; };
 
         function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
@@ -15684,7 +15695,33 @@
             if (gi){ var gDepo = 0, gBal = 0; state._groups.forEach(function(g){ var d = pcSumRows(g.dep); if (d != null) gDepo += d; var bb = pcBalSum(g.bal); if (bb != null) gBal += bb; }); html += '<tr><td colspan="8" style="background:#332524;color:#fff;font-weight:700;padding:5px 8px">RAZEM &nbsp; Depo: <b id="pc-grand-depo">' + gDepo.toFixed(2) + '</b> &nbsp;·&nbsp; Balance: <b id="pc-grand-bal">' + gBal.toFixed(2) + '</b> &nbsp;·&nbsp; Łącznie: <b id="pc-grand-total">' + (gDepo + gBal).toFixed(2) + '</b></td></tr>'; }
             if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
             el.innerHTML = html + '</table>';
+            pcSyncScroll();
         }
+        // Gorny suwak jest tylko atrapa: pusty div o szerokosci tabeli. Przewijanie jednego
+        // przestawia drugi. Flaga „lock" przerywa odbicie zwrotne — bez niej oba suwaki
+        // wpadaly w petle zdarzen scroll i szarpaly tabela.
+        var _scrLock = false;
+        function pcSyncScroll(){
+            var m = wp.querySelector('#wp-out-merged'), t = wp.querySelector('#wp-out-top'), inn = wp.querySelector('#wp-out-top-in');
+            if (!m || !t || !inn) return;
+            if (m.scrollWidth <= m.clientWidth + 2){ t.style.display = 'none'; return; }
+            t.style.display = 'block';
+            inn.style.width = m.scrollWidth + 'px';
+            t.scrollLeft = m.scrollLeft;
+        }
+        (function bindScroll(){
+            var m = wp.querySelector('#wp-out-merged'), t = wp.querySelector('#wp-out-top');
+            if (!m || !t) return;
+            t.addEventListener('scroll', function(){ if (_scrLock) return; _scrLock = true; m.scrollLeft = t.scrollLeft; _scrLock = false; });
+            m.addEventListener('scroll', function(){ if (_scrLock) return; _scrLock = true; t.scrollLeft = m.scrollLeft; _scrLock = false; });
+            // Shift + kolko myszy przewija w bok — szybsze niz celowanie w suwak.
+            m.addEventListener('wheel', function(e){
+                if (!e.shiftKey || m.scrollWidth <= m.clientWidth) return;
+                m.scrollLeft += (e.deltaY || e.deltaX);
+                e.preventDefault();
+            }, { passive: false });
+            window.addEventListener('resize', pcSyncScroll);
+        })();
         function renderTables(){ renderMerged(); renderPain(); }
         async function resolveAccounts(status){
             var depoAcc = {}, total = state.dep.order.length + state.bal.order.length, done = 0;
@@ -16895,6 +16932,27 @@
 
         // ===== Payment confirmation: osobno plik i osobno komentarz (UI-only, nie dotyka kopiowania do Sheets) =====
         function pcCountOcc(str, sub){ return (sub && str) ? str.split(sub).length - 1 : 0; }
+        // Co juz poszlo w tej sesji — osobno plik potwierdzenia (pc) i komentarz (cm).
+        var pcDone = { pc: {}, cm: {} };
+        // Zamowienie wyslane znika z zaznaczenia. Naglowek grupy odznaczamy dopiero wtedy,
+        // gdy w calej grupie nie zostal juz zaden zaznaczony wiersz.
+        function pcUncheck(order){
+            var gs = {};
+            wp.querySelectorAll('#wp-out-merged .pc-chk[data-order="' + order + '"]').forEach(function(c){ c.checked = false; gs[c.getAttribute('data-sup')] = 1; });
+            Object.keys(gs).forEach(function(gi){
+                var any = false;
+                wp.querySelectorAll('#wp-out-merged .pc-chk[data-sup="' + gi + '"]').forEach(function(c){ if (c.checked) any = true; });
+                if (!any) wp.querySelectorAll('#wp-out-merged .pc-sup-chk[data-sup="' + gi + '"]').forEach(function(b){ b.checked = false; });
+            });
+        }
+        // Siatka bezpieczenstwa na wypadek recznego zaznaczenia czegos, co juz poszlo.
+        function pcAskRepeat(orders, kind, what){
+            var again = orders.filter(function(o){ return pcDone[kind][o]; });
+            if (!again.length) return true;
+            return confirm('Dla ' + again.length + ' z zaznaczonych zamówień ' + what + ' w tej sesji:\n'
+                + again.slice(0, 8).join(', ') + (again.length > 8 ? ' …' : '')
+                + '\n\nWysłać jeszcze raz?');
+        }
         function pcSelectedOrders(){
             var out = [];
             wp.querySelectorAll('#wp-out-merged .pc-chk:checked').forEach(function(c){ var o = c.getAttribute('data-order'); if (o && out.indexOf(o) === -1) out.push(o); });
@@ -16970,25 +17028,37 @@
             var status = wp.querySelector('#wp-status');
             var orders = pcSelectedOrders();
             if (!orders.length){ status.textContent = 'Zaznacz zamówienia (ostatnia kolumna w tabeli DEPO).'; return; }
+            // Pytamy PRZED otwarciem okna wyboru pliku — inaczej czlowiek najpierw szuka pliku,
+            // a dopiero potem dowiaduje sie, ze to powtorka.
+            if (!pcAskRepeat(orders, 'pc', 'plik był już wgrywany')) return;
             var fi = wp.querySelector('#wp-pc-file'); fi.value = ''; fi._orders = orders; fi.click();
         };
         wp.querySelector('#wp-pc-file').onchange = async function(){
             var status = wp.querySelector('#wp-status');
             var file = this.files && this.files[0]; var orders = this._orders || [];
             if (!file || !orders.length) return;
-            var okc = 0, warnc = 0, badc = 0;
+            var okc = 0, warnc = 0, badc = 0, done = 0;
             orders.forEach(function(o){ pcSetMark(o, '⏳', '#888'); });
-            for (var i = 0; i < orders.length; i++){
-                var o = orders[i];
-                status.textContent = 'Wgrywam plik ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
-                var before = await pcOrderHtml(o);
-                var up = await pcUploadFile(o, file);
-                if (!up.ok){ badc++; pcSetMark(o, '✗ błąd wysyłki pliku (sprawdź)', '#c00'); continue; }
-                var after = await pcOrderHtml(o);
-                if (pcCountOcc(after, file.name) > pcCountOcc(before, file.name)){ okc++; pcSetMark(o, '✓ Potwierdzenie dołączone', '#0a0'); }
-                else { warnc++; pcSetMark(o, '⚠ Wgrane; nie potwierdzono (sprawdź)', '#c47f00'); }
+            try {
+                await runPool(orders, async function(o){
+                    var before = await pcOrderHtml(o);
+                    var up = await pcUploadFile(o, file);
+                    if (!up.ok){ badc++; pcSetMark(o, '✗ błąd wysyłki pliku (sprawdź)', '#c00'); }
+                    else {
+                        var after = await pcOrderHtml(o);
+                        // Wyslane = zaznaczenie znika, niezaleznie od tego, czy udalo sie to
+                        // potwierdzic. Zostawione zaznaczenie powodowalo, ze przy nastepnym
+                        // dostawcy plik szedl drugi raz takze do poprzednich zamowien.
+                        pcDone.pc[o] = 1; pcUncheck(o);
+                        if (pcCountOcc(after, file.name) > pcCountOcc(before, file.name)){ okc++; pcSetMark(o, '✓ Potwierdzenie dołączone', '#0a0'); }
+                        else { warnc++; pcSetMark(o, '⚠ Wgrane; nie potwierdzono (sprawdź)', '#c47f00'); }
+                    }
+                    done++; status.textContent = 'Wgrywam plik ' + done + '/' + orders.length + '…';
+                }, 5);
+                status.textContent = 'Payment confirmation „' + file.name + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + '.';
+            } catch (e) {
+                status.textContent = 'Przerwane po ' + done + '/' + orders.length + ': ' + ((e && e.message) || e);
             }
-            status.textContent = 'Payment confirmation „' + file.name + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + '.';
         };
         // --- osobno: dodaj komentarz ---
         wp.querySelector('#wp-add-comment').onclick = async function(){
@@ -16997,27 +17067,30 @@
             if (!orders.length){ status.textContent = 'Zaznacz zamówienia (ostatnia kolumna w tabeli DEPO).'; return; }
             var text = (wp.querySelector('#wp-pc-comment-text').value || '').trim();
             if (!text){ status.textContent = 'Wpisz treść komentarza.'; return; }
+            if (!pcAskRepeat(orders, 'cm', 'komentarz był już dodawany')) return;
             var cBtn = this;
             cBtn.disabled = true;
-            var okc = 0, warnc = 0, badc = 0;
+            var okc = 0, warnc = 0, badc = 0, done = 0;
             orders.forEach(function(o){ pcSetMark(o, '⏳', '#888'); });
             // try/finally: bez tego wyjatek w petli (zerwana siec) zostawial guzik
             // na zawsze wygaszony — trzeba bylo przeladowac strone.
             try {
-                for (var i = 0; i < orders.length; i++){
-                    var o = orders[i];
-                    status.textContent = 'Dodaję komentarz ' + (i + 1) + '/' + orders.length + ' (zam. ' + o + ')…';
+                await runPool(orders, async function(o){
                     var before = await pcOrderHtml(o);
                     var cm = await pcPostComment(o, text);
-                    if (!cm.ok){ badc++; pcSetMark(o, '✗ błąd komentarza (sprawdź)', '#c00'); continue; }
-                    var after = await pcOrderHtml(o);
-                    if (pcCountOcc(after, text) > pcCountOcc(before, text)){ okc++; pcSetMark(o, '✓ komentarz dodany', '#0a0'); }
-                    else { warnc++; pcSetMark(o, '⚠ Wysłany; nie potwierdzono (sprawdź)', '#c47f00'); }
-                }
+                    if (!cm.ok){ badc++; pcSetMark(o, '✗ błąd komentarza (sprawdź)', '#c00'); }
+                    else {
+                        var after = await pcOrderHtml(o);
+                        pcDone.cm[o] = 1; pcUncheck(o);
+                        if (pcCountOcc(after, text) > pcCountOcc(before, text)){ okc++; pcSetMark(o, '✓ komentarz dodany', '#0a0'); }
+                        else { warnc++; pcSetMark(o, '⚠ Wysłany; nie potwierdzono (sprawdź)', '#c47f00'); }
+                    }
+                    done++; status.textContent = 'Dodaję komentarz ' + done + '/' + orders.length + '…';
+                }, 5);
                 status.textContent = 'Komentarz „' + text + '”: ✓ ' + okc + (warnc ? ', ⚠ ' + warnc : '') + (badc ? ', ✗ ' + badc : '') + '.';
             } catch (e) {
                 var _cm = (e && e.message) ? e.message : String(e);
-                status.textContent = 'Przerwane po ' + (okc + warnc + badc) + '/' + orders.length + ': ' + _cm;
+                status.textContent = 'Przerwane po ' + done + '/' + orders.length + ': ' + _cm;
             } finally {
                 cBtn.disabled = false;
             }
