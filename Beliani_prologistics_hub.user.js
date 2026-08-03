@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.39
+// @version      2.40
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17712,7 +17712,19 @@
                 onload: function (r){
                     let j = null;
                     try { j = JSON.parse(r.responseText); } catch (e){}
-                    if (!j){ reject(new Error('nieczytelna odpowiedź (HTTP ' + r.status + ') — sprawdź wdrożenie')); return; }
+                    if (!j){
+                        // Google przy bledzie oddaje strone HTML ze statusem 200, wiec sam
+                        // kod odpowiedzi nic nie mowi. Wyciagamy z niej tresc — najczestszy
+                        // przypadek to „Script function not found", czyli wdrozenie wciaz
+                        // serwuje starsza wersje kodu.
+                        const txt = String(r.responseText || '')
+                            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                            .replace(/<[^>]+>/g, ' ')
+                            .replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+                        reject(new Error(txt ? (txt.slice(0, 160)) : ('nieczytelna odpowiedź, HTTP ' + r.status)));
+                        return;
+                    }
                     if (!j.ok){ reject(new Error(j.err || 'arkusz odrzucił zapis')); return; }
                     resolve(j);
                 },
