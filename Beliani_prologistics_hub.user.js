@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.47
+// @version      2.48
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18219,14 +18219,29 @@
     // przelaczaniem na nieistniejacy sklep.
     const MK_SHOPS_KEY = 'mkt_shop_ids', MK_HOME_KEY = 'mkt_home_by_host';
     function mapGet(key){
-        try { const o = JSON.parse(GM_getValue(key, '{}')); return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {}; }
-        catch (e){ return {}; }
+        try {
+            const o = JSON.parse(GM_getValue(key, '{}'));
+            // Starszy format trzymal plaska liste dla jedynego wtedy hosta — przepisujemy
+            // ja, zamiast wyrzucac. Bez tego Vente traci zapamietane numery sklepow.
+            if (Array.isArray(o)){
+                const m = {}; m['venteunique-prod.mirakl.net'] = o;
+                try { GM_setValue(key, JSON.stringify(m)); } catch (e){}
+                return m;
+            }
+            return (o && typeof o === 'object') ? o : {};
+        } catch (e){ return {}; }
     }
     function mapPut(key, host, val){
         const o = mapGet(key); o[host] = val;
         try { GM_setValue(key, JSON.stringify(o)); } catch (e){}
     }
-    function mkHomeGet(){ return String(mapGet(MK_HOME_KEY)[mkHost()] || ''); }
+    function mkHomeGet(){
+        const v = mapGet(MK_HOME_KEY)[mkHost()];
+        if (v) return String(v);
+        // przeniesienie ze starego, jednohostowego zapisu
+        const old = String(GM_getValue('mkt_home', '') || '');
+        return (old && mkHost() === 'venteunique-prod.mirakl.net') ? old : '';
+    }
     function mkHomeSet(v){ mapPut(MK_HOME_KEY, mkHost(), String(v || '')); }
     function mkShopIdsFrom(html){
         const seen = {}, ids = [];
@@ -18248,6 +18263,10 @@
     }
     const MK_HOME = onMirakl ? mkCurShopId() : '';
     if (onMirakl && MK_HOME) mkHomeSet(MK_HOME);
+    // Numery sklepow zdejmujemy z DOM-u przy KAZDYM wejsciu na Mirakla, nie dopiero
+    // przy klikanciu. Naglowek podciaga logo wszystkich sklepow, wiec samo otwarcie
+    // strony wystarcza — a z prologistics tej listy nie da sie zdobyc, bo w zrodle jej nie ma.
+    if (onMirakl) { try { mkShopIds(); } catch (e){} }
     async function mkSwitch(uid){
         const p = '/switch-shop/' + encodeURIComponent(uid);
         if (onMirakl){
@@ -18972,7 +18991,15 @@
                     const boot = await mkBoot();
                     home = boot.home || '';
                     const ids = boot.ids || [];
-                    if (!ids.length){ problem.push(host + ': nie widzę listy sklepów'); continue; }
+                    if (!ids.length){
+                        // Bez listy nie ma czym przelaczac, ale sklep BIEZACY zawsze mozemy
+                        // sprawdzic — przy jednym sklepie to zalatwia sprawe w calosci.
+                        say(host + ' — nie znam listy sklepów, sprawdzam bieżący…');
+                        seen++;
+                        ok += await mkPass(jobs, await mkShopName());
+                        if (mkLeft(jobsLoad(), host)) problem.push(host + ': zostały rozliczenia na innych sklepach — wejdź tam raz na stronę Mirakla, moduł zapamięta ich listę');
+                        continue;
+                    }
                     for (let i = 0; i < ids.length; i++){
                         jobs = jobsLoad();
                         if (!mkLeft(jobs, host)) break;       // z tej platformy juz wszystko mamy
