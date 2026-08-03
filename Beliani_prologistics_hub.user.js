@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.46
+// @version      2.47
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17901,16 +17901,21 @@
     // ===== rozpoznawanie wplat w wyciagu =====
     // Kolejnosc ma znaczenie: MangoPay obsluguje wiele marketplace'ow Mirakla, wiec sam
     // platnik nie wystarcza — rozstrzyga dopiero prefiks referencji w tytule przelewu.
+    // „host" to instancja Mirakla, z ktorej pobieramy rozliczenie — kazdy operator ma swoja.
     const MK_RULES = [
-        { mp: 'Mirakl (Vente)', ok: true,  payer: /MANGOPAY/i,                 ref: /\b(VEN\d+)\b/, brand: 'Vente Unique', short: 'Vente' },
-        { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,                 ref: /\b(\d{5,})\s*MARKETPAY/i },
+        { mp: 'Mirakl (Vente)', ok: true,  payer: /MANGOPAY/i,  ref: /\b(VEN\d+)\b/,
+          brand: 'Vente Unique', short: 'Vente',  host: 'venteunique-prod.mirakl.net' },
+        // Home24 placi bezposrednio, nie przez posrednika, a kluczem jest numer faktury
+        // z tytulu: „PAYOUT FOR INVOICE 318628 FOR SHOP 3481".
+        { mp: 'Mirakl (Home24)', ok: true, payer: /HOME\s?24/i, ref: /INVOICE\s+(\d+)/i,
+          brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
         { mp: 'Worldline',      ok: false, payer: /WORLDLINE/i },
         { mp: 'Amex',           ok: false, payer: /AMERICAN EXPRESS/i },
         { mp: 'Wayfair',        ok: false, payer: /WAYFAIR/i },
         { mp: 'Check24',        ok: false, payer: /CHECK24/i },
-        { mp: 'Home24',         ok: false, payer: /HOME24/i },
         { mp: 'Worten',         ok: false, payer: /WORTEN/i },
         { mp: 'JD / Joybuy',    ok: false, payer: /JINGDONG/i },
         { mp: 'Cdiscount',      ok: false, payer: /CNOVA/i },
@@ -17921,8 +17926,8 @@
         for (let i = 0; i < MK_RULES.length; i++){
             const r = MK_RULES[i];
             if (!r.payer.test(payer)) continue;
-            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1], brand: r.brand || '', short: r.short || '' }; }
-            return { mp: r.mp, ok: r.ok, ref: '', brand: r.brand || '', short: r.short || '' };
+            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1], brand: r.brand || '', short: r.short || '', host: r.host || '' }; }
+            return { mp: r.mp, ok: r.ok, ref: '', brand: r.brand || '', short: r.short || '', host: r.host || '' };
         }
         return null;
     }
@@ -17978,7 +17983,7 @@
                 amount: r2(cr), payer: payer, reason: reason,
                 txId: String(r[ix['transaction no.']] || '').trim(),
                 mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : '',
-                brand: d ? (d.brand || '') : '', short: d ? (d.short || '') : ''
+                brand: d ? (d.brand || '') : '', short: d ? (d.short || '') : '', host: d ? (d.host || '') : ''
             });
         }
         return { rows: out };
@@ -18062,8 +18067,12 @@
     // inna domena — fetch nie dolozy tam ciasteczek — ale GM_xmlhttpRequest potrafi,
     // bo dziala poza polityka pochodzenia (stad @connect mirakl.net). Token XSRF
     // zdejmujemy wtedy ze strony glownej Mirakla, tak jak zrobilaby to przegladarka.
-    const MK_HOST_KEY = 'mkt_mirakl_host';
-    function mkHost(){ return String(GM_getValue(MK_HOST_KEY, 'venteunique-prod.mirakl.net')); }
+    // Kazdy operator ma wlasna instancje Mirakla (venteunique-prod…, home24…), wiec host
+    // nie jest jeden — ustawiamy go przed obsluga kazdej platformy. Na samym Miraklu
+    // pracujemy oczywiscie z tym, na ktorym stoimy.
+    let _host = '', MK_TOK = '';
+    function mkHost(){ return onMirakl ? location.hostname : (_host || 'venteunique-prod.mirakl.net'); }
+    function mkSetHost(h){ if (h && h !== _host){ _host = h; MK_TOK = ''; } }   // zmiana hosta unieważnia token
     function mkBase(){ return onMirakl ? '' : ('https://' + mkHost()); }
 
     // Na Miraklu token bierzemy z ciasteczka, nie ze znacznika <meta>: po przelaczeniu
@@ -18085,12 +18094,11 @@
             });
         });
     }
-    let MK_TOK = '';
     // Jedno wejscie na strone glowna daje wszystko naraz: token, liste sklepow
-    // i sklep biezacy. Odswiezamy je tylko raz na uruchomienie.
+    // i sklep biezacy. Odswiezamy je raz na host.
     async function mkBoot(){
         if (onMirakl) return { tok: mkXsrf(), ids: mkShopIds(), home: MK_HOME };
-        if (MK_TOK) return { tok: MK_TOK, ids: mkShopIds(), home: GM_getValue('mkt_home', '') };
+        if (MK_TOK) return { tok: MK_TOK, ids: mkShopIds(), home: mkHomeGet() };
         const r = await gmGet(mkBase() + '/', { 'accept': 'text/html' });
         const h = String(r.responseText || '');
         if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' na ' + mkHost());
@@ -18099,7 +18107,7 @@
         MK_TOK = m[1];
         mkShopIdsFrom(h);
         const cm = h.match(/"currentShopUUID"\s*:\s*"?(\d+)"?/);
-        if (cm) { try { GM_setValue('mkt_home', cm[1]); } catch (e){} }
+        if (cm) mkHomeSet(cm[1]);
         return { tok: MK_TOK, ids: mkShopIds(), home: cm ? cm[1] : '' };
     }
     async function mkApi(path){
@@ -18153,16 +18161,50 @@
         const near = (list || []).filter(function (c){ const x = mkCycDay(c); return x != null && Math.abs(x - d) <= w; });
         return near.length ? near : null;
     }
+    // Referencja z przelewu moze siedziec w roznych polach zaleznie od operatora:
+    // u Vente w payOut.reference („VEN291389"), u Home24 to numer faktury z tytulu
+    // („318628"), ktory w Miraklu bywa zapisany jako „000000318628". Dlatego szukamy
+    // w kilku polach i porownujemy takze po odarciu z zer wiodacych i liter.
+    function cycFields(c){
+        const o = [];
+        if (c && c.payOut) o.push(c.payOut.reference, c.payOut.invoiceNumber, c.payOut.number, c.payOut.id);
+        if (c) o.push(c.invoiceNumber, c.reference, c.number, c.name, c.id);
+        return o.filter(function (x){ return x != null && typeof x !== 'object'; }).map(String);
+    }
     function mkMatchIn(list, ref){
-        for (let i = 0; i < list.length; i++){
-            const r = (list[i].payOut && list[i].payOut.reference) || '';
-            if (String(r).indexOf(ref) >= 0) return list[i];
+        const bare = String(ref).replace(/\D+/g, '');
+        for (let i = 0; i < (list || []).length; i++){
+            const f = cycFields(list[i]);
+            for (let k = 0; k < f.length; k++){
+                if (f[k].indexOf(ref) >= 0) return list[i];
+                if (bare.length >= 5 && f[k].replace(/\D+/g, '').replace(/^0+/, '') === bare.replace(/^0+/, '')) return list[i];
+            }
         }
         return null;
     }
-    function mkMatchCycle(list, ref, dateStr){
+    // Kwota wyplaty z cyklu — nazwy pol tez bywaja rozne.
+    function cycAmount(c){
+        const cand = [c && c.payOut && c.payOut.amount, c && c.amount, c && c.totalAmount, c && c.netAmount];
+        for (let i = 0; i < cand.length; i++){
+            const n = Number(cand[i]);
+            if (isFinite(n) && n !== 0) return Math.abs(n);
+        }
+        return null;
+    }
+    function mkMatchAmt(list, amount){
+        const hit = (list || []).filter(function (c){ const a = cycAmount(c); return a != null && Math.abs(a - amount) < 0.005; });
+        return hit.length === 1 ? hit[0] : null;      // przy dwoch takich samych kwotach nie zgadujemy
+    }
+    function mkMatchCycle(list, ref, dateStr, amount){
         const near = mkNear(list, dateStr, 3);
-        if (near){ const hit = mkMatchIn(near, ref); if (hit) return hit; }
+        if (near){
+            const hit = mkMatchIn(near, ref);
+            if (hit) return hit;
+            // Nowy operator moze trzymac numer gdzie indziej — w waskim oknie dat kwota
+            // wyplaty jest wystarczajaco jednoznaczna, o ile pasuje DOKLADNIE JEDNA.
+            const byAmt = mkMatchAmt(near, amount);
+            if (byAmt) return byAmt;
+        }
         return mkMatchIn(list || [], ref);
     }
 
@@ -18172,16 +18214,28 @@
     // Identyfikatory bierzemy ze strony: przelacznik w naglowku podciaga logo kazdego
     // sklepu (/mmp/media/shop-logo/<uid>), a same odnosniki maja /switch-shop/<uid>.
     // Zapamietujemy je, bo menu bywa doladowywane dopiero po rozwinieciu.
-    const MK_SHOPS_KEY = 'mkt_shop_ids';
+    // Sklepy i sklep wyjsciowy pamietamy OSOBNO DLA KAZDEGO HOSTA — numery sklepow
+    // Vente i Home24 to zupelnie inne przestrzenie i pomieszanie ich konczyloby sie
+    // przelaczaniem na nieistniejacy sklep.
+    const MK_SHOPS_KEY = 'mkt_shop_ids', MK_HOME_KEY = 'mkt_home_by_host';
+    function mapGet(key){
+        try { const o = JSON.parse(GM_getValue(key, '{}')); return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {}; }
+        catch (e){ return {}; }
+    }
+    function mapPut(key, host, val){
+        const o = mapGet(key); o[host] = val;
+        try { GM_setValue(key, JSON.stringify(o)); } catch (e){}
+    }
+    function mkHomeGet(){ return String(mapGet(MK_HOME_KEY)[mkHost()] || ''); }
+    function mkHomeSet(v){ mapPut(MK_HOME_KEY, mkHost(), String(v || '')); }
     function mkShopIdsFrom(html){
         const seen = {}, ids = [];
         const re = /(?:switch-shop|shop-logo)\/(\d+)/g;
         let m;
         while ((m = re.exec(String(html || '')))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
-        let old = [];
-        try { old = JSON.parse(GM_getValue(MK_SHOPS_KEY, '[]')) || []; } catch (e){}
+        const old = mapGet(MK_SHOPS_KEY)[mkHost()] || [];
         old.forEach(function (x){ if (!seen[x]) { seen[x] = 1; ids.push(x); } });
-        if (ids.length) { try { GM_setValue(MK_SHOPS_KEY, JSON.stringify(ids)); } catch (e){} }
+        if (ids.length) mapPut(MK_SHOPS_KEY, mkHost(), ids);
         return ids;
     }
     function mkShopIds(){ return mkShopIdsFrom(onMirakl && document.documentElement ? document.documentElement.innerHTML : ''); }
@@ -18193,7 +18247,7 @@
         return m ? m[1] : '';
     }
     const MK_HOME = onMirakl ? mkCurShopId() : '';
-    if (onMirakl && MK_HOME) { try { GM_setValue('mkt_home', MK_HOME); } catch (e){} }
+    if (onMirakl && MK_HOME) mkHomeSet(MK_HOME);
     async function mkSwitch(uid){
         const p = '/switch-shop/' + encodeURIComponent(uid);
         if (onMirakl){
@@ -18613,7 +18667,7 @@
                     known++;
                     const k = r.ref || (r.txId || (r.date + '_' + r.amount));
                     if (jobs[k] && jobs[k].status === 'done') return;
-                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
                 });
                 jobsSave(jobs);
                 say('Wczytano: ' + p.rows.length + ' wpłat, rozpoznanych obsługiwanych ' + known + ' (nowych zleceń ' + add + ')'
@@ -18811,7 +18865,7 @@
             let ok = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                const cyc = mkMatchCycle(cycles, j.ref, j.date);
+                const cyc = mkMatchCycle(cycles, j.ref, j.date, j.amount);
                 if (!cyc) continue;
                 say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
                 try {
@@ -18861,7 +18915,24 @@
             }
             return ok;
         }
-        function mkLeft(jobs){ return Object.keys(jobs).filter(function (k){ return jobs[k].status === 'new' && jobs[k].ref; }).length; }
+        function mkLeft(jobs, host){
+            return Object.keys(jobs).filter(function (k){
+                const j = jobs[k];
+                if (j.status !== 'new' || !j.ref) return false;
+                return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
+            }).length;
+        }
+        // Ktore platformy w ogole wystepuja wsrod czekajacych zlecen.
+        function mkHosts(jobs){
+            const o = {}, out = [];
+            Object.keys(jobs).forEach(function (k){
+                const j = jobs[k];
+                if (j.status !== 'new' || !j.ref) return;
+                const h = j.host || 'venteunique-prod.mirakl.net';
+                if (!o[h]){ o[h] = 1; out.push(h); }
+            });
+            return out;
+        }
         async function mkShopName(){ const s = await mkShop(); return String(s.name || s.shopName || ''); }
 
         const bRun = $('#mk-run'), bAll = $('#mk-all');
@@ -18882,42 +18953,49 @@
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
             if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
+            // z prologistics mozemy przelecac wszystkie po kolei.
+            const hosts = onMirakl ? [location.hostname] : mkHosts(jobs);
+            if (!hosts.length){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            if (!confirm('Pobrać ' + mkLeft(jobs) + ' rozliczeń z ' + hosts.length + ' platform?\n\n'
+                + hosts.map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; }).join('\n')
+                + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
+                + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
-            let ok = 0, seen = 0, home = '', ids = [];
-            try {
-                say('Łączę się z ' + mkHost() + '…');
-                const boot = await mkBoot();
-                home = boot.home || '';
-                ids = boot.ids || [];
-                if (!ids.length){ say('Nie widzę listy sklepów — otwórz raz stronę Mirakla i rozwiń przełącznik sklepu, potem wróć tutaj.', '#c47f00'); return; }
-                if (!home){ if (!confirm('Nie rozpoznałem sklepu wyjściowego, więc po zakończeniu nie wrócę na niego sam.\n\nKontynuować?')) return; }
-                if (!confirm('Przelecieć ' + ids.length + ' sklepów w poszukiwaniu ' + mkLeft(jobs) + ' rozliczeń?\n\n'
-                    + 'Moduł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.\n'
-                    + (home ? 'Na koniec wrócę na sklep, od którego zacząłeś.' : ''))) return;
-                for (let i = 0; i < ids.length; i++){
-                    jobs = jobsLoad();
-                    if (!mkLeft(jobs)) break;                 // wszystko znalezione — nie ma po co isc dalej
-                    say('Sklep ' + (i + 1) + '/' + ids.length + ' — przełączam…');
-                    try { await mkSwitch(ids[i]); } catch (e){ continue; }
-                    seen++;
-                    const nm = await mkShopName();
-                    ok += await mkPass(jobs, nm);
-                }
-            } catch (e){ say('Błąd: ' + ((e && e.message) || e), '#c00'); }
-            finally {
-                // Powrot do sklepu wyjsciowego takze po bledzie — inaczej zostawilbym
-                // sesje na przypadkowym sklepie, a strona nadal pokazywalaby stary.
-                if (home){ try { await mkSwitch(home); } catch (e){} }
-                b.disabled = false; if (b2) b2.disabled = false;
-                render();
-                if (seen || ok){
-                    const left = mkLeft(jobsLoad());
-                    say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
-                        + (left ? (', nieznalezionych ' + left) : '')
-                        + (home && onMirakl ? '. Wróciłem na sklep wyjściowy — odśwież stronę, żeby zgadzała się z tym, co widzisz.' : '.'),
-                        left ? '#c47f00' : '#0a7a2f');
+            let ok = 0, seen = 0; const problem = [];
+            for (let hi = 0; hi < hosts.length; hi++){
+                const host = hosts[hi];
+                let home = '';
+                mkSetHost(host);
+                try {
+                    say('Platforma ' + (hi + 1) + '/' + hosts.length + ' — łączę się z ' + host + '…');
+                    const boot = await mkBoot();
+                    home = boot.home || '';
+                    const ids = boot.ids || [];
+                    if (!ids.length){ problem.push(host + ': nie widzę listy sklepów'); continue; }
+                    for (let i = 0; i < ids.length; i++){
+                        jobs = jobsLoad();
+                        if (!mkLeft(jobs, host)) break;       // z tej platformy juz wszystko mamy
+                        say(host + ' — sklep ' + (i + 1) + '/' + ids.length + '…');
+                        try { await mkSwitch(ids[i]); } catch (e){ continue; }
+                        seen++;
+                        const nm = await mkShopName();
+                        ok += await mkPass(jobs, nm);
+                    }
+                } catch (e){ problem.push(host + ': ' + ((e && e.message) || e)); }
+                finally {
+                    // Powrot na sklep wyjsciowy takze po bledzie — inaczej zostawilbym
+                    // sesje na przypadkowym sklepie, a strona pokazywalaby stary.
+                    if (home){ try { await mkSwitch(home); } catch (e){} }
                 }
             }
+            b.disabled = false; if (b2) b2.disabled = false;
+            render();
+            const left = mkLeft(jobsLoad());
+            say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
+                + (left ? (', nieznalezionych ' + left) : '')
+                + (problem.length ? ('. Problemy: ' + problem.join('; ')) : '.'),
+                (left || problem.length) ? '#c47f00' : '#0a7a2f');
         };
     }
 
