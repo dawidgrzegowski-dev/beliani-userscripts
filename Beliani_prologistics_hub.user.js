@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.26
+// @version      2.28
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18,6 +18,7 @@
 // @connect      wyszukiwarkaregon.stat.gov.pl
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
+// @connect      mirakl.net
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
 // @grant        GM_xmlhttpRequest
@@ -17641,21 +17642,67 @@
     const MK_KEY = 'mkt_jobs';
     function jobsLoad(){ try { return JSON.parse(GM_getValue(MK_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function jobsSave(j){ try { GM_setValue(MK_KEY, JSON.stringify(j)); } catch (e){} }
-    // Ustawienia importu per sklep. bank_setting decyduje, na jakie konto trafia wplata.
-    // Vente DE = 157 (konto 1114). Reszte dopiszesz, gdy bedzie potrzebna.
+    // Ustawienia importu per sklep. Klucz zawiera marketplace, bo „Beliani DE" wystepuje
+    // na kilku platformach naraz i sam numer sklepu by nie wystarczyl.
+    //   acct — numer konta z planu kont (informacyjnie, do kontroli wzrokowej)
+    //   bank — bank_setting, czyli to, czego naprawde chce /api/importPayments/
+    // Vente DE = konto 1114 = bank_setting 157; reszta dopisuje sie przy pierwszym imporcie.
     const MK_SET_KEY = 'mkt_settings';
+    function setKey(mp, shop){ return String(mp || '?') + ' · ' + String(shop || '?'); }
     function setLoad(){
-        let d = { 'Beliani DE': { bank: '157', booking: '9', acct: '1114' } };
-        try { const o = JSON.parse(GM_getValue(MK_SET_KEY, 'null')); if (o) d = o; } catch (e){}
+        let d = null;
+        try { d = JSON.parse(GM_getValue(MK_SET_KEY, 'null')); } catch (e){}
+        if (!d || typeof d !== 'object'){ d = {}; d[setKey('Mirakl (Vente)', 'Beliani DE')] = { bank: '157', booking: '9', acct: '1114' }; }
         return d;
     }
     function setSave(o){ try { GM_setValue(MK_SET_KEY, JSON.stringify(o)); } catch (e){} }
+
+    // --- plan kont ---
+    // Czytamy go ze strony /accounts.php zamiast wpisywac numery na sztywno: nazwy
+    // sie zmieniaja, konta bywaja zamykane, a lista ma kilkaset pozycji. Zapamietujemy
+    // wynik, bo plan kont zmienia sie rzadko.
+    const MK_ACC_KEY = 'mkt_accounts';
+    function mkAcctLoad(){ try { return JSON.parse(GM_getValue(MK_ACC_KEY, '[]')) || []; } catch (e){ return []; } }
+    async function mkAcctFetch(){
+        const r = await fetch('/accounts.php', { credentials: 'same-origin' });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' na /accounts.php');
+        const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+        const out = [], seen = {};
+        doc.querySelectorAll('a[href*="original_number="]').forEach(function (a){
+            const m = String(a.getAttribute('href') || '').match(/original_number=(\d+)/);
+            if (!m || seen[m[1]]) return;
+            const tr = a.closest('tr'); if (!tr) return;
+            const td = tr.querySelectorAll('td');
+            if (td.length < 4) return;
+            const nm = String(td[1].textContent || '').replace(/\s+/g, ' ').trim();
+            if (!nm) return;
+            seen[m[1]] = 1;
+            // uwaga: „Active" jest podciagiem „Inactive", wiec pytamy o zaprzeczenie
+            out.push({ n: m[1], nm: nm, on: !/inactive/i.test(td[3].textContent || '') });
+        });
+        if (out.length) { try { GM_setValue(MK_ACC_KEY, JSON.stringify(out)); } catch (e){} }
+        return out;
+    }
+    // Sklep na Miraklu nazywa sie „Beliani DE", a konto w prologistics „Vente Unique DE
+    // Beliani DE". Kluczem jest kod kraju, ale MUSI stac zaraz za nazwa marketplace'u:
+    // „Vente Unique ES Beliani DE" tez zawiera DE, wiec samo szukanie kodu myli kraje.
+    // Konta rozliczeniowe to zawsze czterocyfrowe 1xxx — pieciocyfrowe 11xxx to VAT.
+    // Odsiewamy jeszcze konta podatkowe i przychodowe po nazwie, bo „VAT Vente Unique FR"
+    // ma numer 1999 i przechodzi przez sito numeru — bez tego Francja wychodzila dwuznacznie.
+    const MK_NOT_BANK = /^\s*(VAT|Umsatzsteuer|Umsatzsteur|Erl[oö]s)/i;
+    function mkAcctGuess(brand, shop, list){
+        const cc = String(shop || '').match(/\b([A-Z]{2})\s*$/);
+        if (!cc || !brand) return null;
+        const re = new RegExp(brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s+' + cc[1] + '\\b', 'i');
+        const hit = (list || []).filter(function (a){ return a.on && /^1\d{3}$/.test(a.n) && !MK_NOT_BANK.test(a.nm) && re.test(a.nm); });
+        return hit.length === 1 ? hit[0] : null;   // dwa trafienia = wskazujesz recznie
+    }
 
     // ===== rozpoznawanie wplat w wyciagu =====
     // Kolejnosc ma znaczenie: MangoPay obsluguje wiele marketplace'ow Mirakla, wiec sam
     // platnik nie wystarcza — rozstrzyga dopiero prefiks referencji w tytule przelewu.
     const MK_RULES = [
-        { mp: 'Mirakl (Vente)', ok: true,  payer: /MANGOPAY/i,                 ref: /\b(VEN\d+)\b/ },
+        { mp: 'Mirakl (Vente)', ok: true,  payer: /MANGOPAY/i,                 ref: /\b(VEN\d+)\b/, brand: 'Vente Unique' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,                 ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -17674,8 +17721,8 @@
         for (let i = 0; i < MK_RULES.length; i++){
             const r = MK_RULES[i];
             if (!r.payer.test(payer)) continue;
-            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1] }; }
-            return { mp: r.mp, ok: r.ok, ref: '' };
+            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1], brand: r.brand || '' }; }
+            return { mp: r.mp, ok: r.ok, ref: '', brand: r.brand || '' };
         }
         return null;
     }
@@ -17730,7 +17777,7 @@
                 cur: String(r[ix['currency']] || '').trim(),
                 amount: r2(cr), payer: payer, reason: reason,
                 txId: String(r[ix['transaction no.']] || '').trim(),
-                mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : ''
+                mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : '', brand: d ? (d.brand || '') : ''
             });
         }
         return { rows: out };
@@ -17742,6 +17789,9 @@
     // i komplet wariantow „…refund". Dlatego klasyfikujemy po WZORCU, nie po liscie —
     // a czego nie rozpoznamy, TRAFIA NA EKRAN. Cicho pominieta pozycja to najgorszy blad,
     // jaki taki modul moze popelnic.
+    // UWAGA na nazewnictwo: w plikach CSV zwrot to sufiks („Order amount refund"), ale
+    // w JSON-ie z API to PREFIKS — REFUND_ORDER_AMOUNT. Pierwsza wersja szukala tylko
+    // sufiksu i wszystkie prawdziwe zwroty ladowaly wsrod nierozpoznanych.
     function mkCls(t){
         const s = String(t || '').toUpperCase().replace(/[^A-Z]+/g, '_');
         const ref = /REFUND/.test(s);
@@ -17750,13 +17800,15 @@
         if (/COMMISSION/.test(s)) return { k: 'skip', ref: ref };
         if (/SUBSCRIPTION/.test(s)) return { k: 'skip', ref: ref };
         if (/OPEN_AMOUNT/.test(s)) return { k: 'skip', ref: ref };
-        if (/^ORDER_AMOUNT(_TAX)?(_REFUND)?$/.test(s)) return { k: 'gross', ref: ref };
+        if (/MANUAL_INVOICE/.test(s)) return { k: 'skip', ref: ref };   // faktury operatora
+        if (/PENALTY/.test(s)) return { k: 'skip', ref: ref };          // kary naliczone sprzedawcy
+        if (/^(REFUND_)?ORDER_AMOUNT(_TAX)?(_REFUND)?$/.test(s)) return { k: 'gross', ref: ref };
         if (/SHIPPING/.test(s)) return { k: 'gross', ref: ref };   // wysylka + jej podatek
         return { k: 'unknown', ref: ref };
     }
     // brutto = Order amount + Order amount tax + Shipping charges + Shipping tax
     function mkAggregate(data){
-        const ord = {}, ref = {}, unknown = {};
+        const ord = {}, ref = {}, unknown = {}, skipped = {};
         // „comp" to suma wszystkich pozycji BEZ wiersza Payment — czyli to, co powinno wyjsc
         // na konto. Gdyby liczyc razem z Payment, wynik zawsze bylby zerem (sprawdzone:
         // skladniki +694.52, Payment -694.52), a sciezka zapasowa dla cykli jeszcze bez
@@ -17768,12 +17820,12 @@
             if (c.k === 'payment') { pay = a; return; }
             comp = r2(comp + a);
             if (c.k === 'unknown') { unknown[x.type] = (unknown[x.type] || 0) + 1; return; }
-            if (c.k !== 'gross') return;
+            if (c.k !== 'gross') { skipped[x.type] = (skipped[x.type] || 0) + 1; return; }
             const id = String(x.orderUuid || '').trim();
             if (!id) return;
             if (c.ref) ref[id] = r2((ref[id] || 0) + a); else ord[id] = r2((ord[id] || 0) + a);
         });
-        return { ord: ord, ref: ref, unknown: unknown, comp: comp, pay: pay };
+        return { ord: ord, ref: ref, unknown: unknown, skipped: skipped, comp: comp, pay: pay };
     }
 
     // ===== plik do importu — 1:1 z tym, co robi dzisiejsza aplikacja =====
@@ -17791,24 +17843,70 @@
         return '﻿' + lines.join('\n') + '\n';
     }
 
-    // ================= POLOWA NA MIRAKLU =================
-    // Token XSRF czytamy z ciasteczka, nie ze znacznika <meta>. Po przelaczeniu sklepu
-    // przez fetch strona sie NIE przeladowuje, wiec meta zostaje stary — ciasteczko jest
-    // zawsze aktualne. Meta sluzy tylko jako awaryjne zrodlo.
+    // ================= ROZMOWA Z MIRAKLEM =================
+    // Modul dziala z obu stron. Na Miraklu idzie zwyklym fetch-em. Z prologistics to
+    // inna domena — fetch nie dolozy tam ciasteczek — ale GM_xmlhttpRequest potrafi,
+    // bo dziala poza polityka pochodzenia (stad @connect mirakl.net). Token XSRF
+    // zdejmujemy wtedy ze strony glownej Mirakla, tak jak zrobilaby to przegladarka.
+    const MK_HOST_KEY = 'mkt_mirakl_host';
+    function mkHost(){ return String(GM_getValue(MK_HOST_KEY, 'venteunique-prod.mirakl.net')); }
+    function mkBase(){ return onMirakl ? '' : ('https://' + mkHost()); }
+
+    // Na Miraklu token bierzemy z ciasteczka, nie ze znacznika <meta>: po przelaczeniu
+    // sklepu strona sie NIE przeladowuje, wiec meta zostaje stary, a ciasteczko nie.
     function mkXsrf(){
         const m = String(document.cookie || '').match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
         if (m) { try { return decodeURIComponent(m[1]); } catch (e){ return m[1]; } }
         const t = document.querySelector('meta[name="_csrf"]');
         return t ? t.getAttribute('content') : '';
     }
+    function gmGet(url, hdrs){
+        return new Promise(function (resolve, reject){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest — otwórz moduł na stronie Mirakla')); return; }
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, headers: hdrs || {}, timeout: 90000,
+                onload: function (r){ resolve(r); },
+                onerror: function (){ reject(new Error('nie mogę połączyć się z ' + mkHost())); },
+                ontimeout: function (){ reject(new Error(mkHost() + ' nie odpowiedział na czas')); }
+            });
+        });
+    }
+    let MK_TOK = '';
+    // Jedno wejscie na strone glowna daje wszystko naraz: token, liste sklepow
+    // i sklep biezacy. Odswiezamy je tylko raz na uruchomienie.
+    async function mkBoot(){
+        if (onMirakl) return { tok: mkXsrf(), ids: mkShopIds(), home: MK_HOME };
+        if (MK_TOK) return { tok: MK_TOK, ids: mkShopIds(), home: GM_getValue('mkt_home', '') };
+        const r = await gmGet(mkBase() + '/', { 'accept': 'text/html' });
+        const h = String(r.responseText || '');
+        if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' na ' + mkHost());
+        const m = h.match(/name="_csrf"[^>]*content="([^"]+)"/) || h.match(/content="([^"]+)"[^>]*name="_csrf"/);
+        if (!m) throw new Error('nie widzę tokena na ' + mkHost() + ' — zaloguj się tam w przeglądarce i spróbuj ponownie');
+        MK_TOK = m[1];
+        mkShopIdsFrom(h);
+        const cm = h.match(/"currentShopUUID"\s*:\s*"?(\d+)"?/);
+        if (cm) { try { GM_setValue('mkt_home', cm[1]); } catch (e){} }
+        return { tok: MK_TOK, ids: mkShopIds(), home: cm ? cm[1] : '' };
+    }
     async function mkApi(path){
-        const r = await fetch(path, { credentials: 'same-origin', headers: {
+        if (onMirakl){
+            const r = await fetch(path, { credentials: 'same-origin', headers: {
+                'accept': 'application/json, text/plain, */*',
+                'x-requested-with': 'XMLHttpRequest',
+                'x-xsrf-token': mkXsrf()
+            } });
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + path.split('?')[0]);
+            return r.json();
+        }
+        const b = await mkBoot();
+        const r = await gmGet(mkBase() + path, {
             'accept': 'application/json, text/plain, */*',
             'x-requested-with': 'XMLHttpRequest',
-            'x-xsrf-token': mkXsrf()
-        } });
-        if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + path.split('?')[0]);
-        return r.json();
+            'x-xsrf-token': b.tok
+        });
+        if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' na ' + path.split('?')[0]);
+        try { return JSON.parse(r.responseText); }
+        catch (e){ throw new Error('z ' + mkHost() + ' przyszedł nie-JSON — najpewniej strona logowania'); }
     }
     function mkArr(j){ return (j && Array.isArray(j.data)) ? j.data : (Array.isArray(j) ? j : []); }
     async function mkShop(){ try { const j = await mkApi('/sellerpayment/private/shops/current'); return j || {}; } catch (e){ return {}; } }
@@ -17830,18 +17928,18 @@
     // sklepu (/mmp/media/shop-logo/<uid>), a same odnosniki maja /switch-shop/<uid>.
     // Zapamietujemy je, bo menu bywa doladowywane dopiero po rozwinieciu.
     const MK_SHOPS_KEY = 'mkt_shop_ids';
-    function mkShopIds(){
+    function mkShopIdsFrom(html){
         const seen = {}, ids = [];
-        const h = document.documentElement ? document.documentElement.innerHTML : '';
         const re = /(?:switch-shop|shop-logo)\/(\d+)/g;
         let m;
-        while ((m = re.exec(h))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
+        while ((m = re.exec(String(html || '')))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
         let old = [];
         try { old = JSON.parse(GM_getValue(MK_SHOPS_KEY, '[]')) || []; } catch (e){}
         old.forEach(function (x){ if (!seen[x]) { seen[x] = 1; ids.push(x); } });
         if (ids.length) { try { GM_setValue(MK_SHOPS_KEY, JSON.stringify(ids)); } catch (e){} }
         return ids;
     }
+    function mkShopIds(){ return mkShopIdsFrom(onMirakl && document.documentElement ? document.documentElement.innerHTML : ''); }
     // Sklep, na ktorym zaczynamy — zdejmowany z HTML-a PRZED jakimkolwiek przelaczaniem,
     // zeby bylo dokad wrocic.
     function mkCurShopId(){
@@ -17850,17 +17948,42 @@
         return m ? m[1] : '';
     }
     const MK_HOME = onMirakl ? mkCurShopId() : '';
+    if (onMirakl && MK_HOME) { try { GM_setValue('mkt_home', MK_HOME); } catch (e){} }
     async function mkSwitch(uid){
-        const r = await fetch('/switch-shop/' + encodeURIComponent(uid), { credentials: 'same-origin', redirect: 'follow' });
-        if (!r.ok) throw new Error('switch-shop ' + uid + ' → HTTP ' + r.status);
+        const p = '/switch-shop/' + encodeURIComponent(uid);
+        if (onMirakl){
+            const r = await fetch(p, { credentials: 'same-origin', redirect: 'follow' });
+            if (!r.ok) throw new Error('switch-shop ' + uid + ' → HTTP ' + r.status);
+            return true;
+        }
+        const r = await gmGet(mkBase() + p, { 'accept': 'text/html' });
+        if (r.status < 200 || r.status >= 300) throw new Error('switch-shop ' + uid + ' → HTTP ' + r.status);
         return true;
     }
+    // Mirakl tnie odpowiedz do 100 pozycji niezaleznie od tego, o ile poprosisz — reszte
+    // wydaje przez nextPageToken. Bez tego cykl na 405 pozycji dawal 100 i kwoty byly
+    // po prostu nieprawdziwe. Deduplikujemy po identyfikatorze, wiec gdyby nazwa parametru
+    // stronicowania kiedys sie zmienila, petla stanie zamiast w kolko liczyc te same wiersze.
     async function mkCycleTx(id){
-        const j = await mkApi('/sellerpayment/private/transactions?search=' + encodeURIComponent(id) +
-            '&searchType=SHOP_BILLING_CYCLE_ID&limit=1000');
-        const list = mkArr(j);
-        const total = (j && j.count && j.count.counted != null) ? j.count.counted : list.length;
-        return { list: list, total: total, capped: !!(j && j.count && j.count.capped) };
+        const base = '/sellerpayment/private/transactions?search=' + encodeURIComponent(id) +
+                     '&searchType=SHOP_BILLING_CYCLE_ID&limit=100';
+        const all = [], seen = {};
+        let token = '', total = null, pages = 0;
+        while (pages < 80){
+            pages++;
+            const j = await mkApi(base + (token ? ('&nextPageToken=' + encodeURIComponent(token)) : ''));
+            if (total == null && j && j.count && j.count.counted != null) total = j.count.counted;
+            let added = 0;
+            mkArr(j).forEach(function (x){
+                const k = x.id || x.uuid || (String(x.type) + '|' + x.amount + '|' + x.orderUuid + '|' + x.dateCreated);
+                if (seen[k]) return;
+                seen[k] = 1; all.push(x); added++;
+            });
+            const next = j && j.nextPageToken;
+            if (!next || !added) break;
+            token = next;
+        }
+        return { list: all, total: (total == null ? all.length : total), pages: pages };
     }
 
     // ================= UI =================
@@ -17879,11 +18002,14 @@
       + '</div>'
       + '<div style="padding:12px 16px">'
       +   (onProlo
-            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS, CSV). Rozpoznam wpłaty od marketplace\'ów. Dla wypłat Mirakla otwórz potem stronę marketplace\'u — moduł sam dociągnie tam rozliczenie i wróci z gotowymi kwotami.</div>'
+            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS, CSV) — rozpoznam wpłaty od marketplace\'ów. Rozliczenia dociągam prosto z Mirakla, stąd; musisz być tam zalogowany w przeglądarce.</div>'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
+              + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz rozliczenia z Mirakla</button>'
+              + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
               + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
+              + '<div id="mk-set" style="display:none;margin-top:10px;padding:8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:8px"></div>'
             : '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Dla każdego znajdę cykl rozliczeniowy po referencji z przelewu, pobiorę pozycje i policzę kwoty brutto per zamówienie. Sesja Mirakla widzi naraz tylko jeden sklep — „wszystkie sklepy" przełącza je po kolei i na koniec wraca tam, gdzie zacząłeś.</div>'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz z tego sklepu</button>'
@@ -17915,15 +18041,17 @@
               + '<td style="padding:2px 5px">Stan</td><td style="padding:2px 5px">Szczegóły</td></tr>';
         jobs.forEach(function (j){
             const st = j.status || 'new';
-            const col = st === 'done' ? '#0a7a2f' : (st === 'ready' ? '#5b21b6' : (st === 'err' ? '#c00' : '#666'));
-            const lbl = { 'new': 'czeka na dane', 'ready': 'gotowe do importu', 'done': 'zaimportowane', 'err': 'błąd', 'skip': 'poza zakresem' }[st] || st;
+            const col = st === 'done' ? '#0a7a2f' : (st === 'ready' ? '#5b21b6' : (st === 'err' ? '#c00' : (st === 'partial' ? '#c47f00' : '#666')));
+            const lbl = { 'new': 'czeka na dane', 'ready': 'gotowe do importu', 'partial': 'wymaga sprawdzenia', 'done': 'zaimportowane', 'err': 'błąd', 'skip': 'poza zakresem' }[st] || st;
             let det = esc(j.msg || '');
             if (j.data){
                 const n = Object.keys(j.data.ord || {}).length, nr = Object.keys(j.data.ref || {}).length;
                 det = 'zamówień: <b>' + n + '</b> na ' + f2(j.data.gross) + (nr ? (' · zwrotów: <b>' + nr + '</b> na ' + f2(j.data.refund)) : '') +
                       ' · kontrola netto ' + (j.data.netOk ? '<b style="color:#0a7a2f">✓</b>' : '<b style="color:#c00">✗ ' + f2(j.data.net) + '</b>');
                 if (j.data.unknown && Object.keys(j.data.unknown).length) det += ' · <b style="color:#c00">nierozpoznane typy: ' + esc(Object.keys(j.data.unknown).join(', ')) + '</b>';
-                if (j.msg) det += '<div style="color:#666">' + esc(j.msg) + '</div>';
+                const sk = Object.keys(j.data.skipped || {});
+                if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
+                if (j.msg) det += '<div style="color:#c47f00">' + esc(j.msg) + '</div>';
             }
             h += '<tr style="border-top:1px solid #eee">'
               +  '<td style="padding:3px 5px;white-space:nowrap">' + esc(j.date) + '</td>'
@@ -17932,9 +18060,11 @@
               +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur) + '</td>'
               +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
-            if (onProlo && st === 'ready'){
+            if (onProlo && (st === 'ready' || st === 'partial')){
                 h += '<tr><td colspan="6" style="padding:2px 5px 8px 5px;background:#faf9ff">'
-                  +  '<button class="mk-imp" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬆ Importuj ' + Object.keys(j.data.ord || {}).length + ' zamówień</button>'
+                  +  (st === 'ready'
+                        ? '<button class="mk-imp" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬆ Importuj ' + Object.keys(j.data.ord || {}).length + ' zamówień</button>'
+                        : '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span>')
                   +  (Object.keys(j.data.ref || {}).length ? ' <button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button>' : '')
                   +  ' <button class="mk-csv" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz „do prolo" CSV</button>'
                   +  '</td></tr>';
@@ -17963,7 +18093,7 @@
                     known++;
                     const k = r.ref || (r.txId || (r.date + '_' + r.amount));
                     if (jobs[k] && jobs[k].status === 'done') return;
-                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
                 });
                 jobsSave(jobs);
                 say('Wczytano: ' + p.rows.length + ' wpłat, rozpoznanych obsługiwanych ' + known + ' (nowych zleceń ' + add + ')'
@@ -17977,10 +18107,82 @@
             if (!confirm('Usunąć wszystkie zlecenia (także pobrane rozliczenia)?')) return;
             jobsSave({}); render(); say('Wyczyszczone.');
         };
+        $('#mk-cfg').onclick = async function(){
+            const box = $('#mk-set');
+            if (box.style.display !== 'none'){ box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            if (!mkAcctLoad().length){
+                box.innerHTML = '<div style="color:#666">Wczytuję plan kont…</div>';
+                try { await mkAcctFetch(); } catch (e){ box.innerHTML = '<div style="color:#c00">Nie mogę wczytać planu kont: ' + esc((e && e.message) || e) + '</div>'; return; }
+            }
+            renderSet();
+        };
+    }
+
+    // Konta per sklep. Numer konta jest do kontroli wzrokowej — import i tak jedzie
+    // na bank_setting, wiec to jego brak blokuje wysylke.
+    function renderSet(){
+        const box = $('#mk-set'); if (!box) return;
+        const acc = mkAcctLoad(), sets = setLoad(), jobs = jobsLoad();
+        const rows = {};
+        Object.keys(sets).forEach(function (k){ rows[k] = sets[k]; });
+        Object.keys(jobs).forEach(function (k){
+            const j = jobs[k];
+            if (!j.data || !j.data.shop) return;
+            const key = setKey(j.mp, j.data.shop);
+            if (!rows[key]) rows[key] = { bank: '', booking: '9', acct: (mkAcctGuess(j.brand, j.data.shop, acc) || {}).n || '' };
+        });
+        const keys = Object.keys(rows).sort();
+        let h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+              + '<b style="font-size:11px;color:#5b21b6">Konta i ustawienia importu</b>'
+              + '<button id="mk-acc-rel" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">↻ Odśwież plan kont (' + acc.length + ')</button></div>';
+        if (!keys.length){ box.innerHTML = h + '<div style="color:#888;font-size:11px">Brak sklepów — najpierw pobierz rozliczenie na Miraklu.</div>'; }
+        else {
+            h += '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:2px 4px">Marketplace · sklep</td>'
+              +  '<td style="padding:2px 4px">Konto</td><td style="padding:2px 4px">bank_setting</td>'
+              +  '<td style="padding:2px 4px">booking</td><td></td></tr>';
+            keys.forEach(function (k, i){
+                const c = rows[k];
+                const cur = acc.filter(function (a){ return a.n === String(c.acct || ''); })[0];
+                let opt = '<option value="">— wybierz —</option>';
+                acc.forEach(function (a){
+                    if (!a.on || !/^1\d{3}$/.test(a.n) || MK_NOT_BANK.test(a.nm)) return;
+                    opt += '<option value="' + esc(a.n) + '"' + (a.n === String(c.acct || '') ? ' selected' : '') + '>' + esc(a.n + ' — ' + a.nm) + '</option>';
+                });
+                h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
+                  +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
+                  +  '<td style="padding:3px 4px"><select class="mk-s-acct" style="font-size:11px;max-width:280px">' + opt + '</select></td>'
+                  +  '<td style="padding:3px 4px"><input class="mk-s-bank" value="' + esc(c.bank || '') + '" style="width:60px;font-size:11px" placeholder="np. 157"></td>'
+                  +  '<td style="padding:3px 4px"><input class="mk-s-book" value="' + esc(c.booking || '9') + '" style="width:40px;font-size:11px"></td>'
+                  +  '<td style="padding:3px 4px;color:' + (c.bank ? '#0a7a2f' : '#c47f00') + '">' + (c.bank ? '✓' : 'brak bank_setting') + '</td></tr>';
+                void i; void cur;
+            });
+            h += '</table><div style="margin-top:6px"><button id="mk-set-save" style="padding:4px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">Zapisz</button>'
+              +  ' <span style="font-size:10px;color:#888">bank_setting to identyfikator konta w imporcie — nie numer konta. Vente DE = 157.</span></div>';
+            box.innerHTML = h;
+            box.querySelector('#mk-set-save').onclick = function(){
+                const out = {};
+                box.querySelectorAll('tr[data-k]').forEach(function (tr){
+                    out[tr.getAttribute('data-k')] = {
+                        acct: tr.querySelector('.mk-s-acct').value,
+                        bank: tr.querySelector('.mk-s-bank').value.trim(),
+                        booking: tr.querySelector('.mk-s-book').value.trim() || '9'
+                    };
+                });
+                setSave(out); renderSet(); say('Ustawienia zapisane.', '#0a7a2f');
+            };
+        }
+        const rel = box.querySelector('#mk-acc-rel');
+        if (rel) rel.onclick = async function(){
+            rel.disabled = true; rel.textContent = '↻ …';
+            try { await mkAcctFetch(); renderSet(); say('Plan kont odświeżony.', '#0a7a2f'); }
+            catch (e){ say('Nie mogę wczytać planu kont: ' + ((e && e.message) || e), '#c00'); rel.disabled = false; }
+        };
     }
 
     // ---------- Mirakl: pobranie rozliczen ----------
-    if (onMirakl){
+    {
         // Jedno przejscie po aktualnie ustawionym sklepie. Liste cykli pobieramy RAZ
         // i dopasowujemy do niej wszystkie czekajace referencje — inaczej przy 13 sklepach
         // i 7 zleceniach bylo by 91 zapytan zamiast 13.
@@ -18005,13 +18207,23 @@
                     const net = (a.pay != null) ? Math.abs(a.pay) : a.comp;
                     // Kontrola spojnosci samego raportu: skladniki + Payment musza dac zero.
                     const selfOk = (a.pay == null) || eq(r2(a.comp + a.pay), 0);
+                    // Do importu wpuszczamy WYLACZNIE komplet: wszystkie pozycje pobrane,
+                    // zaden typ nierozpoznany i raport domykajacy sie sam. Kazdy z tych
+                    // brakow oznacza, ze ktoregos zamowienia mogloby zabraknac w kwocie —
+                    // a to blad ksiegowy, nie kosmetyka.
+                    const full = (tx.total <= tx.list.length);
+                    const unk = Object.keys(a.unknown).length;
                     j.data = { cycle: cyc.id, shop: shopName, gross: gross, refund: refund, net: net,
-                               netOk: eq(net, j.amount), ord: a.ord, ref: a.ref, unknown: a.unknown,
+                               netOk: full && eq(net, j.amount), ord: a.ord, ref: a.ref,
+                               unknown: a.unknown, skipped: a.skipped, full: full,
                                rows: tx.list.length, total: tx.total };
-                    j.status = 'ready';
-                    j.msg = (tx.total > tx.list.length) ? ('UWAGA: pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji') : '';
-                    if (!selfOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłata ' + f2(a.pay);
-                    if (!j.data.netOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu';
+                    const bad = [];
+                    if (!full) bad.push('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji');
+                    if (unk) bad.push('nierozpoznane typy pozycji');
+                    if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłata ' + f2(a.pay));
+                    if (full && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+                    j.status = bad.length ? 'partial' : 'ready';
+                    j.msg = bad.join('; ');
                     ok++;
                 } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
                 jobsSave(jobs); render();
@@ -18021,7 +18233,8 @@
         function mkLeft(jobs){ return Object.keys(jobs).filter(function (k){ return jobs[k].status === 'new' && jobs[k].ref; }).length; }
         async function mkShopName(){ const s = await mkShop(); return String(s.name || s.shopName || ''); }
 
-        $('#mk-run').onclick = async function(){
+        const bRun = $('#mk-run'), bAll = $('#mk-all');
+        if (bRun) bRun.onclick = async function(){
             const b = this; b.disabled = true;
             try {
                 const jobs = jobsLoad();
@@ -18034,19 +18247,22 @@
             finally { b.disabled = false; render(); }
         };
 
-        $('#mk-all').onclick = async function(){
+        if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
             if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-            const ids = mkShopIds();
-            if (!ids.length){ say('Nie widzę listy sklepów — rozwiń przełącznik sklepu w nagłówku Mirakla i kliknij ponownie.', '#c47f00'); return; }
-            if (!MK_HOME) { if (!confirm('Nie rozpoznałem, na którym sklepie jesteś, więc po zakończeniu nie wrócę na niego sam — przełączysz się ręcznie.\n\nKontynuować?')) return; }
-            if (!confirm('Przelecieć ' + ids.length + ' sklepów w poszukiwaniu ' + mkLeft(jobs) + ' rozliczeń?\n\n'
-                + 'Moduł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.\n'
-                + (MK_HOME ? 'Na koniec wrócę na sklep, od którego zacząłeś.' : ''))) return;
             b.disabled = true; if (b2) b2.disabled = true;
-            let ok = 0, seen = 0;
+            let ok = 0, seen = 0, home = '', ids = [];
             try {
+                say('Łączę się z ' + mkHost() + '…');
+                const boot = await mkBoot();
+                home = boot.home || '';
+                ids = boot.ids || [];
+                if (!ids.length){ say('Nie widzę listy sklepów — otwórz raz stronę Mirakla i rozwiń przełącznik sklepu, potem wróć tutaj.', '#c47f00'); return; }
+                if (!home){ if (!confirm('Nie rozpoznałem sklepu wyjściowego, więc po zakończeniu nie wrócę na niego sam.\n\nKontynuować?')) return; }
+                if (!confirm('Przelecieć ' + ids.length + ' sklepów w poszukiwaniu ' + mkLeft(jobs) + ' rozliczeń?\n\n'
+                    + 'Moduł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.\n'
+                    + (home ? 'Na koniec wrócę na sklep, od którego zacząłeś.' : ''))) return;
                 for (let i = 0; i < ids.length; i++){
                     jobs = jobsLoad();
                     if (!mkLeft(jobs)) break;                 // wszystko znalezione — nie ma po co isc dalej
@@ -18060,14 +18276,16 @@
             finally {
                 // Powrot do sklepu wyjsciowego takze po bledzie — inaczej zostawilbym
                 // sesje na przypadkowym sklepie, a strona nadal pokazywalaby stary.
-                if (MK_HOME){ try { await mkSwitch(MK_HOME); } catch (e){} }
+                if (home){ try { await mkSwitch(home); } catch (e){} }
                 b.disabled = false; if (b2) b2.disabled = false;
                 render();
-                const left = mkLeft(jobsLoad());
-                say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
-                    + (left ? (', nieznalezionych ' + left) : '')
-                    + (MK_HOME ? '. Wróciłem na sklep wyjściowy — odśwież stronę, żeby zgadzała się z tym, co widzisz.' : '.'),
-                    left ? '#c47f00' : '#0a7a2f');
+                if (seen || ok){
+                    const left = mkLeft(jobsLoad());
+                    say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
+                        + (left ? (', nieznalezionych ' + left) : '')
+                        + (home && onMirakl ? '. Wróciłem na sklep wyjściowy — odśwież stronę, żeby zgadzała się z tym, co widzisz.' : '.'),
+                        left ? '#c47f00' : '#0a7a2f');
+                }
             }
         };
     }
@@ -18099,21 +18317,27 @@
     async function doImport(ref, b){
         const jobs = jobsLoad(), j = jobs[ref];
         if (!j || !j.data) return;
-        const sets = setLoad(), cfg = sets[j.data.shop] || null;
-        if (!cfg){
-            const bank = prompt('Nie znam ustawień importu dla sklepu „' + j.data.shop + '".\n\nPodaj bank_setting (dla Vente DE to 157):', '');
-            if (!bank) return;
-            const bk = prompt('booking_setting (zwykle 9):', '9') || '9';
-            sets[j.data.shop] = { bank: String(bank).trim(), booking: String(bk).trim(), acct: '' };
-            setSave(sets);
+        const key = setKey(j.mp, j.data.shop);
+        const c = setLoad()[key];
+        if (!c || !c.bank){
+            // Bez bank_setting import poszedlby na zle konto — lepiej otworzyc ustawienia
+            // niz zgadywac. Konto podpowiadamy z planu kont po kodzie kraju.
+            const box = $('#mk-set');
+            if (box) box.style.display = 'block';
+            if (!mkAcctLoad().length){ say('Wczytuję plan kont…'); try { await mkAcctFetch(); } catch (e){} }
+            renderSet();
+            say('Uzupełnij bank_setting dla „' + key + '" i zapisz — dopiero wtedy zaimportuję.', '#c47f00');
+            return;
         }
-        const c = setLoad()[j.data.shop];
+        const acct = mkAcctLoad().filter(function (a){ return a.n === String(c.acct || ''); })[0];
         const pairs = pairsOf(j);
         const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
         if (!d){ say('Nie umiem odczytać daty wypłaty.', '#c00'); return; }
         const dateIso = d[1] + '-' + d[2] + '-' + d[3];
         if (!confirm('Zaimportować ' + pairs.length + ' zamówień na ' + f2(j.data.gross) + ' ' + j.cur + '?\n\n'
-            + 'Sklep: ' + j.data.shop + '\nData płatności: ' + dateIso + '\nKonto (bank_setting): ' + c.bank + (c.acct ? (' = ' + c.acct) : '')
+            + 'Sklep: ' + j.data.shop + '\nData płatności: ' + dateIso
+            + '\nKonto: ' + (acct ? (acct.n + ' — ' + acct.nm) : (c.acct || '(nie wskazane)'))
+            + '\nbank_setting: ' + c.bank
             + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
         b.disabled = true; say('Wysyłam import…');
         try {
