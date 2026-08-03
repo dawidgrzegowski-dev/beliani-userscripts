@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.59
+// @version      2.60
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18296,7 +18296,9 @@
         const s = String(html || '');
         // Dwa zrodla: odnosniki w naglowku (DOM) i jednoznacznie nazwane pola w JSON-ie.
         // Nazwy pol musza byc konkretne — samo „id" wciagneloby polowe strony.
-        [/(?:switch-shop|shop-logo)\/(\d+)/g, /"(?:shopUid|shopId|currentShopUUID)"\s*:\s*"?(\d+)/g].forEach(function (re){
+        [/(?:switch-shop|shop-logo)\/(\d+)/g,
+         /[?&]shopUid=(\d+)/g,
+         /"(?:shopUid|shopId|currentShopUUID)"\s*:\s*"?(\d+)/g].forEach(function (re){
             let m;
             while ((m = re.exec(s))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
         });
@@ -18322,14 +18324,30 @@
     // czegos nie zobaczymy. Raz zapamietane numery dzialaja potem takze z prologistics.
     if (onMirakl){
         (function (){
-            let n = 0;
-            const iv = setInterval(function (){
-                n++;
-                let have = 0;
-                try { have = mkShopIds().length; } catch (e){}
-                if (have > 1 || n >= 20) clearInterval(iv);      // 20 x 2 s = 40 s
-            }, 2000);
-            try { mkShopIds(); } catch (e){}
+            let last = 0, done = false;
+            function scan(){
+                if (done) return;
+                let n = 0;
+                try { n = mkShopIds().length; } catch (e){}
+                if (n > 1){ done = true; try { shopsInfo(); } catch (e){} }
+            }
+            scan();
+            const iv = setInterval(function (){ scan(); if (done) clearInterval(iv); }, 2000);
+            setTimeout(function (){ clearInterval(iv); }, 120000);
+            // Nowa nawigacja Mirakla (Home24) rysuje liste sklepow DOPIERO po rozwinieciu
+            // przelacznika — przy zamknietym w drzewie nie ma jej wcale. Stara (Vente)
+            // laduje logotypy od razu w naglowku. Dlatego oprocz odpytywania co chwile
+            // nasluchujemy zmian drzewa: rozwiniecie przelacznika w dowolnym momencie
+            // zostanie zlapane, a nie tylko w pierwszych sekundach po wejsciu.
+            try {
+                const mo = new MutationObserver(function (){
+                    const t = Date.now();
+                    if (t - last < 400) return;               // bez skanowania przy kazdym drgnieciu
+                    last = t; scan();
+                    if (done) mo.disconnect();
+                });
+                mo.observe(document.documentElement, { childList: true, subtree: true });
+            } catch (e){}
         })();
     }
     async function mkSwitch(uid){
@@ -18450,6 +18468,7 @@
               + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz rozliczenia z Mirakla</button>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
+              + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
               + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
               + '<div id="mk-set" style="display:none;margin-top:10px;padding:8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:8px"></div>'
@@ -18472,10 +18491,21 @@
     // czasu naglowek na pewno jest juz wczytany — i pokazujemy, ile ich znamy.
     function shopsInfo(){
         const e = $('#mk-shops');
-        if (!e || !onMirakl) return;
-        const n = mkShopIds().length;
-        e.textContent = n ? ('znam ' + n + ' sklepów tej platformy') : 'nie znam jeszcze listy sklepów — poczekaj chwilę i otwórz ponownie';
-        e.style.color = n > 1 ? '#0a7a2f' : '#c47f00';
+        if (!e) return;
+        if (onMirakl){
+            const n = mkShopIds().length;
+            e.textContent = n > 1 ? ('znam ' + n + ' sklepów tej platformy')
+                                  : 'nie znam listy sklepów — rozwiń przełącznik sklepu w nagłówku, zapamiętam ją';
+            e.style.color = n > 1 ? '#0a7a2f' : '#c47f00';
+            return;
+        }
+        // Na prologistics pokazujemy, co mamy zapamietane dla kazdej platformy —
+        // inaczej nie da sie sprawdzic, czy jest po czym przelatywac.
+        const m = mapGet(MK_SHOPS_KEY), hs = Object.keys(m);
+        e.textContent = hs.length
+            ? ('sklepy: ' + hs.map(function (h){ return h.split('.')[0] + ' ' + (mapArr(MK_SHOPS_KEY, h).length); }).join(' · '))
+            : 'nie znam jeszcze żadnych sklepów — wejdź na Mirakla i rozwiń przełącznik sklepu';
+        e.style.color = hs.length ? '#666' : '#c47f00';
     }
     btn.onclick = function(){
         panel.style.display = (panel.style.display === 'none' ? 'flex' : 'none');
