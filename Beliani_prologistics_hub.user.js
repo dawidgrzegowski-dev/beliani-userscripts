@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.42
+// @version      2.43
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17733,10 +17733,12 @@
             });
         });
     }
-    // „Vente DE" — skrot platformy plus kod kraju ze sklepu.
+    // Nazwa marketu MUSI zgadzac sie z lista rozwijana w arkuszu, bo kolumna „Konto"
+    // to formula VLOOKUP po tej wlasnie nazwie. W arkuszu etykiety maja postac
+    // „Vente Unique DE" (pelna nazwa + kraj), a nie „Vente DE".
     function mkShort(j){
         const cc = String((j.data && j.data.shop) || '').match(/\b([A-Z]{2})\s*$/);
-        const s = j.short || j.mp || '';
+        const s = j.brand || j.short || j.mp || '';
         return cc ? (s + ' ' + cc[1]).trim() : (s || (j.data && j.data.shop) || '');
     }
     function shRow(j, c){
