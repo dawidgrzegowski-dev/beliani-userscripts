@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.58
+// @version      2.59
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18110,6 +18110,14 @@
         if (!m) throw new Error('nie widzę tokena na ' + mkHost() + ' — zaloguj się tam w przeglądarce i spróbuj ponownie');
         MK_TOK = m[1];
         mkShopIdsFrom(h);
+        // Strona glowna listy sklepow nie zawiera, ale naglowek Mirakla pobiera ja
+        // z /_usercontext. Sprobujmy — jesli nic tam nie ma, nic sie nie zmienia.
+        if (mkShopIds().length < 2){
+            try {
+                const u = await gmGet(mkBase() + '/_usercontext', { 'accept': 'application/json, */*' });
+                if (u.status >= 200 && u.status < 300) mkShopIdsFrom(String(u.responseText || ''));
+            } catch (e){}
+        }
         const cm = h.match(/"currentShopUUID"\s*:\s*"?(\d+)"?/);
         if (cm) mkHomeSet(cm[1]);
         return { tok: MK_TOK, ids: mkShopIds(), home: cm ? cm[1] : '' };
@@ -18285,9 +18293,13 @@
     function mkHomeSet(v){ mapPut(MK_HOME_KEY, mkHost(), String(v || '')); }
     function mkShopIdsFrom(html){
         const seen = {}, ids = [];
-        const re = /(?:switch-shop|shop-logo)\/(\d+)/g;
-        let m;
-        while ((m = re.exec(String(html || '')))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
+        const s = String(html || '');
+        // Dwa zrodla: odnosniki w naglowku (DOM) i jednoznacznie nazwane pola w JSON-ie.
+        // Nazwy pol musza byc konkretne — samo „id" wciagneloby polowe strony.
+        [/(?:switch-shop|shop-logo)\/(\d+)/g, /"(?:shopUid|shopId|currentShopUUID)"\s*:\s*"?(\d+)/g].forEach(function (re){
+            let m;
+            while ((m = re.exec(s))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
+        });
         mapArr(MK_SHOPS_KEY, mkHost()).forEach(function (x){ if (!seen[x]) { seen[x] = 1; ids.push(x); } });
         if (ids.length) mapPut(MK_SHOPS_KEY, mkHost(), ids);
         return ids;
@@ -18302,10 +18314,24 @@
     }
     const MK_HOME = onMirakl ? mkCurShopId() : '';
     if (onMirakl && MK_HOME) mkHomeSet(MK_HOME);
-    // Numery sklepow zdejmujemy z DOM-u przy KAZDYM wejsciu na Mirakla, nie dopiero
-    // przy klikanciu. Naglowek podciaga logo wszystkich sklepow, wiec samo otwarcie
-    // strony wystarcza — a z prologistics tej listy nie da sie zdobyc, bo w zrodle jej nie ma.
-    if (onMirakl) { try { mkShopIds(); } catch (e){} }
+    // Numery sklepow zdejmujemy z DOM-u Mirakla — z prologistics sie nie da, bo w zrodle
+    // strony ich nie ma (React dociaga naglowek dopiero po zaladowaniu).
+    //
+    // I wlasnie dlatego JEDNO zerkniecie przy starcie skryptu nie wystarcza: w tym momencie
+    // przelacznika sklepow jeszcze nie ma w drzewie. Skanujemy wiec kilka razy, dopoki
+    // czegos nie zobaczymy. Raz zapamietane numery dzialaja potem takze z prologistics.
+    if (onMirakl){
+        (function (){
+            let n = 0;
+            const iv = setInterval(function (){
+                n++;
+                let have = 0;
+                try { have = mkShopIds().length; } catch (e){}
+                if (have > 1 || n >= 20) clearInterval(iv);      // 20 x 2 s = 40 s
+            }, 2000);
+            try { mkShopIds(); } catch (e){}
+        })();
+    }
     async function mkSwitch(uid){
         const p = '/switch-shop/' + encodeURIComponent(uid);
         if (onMirakl){
@@ -18431,6 +18457,7 @@
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz z tego sklepu</button>'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">🔄 Przeleć wszystkie sklepy</button>'
+              + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>')
       +   '<div id="mk-out" style="margin-top:12px"></div>'
       // Podglad postepu stoi POD lista i zwrotami — tam, gdzie klikasz — ale wciaz POZA
@@ -18441,7 +18468,19 @@
 
     function $(s){ return panel.querySelector(s); }
     function say(t, c){ const e = $('#mk-status'); if (e){ e.textContent = t || ''; e.style.color = c || '#666'; } }
-    btn.onclick = function(){ panel.style.display = (panel.style.display === 'none' ? 'flex' : 'none'); if (panel.style.display === 'flex') render(); };
+    // Na Miraklu przy otwarciu panelu jeszcze raz zdejmujemy liste sklepow — do tego
+    // czasu naglowek na pewno jest juz wczytany — i pokazujemy, ile ich znamy.
+    function shopsInfo(){
+        const e = $('#mk-shops');
+        if (!e || !onMirakl) return;
+        const n = mkShopIds().length;
+        e.textContent = n ? ('znam ' + n + ' sklepów tej platformy') : 'nie znam jeszcze listy sklepów — poczekaj chwilę i otwórz ponownie';
+        e.style.color = n > 1 ? '#0a7a2f' : '#c47f00';
+    }
+    btn.onclick = function(){
+        panel.style.display = (panel.style.display === 'none' ? 'flex' : 'none');
+        if (panel.style.display === 'flex'){ shopsInfo(); render(); }
+    };
     (document.body || document.documentElement).appendChild(btn);
     (document.body || document.documentElement).appendChild(panel);
     $('#mk-close').onclick = function(){ panel.style.display = 'none'; };
