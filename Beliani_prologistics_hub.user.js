@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.54
+// @version      2.56
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18428,6 +18428,7 @@
       +   '<div id="mk-out" style="margin-top:12px"></div>'
       // Podglad postepu stoi POD lista i zwrotami — tam, gdzie klikasz — ale wciaz POZA
       // #mk-out, zeby przerysowanie listy go nie kasowalo.
+      +   '<div id="mk-imp-box" style="display:none;margin-top:10px;padding:8px;background:#fbfaff;border:1px solid #ede9fe;border-radius:8px"></div>'
       +   '<div id="mk-prog" style="display:none;margin-top:10px;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px"></div>'
       + '</div>';
 
@@ -18512,6 +18513,12 @@
               +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur) + '</td>'
               +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
+            if (onProlo && st === 'done' && j.impId){
+                h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
+                  +  '<button class="mk-chk" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź paczkę ' + esc(j.impId) + ' i zaksięguj</button>'
+                  +  ' <a href="/react/settings_page/import_payments/' + esc(j.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
+                  +  '</td></tr>';
+            }
             if (onProlo && (st === 'ready' || st === 'partial')){
                 // Ksiegowanie idzie wylacznie przez zaznaczenie i guzik zbiorczy nad tabela.
                 // Osobny przycisk przy kazdym wierszu tylko dublowalby te sama droge.
@@ -18524,6 +18531,7 @@
         });
         out.innerHTML = h + '</table><div id="mk-ref"></div>';
         out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-chk').forEach(function (b){ b.onclick = function(){ impCheck(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-ck').forEach(function (c){
             c.onchange = function(){ mkSel[c.getAttribute('data-ref')] = c.checked; render(); };
@@ -19126,6 +19134,119 @@
         try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); say('Skopiowano ' + Object.keys(j.data.ref).length + ' zwrotów — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
         catch (e){ say('Nie udało się skopiować.', '#c00'); }
     }
+    // ---------- paczka importu: kontrola i ksiegowanie ----------
+    // Import NIE ksieguje — tworzy tylko paczke. Dopiero „Book on main account" ksieguje
+    // pozycje ze statusem OK. Status nadaje system: OK gdy kwota wplaty rowna sie
+    // open amount auftragu, CHECK gdy sie rozni, NOT FOUND gdy nie ma auftragu.
+    const MK_BLOCK = 'booking_without_assign';     // = przycisk „Book on main account"
+    async function impRows(id){
+        const r = await fetch('/api/importPayments/index/' + encodeURIComponent(id) + '/?', {
+            credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy odczycie paczki ' + id);
+        const j = await r.json();
+        return { rows: Array.isArray(j.hash_result) ? j.hash_result : [], colours: j.colours || {} };
+    }
+    async function impBook(id, ids){
+        const body = 'file_id=' + encodeURIComponent(id) + '&block=' + MK_BLOCK
+                   + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
+        const r = await fetch('/api/importPayments/save/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy księgowaniu');
+        return r.text();
+    }
+    function impNum(v){ const n = Number(String(v == null ? '' : v).replace(/[\s'’]/g, '').replace(',', '.')); return isFinite(n) ? n : null; }
+
+    function impRender(job, d){
+        const box = document.getElementById('mk-imp-box');
+        if (!box) return;
+        const rows = d.rows, col = d.colours || {};
+        const by = {};
+        rows.forEach(function (x){ const s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
+        const ok = by['OK'] || [], chk = by['CHECK'] || [], nf = by['NOT FOUND'] || [];
+        // Zwroty z tego samego cyklu tlumacza czesc „NOT FOUND": zamowienie zostalo
+        // zwrocone w calosci, wiec auftragu moze juz nie byc i nie ma czego ksiegowac.
+        const refs = (job.data && job.data.ref) || {};
+        const nfKnown = nf.filter(function (x){ return refs[String(x.payment_descr || '').trim()] != null; });
+        const nfNew   = nf.filter(function (x){ return refs[String(x.payment_descr || '').trim()] == null; });
+
+        let h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
+              + '<b style="font-size:11px;color:#5b21b6">Paczka importu ' + esc(job.impId) + '</b>'
+              + '<a href="/react/settings_page/import_payments/' + esc(job.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
+              + '<span style="font-size:11px;color:#666">wierszy ' + rows.length + '</span>';
+        Object.keys(by).sort().forEach(function (s){
+            h += '<span style="font-size:11px;color:' + esc(col[s] || '#374151') + ';font-weight:700">' + esc(s) + ': ' + by[s].length + '</span>';
+        });
+        h += '</div>';
+
+        if (chk.length){
+            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c47f00">CHECK — kwota nie zgadza się z open amount (' + chk.length + ')</b>'
+              +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Zamówienie</td><td style="padding:1px 6px;text-align:right">Wpłata</td>'
+              +  '<td style="padding:1px 6px;text-align:right">Open amount</td><td style="padding:1px 6px;text-align:right">Różnica</td><td style="padding:1px 6px">Auftrag</td></tr>';
+            chk.forEach(function (x){
+                const a = impNum(x.amount), o = impNum(x.open_amount);
+                const df = (a != null && o != null) ? r2(a - o) : null;
+                h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:#c00">' + (df == null ? '—' : f2(df)) + '</td>'
+                  +  '<td style="padding:2px 6px">' + (x.auction_number
+                        ? ('<a href="/auction.php?number=' + esc(x.auction_number) + '" target="_blank">' + esc(x.auction_number) + '</a>') : '—') + '</td></tr>';
+            });
+            h += '</table></div>';
+        }
+        if (nf.length){
+            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>';
+            if (nfKnown.length) h += '<div style="font-size:10px;color:#666;margin-top:2px">wyjaśnione zwrotem w tym samym cyklu — nie ma czego księgować: '
+                                  + esc(nfKnown.map(function (x){ return x.payment_descr; }).join(', ')) + '</div>';
+            if (nfNew.length) h += '<div style="font-size:11px;color:#c00;margin-top:2px;font-weight:700">bez wyjaśnienia — wpłata przyszła, a nie ma auftragu: '
+                                  + esc(nfNew.map(function (x){ return x.payment_descr + ' (' + x.amount + ')'; }).join(', ')) + '</div>';
+            h += '</div>';
+        }
+        h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +  '<button id="mk-book"' + (ok.length ? '' : ' disabled')
+          +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (ok.length ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (ok.length ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj OK (' + ok.length + ')</button>'
+          +  '<button id="mk-imp-re" style="padding:5px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">↻ Odśwież</button>'
+          +  '<span id="mk-book-msg" style="font-size:11px;color:#666"></span></div>';
+        box.style.display = 'block';
+        box.innerHTML = h;
+        try { box.scrollIntoView({ block: 'nearest' }); } catch (e){}
+
+        const re = box.querySelector('#mk-imp-re');
+        if (re) re.onclick = function(){ impCheck(job.ref); };
+        const bb = box.querySelector('#mk-book');
+        if (bb) bb.onclick = async function(){
+            const m = box.querySelector('#mk-book-msg');
+            if (!confirm('Zaksięgować ' + ok.length + ' pozycji ze statusem OK na koncie głównym?\n\n'
+                + 'Paczka ' + job.impId + ' · ' + (job.data ? job.data.shop : '') + '\n'
+                + 'Odpowiada to przyciskowi „Book on main account".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            bb.disabled = true; m.style.color = '#666'; m.textContent = 'księguję…';
+            try {
+                await impBook(job.impId, ok.map(function (x){ return x.id; }));
+                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję wynik…';
+                await impCheck(job.ref);                 // stan po ksiegowaniu, prosto z systemu
+            } catch (e){
+                m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
+                bb.disabled = false;
+            }
+        };
+    }
+
+    async function impCheck(ref){
+        const j = jobsLoad()[ref];
+        if (!j || !j.impId){ say('Ta pozycja nie ma numeru paczki — otwórz Import payments ręcznie.', '#c47f00'); return; }
+        say('Czytam paczkę ' + j.impId + '…');
+        try {
+            const d = await impRows(j.impId);
+            impRender(j, d);
+            const n = d.rows.filter(function (x){ return String(x.state) === 'OK'; }).length;
+            say('Paczka ' + j.impId + ': ' + d.rows.length + ' wierszy, OK ' + n + '.', '#0a7a2f');
+        } catch (e){ say('Nie mogę odczytać paczki: ' + ((e && e.message) || e), '#c00'); }
+    }
+
     // Zbiorcze ksiegowanie zaznaczonych. Jedno potwierdzenie na calosc, ale wysylka
     // po kolei — dzieki temu blad na jednym zleceniu nie przewraca reszty, a kazde
     // zaksiegowane od razu dostaje stan „done" i nie da sie go wyslac drugi raz.
@@ -19180,9 +19301,20 @@
             fd.append('imgs[]', new Blob([mkCsvText(pairs)], { type: 'text/csv' }), fileName(j));
             fd.append('data', JSON.stringify({ booking_setting: c.booking, date_overwrite_to: dateIso, bank_setting: c.bank, import_type: 'manual' }));
             const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
+            const txt = await r.text();
             if (!r.ok) throw new Error('HTTP ' + r.status);
+            // Endpoint oddaje STRONE paczki, nie JSON — to normalne. Numer paczki bierzemy
+            // z adresu po przekierowaniu, a gdyby go tam nie bylo, szukamy w tresci.
+            // Bez niego nie da sie sprawdzic ani zaksiegowac tego, co weszlo.
+            let imp = '';
+            const mu = String(r.url || '').match(/import_payments\/(\d+)/);
+            if (mu) imp = mu[1];
+            if (!imp){ const mt = String(txt).match(/import_payments\/(\d+)/); if (mt) imp = mt[1]; }
+            cur.impId = imp;
             cur.status = 'done';
-            cur.msg = 'zaimportowane ' + pairs.length + ' zamówień, konto ' + (c.acct || c.bank);
+            cur.msg = 'zaimportowane ' + pairs.length + ' zamówień, konto ' + (c.acct || c.bank)
+                    + (imp ? (' · paczka ' + imp + ' — jeszcze NIEZAKSIĘGOWANA')
+                           : ' · nie odczytałem numeru paczki — wejdź na Import payments ręcznie');
             jobsSave(jobs);
             // Dopisek do arkusza jest KROKIEM OSOBNYM: jego niepowodzenie nie cofa
             // ksiegowania — trafia tylko do opisu, zebys wiedzial, co dopisac recznie.
