@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.53
+// @version      2.54
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17977,8 +17977,12 @@
             const payer = String(r[ix['description1']] || '').split(';')[0].replace(/\s+/g, ' ').trim();
             const reason = String(r[ix['description3']] || '').replace(/\s+/g, ' ').trim();
             const d = mkDetect(payer, reason);
+            // Date sprowadzamy do jednego zapisu JUZ TUTAJ — dalej caly modul zaklada
+            // RRRR-MM-DD (dopasowanie cyklu, import, arkusz), wiec kazde inne wejscie
+            // musi zostac znormalizowane u zrodla, a nie w kilku miejscach osobno.
+            const dRaw = String(r[ix['booking date']] || '').trim();
             out.push({
-                date: String(r[ix['booking date']] || '').trim(),
+                date: mkIso(dRaw) || dRaw,
                 cur: String(r[ix['currency']] || '').trim(),
                 amount: r2(cr), payer: payer, reason: reason,
                 txId: String(r[ix['transaction no.']] || '').trim(),
@@ -18140,14 +18144,22 @@
     // caly wykaz (razem z archiwum sprzed lat) patrzymy najpierw na cykle z okolic daty
     // z wyciagu. Jesli tam nic nie ma, dopiero wtedy schodzimy do pelnej listy — zawezenie
     // ma przyspieszac, a nie gubic.
+    // Daty z wyciagow przychodza w kilku zapisach i to NIE jest drobiazg: „03.08.2026"
+    // wpuszczone do Date.parse zostaje odczytane jako 8 marca, a wtedy dobieramy cykl
+    // sprzed pol roku i liczymy kwoty z zupelnie innego rozliczenia.
+    // Kropkowany i ukosnikowany zapis jest zawsze dzien-miesiac-rok (europejski).
+    function mkIso(v){
+        const s = String(v == null ? '' : v).trim();
+        let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);                     // 2026-07-21
+        if (m) return m[1] + '-' + m[2] + '-' + m[3];
+        m = s.match(/^(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/);             // 21.07.2026 albo 21/07/2026
+        if (m) return m[3] + '-' + pad2(+m[2]) + '-' + pad2(+m[1]);
+        return '';
+    }
     function mkDay(v){
-        if (!v) return null;
-        const s = String(v);
-        let m = s.match(/(\d{4})-(\d{2})-(\d{2})/);                 // 2026-07-21
-        if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
-        m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);                   // 21/07/2026
-        if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1]);
-        const t = Date.parse(s);
+        const iso = mkIso(v);
+        if (iso){ const p = iso.split('-'); return Date.UTC(+p[0], +p[1] - 1, +p[2]); }
+        const t = Date.parse(String(v || ''));
         return isNaN(t) ? null : t;
     }
     function mkCycDay(c){
@@ -18482,7 +18494,8 @@
                      + (j.data.total != null ? (' z ' + j.data.total) : ' (API nie podaje ile ma być)')
                      + ' · stron ' + (j.data.pages || 1)
                      + ' · przewijanie ' + (j.data.how ? esc(j.data.how) : 'niepotrzebne/nieznane')
-                     + ' · wierszy wypłaty ' + (j.data.pays == null ? '?' : j.data.pays) + '</div>';
+                     + ' · wierszy wypłaty ' + (j.data.pays == null ? '?' : j.data.pays)
+                     + (j.data.cycle ? (' · cykl ' + esc(String(j.data.cycle).slice(0, 8))) : '') + '</div>';
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
