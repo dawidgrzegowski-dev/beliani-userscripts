@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.32
+// @version      2.33
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17691,8 +17691,10 @@
     // musi zawierac 157 wskazujace na konto 1114. Bez tego nie przyjmujemy niczego —
     // zle przypisany bank_setting to przelew zaksiegowany na cudzym koncie.
     const MK_BS_KEY = 'mkt_bank_settings';
-    const MK_BS_TRY = ['/api/bankSettings/', '/api/bankSettings/search/', '/api/bank_settings/',
-                       '/api/bankSetting/', '/api/settings/bankSettings/', '/api/bankSettings/list/'];
+    // Pierwszy adres jest ten wlasciwy — podejrzany z ruchu strony Bank settings.
+    // Reszta zostaje na wypadek, gdyby kiedys sie przesunal.
+    const MK_BS_TRY = ['/api/bankSettings/index/', '/api/bankSettings/', '/api/bankSettings/search/',
+                       '/api/bank_settings/', '/api/bankSetting/', '/api/bankSettings/list/'];
     function bsLoad(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function bsSave(o){ try { GM_setValue(MK_BS_KEY, JSON.stringify(o)); } catch (e){} }
     // Nie znamy ksztaltu odpowiedzi, wiec chodzimy po calym drzewie i zbieramy kazdy
@@ -17702,11 +17704,21 @@
         (function walk(v, d){
             if (!v || typeof v !== 'object' || d > 8) return;
             if (Array.isArray(v)){ v.forEach(function (x){ walk(x, d + 1); }); return; }
-            const id = (v.id != null) ? String(v.id) : '';
-            if (/^\d{1,6}$/.test(id)){
-                const txt = ['name', 'title', 'label', 'account', 'accountNumber', 'account_number', 'bank', 'description']
+            // Nie znamy nazw pol, wiec i identyfikatora szukamy w kilku miejscach,
+            // a opis skladamy ze WSZYSTKICH prostych wartosci obiektu poza samym id.
+            // Wystarczy, ze gdziekolwiek w srodku siedzi numer konta albo jego nazwa.
+            let id = '';
+            ['id', 'bank_setting_id', 'bankSettingId', 'value'].forEach(function (k){
+                if (id) return;
+                const x = v[k];
+                if (x != null && typeof x !== 'object' && /^\d{1,6}$/.test(String(x))) id = String(x);
+            });
+            if (id){
+                const txt = Object.keys(v)
+                    .filter(function (k){ return k !== 'id'; })
                     .map(function (k){ return v[k]; })
-                    .filter(function (x){ return x != null && typeof x !== 'object'; }).join(' ');
+                    .filter(function (x){ return x != null && typeof x !== 'object' && typeof x !== 'function' && String(x) !== ''; })
+                    .join(' ');
                 if (txt.trim()) out[id] = String(txt).replace(/\s+/g, ' ').trim();
             }
             Object.keys(v).forEach(function (k){ walk(v[k], d + 1); });
@@ -17734,7 +17746,9 @@
     async function bsFetch(){
         for (let i = 0; i < MK_BS_TRY.length; i++){
             try {
-                const r = await fetch(MK_BS_TRY[i], { credentials: 'same-origin', headers: { 'accept': 'application/json' } });
+                const r = await fetch(MK_BS_TRY[i], { credentials: 'same-origin', headers: {
+                    'accept': '*/*', 'x-requested-with': 'XMLHttpRequest'   // bez tego API oddaje strone, nie dane
+                } });
                 if (!r.ok) continue;
                 const m = bsFromJson(await r.json());
                 if (bsOk(m)){ bsSave(m); return { map: m, src: MK_BS_TRY[i] }; }
