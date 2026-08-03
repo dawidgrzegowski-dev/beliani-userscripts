@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.50
+// @version      2.52
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18323,54 +18323,65 @@
     // przy drugiej stronie i zapamietujemy ten, ktory faktycznie przesuwa wyniki.
     const MK_PAGE_KEY = 'mkt_page_param';
     const MK_PAGE_TRY = ['nextPageToken', 'pageToken', 'nextToken', 'page_token', 'paginationToken'];
-    function mkSig(list){
-        return list.length + '|' + JSON.stringify(list[0] || null) + '|' + JSON.stringify(list[list.length - 1] || null);
-    }
+    const MK_LIMIT = 100;
     async function mkCycleTx(id){
         const base = '/sellerpayment/private/transactions?search=' + encodeURIComponent(id) +
-                     '&searchType=SHOP_BILLING_CYCLE_ID&limit=100';
+                     '&searchType=SHOP_BILLING_CYCLE_ID&limit=' + MK_LIMIT;
         const all = [], seen = {};
-        let total = null, pages = 0, sig = '', token = '', how = '';
+        let total = null, pages = 0, token = '', how = '', last = 0;
         try { how = String(GM_getValue(MK_PAGE_KEY, '')); } catch (e){}
-        while (pages < 80){
-            pages++;
-            let j, list;
-            if (!token){                                   // pierwsza strona
-                j = await mkApi(base);
-                list = mkArr(j);
-            } else if (how){                               // znany juz sposob
-                j = await mkApi(base + '&' + how + '=' + encodeURIComponent(token));
-                list = mkArr(j);
-                // zapamietana nazwa przestala dzialac — zapominamy ja i szukamy od nowa
-                if (mkSig(list) === sig){ how = ''; try { GM_setValue(MK_PAGE_KEY, ''); } catch (e){} continue; }
-            } else {                                       // szukamy dzialajacego parametru
-                let got = null;
-                for (let t = 0; t < MK_PAGE_TRY.length && !got; t++){
-                    try {
-                        const jj = await mkApi(base + '&' + MK_PAGE_TRY[t] + '=' + encodeURIComponent(token));
-                        const ll = mkArr(jj);
-                        if (ll.length && mkSig(ll) !== sig){ got = { j: jj, l: ll, p: MK_PAGE_TRY[t] }; }
-                    } catch (e){ /* ten wariant odpada */ }
-                }
-                if (!got) break;                           // zadna nazwa nie zadziala — konczymy niekompletnie
-                how = got.p; j = got.j; list = got.l;
-                try { GM_setValue(MK_PAGE_KEY, how); } catch (e){}
-            }
-            if (total == null && j && j.count && j.count.counted != null) total = j.count.counted;
-            if (!list.length) break;
-            sig = mkSig(list);
-            let added = 0;
+
+        function addAll(list){
+            let n = 0;
             list.forEach(function (x){
                 const k = x.id || x.uuid || x.transactionId || x.transactionNumber || JSON.stringify(x);
                 if (seen[k]) return;
-                seen[k] = 1; all.push(x); added++;
+                seen[k] = 1; all.push(x); n++;
             });
-            const next = j && j.nextPageToken;
-            // brak nowych wierszy = strona sie powtorzyla, dalej nie ma po co isc
-            if (!next || !added || (total != null && all.length >= total)) break;
-            token = next;
+            return n;
         }
-        return { list: all, total: (total == null ? all.length : total), pages: pages, how: how };
+        async function grab(u){
+            const j = await mkApi(u);
+            if (total == null && j && j.count && j.count.counted != null) total = j.count.counted;
+            return { j: j, list: mkArr(j) };
+        }
+
+        const first = await grab(base);
+        pages = 1; last = first.list.length;
+        addAll(first.list);
+        token = (first.j && first.j.nextPageToken) || '';
+
+        // Dopoki strona przychodzi PELNA, zakladamy ze jest dalszy ciag — nawet gdy
+        // odpowiedz nie mowi, ile pozycji ma cykl. Home24 nie podaje count.counted,
+        // wiec bez tego zalozenia moduł uznalby pierwsza setke z 599 wierszy za komplet.
+        while (pages < 80 && last >= MK_LIMIT){
+            const tries = [];
+            if (how === 'offset') tries.push({ p: 'offset', u: base + '&offset=' + all.length });
+            else if (how && token) tries.push({ p: how, u: base + '&' + how + '=' + encodeURIComponent(token) });
+            if (token) MK_PAGE_TRY.forEach(function (p){ if (p !== how) tries.push({ p: p, u: base + '&' + p + '=' + encodeURIComponent(token) }); });
+            if (how !== 'offset') tries.push({ p: 'offset', u: base + '&offset=' + all.length });
+
+            let got = null;
+            for (let i = 0; i < tries.length && !got; i++){
+                try {
+                    const rr = await grab(tries[i].u);
+                    // Powtorzona strona nie wniesie nic nowego — odsiew po identyfikatorze
+                    // zalatwia rozpoznanie, ktory wariant naprawde przesuwa wyniki.
+                    if (addAll(rr.list) > 0) got = { r: rr, p: tries[i].p };
+                } catch (e){ /* ten wariant odpada */ }
+            }
+            if (!got) break;                               // nie umiem przewinac dalej
+            if (how !== got.p){ how = got.p; try { GM_setValue(MK_PAGE_KEY, how); } catch (e){} }
+            pages++;
+            last = got.r.list.length;
+            token = (got.r.j && got.r.j.nextPageToken) || token;
+            if (total != null && all.length >= total) break;
+        }
+
+        // Komplet mamy, gdy albo zgadza sie z deklarowana liczba, albo ostatnia strona
+        // przyszla niepelna. Pelna strona i brak sposobu na dalej = NIE WIEMY, czyli niekomplet.
+        const full = (total != null) ? (all.length >= total) : (last < MK_LIMIT);
+        return { list: all, total: total, full: full, pages: pages, how: how };
     }
 
     // ================= UI =================
@@ -18750,6 +18761,15 @@
         });
         const keys = Object.keys(rows).sort();
         const bs = bsLoad(), bsN = Object.keys(bs).length;
+        const bsKeys = Object.keys(bs).sort(function (a, b){ return (Number(a) || 0) - (Number(b) || 0); });
+        function bankSel(val, hl){
+            let o = '<option value="">— wybierz —</option>';
+            bsKeys.forEach(function (k){
+                o += '<option value="' + esc(k) + '"' + (String(val || '') === k ? ' selected' : '') + '>'
+                   + esc(k + ' — ' + String(bs[k]).slice(0, 70)) + '</option>';
+            });
+            return '<select class="mk-s-bank" style="font-size:11px;max-width:240px' + (hl ? ';background:#fef9c3' : '') + '">' + o + '</select>';
+        }
         let h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
               + '<b style="font-size:11px;color:#5b21b6">Konta i ustawienia importu</b>'
               + '<span style="display:flex;gap:6px">'
@@ -18788,7 +18808,11 @@
                 if (sug) sugN++;
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
-                  +  '<td style="padding:3px 4px"><input class="mk-s-bank" value="' + esc(c.bank || sug) + '" style="width:64px;font-size:11px' + (sug ? ';background:#fef9c3' : '') + '" placeholder="np. 157"' + (sug ? ' title="podpowiedź z listy Bank settings — sprawdź i zapisz"' : '') + '></td>'
+                  // Gdy mamy wykaz Bank settings, dajemy go do wyboru zamiast kazac
+                  // wpisywac numer z pamieci. Dopasowanie po nazwie bywa zawodne, a lista
+                  // jest pewna — wybierasz i widzisz, co wybierasz.
+                  +  '<td style="padding:3px 4px">' + (bsN ? bankSel(c.bank || sug, sug && !c.bank)
+                        : ('<input class="mk-s-bank" value="' + esc(c.bank || sug) + '" style="width:64px;font-size:11px' + (sug ? ';background:#fef9c3' : '') + '" placeholder="np. 157">')) + '</td>'
                   +  '<td style="padding:3px 4px"><input class="mk-s-book" value="' + esc(c.booking || '9') + '" style="width:40px;font-size:11px"></td>'
                   +  '<td style="padding:3px 4px"><select class="mk-s-acct" style="font-size:11px;width:250px">' + opt + '</select></td>'
                   +  '<td style="padding:3px 4px;white-space:nowrap;color:' + (c.bank ? '#0a7a2f' : (sug ? '#a16207' : '#c47f00')) + '">'
@@ -18806,7 +18830,7 @@
                     m0.style.color = sugN ? '#a16207' : '#c47f00';
                     m0.textContent = sugN
                         ? ('podpowiedzi: ' + sugN + ' z ' + keys.length + ' — sprawdź i zapisz')
-                        : ('mam ' + bsN + ' pozycji Bank settings, ale żadnej nie umiem jednoznacznie przypisać');
+                        : ('mam ' + bsN + ' pozycji Bank settings — wybierz z listy w kolumnie bank_setting');
                 }
             }
             box.querySelector('#mk-set-save').onclick = function(){
@@ -18934,7 +18958,7 @@
                     // zaden typ nierozpoznany i raport domykajacy sie sam. Kazdy z tych
                     // brakow oznacza, ze ktoregos zamowienia mogloby zabraknac w kwocie —
                     // a to blad ksiegowy, nie kosmetyka.
-                    const full = (tx.total <= tx.list.length);
+                    const full = tx.full;
                     const unk = Object.keys(a.unknown).length;
                     j.data = { cycle: cyc.id, shop: shopName, gross: gross, refund: refund, net: net,
                                netOk: full && eq(net, j.amount), ord: a.ord, ref: a.ref,
@@ -18945,7 +18969,9 @@
                     // kasujemy uwage z poprzedniego przebiegu i zaznaczamy, jesli cykl
                     // zostal dobrany po dacie, a nie po numerze z przelewu
                     j.note = byRef ? '' : 'cykl dobrany po dacie — rozliczenie nie zawiera numeru z przelewu';
-                    if (!full) bad.push('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji');
+                    if (!full) bad.push(tx.total != null
+                        ? ('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji')
+                        : ('pobrano ' + tx.list.length + ' pozycji i nie umiem przewinąć dalej — to nie musi być komplet'));
                     if (unk) bad.push('nierozpoznane typy pozycji');
                     if (a.pays.length > 1 && !split) bad.push('cykl ma ' + a.pays.length + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
                     if (a.pays.length > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + a.pays.length + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
