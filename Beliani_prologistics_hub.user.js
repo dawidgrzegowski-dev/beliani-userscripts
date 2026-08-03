@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.29
+// @version      2.30
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17807,17 +17807,23 @@
         return { k: 'unknown', ref: ref };
     }
     // brutto = Order amount + Order amount tax + Shipping charges + Shipping tax
-    function mkAggregate(data){
-        const ord = {}, ref = {}, unknown = {}, skipped = {};
-        // „comp" to suma wszystkich pozycji BEZ wiersza Payment — czyli to, co powinno wyjsc
+    function mkPayRef(x){ return String((x && x.paymentReference) || ''); }
+    // Cykl potrafi miec WIECEJ NIZ JEDNA wyplate. Pierwsza wersja zapamietywala tylko
+    // ostatni wiersz PAYMENT i wtedy kontrola spojnosci nie wychodzila — przy VEN291389
+    // dokladnie o te druga wyplate: skladniki 3617.29 vs zapamietane 3604.26, czyli 13.03.
+    // Teraz zbieramy wszystkie, a do porownania z wyciagiem bierzemy te, ktorej odnosnik
+    // zgadza sie z przelewem.
+    function mkAggregate(data, wantRef){
+        const ord = {}, ref = {}, unknown = {}, skipped = {}, pays = [];
+        // „comp" to suma wszystkich pozycji BEZ wierszy Payment — czyli to, co powinno wyjsc
         // na konto. Gdyby liczyc razem z Payment, wynik zawsze bylby zerem (sprawdzone:
         // skladniki +694.52, Payment -694.52), a sciezka zapasowa dla cykli jeszcze bez
         // wiersza wyplaty pokazywalaby 0.00 zamiast prawdziwej kwoty.
-        let comp = 0, pay = null;
+        let comp = 0;
         (data || []).forEach(function (x){
             const a = Number(x.amount) || 0;
             const c = mkCls(x.type);
-            if (c.k === 'payment') { pay = a; return; }
+            if (c.k === 'payment') { pays.push({ a: a, r: mkPayRef(x) }); return; }
             comp = r2(comp + a);
             if (c.k === 'unknown') { unknown[x.type] = (unknown[x.type] || 0) + 1; return; }
             if (c.k !== 'gross') { skipped[x.type] = (skipped[x.type] || 0) + 1; return; }
@@ -17825,7 +17831,14 @@
             if (!id) return;
             if (c.ref) ref[id] = r2((ref[id] || 0) + a); else ord[id] = r2((ord[id] || 0) + a);
         });
-        return { ord: ord, ref: ref, unknown: unknown, skipped: skipped, comp: comp, pay: pay };
+        let payAll = 0;
+        pays.forEach(function (p){ payAll = r2(payAll + p.a); });
+        // Do zestawienia z wyciagiem bierzemy wyplate o pasujacym odnosniku; przy jednej
+        // wyplacie nie ma czego wybierac.
+        let pay = null;
+        if (wantRef){ const m = pays.filter(function (p){ return p.r.indexOf(wantRef) >= 0; }); if (m.length === 1) pay = m[0].a; }
+        if (pay == null && pays.length === 1) pay = pays[0].a;
+        return { ord: ord, ref: ref, unknown: unknown, skipped: skipped, comp: comp, pay: pay, pays: pays, payAll: payAll };
     }
 
     // ===== plik do importu — 1:1 z tym, co robi dzisiejsza aplikacja =====
@@ -18112,6 +18125,8 @@
                 if (j.data.unknown && Object.keys(j.data.unknown).length) det += ' · <b style="color:#c00">nierozpoznane typy: ' + esc(Object.keys(j.data.unknown).join(', ')) + '</b>';
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
+                if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
+                if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
                 if (j.msg) det += '<div style="color:#c47f00">' + esc(j.msg) + '</div>';
             }
             h += '<tr style="border-top:1px solid #eee">'
@@ -18199,10 +18214,13 @@
               + '<button id="mk-acc-rel" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">↻ Odśwież plan kont (' + acc.length + ')</button></div>';
         if (!keys.length){ box.innerHTML = h + '<div style="color:#888;font-size:11px">Brak sklepów — najpierw pobierz rozliczenie na Miraklu.</div>'; }
         else {
-            h += '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+            // Kolejnosc kolumn nie jest przypadkowa: bank_setting to jedyne pole, ktore
+            // blokuje import, wiec stoi zaraz obok nazwy sklepu. Szeroka lista kont idzie
+            // na koniec — gdy zabraknie miejsca, to ona ucieka za krawedz, a nie ona.
+            h += '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px">'
               +  '<tr style="color:#999;font-size:10px"><td style="padding:2px 4px">Marketplace · sklep</td>'
-              +  '<td style="padding:2px 4px">Konto</td><td style="padding:2px 4px">bank_setting</td>'
-              +  '<td style="padding:2px 4px">booking</td><td></td></tr>';
+              +  '<td style="padding:2px 4px">bank_setting</td><td style="padding:2px 4px">booking</td>'
+              +  '<td style="padding:2px 4px">Konto (informacyjnie)</td><td></td></tr>';
             keys.forEach(function (k, i){
                 const c = rows[k];
                 const cur = acc.filter(function (a){ return a.n === String(c.acct || ''); })[0];
@@ -18213,14 +18231,16 @@
                 });
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
-                  +  '<td style="padding:3px 4px"><select class="mk-s-acct" style="font-size:11px;max-width:280px">' + opt + '</select></td>'
-                  +  '<td style="padding:3px 4px"><input class="mk-s-bank" value="' + esc(c.bank || '') + '" style="width:60px;font-size:11px" placeholder="np. 157"></td>'
+                  +  '<td style="padding:3px 4px"><input class="mk-s-bank" value="' + esc(c.bank || '') + '" style="width:64px;font-size:11px" placeholder="np. 157"></td>'
                   +  '<td style="padding:3px 4px"><input class="mk-s-book" value="' + esc(c.booking || '9') + '" style="width:40px;font-size:11px"></td>'
-                  +  '<td style="padding:3px 4px;color:' + (c.bank ? '#0a7a2f' : '#c47f00') + '">' + (c.bank ? '✓' : 'brak bank_setting') + '</td></tr>';
+                  +  '<td style="padding:3px 4px"><select class="mk-s-acct" style="font-size:11px;width:250px">' + opt + '</select></td>'
+                  +  '<td style="padding:3px 4px;white-space:nowrap;color:' + (c.bank ? '#0a7a2f' : '#c47f00') + '">' + (c.bank ? '✓' : 'brak bank_setting') + '</td></tr>';
                 void i; void cur;
             });
-            h += '</table><div style="margin-top:6px"><button id="mk-set-save" style="padding:4px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">Zapisz</button>'
-              +  ' <span style="font-size:10px;color:#888">bank_setting to identyfikator konta w imporcie — nie numer konta. Vente DE = 157.</span></div>';
+            h += '</table></div><div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              +  '<button id="mk-set-save" type="button" style="padding:5px 14px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">Zapisz</button>'
+              +  '<span id="mk-set-msg" style="font-size:11px;color:#0a7a2f"></span>'
+              +  '<span style="font-size:10px;color:#888">bank_setting to identyfikator konta w imporcie — nie numer konta. Vente DE = 157.</span></div>';
             box.innerHTML = h;
             box.querySelector('#mk-set-save').onclick = function(){
                 const out = {};
@@ -18231,7 +18251,14 @@
                         booking: tr.querySelector('.mk-s-book').value.trim() || '9'
                     };
                 });
-                setSave(out); renderSet(); say('Ustawienia zapisane.', '#0a7a2f');
+                setSave(out);
+                const n = Object.keys(out).filter(function (x){ return out[x].bank; }).length;
+                renderSet();
+                // potwierdzenie tuz przy guziku — pasek stanu bywa poza widokiem
+                const m = box.querySelector('#mk-set-msg');
+                if (m) m.textContent = '✓ zapisane (' + n + ' z ' + Object.keys(out).length + ' ma bank_setting)';
+                say('Ustawienia zapisane.', '#0a7a2f');
+                render();
             };
         }
         const rel = box.querySelector('#mk-acc-rel');
@@ -18260,14 +18287,23 @@
                 say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
                 try {
                     const tx = await mkCycleTx(cyc.id);
-                    const a = mkAggregate(tx.list);
+                    let a = mkAggregate(tx.list, j.ref), split = false;
+                    // Cykl z kilkoma wyplatami: jesli pozycje niosa odnosnik do wyplaty,
+                    // bierzemy tylko te z naszego przelewu. Jesli nie niosa — nie zgadujemy.
+                    if (a.pays.length > 1 && j.ref){
+                        const sub = tx.list.filter(function (x){ return mkPayRef(x).indexOf(j.ref) >= 0; });
+                        if (sub.length){ a = mkAggregate(sub, j.ref); split = true; }
+                    }
                     let gross = 0; Object.keys(a.ord).forEach(function (k){ gross = r2(gross + a.ord[k]); });
                     let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
                     // Netto rozliczenia = wiersz Payment (a gdy go jeszcze nie ma —
                     // suma skladnikow). To ono ma sie zgadzac z kwota z wyciagu.
                     const net = (a.pay != null) ? Math.abs(a.pay) : a.comp;
-                    // Kontrola spojnosci samego raportu: skladniki + Payment musza dac zero.
-                    const selfOk = (a.pay == null) || eq(r2(a.comp + a.pay), 0);
+                    // Kontrola spojnosci: skladniki + WSZYSTKIE wyplaty musza dac zero.
+                    const selfOk = !a.pays.length || eq(r2(a.comp + a.payAll), 0);
+                    // Zamowienie rozliczone i zwrocone w tym samym cyklu — pieniadze sie
+                    // znosza, wiec warto o tym wiedziec przed importem.
+                    const both = Object.keys(a.ord).filter(function (k){ return a.ref[k] != null; });
                     // Do importu wpuszczamy WYLACZNIE komplet: wszystkie pozycje pobrane,
                     // zaden typ nierozpoznany i raport domykajacy sie sam. Kazdy z tych
                     // brakow oznacza, ze ktoregos zamowienia mogloby zabraknac w kwocie —
@@ -18277,12 +18313,17 @@
                     j.data = { cycle: cyc.id, shop: shopName, gross: gross, refund: refund, net: net,
                                netOk: full && eq(net, j.amount), ord: a.ord, ref: a.ref,
                                unknown: a.unknown, skipped: a.skipped, full: full,
+                               both: both, pays: a.pays.length, split: split,
                                rows: tx.list.length, total: tx.total };
                     const bad = [];
+                    j.note = '';                          // kasujemy uwage z poprzedniego przebiegu
                     if (!full) bad.push('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji');
                     if (unk) bad.push('nierozpoznane typy pozycji');
-                    if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłata ' + f2(a.pay));
-                    if (full && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+                    if (a.pays.length > 1 && !split) bad.push('cykl ma ' + a.pays.length + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
+                    if (a.pays.length > 1 && split) j.note = 'cykl ma ' + a.pays.length + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
+                    if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłaty ' + f2(a.payAll));
+                    if (a.pays.length && a.pay == null) bad.push('nie wiem, która z wypłat odpowiada temu przelewowi');
+                    if (full && a.pay != null && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
                     j.status = bad.length ? 'partial' : 'ready';
                     j.msg = bad.join('; ');
                     ok++;
