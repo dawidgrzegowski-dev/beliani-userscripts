@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.25
+// @version      2.26
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17792,27 +17792,68 @@
     }
 
     // ================= POLOWA NA MIRAKLU =================
+    // Token XSRF czytamy z ciasteczka, nie ze znacznika <meta>. Po przelaczeniu sklepu
+    // przez fetch strona sie NIE przeladowuje, wiec meta zostaje stary — ciasteczko jest
+    // zawsze aktualne. Meta sluzy tylko jako awaryjne zrodlo.
+    function mkXsrf(){
+        const m = String(document.cookie || '').match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+        if (m) { try { return decodeURIComponent(m[1]); } catch (e){ return m[1]; } }
+        const t = document.querySelector('meta[name="_csrf"]');
+        return t ? t.getAttribute('content') : '';
+    }
     async function mkApi(path){
-        const meta = document.querySelector('meta[name="_csrf"]');
-        const tok = meta ? meta.getAttribute('content') : '';
         const r = await fetch(path, { credentials: 'same-origin', headers: {
             'accept': 'application/json, text/plain, */*',
             'x-requested-with': 'XMLHttpRequest',
-            'x-xsrf-token': tok || ''
+            'x-xsrf-token': mkXsrf()
         } });
         if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + path.split('?')[0]);
         return r.json();
     }
     function mkArr(j){ return (j && Array.isArray(j.data)) ? j.data : (Array.isArray(j) ? j : []); }
     async function mkShop(){ try { const j = await mkApi('/sellerpayment/private/shops/current'); return j || {}; } catch (e){ return {}; } }
-    async function mkFindCycle(ref){
-        const j = await mkApi('/sellerpayment/private/shop-billing-cycles?limit=100&sort=dateCreated%2CDESC');
-        const list = mkArr(j);
+    async function mkCycles(){
+        return mkArr(await mkApi('/sellerpayment/private/shop-billing-cycles?limit=100&sort=dateCreated%2CDESC'));
+    }
+    function mkMatchCycle(list, ref){
         for (let i = 0; i < list.length; i++){
-            const c = list[i], r = (c.payOut && c.payOut.reference) || '';
-            if (String(r).indexOf(ref) >= 0) return c;
+            const r = (list[i].payOut && list[i].payOut.reference) || '';
+            if (String(r).indexOf(ref) >= 0) return list[i];
         }
         return null;
+    }
+
+    // --- przelaczanie sklepow ---
+    // Sesja jest przypieta do jednego sklepu, wiec cykle innych sklepow sa niewidoczne.
+    // Zmiana sklepu to zwykly GET /switch-shop/<uid> — bez tokena i bez tresci.
+    // Identyfikatory bierzemy ze strony: przelacznik w naglowku podciaga logo kazdego
+    // sklepu (/mmp/media/shop-logo/<uid>), a same odnosniki maja /switch-shop/<uid>.
+    // Zapamietujemy je, bo menu bywa doladowywane dopiero po rozwinieciu.
+    const MK_SHOPS_KEY = 'mkt_shop_ids';
+    function mkShopIds(){
+        const seen = {}, ids = [];
+        const h = document.documentElement ? document.documentElement.innerHTML : '';
+        const re = /(?:switch-shop|shop-logo)\/(\d+)/g;
+        let m;
+        while ((m = re.exec(h))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
+        let old = [];
+        try { old = JSON.parse(GM_getValue(MK_SHOPS_KEY, '[]')) || []; } catch (e){}
+        old.forEach(function (x){ if (!seen[x]) { seen[x] = 1; ids.push(x); } });
+        if (ids.length) { try { GM_setValue(MK_SHOPS_KEY, JSON.stringify(ids)); } catch (e){} }
+        return ids;
+    }
+    // Sklep, na ktorym zaczynamy — zdejmowany z HTML-a PRZED jakimkolwiek przelaczaniem,
+    // zeby bylo dokad wrocic.
+    function mkCurShopId(){
+        const h = document.documentElement ? document.documentElement.innerHTML : '';
+        const m = h.match(/"currentShopUUID"\s*:\s*"?(\d+)"?/);
+        return m ? m[1] : '';
+    }
+    const MK_HOME = onMirakl ? mkCurShopId() : '';
+    async function mkSwitch(uid){
+        const r = await fetch('/switch-shop/' + encodeURIComponent(uid), { credentials: 'same-origin', redirect: 'follow' });
+        if (!r.ok) throw new Error('switch-shop ' + uid + ' → HTTP ' + r.status);
+        return true;
     }
     async function mkCycleTx(id){
         const j = await mkApi('/sellerpayment/private/transactions?search=' + encodeURIComponent(id) +
@@ -17843,9 +17884,10 @@
               + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
               + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
-            : '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Dla każdego znajdę cykl rozliczeniowy po referencji z przelewu, pobiorę pozycje i policzę kwoty brutto per zamówienie.</div>'
+            : '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Dla każdego znajdę cykl rozliczeniowy po referencji z przelewu, pobiorę pozycje i policzę kwoty brutto per zamówienie. Sesja Mirakla widzi naraz tylko jeden sklep — „wszystkie sklepy" przełącza je po kolei i na koniec wraca tam, gdzie zacząłeś.</div>'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-              + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz rozliczenia</button>'
+              + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz z tego sklepu</button>'
+              + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">🔄 Przeleć wszystkie sklepy</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>')
       +   '<div id="mk-out" style="margin-top:12px"></div>'
       + '</div>';
@@ -17939,45 +17981,94 @@
 
     // ---------- Mirakl: pobranie rozliczen ----------
     if (onMirakl){
+        // Jedno przejscie po aktualnie ustawionym sklepie. Liste cykli pobieramy RAZ
+        // i dopasowujemy do niej wszystkie czekajace referencje — inaczej przy 13 sklepach
+        // i 7 zleceniach bylo by 91 zapytan zamiast 13.
+        async function mkPass(jobs, shopName){
+            let cycles;
+            try { cycles = await mkCycles(); }
+            catch (e){ say('Nie mogę pobrać listy cykli: ' + ((e && e.message) || e), '#c00'); return 0; }
+            const todo = Object.keys(jobs).filter(function (k){ return jobs[k].status === 'new' && jobs[k].ref; });
+            let ok = 0;
+            for (let i = 0; i < todo.length; i++){
+                const j = jobs[todo[i]];
+                const cyc = mkMatchCycle(cycles, j.ref);
+                if (!cyc) continue;
+                say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
+                try {
+                    const tx = await mkCycleTx(cyc.id);
+                    const a = mkAggregate(tx.list);
+                    let gross = 0; Object.keys(a.ord).forEach(function (k){ gross = r2(gross + a.ord[k]); });
+                    let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
+                    // Netto rozliczenia = wiersz Payment (a gdy go jeszcze nie ma —
+                    // suma skladnikow). To ono ma sie zgadzac z kwota z wyciagu.
+                    const net = (a.pay != null) ? Math.abs(a.pay) : a.comp;
+                    // Kontrola spojnosci samego raportu: skladniki + Payment musza dac zero.
+                    const selfOk = (a.pay == null) || eq(r2(a.comp + a.pay), 0);
+                    j.data = { cycle: cyc.id, shop: shopName, gross: gross, refund: refund, net: net,
+                               netOk: eq(net, j.amount), ord: a.ord, ref: a.ref, unknown: a.unknown,
+                               rows: tx.list.length, total: tx.total };
+                    j.status = 'ready';
+                    j.msg = (tx.total > tx.list.length) ? ('UWAGA: pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji') : '';
+                    if (!selfOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłata ' + f2(a.pay);
+                    if (!j.data.netOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu';
+                    ok++;
+                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                jobsSave(jobs); render();
+            }
+            return ok;
+        }
+        function mkLeft(jobs){ return Object.keys(jobs).filter(function (k){ return jobs[k].status === 'new' && jobs[k].ref; }).length; }
+        async function mkShopName(){ const s = await mkShop(); return String(s.name || s.shopName || ''); }
+
         $('#mk-run').onclick = async function(){
             const b = this; b.disabled = true;
             try {
-                const shop = await mkShop();
-                const shopName = String(shop.name || shop.shopName || '');
-                say('Sklep: ' + (shopName || '(nieznany)') + ' — szukam cykli…');
                 const jobs = jobsLoad();
-                const todo = Object.keys(jobs).filter(function (k){ return jobs[k].status === 'new' && jobs[k].ref; });
-                if (!todo.length){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-                let ok = 0, miss = 0;
-                for (let i = 0; i < todo.length; i++){
-                    const j = jobs[todo[i]];
-                    say('Pobieram ' + (i + 1) + '/' + todo.length + ' — ' + j.ref + '…');
-                    try {
-                        const cyc = await mkFindCycle(j.ref);
-                        if (!cyc){ j.msg = 'nie znalazłem cyklu z tą referencją na tym sklepie' + (shopName ? (' (' + shopName + ')') : ''); miss++; continue; }
-                        const tx = await mkCycleTx(cyc.id);
-                        const a = mkAggregate(tx.list);
-                        let gross = 0; Object.keys(a.ord).forEach(function (k){ gross = r2(gross + a.ord[k]); });
-                        let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
-                        // Netto rozliczenia = wiersz Payment (a gdy go jeszcze nie ma —
-                        // suma skladnikow). To ono ma sie zgadzac z kwota z wyciagu.
-                        const net = (a.pay != null) ? Math.abs(a.pay) : a.comp;
-                        // Kontrola spojnosci samego raportu: skladniki + Payment musza dac zero.
-                        const selfOk = (a.pay == null) || eq(r2(a.comp + a.pay), 0);
-                        j.data = { cycle: cyc.id, shop: shopName, gross: gross, refund: refund, net: net,
-                                   netOk: eq(net, j.amount), ord: a.ord, ref: a.ref, unknown: a.unknown,
-                                   rows: tx.list.length, total: tx.total };
-                        j.status = 'ready';
-                        j.msg = (tx.total > tx.list.length) ? ('UWAGA: pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji') : '';
-                        if (!selfOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłata ' + f2(a.pay);
-                        if (!j.data.netOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu';
-                        ok++;
-                    } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
-                    jobsSave(jobs); render();
-                }
-                say('Gotowe: pobranych ' + ok + (miss ? (', nieznalezionych na tym sklepie ' + miss + ' — otwórz właściwy sklep Mirakla') : '') + '.', miss ? '#c47f00' : '#0a7a2f');
+                if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+                const nm = await mkShopName();
+                const ok = await mkPass(jobs, nm);
+                const left = mkLeft(jobsLoad());
+                say('Sklep ' + (nm || '?') + ': pobranych ' + ok + (left ? (', zostało ' + left + ' na innych sklepach — użyj „Przeleć wszystkie sklepy"') : '') + '.', left ? '#c47f00' : '#0a7a2f');
             } catch (e){ say('Błąd: ' + ((e && e.message) || e), '#c00'); }
             finally { b.disabled = false; render(); }
+        };
+
+        $('#mk-all').onclick = async function(){
+            const b = this, b2 = $('#mk-run');
+            let jobs = jobsLoad();
+            if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const ids = mkShopIds();
+            if (!ids.length){ say('Nie widzę listy sklepów — rozwiń przełącznik sklepu w nagłówku Mirakla i kliknij ponownie.', '#c47f00'); return; }
+            if (!MK_HOME) { if (!confirm('Nie rozpoznałem, na którym sklepie jesteś, więc po zakończeniu nie wrócę na niego sam — przełączysz się ręcznie.\n\nKontynuować?')) return; }
+            if (!confirm('Przelecieć ' + ids.length + ' sklepów w poszukiwaniu ' + mkLeft(jobs) + ' rozliczeń?\n\n'
+                + 'Moduł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.\n'
+                + (MK_HOME ? 'Na koniec wrócę na sklep, od którego zacząłeś.' : ''))) return;
+            b.disabled = true; if (b2) b2.disabled = true;
+            let ok = 0, seen = 0;
+            try {
+                for (let i = 0; i < ids.length; i++){
+                    jobs = jobsLoad();
+                    if (!mkLeft(jobs)) break;                 // wszystko znalezione — nie ma po co isc dalej
+                    say('Sklep ' + (i + 1) + '/' + ids.length + ' — przełączam…');
+                    try { await mkSwitch(ids[i]); } catch (e){ continue; }
+                    seen++;
+                    const nm = await mkShopName();
+                    ok += await mkPass(jobs, nm);
+                }
+            } catch (e){ say('Błąd: ' + ((e && e.message) || e), '#c00'); }
+            finally {
+                // Powrot do sklepu wyjsciowego takze po bledzie — inaczej zostawilbym
+                // sesje na przypadkowym sklepie, a strona nadal pokazywalaby stary.
+                if (MK_HOME){ try { await mkSwitch(MK_HOME); } catch (e){} }
+                b.disabled = false; if (b2) b2.disabled = false;
+                render();
+                const left = mkLeft(jobsLoad());
+                say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
+                    + (left ? (', nieznalezionych ' + left) : '')
+                    + (MK_HOME ? '. Wróciłem na sklep wyjściowy — odśwież stronę, żeby zgadzała się z tym, co widzisz.' : '.'),
+                    left ? '#c47f00' : '#0a7a2f');
+            }
         };
     }
 
