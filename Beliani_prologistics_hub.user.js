@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.36
+// @version      2.37
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18216,6 +18216,7 @@
               + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz z tego sklepu</button>'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">🔄 Przeleć wszystkie sklepy</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>')
+      +   '<div id="mk-prog" style="display:none;margin-top:10px;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px"></div>'
       +   '<div id="mk-out" style="margin-top:12px"></div>'
       + '</div>';
 
@@ -18421,12 +18422,45 @@
         if (kp) kp.style.display = 'block';        // widoczny, zebys mogl patrzec na postep
         return '';
     }
+    // Podglad postepu. Tamten modul loguje kazdy krok do #tm-t-progress-list, a licznik
+    // do #tm-t-summary — przepisujemy je na zywo do siebie, zeby nie trzeba bylo skakac
+    // miedzy panelami. Czytamy tylko; nic tam nie zmieniamy.
+    let _mirIv = null;
+    function ksMirror(label, want){
+        const box = document.getElementById('mk-prog');
+        if (!box) return;
+        if (_mirIv){ clearInterval(_mirIv); _mirIv = null; }
+        if (label === null) return;                 // koniec — ostatni stan zostaje na ekranie
+        box.style.display = 'block';
+        const draw = function (){
+            const sum = document.getElementById('tm-t-summary');
+            const lst = document.getElementById('tm-t-progress-list');
+            const ds = lst ? lst.querySelectorAll('div') : [];
+            let h = '<div style="font-size:11px;font-weight:700;color:#5b21b6;margin-bottom:3px">'
+                  + esc(label) + ' <span style="font-weight:400;color:#666">· pozycji ' + want + '</span></div>';
+            if (sum && String(sum.innerHTML).trim()) h += '<div style="font-size:11px;margin-bottom:4px">' + sum.innerHTML + '</div>';
+            if (ds.length){
+                const from = Math.max(0, ds.length - 6);
+                let rows = '';
+                for (let i = from; i < ds.length; i++) rows += '<div style="padding:1px 0;border-top:1px solid #eef2f7">' + ds[i].innerHTML + '</div>';
+                h += (from ? '<div style="font-size:10px;color:#94a3b8">… wcześniejsze ' + from + ' linii w panelu ticketa</div>' : '')
+                   + '<div style="font-size:10px;color:#374151">' + rows + '</div>';
+            } else {
+                h += '<div style="font-size:11px;color:#888">czekam na start tamtego modułu…</div>';
+            }
+            box.innerHTML = h;
+        };
+        draw();
+        _mirIv = setInterval(draw, 500);
+    }
     async function bookRefunds(x){
         const err = ksFill(x);
         if (err){ say(err, '#c47f00'); return err; }
         say('Księguję zwroty: ' + x.rows.length + ' poz. na ' + f2(x.sum) + ', konto ' + x.acct + '…');
+        ksMirror(x.date + ' · konto ' + x.acct + (x.accNm ? (' — ' + x.accNm) : ''), x.rows.length);
         ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
         const r = await ksWait(ksBtn());
+        ksMirror(null);
         return r === 'ok' ? '' : r;
     }
     async function bookAllRefunds(b){
