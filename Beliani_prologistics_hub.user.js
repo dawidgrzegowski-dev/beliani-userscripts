@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.33
+// @version      2.34
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17762,11 +17762,36 @@
         return { map: null, src: '' };
     }
     // Podpowiadamy bank_setting tylko wtedy, gdy DOKLADNIE JEDEN wpis wskazuje na to konto.
-    function bsGuess(acct, map){
-        if (!acct) return '';
-        const re = new RegExp('\\b' + acct + '\\b');
-        const hit = Object.keys(map || {}).filter(function (k){ return re.test(map[k]); });
+    // Wykaz Bank settings pokazuje NAZWY kont, a nie ich numery — samo szukanie „1114"
+    // nie znajdowalo nic poza kotwica. Dlatego probujemy po kolei trzech tropow, od
+    // najpewniejszego, i za kazdym razem wymagamy jednego trafienia.
+    function bsNorm(s){ return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim(); }
+    // Dopasowujemy po CALYCH slowach, nie po zwyklym podciagu: „vente unique be" siedzi
+    // w „Vente Unique Beliani Swizterland GmbH" i bez tego Belgia przykleilaby sie
+    // do konta szwajcarskiego.
+    function bsPick(keys, map, needle){
+        if (!needle || needle.length < 6) return '';
+        const n = ' ' + needle + ' ';
+        const hit = keys.filter(function (k){ return (' ' + bsNorm(map[k]) + ' ').indexOf(n) >= 0; });
         return hit.length === 1 ? hit[0] : '';
+    }
+    function bsGuess(acct, map, accList){
+        if (!acct) return '';
+        const keys = Object.keys(map || {});
+        if (!keys.length) return '';
+        // 1) numer konta, jesli wykaz w ogole go podaje
+        const re = new RegExp('\\b' + acct + '\\b');
+        const byNo = keys.filter(function (k){ return re.test(map[k]); });
+        if (byNo.length === 1) return byNo[0];
+        const a = (accList || []).filter(function (x){ return x.n === String(acct); })[0];
+        if (!a) return '';
+        // 2) pelna nazwa konta z planu kont
+        const nm = bsNorm(a.nm);
+        const byName = bsPick(keys, map, nm);
+        if (byName) return byName;
+        // 3) sam poczatek nazwy do kodu kraju: „vente unique de"
+        const m = nm.match(/^(.*?\b[a-z]{2}\b)/);
+        return m ? bsPick(keys, map, m[1]) : '';
     }
 
     // Sklep na Miraklu nazywa sie „Beliani DE", a konto w prologistics „Vente Unique DE
@@ -18326,6 +18351,7 @@
               +  '<tr style="color:#999;font-size:10px"><td style="padding:2px 4px">Marketplace · sklep</td>'
               +  '<td style="padding:2px 4px">bank_setting</td><td style="padding:2px 4px">booking</td>'
               +  '<td style="padding:2px 4px">Konto (informacyjnie)</td><td></td></tr>';
+            let sugN = 0;
             keys.forEach(function (k, i){
                 const c = rows[k];
                 const cur = acc.filter(function (a){ return a.n === String(c.acct || ''); })[0];
@@ -18335,7 +18361,8 @@
                     opt += '<option value="' + esc(a.n) + '"' + (a.n === String(c.acct || '') ? ' selected' : '') + '>' + esc(a.n + ' — ' + a.nm) + '</option>';
                 });
                 // podpowiedz tylko gdy jednoznaczna; do zapisu i tak potrzebne klikniecie
-                const sug = c.bank ? '' : bsGuess(c.acct, bs);
+                const sug = c.bank ? '' : bsGuess(c.acct, bs, acc);
+                if (sug) sugN++;
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
                   +  '<td style="padding:3px 4px"><input class="mk-s-bank" value="' + esc(c.bank || sug) + '" style="width:64px;font-size:11px' + (sug ? ';background:#fef9c3' : '') + '" placeholder="np. 157"' + (sug ? ' title="podpowiedź z listy Bank settings — sprawdź i zapisz"' : '') + '></td>'
@@ -18350,6 +18377,15 @@
               +  '<span id="mk-set-msg" style="font-size:11px;color:#0a7a2f"></span>'
               +  '<span style="font-size:10px;color:#888">bank_setting to identyfikator konta w imporcie — nie numer konta. Vente DE = 157.</span></div>';
             box.innerHTML = h;
+            if (bsN){
+                const m0 = box.querySelector('#mk-set-msg');
+                if (m0){
+                    m0.style.color = sugN ? '#a16207' : '#c47f00';
+                    m0.textContent = sugN
+                        ? ('podpowiedzi: ' + sugN + ' z ' + keys.length + ' — sprawdź i zapisz')
+                        : ('mam ' + bsN + ' pozycji Bank settings, ale żadnej nie umiem jednoznacznie przypisać');
+                }
+            }
             box.querySelector('#mk-set-save').onclick = function(){
                 const out = {};
                 box.querySelectorAll('tr[data-k]').forEach(function (tr){
