@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.49
+// @version      2.50
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18183,8 +18183,15 @@
         return null;
     }
     // Kwota wyplaty z cyklu — nazwy pol tez bywaja rozne.
+    // UWAGA: to ma byc kwota, ktora dostaje SPRZEDAWCA. „operatorPayableAmount" to
+    // naleznosc operatora (prowizje, abonament) i pod zadnym pozorem nie wolno jej tu brac.
     function cycAmount(c){
-        const cand = [c && c.payOut && c.payOut.amount, c && c.amount, c && c.totalAmount, c && c.netAmount];
+        const cand = [
+            c && c.sellerPayableAmount && c.sellerPayableAmount.amount,
+            c && c.sellerPayableAmount,
+            c && c.payOut && c.payOut.amount,
+            c && c.amount, c && c.totalAmount, c && c.netAmount
+        ];
         for (let i = 0; i < cand.length; i++){
             const n = Number(cand[i]);
             if (isFinite(n) && n !== 0) return Math.abs(n);
@@ -18204,6 +18211,12 @@
             // wyplaty jest wystarczajaco jednoznaczna, o ile pasuje DOKLADNIE JEDNA.
             const byAmt = mkMatchAmt(near, amount);
             if (byAmt) return byAmt;
+            // Home24 zostawia payOut.reference puste i nie podaje kwoty wyplaty w wykazie
+            // cykli. Cykle sa jednak co ~10 dni, wiec w oknie +-3 dni od daty przelewu
+            // zostaje zwykle DOKLADNIE JEDEN — i to on. Nie jest to dowod, tylko poszlaka,
+            // dlatego pozycja dostaje o tym adnotacje, a kontrola netto i tak porownuje
+            // pozniej wyplate z kwota z wyciagu i zablokuje import, gdyby sie nie zgadzalo.
+            if (near.length === 1) return near[0];
         }
         return mkMatchIn(list || [], ref);
     }
@@ -18896,6 +18909,7 @@
                 const j = jobs[todo[i]];
                 const cyc = mkMatchCycle(cycles, j.ref, j.date, j.amount);
                 if (!cyc) continue;
+                const byRef = !!mkMatchIn([cyc], j.ref);   // czy trafilismy po numerze, czy po dacie
                 say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
                 try {
                     const tx = await mkCycleTx(cyc.id);
@@ -18928,11 +18942,13 @@
                                both: both, pays: a.pays.length, split: split,
                                rows: tx.list.length, total: tx.total };
                     const bad = [];
-                    j.note = '';                          // kasujemy uwage z poprzedniego przebiegu
+                    // kasujemy uwage z poprzedniego przebiegu i zaznaczamy, jesli cykl
+                    // zostal dobrany po dacie, a nie po numerze z przelewu
+                    j.note = byRef ? '' : 'cykl dobrany po dacie — rozliczenie nie zawiera numeru z przelewu';
                     if (!full) bad.push('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji');
                     if (unk) bad.push('nierozpoznane typy pozycji');
                     if (a.pays.length > 1 && !split) bad.push('cykl ma ' + a.pays.length + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
-                    if (a.pays.length > 1 && split) j.note = 'cykl ma ' + a.pays.length + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
+                    if (a.pays.length > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + a.pays.length + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
                     if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłaty ' + f2(a.payAll));
                     if (a.pays.length && a.pay == null) bad.push('nie wiem, która z wypłat odpowiada temu przelewowi');
                     if (full && a.pay != null && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
