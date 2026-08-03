@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.28
+// @version      2.29
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17913,12 +17913,43 @@
     async function mkCycles(){
         return mkArr(await mkApi('/sellerpayment/private/shop-billing-cycles?limit=100&sort=dateCreated%2CDESC'));
     }
-    function mkMatchCycle(list, ref){
+    // Cykl rozliczeniowy zamyka sie w dniu wyplaty: okres 11/07-21/07 zostal utworzony
+    // 21 lipca o 00:02 i tego samego dnia przyszedl przelew. Dlatego zamiast przegladac
+    // caly wykaz (razem z archiwum sprzed lat) patrzymy najpierw na cykle z okolic daty
+    // z wyciagu. Jesli tam nic nie ma, dopiero wtedy schodzimy do pelnej listy — zawezenie
+    // ma przyspieszac, a nie gubic.
+    function mkDay(v){
+        if (!v) return null;
+        const s = String(v);
+        let m = s.match(/(\d{4})-(\d{2})-(\d{2})/);                 // 2026-07-21
+        if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
+        m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);                   // 21/07/2026
+        if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1]);
+        const t = Date.parse(s);
+        return isNaN(t) ? null : t;
+    }
+    function mkCycDay(c){
+        return mkDay(c && (c.dateCreated || c.creationDate || c.endDate || c.dateEnd ||
+                           (c.period && (c.period.endDate || c.period.end))));
+    }
+    function mkNear(list, dateStr, days){
+        const d = mkDay(dateStr);
+        if (d == null) return null;
+        const w = (days || 3) * 86400000;
+        const near = (list || []).filter(function (c){ const x = mkCycDay(c); return x != null && Math.abs(x - d) <= w; });
+        return near.length ? near : null;
+    }
+    function mkMatchIn(list, ref){
         for (let i = 0; i < list.length; i++){
             const r = (list[i].payOut && list[i].payOut.reference) || '';
             if (String(r).indexOf(ref) >= 0) return list[i];
         }
         return null;
+    }
+    function mkMatchCycle(list, ref, dateStr){
+        const near = mkNear(list, dateStr, 3);
+        if (near){ const hit = mkMatchIn(near, ref); if (hit) return hit; }
+        return mkMatchIn(list || [], ref);
     }
 
     // --- przelaczanie sklepow ---
@@ -17961,29 +17992,59 @@
         return true;
     }
     // Mirakl tnie odpowiedz do 100 pozycji niezaleznie od tego, o ile poprosisz — reszte
-    // wydaje przez nextPageToken. Bez tego cykl na 405 pozycji dawal 100 i kwoty byly
-    // po prostu nieprawdziwe. Deduplikujemy po identyfikatorze, wiec gdyby nazwa parametru
-    // stronicowania kiedys sie zmienila, petla stanie zamiast w kolko liczyc te same wiersze.
+    // wydaje przez nextPageToken.
+    //
+    // NIE deduplikujemy wierszy. Pierwsza wersja to robila „na wszelki wypadek" i sama
+    // psula dane: dwie identyczne prowizje przy tym samym zamowieniu to dwie prawdziwe
+    // pozycje, a nie pomylka — kasowanie ich zbilo zweryfikowane 998.93 do 778.94.
+    // Zapetlenie wykrywamy inaczej: po odcisku strony. Jesli kolejne zapytanie odda to
+    // samo co poprzednie, petla staje.
+    //
+    // Nazwy parametru stronicowania nie zgadujemy na sztywno — probujemy kilku wariantow
+    // przy drugiej stronie i zapamietujemy ten, ktory faktycznie przesuwa wyniki.
+    const MK_PAGE_KEY = 'mkt_page_param';
+    const MK_PAGE_TRY = ['nextPageToken', 'pageToken', 'nextToken', 'page_token', 'paginationToken'];
+    function mkSig(list){
+        return list.length + '|' + JSON.stringify(list[0] || null) + '|' + JSON.stringify(list[list.length - 1] || null);
+    }
     async function mkCycleTx(id){
         const base = '/sellerpayment/private/transactions?search=' + encodeURIComponent(id) +
                      '&searchType=SHOP_BILLING_CYCLE_ID&limit=100';
-        const all = [], seen = {};
-        let token = '', total = null, pages = 0;
+        let all = [], total = null, pages = 0, sig = '', token = '', how = '';
+        try { how = String(GM_getValue(MK_PAGE_KEY, '')); } catch (e){}
         while (pages < 80){
             pages++;
-            const j = await mkApi(base + (token ? ('&nextPageToken=' + encodeURIComponent(token)) : ''));
+            let j, list;
+            if (!token){                                   // pierwsza strona
+                j = await mkApi(base);
+                list = mkArr(j);
+            } else if (how){                               // znany juz sposob
+                j = await mkApi(base + '&' + how + '=' + encodeURIComponent(token));
+                list = mkArr(j);
+                // zapamietana nazwa przestala dzialac — zapominamy ja i szukamy od nowa
+                if (mkSig(list) === sig){ how = ''; try { GM_setValue(MK_PAGE_KEY, ''); } catch (e){} continue; }
+            } else {                                       // szukamy dzialajacego parametru
+                let got = null;
+                for (let t = 0; t < MK_PAGE_TRY.length && !got; t++){
+                    try {
+                        const jj = await mkApi(base + '&' + MK_PAGE_TRY[t] + '=' + encodeURIComponent(token));
+                        const ll = mkArr(jj);
+                        if (ll.length && mkSig(ll) !== sig){ got = { j: jj, l: ll, p: MK_PAGE_TRY[t] }; }
+                    } catch (e){ /* ten wariant odpada */ }
+                }
+                if (!got) break;                           // zadna nazwa nie zadziala — konczymy niekompletnie
+                how = got.p; j = got.j; list = got.l;
+                try { GM_setValue(MK_PAGE_KEY, how); } catch (e){}
+            }
             if (total == null && j && j.count && j.count.counted != null) total = j.count.counted;
-            let added = 0;
-            mkArr(j).forEach(function (x){
-                const k = x.id || x.uuid || (String(x.type) + '|' + x.amount + '|' + x.orderUuid + '|' + x.dateCreated);
-                if (seen[k]) return;
-                seen[k] = 1; all.push(x); added++;
-            });
+            if (!list.length) break;
+            sig = mkSig(list);
+            all = all.concat(list);
             const next = j && j.nextPageToken;
-            if (!next || !added) break;
+            if (!next || (total != null && all.length >= total)) break;
             token = next;
         }
-        return { list: all, total: (total == null ? all.length : total), pages: pages };
+        return { list: all, total: (total == null ? all.length : total), pages: pages, how: how };
     }
 
     // ================= UI =================
@@ -18194,7 +18255,7 @@
             let ok = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                const cyc = mkMatchCycle(cycles, j.ref);
+                const cyc = mkMatchCycle(cycles, j.ref, j.date);
                 if (!cyc) continue;
                 say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
                 try {
