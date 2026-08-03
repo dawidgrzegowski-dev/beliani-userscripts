@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.37
+// @version      2.39
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19,6 +19,8 @@
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
 // @connect      mirakl.net
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
 // @grant        GM_xmlhttpRequest
@@ -17683,6 +17685,68 @@
         if (out.length) { try { GM_setValue(MK_ACC_KEY, JSON.stringify(out)); } catch (e){} }
         return out;
     }
+    // --- rejestr w Arkuszach Google ---
+    // Userscript nie zapisze do Arkuszy bez OAuth, wiec po drugiej stronie stoi wlasny
+    // Apps Script wdrozony jako aplikacja internetowa. On dopisuje wiersz i on pilnuje
+    // duplikatow — dzieki temu dziala takze wtedy, gdy cos dopiszesz recznie.
+    // Adres i klucz siedza w ustawieniach, nie w kodzie: adres jest jak haslo, a klucz
+    // ma zostac tylko u Ciebie.
+    const MK_SH_KEY = 'mkt_sheet';
+    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycby17PasQqFV7vkVT3_j8oZ0L2QmejC3SSs69YxWVxG57nniiclm19AG1q7FZ6r7R80NZQ/exec';
+    function shCfg(){
+        let o = null;
+        try { o = JSON.parse(GM_getValue(MK_SH_KEY, 'null')); } catch (e){}
+        if (!o || typeof o !== 'object') o = { url: MK_SH_DEF, secret: '', on: true };
+        return o;
+    }
+    function shSave(o){ try { GM_setValue(MK_SH_KEY, JSON.stringify(o)); } catch (e){} }
+    function shReq(method, url, body){
+        return new Promise(function (resolve, reject){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: method, url: url,
+                // text/plain, zeby nie wywolywac zapytania wstepnego CORS — Apps Script
+                // i tak czyta cala tresc z e.postData.contents
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                data: body || null, timeout: 60000,
+                onload: function (r){
+                    let j = null;
+                    try { j = JSON.parse(r.responseText); } catch (e){}
+                    if (!j){ reject(new Error('nieczytelna odpowiedź (HTTP ' + r.status + ') — sprawdź wdrożenie')); return; }
+                    if (!j.ok){ reject(new Error(j.err || 'arkusz odrzucił zapis')); return; }
+                    resolve(j);
+                },
+                onerror: function (){ reject(new Error('brak połączenia z arkuszem')); },
+                ontimeout: function (){ reject(new Error('arkusz nie odpowiedział na czas')); }
+            });
+        });
+    }
+    // „Vente DE" — skrot platformy plus kod kraju ze sklepu.
+    function mkShort(j){
+        const cc = String((j.data && j.data.shop) || '').match(/\b([A-Z]{2})\s*$/);
+        const s = j.short || j.mp || '';
+        return cc ? (s + ' ' + cc[1]).trim() : (s || (j.data && j.data.shop) || '');
+    }
+    function shRow(j, c){
+        const rf = (j.data && j.data.ref) || {};
+        const nRef = Object.keys(rf).filter(function (k){ return Math.abs(rf[k]) > 0.004; }).length;
+        return {
+            data: j.date,                    // data wplywu z wyciagu
+            marketplace: mkShort(j),
+            konto: c.acct || '',
+            kwota: j.amount,                 // kwota z wyciagu, nie brutto zamowien
+            booked: 'Tak',
+            refunded: nRef ? 'Tak' : 'Nie',
+            dodane: 'Nie',                   // inny arkusz, bez uprawnien — zawsze Nie
+            comments: j.ref
+        };
+    }
+    async function shPost(rows){
+        const cfg = shCfg();
+        if (!cfg.url) throw new Error('nie ustawiono adresu arkusza');
+        return shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, rows: rows }));
+    }
+
     // --- bank_setting ---
     // To INNA numeracja niz plan kont: Vente DE ma konto 1114, ale bank_setting 157.
     // Z /accounts.php nie da sie tego wyliczyc — zrodlem jest strona
@@ -17813,7 +17877,7 @@
     // Kolejnosc ma znaczenie: MangoPay obsluguje wiele marketplace'ow Mirakla, wiec sam
     // platnik nie wystarcza — rozstrzyga dopiero prefiks referencji w tytule przelewu.
     const MK_RULES = [
-        { mp: 'Mirakl (Vente)', ok: true,  payer: /MANGOPAY/i,                 ref: /\b(VEN\d+)\b/, brand: 'Vente Unique' },
+        { mp: 'Mirakl (Vente)', ok: true,  payer: /MANGOPAY/i,                 ref: /\b(VEN\d+)\b/, brand: 'Vente Unique', short: 'Vente' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,                 ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -17832,8 +17896,8 @@
         for (let i = 0; i < MK_RULES.length; i++){
             const r = MK_RULES[i];
             if (!r.payer.test(payer)) continue;
-            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1], brand: r.brand || '' }; }
-            return { mp: r.mp, ok: r.ok, ref: '', brand: r.brand || '' };
+            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1], brand: r.brand || '', short: r.short || '' }; }
+            return { mp: r.mp, ok: r.ok, ref: '', brand: r.brand || '', short: r.short || '' };
         }
         return null;
     }
@@ -17888,7 +17952,8 @@
                 cur: String(r[ix['currency']] || '').trim(),
                 amount: r2(cr), payer: payer, reason: reason,
                 txId: String(r[ix['transaction no.']] || '').trim(),
-                mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : '', brand: d ? (d.brand || '') : ''
+                mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : '',
+                brand: d ? (d.brand || '') : '', short: d ? (d.short || '') : ''
             });
         }
         return { rows: out };
@@ -18216,8 +18281,10 @@
               + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz z tego sklepu</button>'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">🔄 Przeleć wszystkie sklepy</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>')
-      +   '<div id="mk-prog" style="display:none;margin-top:10px;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px"></div>'
       +   '<div id="mk-out" style="margin-top:12px"></div>'
+      // Podglad postepu stoi POD lista i zwrotami — tam, gdzie klikasz — ale wciaz POZA
+      // #mk-out, zeby przerysowanie listy go nie kasowalo.
+      +   '<div id="mk-prog" style="display:none;margin-top:10px;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px"></div>'
       + '</div>';
 
     function $(s){ return panel.querySelector(s); }
@@ -18432,6 +18499,7 @@
         if (_mirIv){ clearInterval(_mirIv); _mirIv = null; }
         if (label === null) return;                 // koniec — ostatni stan zostaje na ekranie
         box.style.display = 'block';
+        try { box.scrollIntoView({ block: 'nearest' }); } catch (e){}
         const draw = function (){
             const sum = document.getElementById('tm-t-summary');
             const lst = document.getElementById('tm-t-progress-list');
@@ -18499,7 +18567,7 @@
                     known++;
                     const k = r.ref || (r.txId || (r.date + '_' + r.amount));
                     if (jobs[k] && jobs[k].status === 'done') return;
-                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
                 });
                 jobsSave(jobs);
                 say('Wczytano: ' + p.rows.length + ' wpłat, rozpoznanych obsługiwanych ' + known + ' (nowych zleceń ' + add + ')'
@@ -18545,6 +18613,16 @@
               + '<span style="display:flex;gap:6px">'
               + '<button id="mk-bs-get" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">⇩ Pobierz bank_setting' + (bsN ? (' (' + bsN + ')') : '') + '</button>'
               + '<button id="mk-acc-rel" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">↻ Odśwież plan kont (' + acc.length + ')</button></span></div>';
+        const sc = shCfg();
+        h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff;border:1px solid #ede9fe;border-radius:6px">'
+          +  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+          +  '<label style="font-size:11px;display:flex;gap:4px;align-items:center"><input type="checkbox" id="mk-sh-on"' + (sc.on ? ' checked' : '') + '>Dopisuj do arkusza po zaksięgowaniu</label>'
+          +  '<input id="mk-sh-url" value="' + esc(sc.url || '') + '" placeholder="adres wdrożenia /exec" style="flex:1;min-width:220px;font-size:10px;padding:3px 5px">'
+          +  '<input id="mk-sh-sec" type="password" value="' + esc(sc.secret || '') + '" placeholder="SECRET" style="width:110px;font-size:10px;padding:3px 5px">'
+          +  '<button id="mk-sh-test" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">Sprawdź</button>'
+          +  '<span id="mk-sh-msg" style="font-size:10px;color:#666"></span></div>'
+          +  '<div style="font-size:10px;color:#888;margin-top:3px">Adres jest jak hasło — kto go ma, może dopisywać wiersze. SECRET musi być ten sam, co w Apps Scripcie.</div>'
+          +  '</div>';
         if (!keys.length){ box.innerHTML = h + '<div style="color:#888;font-size:11px">Brak sklepów — najpierw pobierz rozliczenie na Miraklu.</div>'; }
         else {
             // Kolejnosc kolumn nie jest przypadkowa: bank_setting to jedyne pole, ktore
@@ -18608,6 +18686,28 @@
                 render();
             };
         }
+        // ustawienia arkusza zapisujemy od razu przy zmianie — nie chowamy ich za „Zapisz",
+        // bo ten guzik dotyczy tabeli kont i pojawia sie tylko gdy sa jakies sklepy
+        (function (){
+            const u = box.querySelector('#mk-sh-url'), s = box.querySelector('#mk-sh-sec'),
+                  o = box.querySelector('#mk-sh-on'), t = box.querySelector('#mk-sh-test'),
+                  m = box.querySelector('#mk-sh-msg');
+            if (!u) return;
+            const put = function (){ shSave({ url: u.value.trim(), secret: s.value, on: !!o.checked }); };
+            [u, s].forEach(function (el){ el.onchange = put; el.onblur = put; });
+            o.onchange = put;
+            t.onclick = async function(){
+                put(); t.disabled = true; m.style.color = '#666'; m.textContent = 'sprawdzam…';
+                try {
+                    const c = shCfg();
+                    if (!c.url || !c.secret) throw new Error('podaj adres i SECRET');
+                    const r = await shReq('GET', c.url + (c.url.indexOf('?') < 0 ? '?' : '&') + 'secret=' + encodeURIComponent(c.secret));
+                    m.style.color = '#0a7a2f';
+                    m.textContent = '✓ połączone' + (r.tab ? (' — zakładka „' + r.tab + '"') : '');
+                } catch (e){ m.style.color = '#c00'; m.textContent = '✗ ' + ((e && e.message) || e); }
+                t.disabled = false;
+            };
+        })();
         const bsb = box.querySelector('#mk-bs-get');
         if (bsb) bsb.onclick = async function(){
             bsb.disabled = true; bsb.textContent = '⇩ …';
@@ -18841,6 +18941,16 @@
             cur.status = 'done';
             cur.msg = 'zaimportowane ' + pairs.length + ' zamówień, konto ' + (c.acct || c.bank);
             jobsSave(jobs);
+            // Dopisek do arkusza jest KROKIEM OSOBNYM: jego niepowodzenie nie cofa
+            // ksiegowania — trafia tylko do opisu, zebys wiedzial, co dopisac recznie.
+            const cfg = shCfg();
+            if (cfg.on && cfg.url && cfg.secret){
+                try {
+                    const res = await shPost([shRow(j, c)]);
+                    cur.msg += res.added ? ' · wpisane do arkusza' : ' · w arkuszu już było';
+                } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); }
+                jobsSave(jobs);
+            }
             return true;
         } catch (e){ return (e && e.message) || String(e); }
     }
