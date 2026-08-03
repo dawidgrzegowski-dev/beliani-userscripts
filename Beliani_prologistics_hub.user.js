@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.45
+// @version      2.46
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18345,9 +18345,12 @@
                 const c = setLoad()[setKey(j.mp, j.data && j.data.shop)];
                 if (!c || !c.bank) no++;
             });
+            const nRdy = jobs.filter(function (j){ return j.status === 'ready'; }).length;
             h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
               +  '<button id="mk-imp-all"' + (nSel ? '' : ' disabled')
               +  ' style="padding:6px 14px;border:none;border-radius:6px;background:' + (nSel ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (nSel ? 'pointer' : 'default') + ';font-size:12px">⬆ Zaksięguj zaznaczone (' + nSel + ')</button>'
+              +  (nRdy ? ('<button id="mk-sel-all"' + (nSel >= nRdy ? ' disabled' : '') + ' style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">☑ Zaznacz wszystkie</button>'
+                       + '<button id="mk-sel-none"' + (nSel ? '' : ' disabled') + ' style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">☐ Odznacz wszystkie</button>') : '')
               +  (nSel ? '<span style="font-size:11px;color:#666">razem ' + f2(gs) + '</span>' : '')
               +  (no ? '<span style="font-size:11px;color:#c47f00">' + no + ' bez bank_setting — uzupełnij w ⚙ Konta</span>' : '')
               +  '</div>';
@@ -18400,6 +18403,15 @@
         });
         const ba = out.querySelector('#mk-imp-all');
         if (ba) ba.onclick = function(){ doImportAll(ba); };
+        // Zaznaczanie hurtem dotyczy tylko wierszy „gotowe do importu" — reszta i tak
+        // nie ma checkboxa, wiec nie ma jej po co ruszac.
+        function selAll(v){
+            jobList().forEach(function (j){ if (j.status === 'ready') mkSel[j.ref] = v; });
+            render();
+        }
+        const sa = out.querySelector('#mk-sel-all'), sn = out.querySelector('#mk-sel-none');
+        if (sa) sa.onclick = function(){ selAll(true); };
+        if (sn) sn.onclick = function(){ selAll(false); };
         renderRef();
     }
 
