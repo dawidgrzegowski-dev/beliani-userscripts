@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.41
+// @version      2.42
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18714,8 +18714,24 @@
                     const c = shCfg();
                     if (!c.url || !c.secret) throw new Error('podaj adres i SECRET');
                     const r = await shReq('GET', c.url + (c.url.indexOf('?') < 0 ? '?' : '&') + 'secret=' + encodeURIComponent(c.secret));
-                    m.style.color = '#0a7a2f';
-                    m.textContent = '✓ połączone' + (r.tab ? (' — zakładka „' + r.tab + '"') : '');
+                    // Nazwa zakladki spod GID nic nie mowi o tym, gdzie TRAFIA wiersz —
+                    // ta jest dobierana po dacie wplaty. Pokazujemy wiec, czy zakladki
+                    // na miesiace czekajacych wplat w ogole istnieja.
+                    if (!r.tabs){
+                        m.style.color = '#c47f00';
+                        m.textContent = '✓ połączone, ale to starsza wersja skryptu — wdróż nową (Manage deployments → New version)';
+                    } else {
+                        const need = {};
+                        jobList().forEach(function (j){
+                            const q = String(j.date || '').match(/(\d{4})-(\d{2})/);
+                            if (q) need[q[2] + '/' + q[1]] = 1;
+                        });
+                        const names = Object.keys(need);
+                        const missing = names.filter(function (n){ return r.tabs.indexOf(n) < 0; });
+                        m.style.color = missing.length ? '#c47f00' : '#0a7a2f';
+                        m.textContent = '✓ połączone · zakładek ' + r.tabs.length
+                            + (names.length ? (' · dla wpłat: ' + names.map(function (n){ return n + (r.tabs.indexOf(n) < 0 ? ' ✗ BRAK' : ' ✓'); }).join(', ')) : '');
+                    }
                 } catch (e){ m.style.color = '#c00'; m.textContent = '✗ ' + ((e && e.message) || e); }
                 t.disabled = false;
             };
