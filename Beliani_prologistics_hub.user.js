@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.40
+// @version      2.41
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18959,7 +18959,8 @@
             if (cfg.on && cfg.url && cfg.secret){
                 try {
                     const res = await shPost([shRow(j, c)]);
-                    cur.msg += res.added ? ' · wpisane do arkusza' : ' · w arkuszu już było';
+                    const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
+                    cur.msg += res.added ? (' · wpisane do arkusza' + tb) : ' · w arkuszu już było';
                 } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); }
                 jobsSave(jobs);
             }
