@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.23
+// @version      2.24
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10482,6 +10482,25 @@
         </div>
         <div id="tm-bank-box" style="font-size:11px;"></div>
 
+        <div style="margin-top:10px;padding-top:8px;border-top:1px dashed #d1d5db;">
+            <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">
+                Kontrola PO zaksięgowaniu: pobieram z systemu listę zaksięgowanych płatności
+                (Export orders payments) dla daty z pola wyżej i kont poniżej, sumuję je per
+                zamówienie i porównuję z wklejką. Nie trzeba niczego eksportować ani pobierać —
+                skrypt woła to samo API, co strona eksportu.
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+                <label style="font-size:11px;color:#333;">Winien</label>
+                <input id="tm-exp-debit" value="1270" style="width:58px;padding:3px 5px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+                <label style="font-size:11px;color:#333;">Ma</label>
+                <input id="tm-exp-credit" value="1049" style="width:58px;padding:3px 5px;border:1px solid #ccc;border-radius:4px;font-size:11px;"
+                    title="1049 = konto bankowe. Nogi discount/penalty idą na inne konto (np. 4221) i celowo tu nie wchodzą — sprawdzamy kwotę, która faktycznie zeszła z banku.">
+                <button id="tm-exp-check" style="padding:4px 10px;border:none;border-radius:4px;background:#0a5a2f;color:#fff;cursor:pointer;font-size:11px;font-weight:bold;">Sprawdź zaksięgowane</button>
+                <span id="tm-exp-status" style="font-size:11px;color:#6b7280;"></span>
+            </div>
+            <div id="tm-exp-box" style="font-size:11px;"></div>
+        </div>
+
         <div style="margin-top:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
             <label style="font-size:12px;color:#333;">Waluta:</label>
             <select id="tm-currency" style="padding:4px 6px;border-radius:4px;border:1px solid #ccc;font-size:12px;">
@@ -11897,6 +11916,109 @@
         box.innerHTML = html + '</div>';
     }
 
+    // ===== Kontrola PO zaksiegowaniu: Export orders payments =====
+    // Strona /react/settings_page/export_orders_payments/ wola zwykly GET:
+    //   /api/opOrderPayments/search/?payment_date_from=&payment_date_to=&debit_account=&credit_account=
+    // i dostaje { result: [ {payment_id, order_id, amount, currency, pay_date, sup_id, sup_name,
+    // debit_account_id, credit_account_id, …} ] } — po jednym wpisie na KSIEGOWANIE, bez
+    // konsolidacji (checkbox „Consolidate same date and suppliers" dziala dopiero po stronie
+    // przegladarki). Sumujemy wiec sami, ale per ZAMOWIENIE, nie per dostawca: order_id jest
+    // w obu zrodlach, wiec dopasowanie jest dokladne i nie zalezy od pisowni nazwy firmy.
+    // Zadnego eksportu ani pobierania pliku — to samo API, co strona.
+    async function expFetch(dateStr, deb, cred) {
+        const u = '/api/opOrderPayments/search/?payment_date_from=' + encodeURIComponent(dateStr) +
+            '&payment_date_to=' + encodeURIComponent(dateStr) +
+            '&debit_account=' + encodeURIComponent(deb) +
+            '&credit_account=' + encodeURIComponent(cred);
+        const r = await fetch(u, { credentials: 'same-origin' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        return Array.isArray(j && j.result) ? j.result : [];
+    }
+    // Ile POWINNO zejsc z konta bankowego dla danego zamowienia: suma tych wpisow z wklejki,
+    // ktore ida na to wlasnie konto Ma. Nogi discount/penalty maja inne konto (np. 4221)
+    // i wypadaja same, bez zadnego specjalnego przypadku — a to wlasnie one sprawiaja,
+    // ze „kwota z banku" rozni sie od kwoty brutto zamowienia.
+    function expExpected(parsed, cred) {
+        const want = {};
+        ((parsed && parsed.entries) || []).forEach(function (e) {
+            if (String(e.credit == null ? '' : e.credit) !== String(cred)) return;
+            const v = parseFloat(e.amount);
+            if (!isFinite(v)) return;
+            const id = String(e.id == null ? '' : e.id);
+            if (!id) return;
+            want[id] = bal2((want[id] || 0) + v);
+        });
+        return want;
+    }
+    function expGot(rows) {
+        const got = {}, sup = {};
+        (rows || []).forEach(function (p) {
+            const id = String(p.order_id == null ? '' : p.order_id);
+            const v = parseFloat(p.amount);
+            if (!id || !isFinite(v)) return;
+            got[id] = bal2((got[id] || 0) + v);
+            if (!sup[id] && p.sup_name) sup[id] = String(p.sup_name);
+        });
+        return { got: got, sup: sup };
+    }
+    function expRender(parsed, rows, dateStr, deb, cred) {
+        const box = document.getElementById('tm-exp-box');
+        if (!box) return;
+        const want = expExpected(parsed, cred), g = expGot(rows), got = g.got;
+        const ok = [], diff = [], missing = [], extra = [];
+        Object.keys(want).forEach(function (id) {
+            if (!(id in got)) { missing.push({ id: id, want: want[id] }); return; }
+            if (Math.abs(bal2(got[id] - want[id])) < 0.005) ok.push({ id: id, v: want[id] });
+            else diff.push({ id: id, want: want[id], got: got[id] });
+        });
+        Object.keys(got).forEach(function (id) { if (!(id in want)) extra.push({ id: id, got: got[id], sup: g.sup[id] || '' }); });
+        let wSum = 0, gSum = 0;
+        Object.keys(want).forEach(function (id) { wSum = bal2(wSum + want[id]); });
+        Object.keys(got).forEach(function (id) { gSum = bal2(gSum + got[id]); });
+        const bad = diff.length + missing.length;
+        const head = 'System, ' + balEsc(dateStr) + ', konta ' + balEsc(deb) + '/' + balEsc(cred) + ': ' +
+            rows.length + ' wpisów na ' + Object.keys(got).length + ' zamówieniach, razem ' + balFix(gSum) +
+            '  ·  z wklejki: ' + Object.keys(want).length + ' zamówień, razem ' + balFix(wSum);
+        const title = bad
+            ? '⚠ ' + bad + ' z ' + Object.keys(want).length + ' zamówień nie zgadza się z systemem'
+            : '✓ Wszystkie ' + Object.keys(want).length + ' zamówień z wklejki jest zaksięgowanych na właściwe kwoty (' + balFix(wSum) + ')';
+        let html = '<div style="background:' + (bad ? '#fffbeb' : '#f0fdf4') + ';border:1px solid ' +
+            (bad ? '#fde68a' : '#bbf7d0') + ';border-radius:6px;padding:6px 8px;margin-top:4px;color:' +
+            (bad ? '#92400e' : '#166534') + ';">' +
+            '<div style="color:#6b7280;">' + head + '</div><strong>' + title + '</strong>';
+        if (missing.length) {
+            html += '<div style="margin-top:4px;">' + missing.map(function (x) {
+                return '<div style="color:#991b1b;">✗ <strong>' + balEsc(x.id) + '</strong> — ' + balFix(x.want) +
+                    ' z wklejki, a w systemie NIE MA tego zamówienia na ten dzień i te konta</div>';
+            }).join('') + '</div>';
+        }
+        if (diff.length) {
+            html += '<div style="margin-top:4px;">' + diff.map(function (x) {
+                return '<div style="color:#991b1b;">⚠ <strong>' + balEsc(x.id) + '</strong> — wklejka ' + balFix(x.want) +
+                    ', system ' + balFix(x.got) + ', różnica ' + (bal2(x.got - x.want) > 0 ? '+' : '') + balFix(bal2(x.got - x.want)) + '</div>';
+            }).join('') + '</div>';
+        }
+        if (ok.length) {
+            html += '<details style="margin-top:4px;"><summary style="cursor:pointer;color:#6b7280;">zgodne zamówienia (' +
+                ok.length + ')</summary><div style="margin-top:2px;color:#374151;">' + ok.map(function (x) {
+                    return '<span style="display:inline-block;margin-right:10px;"><strong>' + balEsc(x.id) + '</strong> ' + balFix(x.v) + '</span>';
+                }).join('') + '</div></details>';
+        }
+        if (extra.length) {
+            // Ktos inny ksiegowal tego dnia na te same konta — to nie blad, tylko kontekst.
+            let eSum = 0; extra.forEach(function (x) { eSum = bal2(eSum + x.got); });
+            html += '<details style="margin-top:4px;"><summary style="cursor:pointer;color:#6b7280;">w systemie, poza wklejką: ' +
+                extra.length + ' zamówień na ' + balFix(eSum) + ' — księgowane poza tą paczką, niczego nie blokują</summary>' +
+                '<div style="margin-top:2px;color:#374151;">' + extra.map(function (x) {
+                    return '<div><strong>' + balEsc(x.id) + '</strong> ' + balFix(x.got) + ' — ' + balEsc(String(x.sup).slice(0, 70)) + '</div>';
+                }).join('') + '</div></details>';
+        }
+        html += '<div style="color:#6b7280;margin-top:3px;">Porównanie po numerze zamówienia. Nogi discount/penalty ' +
+            'idą na inne konto Ma i celowo nie wchodzą — sprawdzana jest kwota schodząca z konta ' + balEsc(cred) + '.</div>';
+        box.innerHTML = html + '</div>';
+    }
+
     // Wczytanie pliku. Czytamy jako UTF-8; jesli w tekscie wyladuja znaki zastepcze (stary
     // eksport w windows-1252), probujemy jeszcze raz w tym kodowaniu.
     function bankReadFile(file, done) {
@@ -12734,6 +12856,28 @@
             bankFile = null;
             if (bankInp) bankInp.value = '';
             try { updateTextPreview(); } catch(e) {}
+        });
+        const expBtn = panel.querySelector('#tm-exp-check');
+        if (expBtn) expBtn.addEventListener('click', async function () {
+            const st = document.getElementById('tm-exp-status');
+            const box = document.getElementById('tm-exp-box');
+            const deb = (document.getElementById('tm-exp-debit') || {}).value || '';
+            const cred = (document.getElementById('tm-exp-credit') || {}).value || '';
+            const date = currentBookingDate();
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { if (st) { st.textContent = 'Najpierw ustaw datę księgowania.'; st.style.color = '#dc2626'; } return; }
+            if (!deb || !cred) { if (st) { st.textContent = 'Uzupełnij konta Winien/Ma.'; st.style.color = '#dc2626'; } return; }
+            const parsed = balParseCurrent();
+            if (!parsed || !parsed.entries || !parsed.entries.length) { if (st) { st.textContent = 'Najpierw wklej dane.'; st.style.color = '#dc2626'; } return; }
+            expBtn.disabled = true;
+            if (st) { st.textContent = 'Pobieram z systemu…'; st.style.color = '#6b7280'; }
+            if (box) box.innerHTML = '';
+            try {
+                const rows = await expFetch(date, deb, cred);
+                expRender(parsed, rows, date, deb, cred);
+                if (st) { st.textContent = ''; }
+            } catch (e) {
+                if (st) { st.textContent = 'Nie udało się pobrać: ' + ((e && e.message) || e); st.style.color = '#dc2626'; }
+            } finally { expBtn.disabled = false; }
         });
         // Waluta zmienia tylko ostrzezenie „plik jest w innej walucie", ale bez tego zostaloby
         // ono na ekranie po przelaczeniu.
