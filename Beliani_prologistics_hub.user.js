@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.52
+// @version      2.53
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18476,6 +18476,13 @@
                 det = 'zamówień: <b>' + n + '</b> na ' + f2(j.data.gross) + (nr ? (' · zwrotów: <b>' + nr + '</b> na ' + f2(j.data.refund)) : '') +
                       ' · kontrola netto ' + (j.data.netOk ? '<b style="color:#0a7a2f">✓</b>' : '<b style="color:#c00">✗ ' + f2(j.data.net) + '</b>');
                 if (j.data.unknown && Object.keys(j.data.unknown).length) det += ' · <b style="color:#c00">nierozpoznane typy: ' + esc(Object.keys(j.data.unknown).join(', ')) + '</b>';
+                // Skad wzielismy dane — przy dochodzeniu, czy pobralo komplet, to pierwsza
+                // rzecz, ktora chce sie zobaczyc.
+                det += '<div style="color:#94a3b8;font-size:10px">pozycji ' + (j.data.rows || 0)
+                     + (j.data.total != null ? (' z ' + j.data.total) : ' (API nie podaje ile ma być)')
+                     + ' · stron ' + (j.data.pages || 1)
+                     + ' · przewijanie ' + (j.data.how ? esc(j.data.how) : 'niepotrzebne/nieznane')
+                     + ' · wierszy wypłaty ' + (j.data.pays == null ? '?' : j.data.pays) + '</div>';
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
@@ -18964,8 +18971,12 @@
                                netOk: full && eq(net, j.amount), ord: a.ord, ref: a.ref,
                                unknown: a.unknown, skipped: a.skipped, full: full,
                                both: both, pays: a.pays.length, split: split,
-                               rows: tx.list.length, total: tx.total };
+                               rows: tx.list.length, total: tx.total, pages: tx.pages, how: tx.how };
                     const bad = [];
+                    // Rozliczony cykl ZAWSZE ma wiersz wyplaty. Jego brak oznacza, ze
+                    // pobralismy tylko czesc pozycji — i to dowod mocniejszy niz liczenie
+                    // stron, bo nie zalezy od tego, czy API podaje liczbe pozycji.
+                    if (!a.pays.length) bad.push('w pobranych pozycjach nie ma wiersza wypłaty — to nie jest komplet rozliczenia');
                     // kasujemy uwage z poprzedniego przebiegu i zaznaczamy, jesli cykl
                     // zostal dobrany po dacie, a nie po numerze z przelewu
                     j.note = byRef ? '' : 'cykl dobrany po dacie — rozliczenie nie zawiera numeru z przelewu';
