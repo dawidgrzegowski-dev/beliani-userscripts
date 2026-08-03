@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.56
+// @version      2.57
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18513,6 +18513,14 @@
               +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur) + '</td>'
               +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
+            if (onProlo && st === 'done' && !j.impId){
+                // Awaryjnie: numer paczki z adresu strony importu, wpisany recznie.
+                h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff;font-size:11px">'
+                  +  'Nie znam numeru paczki. Wpisz go z adresu <span style="font-family:monospace">…/import_payments/<b>NUMER</b>/</span>: '
+                  +  '<input class="mk-impid" data-ref="' + esc(j.ref) + '" style="width:90px;font-size:11px" placeholder="np. 2061242"> '
+                  +  '<button class="mk-impset" data-ref="' + esc(j.ref) + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">Zapisz</button>'
+                  +  '</td></tr>';
+            }
             if (onProlo && st === 'done' && j.impId){
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  '<button class="mk-chk" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź paczkę ' + esc(j.impId) + ' i zaksięguj</button>'
@@ -18532,6 +18540,17 @@
         out.innerHTML = h + '</table><div id="mk-ref"></div>';
         out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-chk').forEach(function (b){ b.onclick = function(){ impCheck(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-impset').forEach(function (b){ b.onclick = function(){
+            const ref = b.getAttribute('data-ref');
+            const inp = out.querySelector('.mk-impid[data-ref="' + ref + '"]');
+            const v = String((inp && inp.value) || '').replace(/\D+/g, '');
+            if (!v){ say('Podaj sam numer paczki, np. 2061242.', '#c47f00'); return; }
+            const jobs = jobsLoad();
+            if (!jobs[ref]) return;
+            jobs[ref].impId = v;
+            jobs[ref].msg = String(jobs[ref].msg || '').replace(/ · nie odczytałem numeru paczki[^·]*/, '') + ' · paczka ' + v;
+            jobsSave(jobs); render();
+        }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-ck').forEach(function (c){
             c.onchange = function(){ mkSel[c.getAttribute('data-ref')] = c.checked; render(); };
@@ -19139,6 +19158,21 @@
     // pozycje ze statusem OK. Status nadaje system: OK gdy kwota wplaty rowna sie
     // open amount auftragu, CHECK gdy sie rozni, NOT FOUND gdy nie ma auftragu.
     const MK_BLOCK = 'booking_without_assign';     // = przycisk „Book on main account"
+    // Odpowiedz na import NIE zawiera numeru paczki — serwer oddaje szkielet strony React,
+    // a numer dociaga dopiero JavaScript. Znajdujemy go wiec po fakcie na liscie importow:
+    // po nazwie pliku, ktora sami nadalismy, a zapasowo po koncie.
+    async function impFind(fname, bank){
+        const r = await fetch('/api/importPayments/index/?', {
+            credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) return '';
+        const j = await r.json();
+        const list = (Array.isArray(j.parsing_list) ? j.parsing_list : []).slice()
+            .sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });   // najnowsze pierwsze
+        const hit = list.filter(function (x){ return fname && String(x.filename || '').indexOf(fname) >= 0; });
+        if (hit.length) return String(hit[0].file_id || '');
+        const alt = list.filter(function (x){ return bank && String(x.bank_id || '') === String(bank); });
+        return alt.length ? String(alt[0].file_id || '') : '';
+    }
     async function impRows(id){
         const r = await fetch('/api/importPayments/index/' + encodeURIComponent(id) + '/?', {
             credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
@@ -19310,6 +19344,7 @@
             const mu = String(r.url || '').match(/import_payments\/(\d+)/);
             if (mu) imp = mu[1];
             if (!imp){ const mt = String(txt).match(/import_payments\/(\d+)/); if (mt) imp = mt[1]; }
+            if (!imp){ try { imp = await impFind(fileName(j), c.bank); } catch (e){} }
             cur.impId = imp;
             cur.status = 'done';
             cur.msg = 'zaimportowane ' + pairs.length + ' zamówień, konto ' + (c.acct || c.bank)
