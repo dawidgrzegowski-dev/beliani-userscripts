@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.57
+// @version      2.58
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18214,7 +18214,11 @@
         const hit = (list || []).filter(function (c){ const a = cycAmount(c); return a != null && Math.abs(a - amount) < 0.005; });
         return hit.length === 1 ? hit[0] : null;      // przy dwoch takich samych kwotach nie zgadujemy
     }
-    function mkMatchCycle(list, ref, dateStr, amount){
+    function mkMatchCycle(list, ref, dateStr, amount, tried){
+        // Cykle juz sprawdzone i odrzucone (bo kwota nie pasowala) pomijamy, inaczej
+        // przelot po sklepach wracalby w kolko do tego samego, blednego kandydata.
+        const skip = tried || [];
+        list = (list || []).filter(function (c){ return skip.indexOf(c.id) < 0; });
         const near = mkNear(list, dateStr, 3);
         if (near){
             const hit = mkMatchIn(near, ref);
@@ -18354,7 +18358,10 @@
         }
         async function grab(u){
             const j = await mkApi(u);
-            if (total == null && j && j.count && j.count.counted != null) total = j.count.counted;
+            // Przy duzych cyklach Mirakl przestaje liczyc i oznacza to jako „capped" —
+            // wtedy „counted" to tylko prog (1000), a nie prawdziwa liczba pozycji.
+            // Branie go za pewnik dawalo bzdury w rodzaju „pobrano 1096 z 1000".
+            if (total == null && j && j.count && j.count.counted != null && !j.count.capped) total = j.count.counted;
             return { j: j, list: mkArr(j) };
         }
 
@@ -18978,7 +18985,7 @@
             let ok = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                const cyc = mkMatchCycle(cycles, j.ref, j.date, j.amount);
+                const cyc = mkMatchCycle(cycles, j.ref, j.date, j.amount, j.tried);
                 if (!cyc) continue;
                 const byRef = !!mkMatchIn([cyc], j.ref);   // czy trafilismy po numerze, czy po dacie
                 say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
@@ -18996,6 +19003,17 @@
                     // Netto rozliczenia = wiersz Payment (a gdy go jeszcze nie ma —
                     // suma skladnikow). To ono ma sie zgadzac z kwota z wyciagu.
                     const net = (a.pay != null) ? Math.abs(a.pay) : a.comp;
+                    // Cykl dobrany po SAMEJ DACIE to kandydat, nie dowod. Cykle wszystkich
+                    // sklepow tej platformy powstaja tego samego dnia, wiec bez tej kontroli
+                    // pierwszy przegladany sklep zabralby zlecenie nalezace do innego —
+                    // i wlasnie to sie stalo: Home24 CH przejal wyplate Beliani AT.
+                    // Kwota wyplaty rozstrzyga, czyj to cykl. Jesli nie pasuje, zlecenie
+                    // zostaje nieprzypisane i szukamy dalej, pomijajac juz sprawdzone cykle.
+                    if (!byRef && a.pay != null && !eq(net, j.amount)){
+                        j.tried = (j.tried || []).concat([cyc.id]);
+                        jobsSave(jobs);
+                        continue;
+                    }
                     // Kontrola spojnosci: skladniki + WSZYSTKIE wyplaty musza dac zero.
                     const selfOk = !a.pays.length || eq(r2(a.comp + a.payAll), 0);
                     // Zamowienie rozliczone i zwrocone w tym samym cyklu — pieniadze sie
