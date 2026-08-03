@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.30
+// @version      2.32
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17683,6 +17683,78 @@
         if (out.length) { try { GM_setValue(MK_ACC_KEY, JSON.stringify(out)); } catch (e){} }
         return out;
     }
+    // --- bank_setting ---
+    // To INNA numeracja niz plan kont: Vente DE ma konto 1114, ale bank_setting 157.
+    // Z /accounts.php nie da sie tego wyliczyc — zrodlem jest strona
+    // /react/settings_page/bank_settings/. Jest reactowa, wiec dane przychodza z API;
+    // nie znamy jego adresu, wiec probujemy kilku i KAZDY wynik weryfikujemy kotwica:
+    // musi zawierac 157 wskazujace na konto 1114. Bez tego nie przyjmujemy niczego —
+    // zle przypisany bank_setting to przelew zaksiegowany na cudzym koncie.
+    const MK_BS_KEY = 'mkt_bank_settings';
+    const MK_BS_TRY = ['/api/bankSettings/', '/api/bankSettings/search/', '/api/bank_settings/',
+                       '/api/bankSetting/', '/api/settings/bankSettings/', '/api/bankSettings/list/'];
+    function bsLoad(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    function bsSave(o){ try { GM_setValue(MK_BS_KEY, JSON.stringify(o)); } catch (e){} }
+    // Nie znamy ksztaltu odpowiedzi, wiec chodzimy po calym drzewie i zbieramy kazdy
+    // obiekt z liczbowym „id" oraz czyms, co wyglada na opis konta.
+    function bsFromJson(j){
+        const out = {};
+        (function walk(v, d){
+            if (!v || typeof v !== 'object' || d > 8) return;
+            if (Array.isArray(v)){ v.forEach(function (x){ walk(x, d + 1); }); return; }
+            const id = (v.id != null) ? String(v.id) : '';
+            if (/^\d{1,6}$/.test(id)){
+                const txt = ['name', 'title', 'label', 'account', 'accountNumber', 'account_number', 'bank', 'description']
+                    .map(function (k){ return v[k]; })
+                    .filter(function (x){ return x != null && typeof x !== 'object'; }).join(' ');
+                if (txt.trim()) out[id] = String(txt).replace(/\s+/g, ' ').trim();
+            }
+            Object.keys(v).forEach(function (k){ walk(v[k], d + 1); });
+        })(j, 0);
+        return out;
+    }
+    function bsFromDom(){
+        const out = {};
+        document.querySelectorAll('tr').forEach(function (tr){
+            const td = tr.querySelectorAll('td');
+            if (td.length < 2) return;
+            const id = String(td[0].textContent || '').trim();
+            if (!/^\d{1,6}$/.test(id)) return;
+            const txt = Array.prototype.slice.call(td, 1).map(function (x){ return String(x.textContent || '').trim(); })
+                        .filter(Boolean).join(' · ').replace(/\s+/g, ' ');
+            if (txt) out[id] = txt;
+        });
+        return out;
+    }
+    // Kotwica: znamy jedna pare na pewno — 157 to konto 1114 (Vente Unique DE).
+    function bsOk(map){
+        const v = map && map['157'];
+        return !!(v && /\b1114\b|Vente\s*Unique\s*DE/i.test(v));
+    }
+    async function bsFetch(){
+        for (let i = 0; i < MK_BS_TRY.length; i++){
+            try {
+                const r = await fetch(MK_BS_TRY[i], { credentials: 'same-origin', headers: { 'accept': 'application/json' } });
+                if (!r.ok) continue;
+                const m = bsFromJson(await r.json());
+                if (bsOk(m)){ bsSave(m); return { map: m, src: MK_BS_TRY[i] }; }
+            } catch (e){ /* nastepny kandydat */ }
+        }
+        if (/settings_page\/bank_settings/i.test(location.pathname)){
+            const m = bsFromDom();
+            if (bsOk(m)){ bsSave(m); return { map: m, src: 'ta strona' }; }
+            if (Object.keys(m).length) return { map: null, src: '', partial: m };
+        }
+        return { map: null, src: '' };
+    }
+    // Podpowiadamy bank_setting tylko wtedy, gdy DOKLADNIE JEDEN wpis wskazuje na to konto.
+    function bsGuess(acct, map){
+        if (!acct) return '';
+        const re = new RegExp('\\b' + acct + '\\b');
+        const hit = Object.keys(map || {}).filter(function (k){ return re.test(map[k]); });
+        return hit.length === 1 ? hit[0] : '';
+    }
+
     // Sklep na Miraklu nazywa sie „Beliani DE", a konto w prologistics „Vente Unique DE
     // Beliani DE". Kluczem jest kod kraju, ale MUSI stac zaraz za nazwa marketplace'u:
     // „Vente Unique ES Beliani DE" tez zawiera DE, wiec samo szukanie kodu myli kraje.
@@ -18007,10 +18079,19 @@
     // Mirakl tnie odpowiedz do 100 pozycji niezaleznie od tego, o ile poprosisz — reszte
     // wydaje przez nextPageToken.
     //
-    // NIE deduplikujemy wierszy. Pierwsza wersja to robila „na wszelki wypadek" i sama
-    // psula dane: dwie identyczne prowizje przy tym samym zamowieniu to dwie prawdziwe
-    // pozycje, a nie pomylka — kasowanie ich zbilo zweryfikowane 998.93 do 778.94.
-    // Zapetlenie wykrywamy inaczej: po odcisku strony. Jesli kolejne zapytanie odda to
+    // Strony POTRAFIA na siebie zachodzic — na cyklu VEN291389 (453 pozycje) doniosly
+    // nadmiarowe wiersze jednego zamowienia i kwota urosla o 28.33. Odsiew jest wiec
+    // konieczny, ale klucz musi byc wlasciwy.
+    //
+    // Sprawdzone na pelnym pliku tego cyklu:
+    //   caly wiersz                    -> 453 z 453 unikalnych   (0 kolizji)
+    //   (typ, kwota, zamowienie, linia)-> 453 unikalnych         (0 kolizji)
+    //   (typ, kwota, zamowienie)       -> 55 unikalnych          (398 kolizji!)
+    // Poprzednia wersja uzywala tego ostatniego i sama kasowala prawdziwe pozycje —
+    // stad zweryfikowane 998.93 spadlo wtedy do 778.94. Teraz kluczem jest identyfikator
+    // wiersza, a gdy go brak — cala jego tresc.
+    //
+    // Zapetlenie lapiemy dodatkowo po odcisku strony: jesli kolejne zapytanie odda to
     // samo co poprzednie, petla staje.
     //
     // Nazwy parametru stronicowania nie zgadujemy na sztywno — probujemy kilku wariantow
@@ -18023,7 +18104,8 @@
     async function mkCycleTx(id){
         const base = '/sellerpayment/private/transactions?search=' + encodeURIComponent(id) +
                      '&searchType=SHOP_BILLING_CYCLE_ID&limit=100';
-        let all = [], total = null, pages = 0, sig = '', token = '', how = '';
+        const all = [], seen = {};
+        let total = null, pages = 0, sig = '', token = '', how = '';
         try { how = String(GM_getValue(MK_PAGE_KEY, '')); } catch (e){}
         while (pages < 80){
             pages++;
@@ -18052,9 +18134,15 @@
             if (total == null && j && j.count && j.count.counted != null) total = j.count.counted;
             if (!list.length) break;
             sig = mkSig(list);
-            all = all.concat(list);
+            let added = 0;
+            list.forEach(function (x){
+                const k = x.id || x.uuid || x.transactionId || x.transactionNumber || JSON.stringify(x);
+                if (seen[k]) return;
+                seen[k] = 1; all.push(x); added++;
+            });
             const next = j && j.nextPageToken;
-            if (!next || (total != null && all.length >= total)) break;
+            // brak nowych wierszy = strona sie powtorzyla, dalej nie ma po co isc
+            if (!next || !added || (total != null && all.length >= total)) break;
             token = next;
         }
         return { list: all, total: (total == null ? all.length : total), pages: pages, how: how };
@@ -18209,9 +18297,12 @@
             if (!rows[key]) rows[key] = { bank: '', booking: '9', acct: (mkAcctGuess(j.brand, j.data.shop, acc) || {}).n || '' };
         });
         const keys = Object.keys(rows).sort();
-        let h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+        const bs = bsLoad(), bsN = Object.keys(bs).length;
+        let h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
               + '<b style="font-size:11px;color:#5b21b6">Konta i ustawienia importu</b>'
-              + '<button id="mk-acc-rel" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">↻ Odśwież plan kont (' + acc.length + ')</button></div>';
+              + '<span style="display:flex;gap:6px">'
+              + '<button id="mk-bs-get" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">⇩ Pobierz bank_setting' + (bsN ? (' (' + bsN + ')') : '') + '</button>'
+              + '<button id="mk-acc-rel" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">↻ Odśwież plan kont (' + acc.length + ')</button></span></div>';
         if (!keys.length){ box.innerHTML = h + '<div style="color:#888;font-size:11px">Brak sklepów — najpierw pobierz rozliczenie na Miraklu.</div>'; }
         else {
             // Kolejnosc kolumn nie jest przypadkowa: bank_setting to jedyne pole, ktore
@@ -18229,12 +18320,15 @@
                     if (!a.on || !/^1\d{3}$/.test(a.n) || MK_NOT_BANK.test(a.nm)) return;
                     opt += '<option value="' + esc(a.n) + '"' + (a.n === String(c.acct || '') ? ' selected' : '') + '>' + esc(a.n + ' — ' + a.nm) + '</option>';
                 });
+                // podpowiedz tylko gdy jednoznaczna; do zapisu i tak potrzebne klikniecie
+                const sug = c.bank ? '' : bsGuess(c.acct, bs);
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
-                  +  '<td style="padding:3px 4px"><input class="mk-s-bank" value="' + esc(c.bank || '') + '" style="width:64px;font-size:11px" placeholder="np. 157"></td>'
+                  +  '<td style="padding:3px 4px"><input class="mk-s-bank" value="' + esc(c.bank || sug) + '" style="width:64px;font-size:11px' + (sug ? ';background:#fef9c3' : '') + '" placeholder="np. 157"' + (sug ? ' title="podpowiedź z listy Bank settings — sprawdź i zapisz"' : '') + '></td>'
                   +  '<td style="padding:3px 4px"><input class="mk-s-book" value="' + esc(c.booking || '9') + '" style="width:40px;font-size:11px"></td>'
                   +  '<td style="padding:3px 4px"><select class="mk-s-acct" style="font-size:11px;width:250px">' + opt + '</select></td>'
-                  +  '<td style="padding:3px 4px;white-space:nowrap;color:' + (c.bank ? '#0a7a2f' : '#c47f00') + '">' + (c.bank ? '✓' : 'brak bank_setting') + '</td></tr>';
+                  +  '<td style="padding:3px 4px;white-space:nowrap;color:' + (c.bank ? '#0a7a2f' : (sug ? '#a16207' : '#c47f00')) + '">'
+                  +  (c.bank ? '✓' : (sug ? 'podpowiedź — sprawdź i zapisz' : 'brak bank_setting')) + '</td></tr>';
                 void i; void cur;
             });
             h += '</table></div><div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
@@ -18261,6 +18355,26 @@
                 render();
             };
         }
+        const bsb = box.querySelector('#mk-bs-get');
+        if (bsb) bsb.onclick = async function(){
+            bsb.disabled = true; bsb.textContent = '⇩ …';
+            try {
+                const r = await bsFetch();
+                if (r.map){
+                    renderSet();
+                    say('Wczytałem ' + Object.keys(r.map).length + ' pozycji z „' + r.src + '". Podpowiedzi na żółto — sprawdź i zapisz.', '#0a7a2f');
+                } else if (r.partial){
+                    say('Widzę tabelę, ale nie rozpoznaję w niej pary 157 = konto 1114 — nie przyjmuję jej, żeby nie przypisać złego konta. Podeślij mi źródło tej strony.', '#c47f00');
+                    bsb.disabled = false; bsb.textContent = '⇩ Pobierz bank_setting';
+                } else {
+                    say('Nie znalazłem listy przez API. Otwórz /react/settings_page/bank_settings/ i kliknij tam ten sam przycisk.', '#c47f00');
+                    bsb.disabled = false; bsb.textContent = '⇩ Pobierz bank_setting';
+                }
+            } catch (e){
+                say('Nie udało się: ' + ((e && e.message) || e), '#c00');
+                bsb.disabled = false; bsb.textContent = '⇩ Pobierz bank_setting';
+            }
+        };
         const rel = box.querySelector('#mk-acc-rel');
         if (rel) rel.onclick = async function(){
             rel.disabled = true; rel.textContent = '↻ …';
