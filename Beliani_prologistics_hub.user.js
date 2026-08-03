@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.48
+// @version      2.49
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18235,6 +18235,17 @@
         const o = mapGet(key); o[host] = val;
         try { GM_setValue(key, JSON.stringify(o)); } catch (e){}
     }
+    // Zapamietana wartosc moze byc czymkolwiek — po zmianach formatu, po recznej edycji
+    // magazynu, po niedokonczonym zapisie. Nie ufamy jej ksztaltowi: to, co nie jest
+    // lista, sprowadzamy do listy albo pomijamy. Padniecie na `forEach` nieistniejacym
+    // dla tekstu zablokowaloby caly modul, a chodzi tylko o pamiec pomocnicza.
+    function mapArr(key, host){
+        const v = mapGet(key)[host];
+        if (Array.isArray(v)) return v.filter(function (x){ return x != null; }).map(String);
+        if (v == null || v === '') return [];
+        if (typeof v === 'object') return Object.keys(v).map(function (k){ return String(v[k]); });
+        return [String(v)];
+    }
     function mkHomeGet(){
         const v = mapGet(MK_HOME_KEY)[mkHost()];
         if (v) return String(v);
@@ -18248,8 +18259,7 @@
         const re = /(?:switch-shop|shop-logo)\/(\d+)/g;
         let m;
         while ((m = re.exec(String(html || '')))) { if (!seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); } }
-        const old = mapGet(MK_SHOPS_KEY)[mkHost()] || [];
-        old.forEach(function (x){ if (!seen[x]) { seen[x] = 1; ids.push(x); } });
+        mapArr(MK_SHOPS_KEY, mkHost()).forEach(function (x){ if (!seen[x]) { seen[x] = 1; ids.push(x); } });
         if (ids.length) mapPut(MK_SHOPS_KEY, mkHost(), ids);
         return ids;
     }
