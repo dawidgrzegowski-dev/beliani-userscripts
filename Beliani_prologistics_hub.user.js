@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.22
+// @version      2.23
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12106,8 +12106,19 @@
                 headerText.indexOf('debit account') >= 0 &&
                 headerText.indexOf('credit account') >= 0;
         });
+        // Filtr po textContent lapie takze tabele-OPAKOWANIE, w ktorej siedzi tabela Payments —
+        // tekst potomka wchodzi przeciez do textContent rodzica. Na stronie ticketu pasuja
+        // przez to DWIE tabele (sprawdzone), a querySelectorAll('tr') na opakowaniu zwraca te
+        // same wiersze po raz drugi. Kazda platnosc liczyla sie wiec podwojnie: licznik
+        // „Payments: 2 → 4" pokazywal dwukrotnosc, a dupScan widzial dwa wpisy tam, gdzie byl
+        // jeden — przez co SWIADOME podwojne ksiegowanie (dupIndex = 2) bylo blokowane po
+        // pierwszym wpisie jako rzekomy duplikat.
+        // Pomijamy wiersze juz policzone — po tozsamosci elementu, bez zgadywania struktury.
+        const seenTr = new Set();
         for (const table of paymentTables) {
             for (const tr of table.querySelectorAll('tr')) {
+                if (seenTr.has(tr)) continue;
+                seenTr.add(tr);
                 const cells = [...tr.querySelectorAll('td,th')];
                 if (cells.length < 7) continue;
                 const firstCellText = String(cells[0].textContent || '').trim();
