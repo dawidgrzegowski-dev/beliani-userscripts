@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.24
+// @version      2.25
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
 // @match        https://prologistics.info/*
 // @match        https://salescenter.allegro.com/*
+// @match        https://*.mirakl.net/*
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
 // @connect      fxds-public-exchange-rates-api.oanda.com
 // @connect      oanda.com
@@ -38,6 +39,9 @@
     const onProlo   = () => /(^|\.)prologistics\.info$/i.test(H);
     const onAllegro = () => /(^|\.)salescenter\.allegro\.com$/i.test(H);
     const onGus     = () => /(^|\.)wyszukiwarkaregon\.stat\.gov\.pl$/i.test(H);
+    // Mirakl to nie jeden host — kazdy operator ma swoj (venteunique-prod.mirakl.net,
+    // …-prod.mirakl.net). Modul Marketplace dziala na wszystkich naraz.
+    const onMirakl  = () => /(^|\.)mirakl\.net$/i.test(H);
 
     const HUB = 'beliani_hub_';
     const isOn = (id) => { try { return GM_getValue(HUB + id, true); } catch (e) { return true; } };
@@ -17604,6 +17608,440 @@
 })();
     }
 
+    // ===================== Ksiegowanie Marketplace's =====================
+    // Lancuch: wyciag bankowy -> raport marketplace'u -> import do prologistics.
+    //
+    // Modul dziala na DWOCH stronach, bo inaczej sie nie da: dane marketplace'u sa dostepne
+    // tylko z jego wlasnej domeny (tam jest sesja i token XSRF), a ksiegowanie tylko
+    // w prologistics. Obie polowy porozumiewaja sie przez GM_setValue, ktore jest wspolne
+    // dla wszystkich stron objetych @match.
+    //
+    //   prologistics : wgrywasz wyciag -> rozpoznaje wplaty -> zapisuje „zlecenia"
+    //   *.mirakl.net : widzi zlecenia -> znajduje cykl po referencji VEN -> liczy -> odklada
+    //   prologistics : podglad -> POST /api/importPayments/ ; zwroty osobno do ticketa
+    //
+    // Wszystkie endpointy i formaty ustalone na zywych danych (wyciag UBS 20.07-03.08.2026,
+    // cykl VEN290820 = 694.52 EUR, 111 plikow archiwalnych z szesciu sklepow Vente).
+    function init_mkt() {
+(function () {
+    'use strict';
+    const onProlo  = /(^|\.)prologistics\.info$/i.test(location.hostname);
+    const onMirakl = /(^|\.)mirakl\.net$/i.test(location.hostname);
+    if (!onProlo && !onMirakl) return;
+
+    const MK_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
+
+    function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
+    function r2(n){ return Math.round(Number(n) * 100) / 100; }
+    function eq(a, b){ return isFinite(a) && isFinite(b) && Math.abs(a - b) < 0.005; }
+    function pad2(n){ return (n < 10 ? '0' : '') + n; }
+
+    // ===== wspolna pamiec obu polowek =====
+    const MK_KEY = 'mkt_jobs';
+    function jobsLoad(){ try { return JSON.parse(GM_getValue(MK_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    function jobsSave(j){ try { GM_setValue(MK_KEY, JSON.stringify(j)); } catch (e){} }
+    // Ustawienia importu per sklep. bank_setting decyduje, na jakie konto trafia wplata.
+    // Vente DE = 157 (konto 1114). Reszte dopiszesz, gdy bedzie potrzebna.
+    const MK_SET_KEY = 'mkt_settings';
+    function setLoad(){
+        let d = { 'Beliani DE': { bank: '157', booking: '9', acct: '1114' } };
+        try { const o = JSON.parse(GM_getValue(MK_SET_KEY, 'null')); if (o) d = o; } catch (e){}
+        return d;
+    }
+    function setSave(o){ try { GM_setValue(MK_SET_KEY, JSON.stringify(o)); } catch (e){} }
+
+    // ===== rozpoznawanie wplat w wyciagu =====
+    // Kolejnosc ma znaczenie: MangoPay obsluguje wiele marketplace'ow Mirakla, wiec sam
+    // platnik nie wystarcza — rozstrzyga dopiero prefiks referencji w tytule przelewu.
+    const MK_RULES = [
+        { mp: 'Mirakl (Vente)', ok: true,  payer: /MANGOPAY/i,                 ref: /\b(VEN\d+)\b/ },
+        { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,                 ref: /\b(\d{5,})\s*MARKETPAY/i },
+        { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
+        { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
+        { mp: 'Worldline',      ok: false, payer: /WORLDLINE/i },
+        { mp: 'Amex',           ok: false, payer: /AMERICAN EXPRESS/i },
+        { mp: 'Wayfair',        ok: false, payer: /WAYFAIR/i },
+        { mp: 'Check24',        ok: false, payer: /CHECK24/i },
+        { mp: 'Home24',         ok: false, payer: /HOME24/i },
+        { mp: 'Worten',         ok: false, payer: /WORTEN/i },
+        { mp: 'JD / Joybuy',    ok: false, payer: /JINGDONG/i },
+        { mp: 'Cdiscount',      ok: false, payer: /CNOVA/i },
+        { mp: 'Xpollens',       ok: false, payer: /XPOLLENS/i },
+        { mp: 'Furniture1',     ok: false, payer: /BALDAI1|Furniture1/i }
+    ];
+    function mkDetect(payer, reason){
+        for (let i = 0; i < MK_RULES.length; i++){
+            const r = MK_RULES[i];
+            if (!r.payer.test(payer)) continue;
+            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1] }; }
+            return { mp: r.mp, ok: r.ok, ref: '' };
+        }
+        return null;
+    }
+    // Wyciag UBS: blok metadanych, naglowek dopiero przy „Trade date", srednik jako separator
+    // i — co wazne — SREDNIKI WEWNATRZ pol w cudzyslowach (adres platnika). Naiwny split
+    // rozjechalby kazdy wiersz, wiec parsujemy znak po znaku.
+    function mkCsvRows(text){
+        const s = String(text || '').replace(/^﻿/, '');
+        const rows = []; let f = '', row = [], q = false;
+        for (let i = 0; i < s.length; i++){
+            const c = s.charAt(i);
+            if (q){
+                if (c !== '"') { f += c; continue; }
+                if (s.charAt(i + 1) === '"') { f += '"'; i++; continue; }
+                q = false; continue;
+            }
+            if (c === '"') { q = true; continue; }
+            if (c === ';') { row.push(f); f = ''; continue; }
+            if (c === '\r') continue;
+            if (c === '\n') { row.push(f); rows.push(row); row = []; f = ''; continue; }
+            f += c;
+        }
+        if (f !== '' || row.length) { row.push(f); rows.push(row); }
+        return rows;
+    }
+    function mkNum(s){
+        const t = String(s == null ? '' : s).replace(/[\s'’]/g, '');
+        if (!t || !/\d/.test(t)) return null;
+        const v = parseFloat(t.replace(',', '.'));
+        return isFinite(v) ? v : null;
+    }
+    function mkParseBank(text){
+        const rows = mkCsvRows(text);
+        let hi = -1;
+        for (let i = 0; i < rows.length && i < 60; i++){ if (/^Trade date$/i.test(String(rows[i][0] || '').trim())) { hi = i; break; } }
+        if (hi < 0) return { err: 'nie znalazłem nagłówka „Trade date" — czy to na pewno wyciąg UBS w CSV?' };
+        const hdr = rows[hi].map(function (h){ return String(h || '').trim().toLowerCase(); });
+        const ix = {};
+        ['booking date', 'currency', 'debit', 'credit', 'transaction no.', 'description1', 'description3'].forEach(function (k){ ix[k] = hdr.indexOf(k); });
+        if (ix['credit'] < 0 || ix['description1'] < 0) return { err: 'w nagłówku brakuje kolumn Credit / Description1' };
+        const out = [];
+        for (let i = hi + 1; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || !r.join('').trim()) continue;
+            const cr = mkNum(r[ix['credit']]);
+            if (cr == null || cr === 0) continue;           // tylko wplaty
+            const payer = String(r[ix['description1']] || '').split(';')[0].replace(/\s+/g, ' ').trim();
+            const reason = String(r[ix['description3']] || '').replace(/\s+/g, ' ').trim();
+            const d = mkDetect(payer, reason);
+            out.push({
+                date: String(r[ix['booking date']] || '').trim(),
+                cur: String(r[ix['currency']] || '').trim(),
+                amount: r2(cr), payer: payer, reason: reason,
+                txId: String(r[ix['transaction no.']] || '').trim(),
+                mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : ''
+            });
+        }
+        return { rows: out };
+    }
+
+    // ===== klasyfikacja pozycji z Mirakla =====
+    // Nazwy typow w JSON znam tylko czesciowo (ORDER_AMOUNT, COMMISSION_FEE, PAYMENT…),
+    // a slownik z dwoch lat archiwum ma tez „Shipping tax", „Subscription fee", „Open amount"
+    // i komplet wariantow „…refund". Dlatego klasyfikujemy po WZORCU, nie po liscie —
+    // a czego nie rozpoznamy, TRAFIA NA EKRAN. Cicho pominieta pozycja to najgorszy blad,
+    // jaki taki modul moze popelnic.
+    function mkCls(t){
+        const s = String(t || '').toUpperCase().replace(/[^A-Z]+/g, '_');
+        const ref = /REFUND/.test(s);
+        if (/^PAYMENT$/.test(s)) return { k: 'payment', ref: false };
+        if (/REMITTED/.test(s))  return { k: 'skip', ref: ref };   // znosi podatek — nie liczy sie do brutto
+        if (/COMMISSION/.test(s)) return { k: 'skip', ref: ref };
+        if (/SUBSCRIPTION/.test(s)) return { k: 'skip', ref: ref };
+        if (/OPEN_AMOUNT/.test(s)) return { k: 'skip', ref: ref };
+        if (/^ORDER_AMOUNT(_TAX)?(_REFUND)?$/.test(s)) return { k: 'gross', ref: ref };
+        if (/SHIPPING/.test(s)) return { k: 'gross', ref: ref };   // wysylka + jej podatek
+        return { k: 'unknown', ref: ref };
+    }
+    // brutto = Order amount + Order amount tax + Shipping charges + Shipping tax
+    function mkAggregate(data){
+        const ord = {}, ref = {}, unknown = {};
+        // „comp" to suma wszystkich pozycji BEZ wiersza Payment — czyli to, co powinno wyjsc
+        // na konto. Gdyby liczyc razem z Payment, wynik zawsze bylby zerem (sprawdzone:
+        // skladniki +694.52, Payment -694.52), a sciezka zapasowa dla cykli jeszcze bez
+        // wiersza wyplaty pokazywalaby 0.00 zamiast prawdziwej kwoty.
+        let comp = 0, pay = null;
+        (data || []).forEach(function (x){
+            const a = Number(x.amount) || 0;
+            const c = mkCls(x.type);
+            if (c.k === 'payment') { pay = a; return; }
+            comp = r2(comp + a);
+            if (c.k === 'unknown') { unknown[x.type] = (unknown[x.type] || 0) + 1; return; }
+            if (c.k !== 'gross') return;
+            const id = String(x.orderUuid || '').trim();
+            if (!id) return;
+            if (c.ref) ref[id] = r2((ref[id] || 0) + a); else ord[id] = r2((ord[id] || 0) + a);
+        });
+        return { ord: ord, ref: ref, unknown: unknown, comp: comp, pay: pay };
+    }
+
+    // ===== plik do importu — 1:1 z tym, co robi dzisiejsza aplikacja =====
+    const MK_HDR = ['Date created','Date received','Transaction Date','Shop','Order number','Invoice number',
+        'Transaction Number','Quantity','Category Label','Offer SKU','Description','Type','Payment status',
+        'Payment reference','Amount','Debit','Credit','Balance','Currency','Customer order reference',
+        'Shop order reference','Billing cycle date','Shop ID','Order line ID','Refund ID','Sales channel','Billing Cycle ID'];
+    function mkCsvText(pairs){
+        const lines = [MK_HDR.join(';')];
+        pairs.forEach(function (p){
+            const c = new Array(MK_HDR.length).fill('');
+            c[4] = p.id; c[14] = f2(p.amt);
+            lines.push(c.join(';'));
+        });
+        return '﻿' + lines.join('\n') + '\n';
+    }
+
+    // ================= POLOWA NA MIRAKLU =================
+    async function mkApi(path){
+        const meta = document.querySelector('meta[name="_csrf"]');
+        const tok = meta ? meta.getAttribute('content') : '';
+        const r = await fetch(path, { credentials: 'same-origin', headers: {
+            'accept': 'application/json, text/plain, */*',
+            'x-requested-with': 'XMLHttpRequest',
+            'x-xsrf-token': tok || ''
+        } });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + path.split('?')[0]);
+        return r.json();
+    }
+    function mkArr(j){ return (j && Array.isArray(j.data)) ? j.data : (Array.isArray(j) ? j : []); }
+    async function mkShop(){ try { const j = await mkApi('/sellerpayment/private/shops/current'); return j || {}; } catch (e){ return {}; } }
+    async function mkFindCycle(ref){
+        const j = await mkApi('/sellerpayment/private/shop-billing-cycles?limit=100&sort=dateCreated%2CDESC');
+        const list = mkArr(j);
+        for (let i = 0; i < list.length; i++){
+            const c = list[i], r = (c.payOut && c.payOut.reference) || '';
+            if (String(r).indexOf(ref) >= 0) return c;
+        }
+        return null;
+    }
+    async function mkCycleTx(id){
+        const j = await mkApi('/sellerpayment/private/transactions?search=' + encodeURIComponent(id) +
+            '&searchType=SHOP_BILLING_CYCLE_ID&limit=1000');
+        const list = mkArr(j);
+        const total = (j && j.count && j.count.counted != null) ? j.count.counted : list.length;
+        return { list: list, total: total, capped: !!(j && j.count && j.count.capped) };
+    }
+
+    // ================= UI =================
+    const btn = document.createElement('button');
+    btn.id = 'mkt-btn';
+    btn.textContent = onMirakl ? '🧾 Księgowanie Marketplace (Mirakl)' : '🧾 Księgowanie Marketplace';
+    btn.style.cssText = 'position:fixed;top:300px;right:12px;z-index:2147483000;padding:9px 14px;border:none;border-radius:8px;background:#5b21b6;color:#fff;font:bold 13px Arial,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)';
+
+    const panel = document.createElement('div');
+    panel.id = 'mkt-panel';
+    panel.style.cssText = 'display:none;position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:2147483001;width:min(1100px,96vw);max-height:88vh;overflow:auto;background:#fff;border:1px solid #ddd6fe;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.28);font:13px Arial,sans-serif;flex-direction:column';
+    panel.innerHTML =
+        '<div style="display:flex;justify-content:space-between;align-items:center;background:#f5f3ff;padding:12px 16px;border-bottom:1px solid #ddd6fe">'
+      +   '<div style="font-weight:700;color:#5b21b6">Księgowanie Marketplace\'s <span style="font-weight:400;font-size:11px;opacity:.6">v' + MK_VER + ' · ' + (onMirakl ? 'Mirakl' : 'prologistics') + '</span></div>'
+      +   '<button id="mk-close" style="padding:4px 12px;border:1px solid #ddd6fe;border-radius:6px;background:#fff;cursor:pointer">✕</button>'
+      + '</div>'
+      + '<div style="padding:12px 16px">'
+      +   (onProlo
+            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS, CSV). Rozpoznam wpłaty od marketplace\'ów. Dla wypłat Mirakla otwórz potem stronę marketplace\'u — moduł sam dociągnie tam rozliczenie i wróci z gotowymi kwotami.</div>'
+              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
+              + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
+              + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
+            : '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Dla każdego znajdę cykl rozliczeniowy po referencji z przelewu, pobiorę pozycje i policzę kwoty brutto per zamówienie.</div>'
+              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz rozliczenia</button>'
+              + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>')
+      +   '<div id="mk-out" style="margin-top:12px"></div>'
+      + '</div>';
+
+    function $(s){ return panel.querySelector(s); }
+    function say(t, c){ const e = $('#mk-status'); if (e){ e.textContent = t || ''; e.style.color = c || '#666'; } }
+    btn.onclick = function(){ panel.style.display = (panel.style.display === 'none' ? 'flex' : 'none'); if (panel.style.display === 'flex') render(); };
+    (document.body || document.documentElement).appendChild(btn);
+    (document.body || document.documentElement).appendChild(panel);
+    $('#mk-close').onclick = function(){ panel.style.display = 'none'; };
+
+    function jobList(){
+        const j = jobsLoad();
+        return Object.keys(j).map(function (k){ return j[k]; })
+            .sort(function (a, b){ return String(a.date).localeCompare(String(b.date)) || String(a.ref).localeCompare(String(b.ref)); });
+    }
+
+    function render(){
+        const out = $('#mk-out');
+        const jobs = jobList();
+        if (!jobs.length){ out.innerHTML = '<div style="color:#888;padding:8px">' + (onProlo ? 'Brak zleceń — wgraj wyciąg bankowy.' : 'Brak zleceń. Najpierw wgraj wyciąg w prologistics.') + '</div>'; return; }
+        let h = '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+              + '<tr style="color:#999;font-size:10px"><td style="padding:2px 5px">Data</td><td style="padding:2px 5px">Marketplace</td>'
+              + '<td style="padding:2px 5px">Referencja</td><td style="padding:2px 5px;text-align:right">Z banku</td>'
+              + '<td style="padding:2px 5px">Stan</td><td style="padding:2px 5px">Szczegóły</td></tr>';
+        jobs.forEach(function (j){
+            const st = j.status || 'new';
+            const col = st === 'done' ? '#0a7a2f' : (st === 'ready' ? '#5b21b6' : (st === 'err' ? '#c00' : '#666'));
+            const lbl = { 'new': 'czeka na dane', 'ready': 'gotowe do importu', 'done': 'zaimportowane', 'err': 'błąd', 'skip': 'poza zakresem' }[st] || st;
+            let det = esc(j.msg || '');
+            if (j.data){
+                const n = Object.keys(j.data.ord || {}).length, nr = Object.keys(j.data.ref || {}).length;
+                det = 'zamówień: <b>' + n + '</b> na ' + f2(j.data.gross) + (nr ? (' · zwrotów: <b>' + nr + '</b> na ' + f2(j.data.refund)) : '') +
+                      ' · kontrola netto ' + (j.data.netOk ? '<b style="color:#0a7a2f">✓</b>' : '<b style="color:#c00">✗ ' + f2(j.data.net) + '</b>');
+                if (j.data.unknown && Object.keys(j.data.unknown).length) det += ' · <b style="color:#c00">nierozpoznane typy: ' + esc(Object.keys(j.data.unknown).join(', ')) + '</b>';
+                if (j.msg) det += '<div style="color:#666">' + esc(j.msg) + '</div>';
+            }
+            h += '<tr style="border-top:1px solid #eee">'
+              +  '<td style="padding:3px 5px;white-space:nowrap">' + esc(j.date) + '</td>'
+              +  '<td style="padding:3px 5px">' + esc(j.mp || '—') + '</td>'
+              +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—') + '</td>'
+              +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur) + '</td>'
+              +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + '</td>'
+              +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
+            if (onProlo && st === 'ready'){
+                h += '<tr><td colspan="6" style="padding:2px 5px 8px 5px;background:#faf9ff">'
+                  +  '<button class="mk-imp" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬆ Importuj ' + Object.keys(j.data.ord || {}).length + ' zamówień</button>'
+                  +  (Object.keys(j.data.ref || {}).length ? ' <button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button>' : '')
+                  +  ' <button class="mk-csv" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz „do prolo" CSV</button>'
+                  +  '</td></tr>';
+            }
+        });
+        out.innerHTML = h + '</table>';
+        out.querySelectorAll('.mk-imp').forEach(function (b){ b.onclick = function(){ doImport(b.getAttribute('data-ref'), b); }; });
+        out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
+    }
+
+    // ---------- prologistics: wczytanie wyciagu ----------
+    if (onProlo){
+        $('#mk-file').onchange = function(){
+            const f = this.files && this.files[0];
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                const p = mkParseBank(String(rd.result || ''));
+                if (p.err){ say(p.err, '#c00'); return; }
+                const jobs = jobsLoad();
+                let add = 0, known = 0, other = 0;
+                p.rows.forEach(function (r){
+                    if (!r.mp) return;
+                    if (!r.ok){ other++; return; }
+                    known++;
+                    const k = r.ref || (r.txId || (r.date + '_' + r.amount));
+                    if (jobs[k] && jobs[k].status === 'done') return;
+                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                });
+                jobsSave(jobs);
+                say('Wczytano: ' + p.rows.length + ' wpłat, rozpoznanych obsługiwanych ' + known + ' (nowych zleceń ' + add + ')'
+                    + (other ? (', pozostałych marketplace’ów ' + other + ' — na razie poza zakresem') : '') + '.', '#0a7a2f');
+                render();
+            };
+            rd.readAsText(f, 'utf-8');
+            try { this.value = ''; } catch (e){}
+        };
+        $('#mk-clear').onclick = function(){
+            if (!confirm('Usunąć wszystkie zlecenia (także pobrane rozliczenia)?')) return;
+            jobsSave({}); render(); say('Wyczyszczone.');
+        };
+    }
+
+    // ---------- Mirakl: pobranie rozliczen ----------
+    if (onMirakl){
+        $('#mk-run').onclick = async function(){
+            const b = this; b.disabled = true;
+            try {
+                const shop = await mkShop();
+                const shopName = String(shop.name || shop.shopName || '');
+                say('Sklep: ' + (shopName || '(nieznany)') + ' — szukam cykli…');
+                const jobs = jobsLoad();
+                const todo = Object.keys(jobs).filter(function (k){ return jobs[k].status === 'new' && jobs[k].ref; });
+                if (!todo.length){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+                let ok = 0, miss = 0;
+                for (let i = 0; i < todo.length; i++){
+                    const j = jobs[todo[i]];
+                    say('Pobieram ' + (i + 1) + '/' + todo.length + ' — ' + j.ref + '…');
+                    try {
+                        const cyc = await mkFindCycle(j.ref);
+                        if (!cyc){ j.msg = 'nie znalazłem cyklu z tą referencją na tym sklepie' + (shopName ? (' (' + shopName + ')') : ''); miss++; continue; }
+                        const tx = await mkCycleTx(cyc.id);
+                        const a = mkAggregate(tx.list);
+                        let gross = 0; Object.keys(a.ord).forEach(function (k){ gross = r2(gross + a.ord[k]); });
+                        let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
+                        // Netto rozliczenia = wiersz Payment (a gdy go jeszcze nie ma —
+                        // suma skladnikow). To ono ma sie zgadzac z kwota z wyciagu.
+                        const net = (a.pay != null) ? Math.abs(a.pay) : a.comp;
+                        // Kontrola spojnosci samego raportu: skladniki + Payment musza dac zero.
+                        const selfOk = (a.pay == null) || eq(r2(a.comp + a.pay), 0);
+                        j.data = { cycle: cyc.id, shop: shopName, gross: gross, refund: refund, net: net,
+                                   netOk: eq(net, j.amount), ord: a.ord, ref: a.ref, unknown: a.unknown,
+                                   rows: tx.list.length, total: tx.total };
+                        j.status = 'ready';
+                        j.msg = (tx.total > tx.list.length) ? ('UWAGA: pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji') : '';
+                        if (!selfOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłata ' + f2(a.pay);
+                        if (!j.data.netOk) j.msg = (j.msg ? j.msg + '; ' : '') + 'netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu';
+                        ok++;
+                    } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                    jobsSave(jobs); render();
+                }
+                say('Gotowe: pobranych ' + ok + (miss ? (', nieznalezionych na tym sklepie ' + miss + ' — otwórz właściwy sklep Mirakla') : '') + '.', miss ? '#c47f00' : '#0a7a2f');
+            } catch (e){ say('Błąd: ' + ((e && e.message) || e), '#c00'); }
+            finally { b.disabled = false; render(); }
+        };
+    }
+
+    // ---------- import do prologistics ----------
+    function pairsOf(j){
+        const out = [];
+        Object.keys(j.data.ord).sort().forEach(function (id){ out.push({ id: id, amt: j.data.ord[id] }); });
+        return out;
+    }
+    function fileName(j){
+        const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+        const ds = d ? (d[3] + '.' + d[2] + '.' + d[1]) : 'export';
+        return ds + ' ' + (j.data.shop || 'marketplace') + ' do prolo.csv';
+    }
+    function doCsv(ref){
+        const j = jobsLoad()[ref]; if (!j || !j.data) return;
+        const blob = new Blob([mkCsvText(pairsOf(j))], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
+        document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
+        say('Zapisano ' + fileName(j));
+    }
+    function doCopyRef(ref){
+        const j = jobsLoad()[ref]; if (!j || !j.data) return;
+        const t = Object.keys(j.data.ref).sort().map(function (id){ return id + '\t' + f2(Math.abs(j.data.ref[id])); }).join('\n');
+        try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); say('Skopiowano ' + Object.keys(j.data.ref).length + ' zwrotów — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
+        catch (e){ say('Nie udało się skopiować.', '#c00'); }
+    }
+    async function doImport(ref, b){
+        const jobs = jobsLoad(), j = jobs[ref];
+        if (!j || !j.data) return;
+        const sets = setLoad(), cfg = sets[j.data.shop] || null;
+        if (!cfg){
+            const bank = prompt('Nie znam ustawień importu dla sklepu „' + j.data.shop + '".\n\nPodaj bank_setting (dla Vente DE to 157):', '');
+            if (!bank) return;
+            const bk = prompt('booking_setting (zwykle 9):', '9') || '9';
+            sets[j.data.shop] = { bank: String(bank).trim(), booking: String(bk).trim(), acct: '' };
+            setSave(sets);
+        }
+        const c = setLoad()[j.data.shop];
+        const pairs = pairsOf(j);
+        const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+        if (!d){ say('Nie umiem odczytać daty wypłaty.', '#c00'); return; }
+        const dateIso = d[1] + '-' + d[2] + '-' + d[3];
+        if (!confirm('Zaimportować ' + pairs.length + ' zamówień na ' + f2(j.data.gross) + ' ' + j.cur + '?\n\n'
+            + 'Sklep: ' + j.data.shop + '\nData płatności: ' + dateIso + '\nKonto (bank_setting): ' + c.bank + (c.acct ? (' = ' + c.acct) : '')
+            + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+        b.disabled = true; say('Wysyłam import…');
+        try {
+            const fd = new FormData();
+            fd.append('imgs[]', new Blob([mkCsvText(pairs)], { type: 'text/csv' }), fileName(j));
+            fd.append('data', JSON.stringify({ booking_setting: c.booking, date_overwrite_to: dateIso, bank_setting: c.bank, import_type: 'manual' }));
+            const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            j.status = 'done'; j.msg = 'zaimportowane ' + pairs.length + ' zamówień ' + new Date().toISOString().slice(0, 16).replace('T', ' ');
+            jobsSave(jobs); render();
+            say('Zaimportowane. Sprawdź wynik na stronie Import payments.', '#0a7a2f');
+        } catch (e){ say('Import nie doszedł do skutku: ' + ((e && e.message) || e), '#c00'); }
+        finally { b.disabled = false; }
+    }
+
+    render();
+})();
+    }
+
     // ===================== Ksiegowanie w auftragu =====================
     // Wklejka z raportu (TSV) -> dla kazdego wiersza szukamy auftraga po numerze FF,
     // porownujemy kwote z „Auftrag value - Total of Payments" i ksiegujemy.
@@ -18036,6 +18474,7 @@
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
+        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl(), init: init_mkt },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
         { id: 'refund',   name: 'Refund Checker',            test: onProlo,   init: init_refund },
         { id: 'sepa',     name: 'SEPA Walidator IBAN',       test: onProlo,   init: init_sepa },
@@ -18091,6 +18530,7 @@
         const LAUNCH_TOOLS = [
             { id:'ksieg',    icon:svgIco('<path d="M15 5v2"/><path d="M15 11v2"/><path d="M15 17v2"/><path d="M5 5h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-3a2 2 0 0 0 0 -4v-3a2 2 0 0 1 2 -2"/>'), label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
             { id:'auftrag',  icon:svgIco('<path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie w auftragu', sel:'#auftrag-btn' },
+            { id:'mkt',      icon:svgIco('<path d="M3 21h18"/><path d="M5 21v-10l7 -5l7 5v10"/><path d="M9 21v-6h6v6"/>'), label:"Ksiegowanie Marketplace's", sel:'#mkt-btn' },
             { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
             { id:'vies',     icon:svgIco('<path d="M17.2 7a6 7 0 1 0 0 10"/><path d="M4 10h9"/><path d="M4 14h9"/>'), label:'Kurs walut', sel:'#oandaKursBtn' },
             { id:'vies',     icon:svgIco('<path d="M11.46 20.85a12 12 0 0 1 -7.96 -14.85a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3a12 12 0 0 1 -.09 7.06"/><path d="M15 19l2 2l4 -4"/>'), label:'VIES / KRS / GUS', sel:'#viesBtn' },
@@ -18113,6 +18553,7 @@
         const HUB_PANELS = [
             { sel: '#ksieg-panel',      needX: true },
             { sel: '#auftrag-panel',    needX: false },
+            { sel: '#mkt-panel',        needX: false },
             { sel: '#refund-panel',     needX: true },
             { sel: '#klient-panel',     needX: true },
             { sel: '#allegro-panel',    needX: true },
