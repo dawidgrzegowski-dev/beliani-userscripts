@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.35
+// @version      2.36
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18343,9 +18343,13 @@
         const box = $('#mk-ref'); if (!box) return;
         const g = refGroups(), keys = Object.keys(g).sort();
         if (!keys.length){ box.innerHTML = ''; return; }
+        const withAcc = keys.filter(function (k){ return g[k].acct; }).length;
         let h = '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ede9fe">'
-              + '<b style="font-size:11px;color:#5b21b6">Zwroty do zaksięgowania w tickecie</b>'
-              + '<div style="font-size:10px;color:#888;margin-bottom:6px">Zebrane ze wszystkich zestawień, pogrupowane po dacie i koncie. Moduł ticketa księguje na jedno konto naraz, więc każda grupa idzie osobno.</div>';
+              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">'
+              + '<b style="font-size:11px;color:#5b21b6">Zwroty</b>'
+              + '<button id="mk-ref-all"' + (withAcc ? '' : ' disabled')
+              + ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (withAcc ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (withAcc ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj wszystkie zwroty (' + withAcc + ')</button></div>'
+              + '<div style="font-size:10px;color:#888;margin-bottom:6px">Zebrane ze wszystkich zestawień, pogrupowane po dacie i koncie — moduł ticketa księguje na jedno konto naraz. Księguje go ten moduł, nic nie trzeba przeklejać.</div>';
         keys.forEach(function (k, i){
             const x = g[k];
             const dup = {}, dupList = [];
@@ -18355,7 +18359,7 @@
               +  '<b style="font-size:11px">' + esc(x.date) + '</b>'
               +  '<span style="font-size:11px;color:#374151">' + (x.acct ? esc(x.acct + (x.accNm ? (' — ' + x.accNm) : '')) : '<span style="color:#c47f00">konto nieustawione (' + esc(Object.keys(x.shops).join(', ')) + ')</span>') + '</span>'
               +  '<span style="font-size:11px;color:#666">' + x.rows.length + ' poz. · ' + f2(x.sum) + '</span>'
-              +  '<button class="mk-rt" data-g="' + i + '" style="padding:3px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">→ Wypełnij Księgowanie w tickecie</button>'
+              +  '<button class="mk-rt" data-g="' + i + '"' + (x.acct ? '' : ' disabled') + ' style="padding:3px 10px;border:none;border-radius:6px;background:' + (x.acct ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (x.acct ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj</button>'
               +  '<button class="mk-rc" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj</button>'
               +  '</div>'
               +  (dupList.length ? '<div style="font-size:10px;color:#c47f00;margin-top:3px">ten sam order w kilku zestawieniach: ' + esc(dupList.join(', ')) + '</div>' : '')
@@ -18363,21 +18367,48 @@
               +  '</div>';
         });
         box.innerHTML = h + '</div>';
-        box.querySelectorAll('.mk-rt').forEach(function (b){ b.onclick = function(){ toTicket(g[keys[+b.getAttribute('data-g')]]); }; });
+        const ra = box.querySelector('#mk-ref-all');
+        if (ra) ra.onclick = function(){ bookAllRefunds(ra); };
+        box.querySelectorAll('.mk-rt').forEach(function (b){ b.onclick = async function(){
+            b.disabled = true;
+            const r = await bookRefunds(g[keys[+b.getAttribute('data-g')]]);
+            b.disabled = false;
+            if (!r) say('Zwroty zaksięgowane — wynik w panelu Księgowanie w tickecie.', '#0a7a2f');
+        }; });
         box.querySelectorAll('.mk-rc').forEach(function (b){ b.onclick = function(){
             const x = g[keys[+b.getAttribute('data-g')]];
             try { GM_setClipboard(refTsv(x.rows), 'text'); say('Skopiowane — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
             catch (e){ say('Nie udało się skopiować.', '#c00'); }
         }; });
     }
-    // Wypelniamy pola tamtego modulu, ale NIE uruchamiamy ksiegowania — start zostaje
-    // po Twojej stronie, tak jak przy recznym wklejeniu.
-    function toTicket(x){
+    // Zwrotow nie ksiegujemy wlasnym kodem — oddajemy je modulowi „Ksiegowanie w tickecie".
+    // On juz umie znalezc ticket, wykryc duplikat platnosci i rozbic pozycje, a druga
+    // implementacja tego samego predzej czy pozniej rozjechalaby sie z pierwsza.
+    // Wchodzimy w niego jego wlasna droga: wypelniamy pola i uruchamiamy jego przycisk,
+    // wiec wszystkie jego kontrole dzialaja tak samo jak przy recznym wklejeniu.
+    function ksBtn(){ return document.getElementById('tm-t-check-and-book-parallel-btn'); }
+    // Sygnal konca: tamten modul blokuje swoj przycisk na czas pracy i odblokowuje go
+    // w bloku finally. Czekamy wiec az sie zablokuje, a potem az znow bedzie wolny.
+    function ksWait(btn){
+        return new Promise(function (resolve){
+            const t0 = Date.now();
+            let started = false;
+            const iv = setInterval(function (){
+                if (btn.disabled){ started = true; }
+                else if (started){ clearInterval(iv); resolve('ok'); }
+                const dt = Date.now() - t0;
+                if (!started && dt > 30000){ clearInterval(iv); resolve('anulowane'); }
+                if (dt > 45 * 60 * 1000){ clearInterval(iv); resolve('przerwane po czasie'); }
+            }, 400);
+        });
+    }
+    function ksFill(x){
         const ta = document.getElementById('tm-t-input');
         const dt = document.getElementById('tm-t-date');
         const ac = document.getElementById('tm-t-account');
-        if (!ta || !ac){ say('Nie widzę modułu „Księgowanie w tickecie" — włącz go w launcherze (⚙ Moduły).', '#c47f00'); return; }
-        if (!x.acct){ say('Najpierw wskaż konto dla tego sklepu w ⚙ Konta.', '#c47f00'); return; }
+        if (!ta || !ac) return 'nie widzę modułu „Księgowanie w tickecie" — włącz go w launcherze (⚙ Moduły)';
+        if (!x.acct) return 'nie wskazano konta dla tego sklepu — uzupełnij w ⚙ Konta';
+        if (!ksBtn()) return 'nie znajduję przycisku księgowania w tamtym module';
         ta.value = refTsv(x.rows);
         if (dt) dt.value = x.date;
         ac.value = String(x.acct);
@@ -18387,8 +18418,34 @@
             el.dispatchEvent(new Event('change', { bubbles: true }));
         });
         const kp = document.getElementById('ksieg-panel');
-        if (kp) kp.style.display = 'block';
-        say('Wypełniłem Księgowanie w tickecie: ' + x.rows.length + ' pozycji na ' + f2(x.sum) + ', konto ' + x.acct + '. Sprawdź i uruchom tam.', '#0a7a2f');
+        if (kp) kp.style.display = 'block';        // widoczny, zebys mogl patrzec na postep
+        return '';
+    }
+    async function bookRefunds(x){
+        const err = ksFill(x);
+        if (err){ say(err, '#c47f00'); return err; }
+        say('Księguję zwroty: ' + x.rows.length + ' poz. na ' + f2(x.sum) + ', konto ' + x.acct + '…');
+        ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
+        const r = await ksWait(ksBtn());
+        return r === 'ok' ? '' : r;
+    }
+    async function bookAllRefunds(b){
+        const g = refGroups(), keys = Object.keys(g).sort().filter(function (k){ return g[k].acct; });
+        if (!keys.length){ say('Żadna grupa nie ma ustawionego konta.', '#c47f00'); return; }
+        let n = 0, sum = 0;
+        keys.forEach(function (k){ n += g[k].rows.length; sum = r2(sum + g[k].sum); });
+        if (!confirm('Zaksięgować zwroty z ' + keys.length + ' grup — razem ' + n + ' pozycji na ' + f2(sum) + '?\n\n'
+            + keys.map(function (k){ return '  • ' + g[k].date + '  konto ' + g[k].acct + '  ' + g[k].rows.length + ' poz.  ' + f2(g[k].sum); }).join('\n')
+            + '\n\nKażda grupa idzie przez moduł „Księgowanie w tickecie" i on jeszcze raz zapyta o potwierdzenie.')) return;
+        b.disabled = true;
+        let ok = 0; const bad = [];
+        for (let i = 0; i < keys.length; i++){
+            say('Grupa ' + (i + 1) + '/' + keys.length + ' — konto ' + g[keys[i]].acct + '…');
+            const r = await bookRefunds(g[keys[i]]);
+            if (r) bad.push('konto ' + g[keys[i]].acct + ': ' + r); else ok++;
+        }
+        b.disabled = false;
+        say('Zwroty: zaksięgowanych grup ' + ok + ' z ' + keys.length + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.', bad.length ? '#c47f00' : '#0a7a2f');
     }
 
     // ---------- prologistics: wczytanie wyciagu ----------
