@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.34
+// @version      2.35
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18232,12 +18232,35 @@
             .sort(function (a, b){ return String(a.date).localeCompare(String(b.date)) || String(a.ref).localeCompare(String(b.ref)); });
     }
 
+    // Zaznaczenie do zbiorczego ksiegowania. Domyslnie zaznaczone jest to, co przeszlo
+    // WSZYSTKIE kontrole (stan „gotowe do importu") — czyli zgadza sie z wyciagiem,
+    // ma komplet pozycji i nie ma nierozpoznanych typow. Reszty nie zaznaczamy sami.
+    const mkSel = {};
+    function selOn(j){ const v = mkSel[j.ref]; return (v === undefined) ? (j.status === 'ready') : !!v; }
+    function selList(){ return jobList().filter(function (j){ return j.status === 'ready' && selOn(j); }); }
+
     function render(){
         const out = $('#mk-out');
         const jobs = jobList();
         if (!jobs.length){ out.innerHTML = '<div style="color:#888;padding:8px">' + (onProlo ? 'Brak zleceń — wgraj wyciąg bankowy.' : 'Brak zleceń. Najpierw wgraj wyciąg w prologistics.') + '</div>'; return; }
-        let h = '<table style="border-collapse:collapse;font-size:11px;width:100%">'
-              + '<tr style="color:#999;font-size:10px"><td style="padding:2px 5px">Data</td><td style="padding:2px 5px">Marketplace</td>'
+        const nSel = selList().length;
+        let h = '';
+        if (onProlo){
+            let gs = 0, no = 0;
+            selList().forEach(function (j){
+                gs = r2(gs + (j.data ? j.data.gross : 0));
+                const c = setLoad()[setKey(j.mp, j.data && j.data.shop)];
+                if (!c || !c.bank) no++;
+            });
+            h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+              +  '<button id="mk-imp-all"' + (nSel ? '' : ' disabled')
+              +  ' style="padding:6px 14px;border:none;border-radius:6px;background:' + (nSel ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (nSel ? 'pointer' : 'default') + ';font-size:12px">⬆ Zaksięguj zaznaczone (' + nSel + ')</button>'
+              +  (nSel ? '<span style="font-size:11px;color:#666">razem ' + f2(gs) + '</span>' : '')
+              +  (no ? '<span style="font-size:11px;color:#c47f00">' + no + ' bez bank_setting — uzupełnij w ⚙ Konta</span>' : '')
+              +  '</div>';
+        }
+        h += '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+              + '<tr style="color:#999;font-size:10px"><td style="padding:2px 5px"></td><td style="padding:2px 5px">Data</td><td style="padding:2px 5px">Marketplace</td>'
               + '<td style="padding:2px 5px">Referencja</td><td style="padding:2px 5px;text-align:right">Z banku</td>'
               + '<td style="padding:2px 5px">Stan</td><td style="padding:2px 5px">Szczegóły</td></tr>';
         jobs.forEach(function (j){
@@ -18257,6 +18280,9 @@
                 if (j.msg) det += '<div style="color:#c47f00">' + esc(j.msg) + '</div>';
             }
             h += '<tr style="border-top:1px solid #eee">'
+              +  '<td style="padding:3px 5px">' + (onProlo && st === 'ready'
+                    ? '<input type="checkbox" class="mk-ck" data-ref="' + esc(j.ref) + '"' + (selOn(j) ? ' checked' : '') + '>'
+                    : '') + '</td>'
               +  '<td style="padding:3px 5px;white-space:nowrap">' + esc(j.date) + '</td>'
               +  '<td style="padding:3px 5px">' + esc(j.mp || '—') + '</td>'
               +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—') + '</td>'
@@ -18264,7 +18290,7 @@
               +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
             if (onProlo && (st === 'ready' || st === 'partial')){
-                h += '<tr><td colspan="6" style="padding:2px 5px 8px 5px;background:#faf9ff">'
+                h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  (st === 'ready'
                         ? '<button class="mk-imp" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬆ Importuj ' + Object.keys(j.data.ord || {}).length + ' zamówień</button>'
                         : '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span>')
@@ -18273,10 +18299,96 @@
                   +  '</td></tr>';
             }
         });
-        out.innerHTML = h + '</table>';
+        out.innerHTML = h + '</table><div id="mk-ref"></div>';
         out.querySelectorAll('.mk-imp').forEach(function (b){ b.onclick = function(){ doImport(b.getAttribute('data-ref'), b); }; });
         out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-ck').forEach(function (c){
+            c.onchange = function(){ mkSel[c.getAttribute('data-ref')] = c.checked; render(); };
+        });
+        const ba = out.querySelector('#mk-imp-all');
+        if (ba) ba.onclick = function(){ doImportAll(ba); };
+        renderRef();
+    }
+
+    // ---------- zwroty zbiorczo, per data i konto ----------
+    // Ksiegowanie w tickecie przyjmuje JEDNO konto na raz, wiec zwroty ze wszystkich
+    // zestawien danego dnia grupujemy po koncie i podajemy osobno dla kazdego.
+    function refGroups(){
+        const g = {}, sets = setLoad(), acc = mkAcctLoad();
+        jobList().forEach(function (j){
+            if (!j.data || !j.data.ref) return;
+            const ids = Object.keys(j.data.ref);
+            if (!ids.length) return;
+            const c = sets[setKey(j.mp, j.data.shop)] || {};
+            const key = String(j.date) + '|' + (c.acct || ('? ' + j.data.shop));
+            if (!g[key]){
+                const a = acc.filter(function (x){ return x.n === String(c.acct || ''); })[0];
+                g[key] = { date: j.date, acct: c.acct || '', accNm: a ? a.nm : '', rows: [], shops: {}, sum: 0 };
+            }
+            g[key].shops[j.data.shop] = 1;
+            ids.forEach(function (id){
+                const v = Math.abs(j.data.ref[id]);
+                if (!v) return;                                  // zerowe wiersze wysylki pomijamy
+                g[key].rows.push({ id: id, amt: v, ref: j.ref });
+                g[key].sum = r2(g[key].sum + v);
+            });
+        });
+        return g;
+    }
+    function refTsv(rows){
+        return 'Order number\tAmount\n' + rows.map(function (r){ return r.id + '\t' + f2(r.amt); }).join('\n');
+    }
+    function renderRef(){
+        const box = $('#mk-ref'); if (!box) return;
+        const g = refGroups(), keys = Object.keys(g).sort();
+        if (!keys.length){ box.innerHTML = ''; return; }
+        let h = '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ede9fe">'
+              + '<b style="font-size:11px;color:#5b21b6">Zwroty do zaksięgowania w tickecie</b>'
+              + '<div style="font-size:10px;color:#888;margin-bottom:6px">Zebrane ze wszystkich zestawień, pogrupowane po dacie i koncie. Moduł ticketa księguje na jedno konto naraz, więc każda grupa idzie osobno.</div>';
+        keys.forEach(function (k, i){
+            const x = g[k];
+            const dup = {}, dupList = [];
+            x.rows.forEach(function (r){ if (dup[r.id]) { if (dupList.indexOf(r.id) < 0) dupList.push(r.id); } dup[r.id] = 1; });
+            h += '<div style="margin:6px 0;padding:6px 8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:6px">'
+              +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              +  '<b style="font-size:11px">' + esc(x.date) + '</b>'
+              +  '<span style="font-size:11px;color:#374151">' + (x.acct ? esc(x.acct + (x.accNm ? (' — ' + x.accNm) : '')) : '<span style="color:#c47f00">konto nieustawione (' + esc(Object.keys(x.shops).join(', ')) + ')</span>') + '</span>'
+              +  '<span style="font-size:11px;color:#666">' + x.rows.length + ' poz. · ' + f2(x.sum) + '</span>'
+              +  '<button class="mk-rt" data-g="' + i + '" style="padding:3px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">→ Wypełnij Księgowanie w tickecie</button>'
+              +  '<button class="mk-rc" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj</button>'
+              +  '</div>'
+              +  (dupList.length ? '<div style="font-size:10px;color:#c47f00;margin-top:3px">ten sam order w kilku zestawieniach: ' + esc(dupList.join(', ')) + '</div>' : '')
+              +  '<div style="font-size:10px;color:#888;margin-top:3px;font-family:monospace">' + esc(x.rows.slice(0, 6).map(function (r){ return r.id + ' ' + f2(r.amt); }).join('  ·  ')) + (x.rows.length > 6 ? '  … +' + (x.rows.length - 6) : '') + '</div>'
+              +  '</div>';
+        });
+        box.innerHTML = h + '</div>';
+        box.querySelectorAll('.mk-rt').forEach(function (b){ b.onclick = function(){ toTicket(g[keys[+b.getAttribute('data-g')]]); }; });
+        box.querySelectorAll('.mk-rc').forEach(function (b){ b.onclick = function(){
+            const x = g[keys[+b.getAttribute('data-g')]];
+            try { GM_setClipboard(refTsv(x.rows), 'text'); say('Skopiowane — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
+            catch (e){ say('Nie udało się skopiować.', '#c00'); }
+        }; });
+    }
+    // Wypelniamy pola tamtego modulu, ale NIE uruchamiamy ksiegowania — start zostaje
+    // po Twojej stronie, tak jak przy recznym wklejeniu.
+    function toTicket(x){
+        const ta = document.getElementById('tm-t-input');
+        const dt = document.getElementById('tm-t-date');
+        const ac = document.getElementById('tm-t-account');
+        if (!ta || !ac){ say('Nie widzę modułu „Księgowanie w tickecie" — włącz go w launcherze (⚙ Moduły).', '#c47f00'); return; }
+        if (!x.acct){ say('Najpierw wskaż konto dla tego sklepu w ⚙ Konta.', '#c47f00'); return; }
+        ta.value = refTsv(x.rows);
+        if (dt) dt.value = x.date;
+        ac.value = String(x.acct);
+        [ta, dt, ac].forEach(function (el){
+            if (!el) return;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        const kp = document.getElementById('ksieg-panel');
+        if (kp) kp.style.display = 'block';
+        say('Wypełniłem Księgowanie w tickecie: ' + x.rows.length + ' pozycji na ' + f2(x.sum) + ', konto ' + x.acct + '. Sprawdź i uruchom tam.', '#0a7a2f');
     }
 
     // ---------- prologistics: wczytanie wyciagu ----------
@@ -18580,6 +18692,68 @@
         try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); say('Skopiowano ' + Object.keys(j.data.ref).length + ' zwrotów — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
         catch (e){ say('Nie udało się skopiować.', '#c00'); }
     }
+    // Zbiorcze ksiegowanie zaznaczonych. Jedno potwierdzenie na calosc, ale wysylka
+    // po kolei — dzieki temu blad na jednym zleceniu nie przewraca reszty, a kazde
+    // zaksiegowane od razu dostaje stan „done" i nie da sie go wyslac drugi raz.
+    async function doImportAll(b){
+        const sel = selList();
+        if (!sel.length) return;
+        const sets = setLoad(), miss = [];
+        sel.forEach(function (j){
+            const c = sets[setKey(j.mp, j.data.shop)];
+            if (!c || !c.bank) miss.push(j.data.shop || j.ref);
+        });
+        if (miss.length){
+            const box = $('#mk-set'); if (box) box.style.display = 'block';
+            if (!mkAcctLoad().length){ try { await mkAcctFetch(); } catch (e){} }
+            renderSet();
+            say('Brakuje bank_setting dla: ' + miss.join(', ') + '. Uzupełnij w ⚙ Konta i spróbuj ponownie.', '#c47f00');
+            return;
+        }
+        let tot = 0, cnt = 0;
+        const lines = sel.map(function (j){
+            const n = Object.keys(j.data.ord).length;
+            const c = sets[setKey(j.mp, j.data.shop)];
+            tot = r2(tot + j.data.gross); cnt += n;
+            return '  • ' + j.data.shop + '  ' + j.date + '  ' + n + ' zam.  ' + f2(j.data.gross) + ' ' + j.cur + '  → konto ' + (c.acct || '?') + ' (bank_setting ' + c.bank + ')';
+        });
+        if (!confirm('Zaksięgować ' + sel.length + ' zestawień, razem ' + cnt + ' zamówień na ' + f2(tot) + '?\n\n'
+            + lines.join('\n') + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+        b.disabled = true;
+        let ok = 0; const err = [];
+        for (let i = 0; i < sel.length; i++){
+            const j = sel[i];
+            say('Księguję ' + (i + 1) + '/' + sel.length + ' — ' + j.data.shop + '…');
+            const r = await sendImport(j, sets[setKey(j.mp, j.data.shop)]);
+            if (r === true) ok++; else err.push(j.data.shop + ': ' + r);
+            render();
+        }
+        b.disabled = false;
+        say('Zaksięgowane ' + ok + ' z ' + sel.length + (err.length ? ('. Nie poszło: ' + err.join('; ')) : '. Sprawdź wynik na stronie Import payments.'), err.length ? '#c00' : '#0a7a2f');
+    }
+
+    // Wspolna wysylka — uzywana i przez pojedynczy import, i przez zbiorczy.
+    // Zwraca true albo tresc bledu.
+    async function sendImport(j, c){
+        const jobs = jobsLoad(), cur = jobs[j.ref];
+        if (!cur || cur.status === 'done') return 'już zaksięgowane';
+        const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+        if (!d) return 'nie umiem odczytać daty wypłaty';
+        const dateIso = d[1] + '-' + d[2] + '-' + d[3];
+        const pairs = pairsOf(j);
+        try {
+            const fd = new FormData();
+            fd.append('imgs[]', new Blob([mkCsvText(pairs)], { type: 'text/csv' }), fileName(j));
+            fd.append('data', JSON.stringify({ booking_setting: c.booking, date_overwrite_to: dateIso, bank_setting: c.bank, import_type: 'manual' }));
+            const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            cur.status = 'done';
+            cur.msg = 'zaimportowane ' + pairs.length + ' zamówień, konto ' + (c.acct || c.bank);
+            jobsSave(jobs);
+            return true;
+        } catch (e){ return (e && e.message) || String(e); }
+    }
+
     async function doImport(ref, b){
         const jobs = jobsLoad(), j = jobs[ref];
         if (!j || !j.data) return;
@@ -18606,17 +18780,11 @@
             + '\nbank_setting: ' + c.bank
             + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
         b.disabled = true; say('Wysyłam import…');
-        try {
-            const fd = new FormData();
-            fd.append('imgs[]', new Blob([mkCsvText(pairs)], { type: 'text/csv' }), fileName(j));
-            fd.append('data', JSON.stringify({ booking_setting: c.booking, date_overwrite_to: dateIso, bank_setting: c.bank, import_type: 'manual' }));
-            const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            j.status = 'done'; j.msg = 'zaimportowane ' + pairs.length + ' zamówień ' + new Date().toISOString().slice(0, 16).replace('T', ' ');
-            jobsSave(jobs); render();
-            say('Zaimportowane. Sprawdź wynik na stronie Import payments.', '#0a7a2f');
-        } catch (e){ say('Import nie doszedł do skutku: ' + ((e && e.message) || e), '#c00'); }
-        finally { b.disabled = false; }
+        const r = await sendImport(j, c);
+        render();
+        if (r === true) say('Zaimportowane. Sprawdź wynik na stronie Import payments.', '#0a7a2f');
+        else say('Import nie doszedł do skutku: ' + r, '#c00');
+        b.disabled = false;
     }
 
     render();
