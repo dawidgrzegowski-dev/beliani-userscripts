@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.21
+// @version      2.22
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11745,6 +11745,24 @@
             else                                state = 'ok';
             list.push(Object.assign({}, e, { hits: hits, bank: bank, total: total, diff: diff, state: state }));
         });
+        // Drugie podejscie — po KWOCIE. Nazwa beneficjenta w banku bywa zupelnie inna niz
+        // nazwa dostawcy w ERP: „YIXING YUANHONG IMP AND EXP CO.,LTD (Home&Garden)" w arkuszu,
+        // a w tresci przelewu „YIXING HOME&GARDEN ARTS CO.,LTD." — wspolny jest tylko dopisek
+        // w nawiasie, ktory do klucza (pierwsze 20 znakow) w ogole nie wchodzi.
+        // Ratujemy takie przypadki, ale TYLKO gdy jest to jednoznaczne: dokladnie jedna
+        // nieznaleziona pozycja o tej kwocie i dokladnie jeden wolny przelew o tej kwocie.
+        // Wynik dostaje osobny stan 'amt', bo czlowiek musi zobaczyc, ze nazwy sie roznia —
+        // to nie to samo co zgodnosc nazwy i kwoty naraz.
+        const miss = list.filter(function (e) { return e.state === 'missing'; });
+        miss.forEach(function (e) {
+            if (miss.filter(function (x) { return Math.abs(x.total - e.total) < 0.005; }).length !== 1) return;
+            const cand = [];
+            (tx || []).forEach(function (t, i) { if (!used[i] && Math.abs(t.amt - e.total) < 0.005) cand.push(i); });
+            if (cand.length !== 1) return;
+            const i = cand[0];
+            used[i] = (used[i] || []).concat([e.key]);
+            e.hits = [i]; e.bank = tx[i].amt; e.diff = 0; e.state = 'amt'; e.bankTxt = tx[i].txt || '';
+        });
         const orphans = [], shared = [];
         (tx || []).forEach(function (t, i) {
             if (!used[i]) orphans.push(t);
@@ -11752,17 +11770,19 @@
         });
         let orphanSum = 0, expSum = 0, hitSum = 0;
         orphans.forEach(function (t) { orphanSum = bal2(orphanSum + t.amt); });
-        const cnt = { ok: 0, diff: 0, missing: 0, nokey: 0 };
+        const cnt = { ok: 0, diff: 0, missing: 0, nokey: 0, amt: 0 };
         list.forEach(function (e) { cnt[e.state]++; expSum = bal2(expSum + e.total); hitSum = bal2(hitSum + e.bank); });
-        // Kolejnosc: najpierw to, co wymaga reakcji, potem reszta alfabetycznie.
-        const rank = { diff: 0, missing: 1, nokey: 2, ok: 3 };
+        // Kolejnosc: najpierw to, co wymaga reakcji, potem dopasowane po kwocie (do rzutu okiem),
+        // na koncu reszta alfabetycznie.
+        const rank = { diff: 0, missing: 1, nokey: 2, amt: 3, ok: 4 };
         list.sort(function (a, b) {
             if (rank[a.state] !== rank[b.state]) return rank[a.state] - rank[b.state];
             return String(a.name).localeCompare(String(b.name));
         });
         return { list: list, orphans: orphans, shared: shared, orphanSum: orphanSum,
                  expSum: expSum, hitSum: hitSum,
-                 ok: cnt.ok, diff: cnt.diff, missing: cnt.missing, nokey: cnt.nokey,
+                 ok: cnt.ok, diff: cnt.diff, missing: cnt.missing, nokey: cnt.nokey, amt: cnt.amt,
+                 // 'amt' NIE jest bledem — kwota sie zgadza, rozni sie tylko nazwa.
                  bad: cnt.diff + cnt.missing + cnt.nokey };
     }
 
@@ -11779,6 +11799,14 @@
             tail = '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
         } else if (e.state === 'nokey') {
             tail = '<span style="color:#92400e">nazwa za krótka, żeby jej szukać w pliku — sprawdź ręcznie</span>';
+        } else if (e.state === 'amt') {
+            // Pokazujemy nazwe z banku, bo to jedyne, co pozwala potwierdzic, ze to ta sama firma.
+            const bn = String(e.bankTxt || '')
+                .replace(/^INTERNATIONAL PAYMENT\s*/i, '')
+                .replace(/\s*SENDER'?S REFERENCE:.*$/i, '');
+            tail = '<span style="color:#92400e">bank ' + balFix(e.bank) +
+                ' — kwota się zgadza, ale w przelewie jest INNA nazwa: <b>' +
+                balEsc(bn.length > 110 ? bn.slice(0, 110) + '…' : bn) + '</b> — sprawdź, czy to ta sama firma</span>';
         } else {
             tail = '<span style="color:#991b1b">bank ' + balFix(e.bank) + ', różnica ' +
                 (e.diff > 0 ? '+' : '') + balFix(e.diff) + '</span>';
@@ -11834,13 +11862,16 @@
                 'każdej z nich, więc sprawdź te pozycje ręcznie.</div>';
         }
 
+        // 'amt' trafia do gornej listy razem z bledami — kwota sie zgadza, ale nazwa nie,
+        // wiec ktos musi na to spojrzec. Do licznika bledow jednak nie wchodzi.
         const bad  = m.list.filter(function (e) { return e.state !== 'ok'; });
         const good = m.list.filter(function (e) { return e.state === 'ok'; });
-        const okAll = !bad.length;
+        const okAll = !m.bad;
+        const amtTxt = m.amt ? (' &nbsp;·&nbsp; ' + m.amt + ' dopasowan' + (m.amt === 1 ? 'a' : 'e') + ' po kwocie (nazwa w banku inna)') : '';
         const title = okAll
-            ? '✓ Wszystkie ' + m.ok + ' firm(y) z wklejki mają w pliku przelew na właściwą kwotę (' + balFix(m.expSum) + ')'
-            : '⚠ ' + bad.length + ' z ' + m.list.length + ' firm nie zgadza się z plikiem' +
-              (m.ok ? ' (pozostałe ' + m.ok + ' OK)' : '');
+            ? '✓ Wszystkie ' + (m.ok + m.amt) + ' firm(y) z wklejki mają w pliku przelew na właściwą kwotę (' + balFix(m.expSum) + ')' + amtTxt
+            : '⚠ ' + m.bad + ' z ' + m.list.length + ' firm nie zgadza się z plikiem' +
+              (m.ok ? ' (pozostałe ' + m.ok + ' OK)' : '') + amtTxt;
 
         let html = '<div style="background:' + (okAll ? '#f0fdf4' : '#fffbeb') + ';border:1px solid ' +
             (okAll ? '#bbf7d0' : '#fde68a') + ';border-radius:6px;padding:6px 8px;margin-top:4px;color:' +
