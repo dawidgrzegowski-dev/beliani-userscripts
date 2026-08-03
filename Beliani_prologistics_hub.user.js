@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.43
+// @version      2.45
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17750,10 +17750,21 @@
             konto: c.acct || '',
             kwota: j.amount,                 // kwota z wyciagu, nie brutto zamowien
             booked: 'Tak',
-            refunded: nRef ? 'Tak' : 'Nie',
+            // W arkuszu „Tak" i „Brak" sa zielone, a „Nie" czerwone — to lista rzeczy
+            // do zrobienia, nie opis. Dlatego: nie ma zwrotow = „Brak" (nie ma co robic),
+            // sa zwroty = „Nie" dopoki ich nie zaksiegujesz.
+            refunded: nRef ? 'Nie' : 'Brak',
             dodane: 'Nie',                   // inny arkusz, bez uprawnien — zawsze Nie
             comments: j.ref
         };
+    }
+    // Klucz wiersza w arkuszu: data + konto + kwota. Ten sam, ktorego uzywa Apps Script
+    // do wykrywania duplikatow, wiec oznaczanie trafia dokladnie w ten sam wiersz.
+    function shKey(j, acct){ return { data: j.date, konto: acct || '', kwota: j.amount }; }
+    async function shMarkRefunded(list){
+        const cfg = shCfg();
+        if (!cfg.on || !cfg.url || !cfg.secret || !list || !list.length) return null;
+        return shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, action: 'refunded', rows: list }));
     }
     async function shPost(rows){
         const cfg = shCfg();
@@ -18372,17 +18383,16 @@
               +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
             if (onProlo && (st === 'ready' || st === 'partial')){
+                // Ksiegowanie idzie wylacznie przez zaznaczenie i guzik zbiorczy nad tabela.
+                // Osobny przycisk przy kazdym wierszu tylko dublowalby te sama droge.
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
-                  +  (st === 'ready'
-                        ? '<button class="mk-imp" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬆ Importuj ' + Object.keys(j.data.ord || {}).length + ' zamówień</button>'
-                        : '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span>')
-                  +  (Object.keys(j.data.ref || {}).length ? ' <button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button>' : '')
-                  +  ' <button class="mk-csv" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz „do prolo" CSV</button>'
+                  +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span> ' : '')
+                  +  (Object.keys(j.data.ref || {}).length ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
+                  +  '<button class="mk-csv" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz „do prolo" CSV</button>'
                   +  '</td></tr>';
             }
         });
         out.innerHTML = h + '</table><div id="mk-ref"></div>';
-        out.querySelectorAll('.mk-imp').forEach(function (b){ b.onclick = function(){ doImport(b.getAttribute('data-ref'), b); }; });
         out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-ck').forEach(function (c){
@@ -18406,9 +18416,11 @@
             const key = String(j.date) + '|' + (c.acct || ('? ' + j.data.shop));
             if (!g[key]){
                 const a = acc.filter(function (x){ return x.n === String(c.acct || ''); })[0];
-                g[key] = { date: j.date, acct: c.acct || '', accNm: a ? a.nm : '', rows: [], shops: {}, sum: 0 };
+                g[key] = { date: j.date, acct: c.acct || '', accNm: a ? a.nm : '', rows: [], shops: {}, sum: 0, keys: [], seen: {} };
             }
             g[key].shops[j.data.shop] = 1;
+            // jedno zestawienie = jeden wiersz w arkuszu, nawet gdy ma kilka zwrotow
+            if (!g[key].seen[j.ref]){ g[key].seen[j.ref] = 1; g[key].keys.push(shKey(j, c.acct)); }
             ids.forEach(function (id){
                 const v = Math.abs(j.data.ref[id]);
                 if (!v) return;                                  // zerowe wiersze wysylki pomijamy
@@ -18543,7 +18555,15 @@
         ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
         const r = await ksWait(ksBtn());
         ksMirror(null);
-        return r === 'ok' ? '' : r;
+        if (r !== 'ok') return r;
+        // Zwroty zaksiegowane — odhaczamy je w arkuszu. Niepowodzenie tego kroku nie
+        // cofa ksiegowania, trafia tylko na pasek stanu.
+        try {
+            const res = await shMarkRefunded(x.keys);
+            if (res) say('Zwroty zaksięgowane · w arkuszu oznaczonych ' + (res.updated || 0)
+                + ((res.missing && res.missing.length) ? (', nie znalazłem ' + res.missing.length + ' wierszy') : ''), '#0a7a2f');
+        } catch (e){ say('Zwroty zaksięgowane, ale arkusz: ' + ((e && e.message) || e), '#c47f00'); }
+        return '';
     }
     async function bookAllRefunds(b){
         const g = refGroups(), keys = Object.keys(g).sort().filter(function (k){ return g[k].acct; });
@@ -18984,39 +19004,6 @@
             }
             return true;
         } catch (e){ return (e && e.message) || String(e); }
-    }
-
-    async function doImport(ref, b){
-        const jobs = jobsLoad(), j = jobs[ref];
-        if (!j || !j.data) return;
-        const key = setKey(j.mp, j.data.shop);
-        const c = setLoad()[key];
-        if (!c || !c.bank){
-            // Bez bank_setting import poszedlby na zle konto — lepiej otworzyc ustawienia
-            // niz zgadywac. Konto podpowiadamy z planu kont po kodzie kraju.
-            const box = $('#mk-set');
-            if (box) box.style.display = 'block';
-            if (!mkAcctLoad().length){ say('Wczytuję plan kont…'); try { await mkAcctFetch(); } catch (e){} }
-            renderSet();
-            say('Uzupełnij bank_setting dla „' + key + '" i zapisz — dopiero wtedy zaimportuję.', '#c47f00');
-            return;
-        }
-        const acct = mkAcctLoad().filter(function (a){ return a.n === String(c.acct || ''); })[0];
-        const pairs = pairsOf(j);
-        const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
-        if (!d){ say('Nie umiem odczytać daty wypłaty.', '#c00'); return; }
-        const dateIso = d[1] + '-' + d[2] + '-' + d[3];
-        if (!confirm('Zaimportować ' + pairs.length + ' zamówień na ' + f2(j.data.gross) + ' ' + j.cur + '?\n\n'
-            + 'Sklep: ' + j.data.shop + '\nData płatności: ' + dateIso
-            + '\nKonto: ' + (acct ? (acct.n + ' — ' + acct.nm) : (c.acct || '(nie wskazane)'))
-            + '\nbank_setting: ' + c.bank
-            + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
-        b.disabled = true; say('Wysyłam import…');
-        const r = await sendImport(j, c);
-        render();
-        if (r === true) say('Zaimportowane. Sprawdź wynik na stronie Import payments.', '#0a7a2f');
-        else say('Import nie doszedł do skutku: ' + r, '#c00');
-        b.disabled = false;
     }
 
     render();
