@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.76
+// @version      2.79
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17666,10 +17666,21 @@
     // Vente DE = konto 1114 = bank_setting 157; reszta dopisuje sie przy pierwszym imporcie.
     const MK_SET_KEY = 'mkt_settings';
     function setKey(mp, shop){ return String(mp || '?') + ' · ' + String(shop || '?'); }
+    // Przypisania znane z gory. Dopisujemy je takze do JUZ ZAPISANYCH ustawien — inaczej
+    // nowy marketplace nie dotarlby do nikogo, kto cokolwiek wczesniej zapisal, i trzeba
+    // by go wklepywac recznie. Wartosci wpisane w ⚙ Konta maja pierwszenstwo: ruszamy
+    // wylacznie brakujace klucze.
+    const MK_SET_SEED = {
+        'Mirakl (Vente) · Beliani DE': { bank: '157', booking: '9', acct: '1114' },
+        'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' }
+    };
     function setLoad(){
         let d = null;
         try { d = JSON.parse(GM_getValue(MK_SET_KEY, 'null')); } catch (e){}
-        if (!d || typeof d !== 'object'){ d = {}; d[setKey('Mirakl (Vente)', 'Beliani DE')] = { bank: '157', booking: '9', acct: '1114' }; }
+        if (!d || typeof d !== 'object') d = {};
+        let add = 0;
+        Object.keys(MK_SET_SEED).forEach(function (k){ if (!d[k]){ d[k] = MK_SET_SEED[k]; add++; } });
+        if (add) setSave(d);
         return d;
     }
     function setSave(o){ try { GM_setValue(MK_SET_KEY, JSON.stringify(o)); } catch (e){} }
@@ -17951,6 +17962,13 @@
         // slowa „KUNDENREFERENZ" i granica slowa miedzy „Z" a „P" nie istnieje.
         { mp: 'OBI',            ok: true,  payer: /OBI\s*Home/i, ref: /(PODE-\d{8}-\d+)/i,
           brand: 'OBI', short: 'OBI', host: 'belianide860.myvtex.com', kind: 'vtex', shop: 'OBI DE' },
+        // Galaxus: referencja to UUID wypisany w „Reason for payment", ktory wyciag lamie
+        // spacja w srodku — dlatego wzorzec musi trafiac takze po sklejeniu bialych znakow.
+        // Bywa tez zwykly numer faktury zamiast UUID (pojedyncze rozliczenie, nie wyplata),
+        // stad druga alternatywa; po niej poznajemy, ze zlecenia nie ma w „Payout overview".
+        { mp: 'Galaxus',        ok: true,  payer: /Digitec\s*Galaxus/i,
+          ref: /reason\s*for\s*payment:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{6,})/i,
+          brand: 'Galaxus', short: 'Galaxus', host: 'partner.galaxus.ch', kind: 'galx', shop: 'Galaxus CH' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -18028,7 +18046,11 @@
         let z = 0, n = Math.min(b.length, 600);
         for (let i = 1; i < n; i += 2) if (b[i] === 0) z++;
         if (z > n / 4) return new TextDecoder('utf-16le').decode(buf);
-        return new TextDecoder('utf-8').decode(buf);
+        // Galaxus wysyla windows-1252: apostrof tysiecy to bajt 0x92, umlauty 0xF6/0xFC.
+        // Zwykly TextDecoder('utf-8') zamienilby je po cichu na znaki zastepcze i nazwy
+        // produktow przyszlyby polamane — dlatego dekodujemy scisle i cofamy sie na 1252.
+        try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+        catch (e){ return new TextDecoder('windows-1252').decode(buf); }
     }
     // Postbank „Umsatzliste": Kontonummer;Buchungsdatum;Valuta;Verwendungszweck;Betrag;Waehrung
     // Jedna kolumna kwoty ze znakiem, platnik i tytul razem w Verwendungszweck.
@@ -18195,8 +18217,152 @@
         });
         return '﻿' + lines.join('\n') + '\n';
     }
+    // ================= GALAXUS =================
+    // Rozliczenie Galaxusa to plik z 24 kolumnami sciagany z „Payout overview". Kolumna N
+    // nie ma naglowka i przychodzi pusta — to brutto z VAT, ktore Beliani dolicza samo.
+    // Sprawdzone na dwoch wyplatach (4336.22 i 8801.72): N = Sales Price x 1.081 zgadza sie
+    // w 102 wierszach na 102. Ostatni wiersz to „Total" — nie jest pozycja i nie liczymy go.
+    const MK_GALX_VAT = { 'Galaxus CH': 0.081 };
+    function galxVat(shop){
+        const v = MK_GALX_VAT[shop];
+        return (typeof v === 'number') ? v : 0.081;
+    }
+    // Kolumny szukamy po nazwach, a nie po numerach — gdyby Galaxus dolozyl pole,
+    // uklad przesunalby sie i cicho psul kwoty.
+    function galxCols(hdr){
+        const at = function (re){
+            for (let i = 0; i < hdr.length; i++) if (re.test(String(hdr[i] || '').trim())) return i;
+            return -1;
+        };
+        const c = { order: at(/^Galaxus Order ID$/i), qty: at(/^Quantity$/i),
+                    price: at(/^Sales Price$/i), com: at(/^Commission Amount$/i),
+                    pay: at(/^Amount paid out$/i), payout: at(/^Payout ID$/i),
+                    date: at(/^Payout Date$/i),
+                    // Przy zwrocie Galaxus potraca koszt obslugi — kwota juz siedzi
+                    // w „Amount paid out", ale pokazujemy ja osobno, zeby nie znikla.
+                    ded: at(/^Deduction on processing costs for returns excl\.?$/i) };
+        // Kolumna VAT to ta bez naglowka tuz przed „Sales Price". Jesli jej nie ma
+        // (Galaxus wyeksportowal 23 kolumny), trzeba ja WSTAWIC, a nie nadpisac sasiada.
+        c.vat = (c.price > 0 && !String(hdr[c.price - 1] || '').trim()) ? (c.price - 1) : -1;
+        return c;
+    }
+    function mkParseGalx(text, shop){
+        const rows = mkCsvRows(text).filter(function (r){ return r && r.join('').trim(); });
+        if (!rows.length) return { err: 'pusty plik' };
+        const hdr = rows[0], c = galxCols(hdr);
+        if (c.order < 0 || c.price < 0 || c.pay < 0 || c.payout < 0){
+            return { err: 'to nie wygląda na rozliczenie Galaxusa — brakuje kolumn Galaxus Order ID / Sales Price / Amount paid out / Payout ID' };
+        }
+        const vat = galxVat(shop);
+        const ord = {}, ref = {};
+        let net = 0, gross = 0, refund = 0, com = 0, ded = 0, payout = '', pdate = '';
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i];
+            if (/^total$/i.test(String(r[0] || '').trim())) continue;   // wiersz sumy
+            const id = String(r[c.order] || '').trim();
+            if (!id) continue;
+            if (!payout) payout = String(r[c.payout] || '').trim();
+            if (!pdate && c.date >= 0) pdate = String(r[c.date] || '').trim();
+            const price = mkNum(r[c.price]), paid = mkNum(r[c.pay]), cm = mkNum(r[c.com]);
+            if (cm != null) com = r2(com + cm);
+            if (c.ded >= 0){ const u = mkNum(r[c.ded]); if (u != null) ded = r2(ded + u); }
+            if (paid != null) net = r2(net + paid);          // to trafia na konto
+            // Zwrot poznajemy po ujemnej wyplacie: przy zwrocie CALY wiersz jest ujemny
+            // (Quantity -1, Sales Price -39.99, Amount paid out -31.44).
+            const back = (paid != null) ? (paid < 0) : (price != null && price < 0);
+            // Do zwrotow i do zamowien idzie BRUTTO z VAT, tak jak w pozostalych
+            // marketplace'ach — w tickecie ksieguje sie to, co dostal klient, a nie
+            // kwote po prowizji Galaxusa.
+            const g = (price == null) ? null : r2(price * (1 + vat));
+            if (g != null && g !== 0){
+                if (back){ ref[id] = r2((ref[id] || 0) + Math.abs(g)); refund = r2(refund + Math.abs(g)); }
+                else { ord[id] = r2((ord[id] || 0) + g); gross = r2(gross + g); }
+            }
+        }
+        const outHdr = hdr.slice();
+        if (c.vat < 0) outHdr.splice(c.price, 0, '');
+        return { hdr: outHdr, rows: rowsOf(rows, c, vat), ord: ord, ref: ref,
+                 net: net, gross: gross, refund: refund, com: com, ded: ded,
+                 payout: payout, pdate: pdate,
+                 n: Object.keys(ord).length + Object.keys(ref).length };
+    }
+    // Te same wiersze, ale gotowe do zapisu — wydzielone, zeby parser czytalo sie liniowo.
+    function rowsOf(rows, c, vat){
+        const out = [];
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i].slice();
+            const isTot = /^total$/i.test(String(r[0] || '').trim());
+            if (!isTot && !String(r[c.order] || '').trim()) continue;
+            const price = mkNum(r[c.price]);
+            const g = (price == null) ? null : r2(price * (1 + vat));
+            if (c.vat >= 0){ if (!isTot) r[c.vat] = (g == null) ? '' : g.toFixed(2); }
+            else r.splice(c.price, 0, (isTot || g == null) ? '' : g.toFixed(2));
+            out.push(r);
+        }
+        return out;
+    }
+    function mkCsvGalx(p){
+        const q = function (v){
+            const s = (v == null) ? '' : String(v);
+            return /[;"\n\r]/.test(s) ? ('"' + s.replace(/"/g, '""') + '"') : s;
+        };
+        const lines = [p.hdr.map(q).join(';')];
+        p.rows.forEach(function (r){ lines.push(r.map(q).join(';')); });
+        return lines.join('\r\n') + '\r\n';
+    }
+
+    // Wplata z numerem faktury zamiast UUID — u Galaxusa zdarza sie przy pojedynczym
+    // rozliczeniu, ktorego nie ma w „Payout overview". Szukamy jej w prologistics tak,
+    // jak zrobilby to czlowiek: search.php, radio „invoice_number", numer w pole.
+    function galxIsInvoice(ref){ return /^\d{5,}$/.test(String(ref || '')); }
+    function galxFindAuftrag(num, done){
+        let fin = false;
+        const fr = document.createElement('iframe');
+        fr.style.cssText = 'position:fixed;left:-9999px;top:0;width:1200px;height:800px;opacity:0';
+        const end = function (res){
+            if (fin) return;
+            fin = true;
+            try { fr.remove(); } catch (e){}
+            done(res);
+        };
+        let sent = false;
+        fr.onload = function(){
+            let d, w;
+            try { d = fr.contentDocument; w = fr.contentWindow; }
+            catch (e){ end({ err: 'nie mam dostępu do ramki wyszukiwarki' }); return; }
+            if (!sent){
+                const inp = d.querySelector('input[name="invoice_number"]');
+                if (!inp){ end({ err: 'nie widzę pola invoice_number na search.php' }); return; }
+                // Radio wlacza wlasciwe kryterium — bez niego formularz szuka po czym innym.
+                try { if (w.select_radio) w.select_radio('radio_49'); } catch (e){}
+                const rb = d.querySelector('input[name="what"][value="invoice_number"], #radio_49');
+                if (rb && !rb.checked){ rb.checked = true; rb.dispatchEvent(new Event('change', { bubbles: true })); }
+                inp.value = String(num);
+                const form = inp.closest('form');
+                if (!form){ end({ err: 'nie znalazłem formularza na search.php' }); return; }
+                sent = true;
+                form.submit();
+                return;
+            }
+            let url = '';
+            try { url = String(w.location.href || ''); } catch (e){}
+            const hits = [];
+            const push = function (u){ if (u && hits.indexOf(u) < 0) hits.push(u); };
+            if (/auction\.php\?number=/i.test(url)) push(url);
+            try {
+                Array.prototype.slice.call(d.querySelectorAll('a[href*="auction.php?number="]'))
+                    .forEach(function (a){ push(a.href); });
+            } catch (e){}
+            end({ urls: hits });
+        };
+        document.body.appendChild(fr);
+        fr.src = location.origin + '/search.php?express';
+        setTimeout(function(){ end({ err: 'wyszukiwarka nie odpowiedziała w 30 s' }); }, 30000);
+    }
+
     // Ktory uklad dla ktorego zlecenia.
     function csvFor(j){
+        if (j.kind === 'galx' && j.data && j.data.galx) return mkCsvGalx(j.data.galx);
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
         return mkCsvText(pairsOf(j));
     }
@@ -18389,7 +18555,8 @@
     const MK_VTEX_BIND = '22f42e19-58d2-4e2a-86e6-64f9ad6df768';
     // Sam adres domeny prowadzi do sklepu dla klientow („Storefront route not found").
     // Panel sprzedawcy, w ktorym dziala sesja, jest pod /admin.
-    const MK_PANEL = { 'belianide860.myvtex.com': '/admin/commission-report/detail' };
+    const MK_PANEL = { 'belianide860.myvtex.com': '/admin/commission-report/detail',
+                       'partner.galaxus.ch': '/en/ui/Receivables/PayoutOverviewCmi/Show' };
     function mkPanelUrl(host){ return 'https://' + host + (MK_PANEL[host] || '/'); }
     // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
     // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
@@ -18913,6 +19080,10 @@
               + '<div style="position:sticky;top:0;z-index:6;background:#fff;padding:4px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
+              // Galaxus nie ma API — rozliczenie sciaga sie recznie z „Payout overview"
+              // i wrzuca tutaj; zlecenie znajdujemy po sumie wyplaty.
+              + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport Galaxus'
+              + '<input type="file" id="mk-galx" accept=".csv,text/csv" style="display:none"></label>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
               + '<button id="mk-sal" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">📊 Salda</button>'
               + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
@@ -19089,6 +19260,15 @@
                   +  ' <a href="/react/settings_page/import_payments/' + esc(j.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
                   +  '</td></tr>';
             }
+            // Galaxus potrafi przelac pojedyncza fakture zamiast wyplaty — wtedy referencja
+            // to jej numer i takiego zlecenia nie ma w „Payout overview". Zamiast szukac
+            // recznie, pytamy prologistics, ktorego Auftragu dotyczy.
+            if (onProlo && st === 'new' && j.kind === 'galx' && galxIsInvoice(j.ref)){
+                h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
+                  +  '<button class="mk-inv" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">🔎 Znajdź Auftrag po fakturze ' + esc(j.ref) + '</button>'
+                  +  ' <span class="mk-invout" data-ref="' + esc(j.ref) + '" style="font-size:11px;color:#666"></span>'
+                  +  '</td></tr>';
+            }
             if (onProlo && (st === 'ready' || st === 'partial')){
                 // Ksiegowanie idzie wylacznie przez zaznaczenie i guzik zbiorczy nad tabela.
                 // Osobny przycisk przy kazdym wierszu tylko dublowalby te sama droge.
@@ -19114,6 +19294,23 @@
             jobsSave(jobs); render();
         }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-inv').forEach(function (b){ b.onclick = function(){
+            const ref = b.getAttribute('data-ref');
+            const span = out.querySelector('.mk-invout[data-ref="' + ref + '"]');
+            b.disabled = true;
+            if (span){ span.style.color = '#666'; span.textContent = 'szukam…'; }
+            galxFindAuftrag(ref, function (res){
+                b.disabled = false;
+                if (!span) return;
+                if (res.err){ span.style.color = '#c00'; span.textContent = res.err; return; }
+                if (!res.urls.length){ span.style.color = '#c47f00'; span.textContent = 'nie znalazłem Auftragu z fakturą ' + ref; return; }
+                span.style.color = '#0a7a2f';
+                span.innerHTML = res.urls.slice(0, 5).map(function (u){
+                    const n = (String(u).match(/number=(\d+)/) || [])[1] || '?';
+                    return '<a href="' + esc(u) + '" target="_blank">Auftrag ' + esc(n) + ' ↗</a>';
+                }).join(' · ') + (res.urls.length > 5 ? (' … (' + res.urls.length + ')') : '');
+            });
+        }; });
         out.querySelectorAll('.mk-ck').forEach(function (c){
             c.onchange = function(){ mkSel[c.getAttribute('data-ref')] = c.checked; render(); };
         });
@@ -19561,6 +19758,49 @@
             rd.readAsArrayBuffer(f);     // kodowanie rozpoznajemy sami — bywa UTF-16
             try { this.value = ''; } catch (e){}
         };
+        // Rozliczenie Galaxusa wrzucane recznie. Dopasowanie idzie po SUMIE „Amount paid out",
+        // bo to ona trafia na konto — referencja z przelewu (UUID) nie wystepuje w pliku.
+        const galxIn = $('#mk-galx');
+        if (galxIn) galxIn.onchange = function(){
+            const f = this.files && this.files[0];
+            try { this.value = ''; } catch (e){}
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                const jobs = jobsLoad();
+                const waiting = Object.keys(jobs).filter(function (k){ return jobs[k].kind === 'galx'; });
+                const p = mkParseGalx(mkDecode(rd.result), 'Galaxus CH');
+                if (p.err){ say(p.err, '#c00'); return; }
+                const hit = waiting.filter(function (k){ return eq(jobs[k].amount, p.net); });
+                if (!hit.length){
+                    say('Wczytałem rozliczenie ' + (p.payout ? ('nr ' + p.payout + ' ') : '')
+                        + 'na ' + f2(p.net) + ' — ale nie mam zlecenia z wyciągu na tę kwotę'
+                        + (waiting.length ? (' (czekają: ' + waiting.map(function (k){ return f2(jobs[k].amount); }).join(', ') + ')') : '')
+                        + '.', '#c47f00');
+                    return;
+                }
+                if (hit.length > 1){
+                    say('Ta sama kwota pasuje do ' + hit.length + ' wpłat — nie zgaduję, którą uzupełnić. Wyczyść zbędne zlecenia i powtórz.', '#c47f00');
+                    return;
+                }
+                const j = jobs[hit[0]];
+                const both = Object.keys(p.ord).filter(function (k){ return p.ref[k] != null; });
+                j.data = { galx: p, shop: j.shop || 'Galaxus CH', gross: p.gross, refund: p.refund,
+                           net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
+                           unknown: {}, skipped: {}, full: true, both: both, pays: 1, split: false,
+                           rows: p.rows.length, total: p.rows.length, pages: 1, how: 'plik ' + f.name };
+                j.status = 'ready';
+                j.msg = '';
+                j.note = 'VAT ' + (galxVat(j.shop || 'Galaxus CH') * 100).toFixed(1).replace('.', ',') + '% w kolumnie N'
+                       + (p.ded ? (' · Galaxus potrącił za obsługę zwrotów ' + f2(p.ded) + ' — siedzi już w wypłacie') : '');
+                jobsSave(jobs); render();
+                say('Rozliczenie ' + (p.payout ? ('nr ' + p.payout) : f.name) + ' wczytane: '
+                    + Object.keys(p.ord).length + ' zamówień brutto ' + f2(p.gross)
+                    + (p.refund ? (', zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund)) : '')
+                    + ', na konto ' + f2(p.net) + '. Kolumna N policzona.', '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
+        };
         $('#mk-clear').onclick = function(){
             if (!confirm('Usunąć wszystkie zlecenia (także pobrane rozliczenia)?')) return;
             jobsSave({}); render(); say('Wyczyszczone.');
@@ -19919,10 +20159,21 @@
             return ok;
         }
 
+        // Zlecenia Galaxusa czekaja na plik, a nie na pobranie — bez tej podpowiedzi
+        // „nie ma zlecen do pobrania" wygladaloby jak zgubienie wplaty.
+        function galxHint(jobs){
+            const n = Object.keys(jobs).filter(function (k){
+                return jobs[k].kind === 'galx' && jobs[k].status === 'new';
+            }).length;
+            return n ? (' Czeka ' + n + ' wpłat Galaxusa — pobierz ich rozliczenia z „Payout overview" i wrzuć przez „📄 Raport Galaxus".') : '';
+        }
         function mkLeft(jobs, host){
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
                 if (j.status !== 'new' || !j.ref) return false;
+                // Galaxus nie ma czego pobierac — jego rozliczenie wgrywa sie recznie,
+                // wiec nie moze podbijac licznika „do pobrania".
+                if ((j.kind || 'mirakl') === 'galx') return false;
                 if ((j.kind || 'mirakl') !== 'mirakl') return host ? false : true;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
             }).length;
@@ -19960,7 +20211,7 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.' + galxHint(jobs), '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
