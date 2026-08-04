@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.87
+// @version      2.88
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19771,11 +19771,11 @@
       + '</div>'
       + '<div style="padding:12px 16px">'
       +   (onProlo
-            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS albo Postbank, CSV) — rozpoznam wpłaty od marketplace\'ów. Zestawienia dociągam prosto z ich paneli, stąd; musisz być tam zalogowany w przeglądarce.</div>'
+            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS albo Postbank, CSV) — rozpoznam wpłaty od marketplace\'ów. <b>Możesz wskazać kilka plików naraz albo dokładać je pojedynczo</b>: wpłaty z różnych banków dopisują się do wspólnej listy (Vente BE i NL wpływają na inne konto niż reszta). Zestawienia dociągam prosto z paneli marketplace\'ów, stąd; musisz być tam zalogowany w przeglądarce.</div>'
               // Pasek narzedzi jedzie z przewijaniem — przy kilkudziesieciu zleceniach
               // guziki byly poza ekranem i trzeba bylo wracac na gore.
               + '<div style="position:sticky;top:0;z-index:6;background:#fff;padding:4px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-              + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
+              + '<input type="file" id="mk-file" accept=".csv,text/csv" multiple style="font-size:11px">'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               // Galaxus nie ma API — rozliczenie sciaga sie recznie z „Payout overview"
               // i wrzuca tutaj; zlecenie znajdujemy po sumie wyplaty.
@@ -20761,30 +20761,52 @@
 
     // ---------- prologistics: wczytanie wyciagu ----------
     if (onProlo){
-        $('#mk-file').onchange = function(){
-            const f = this.files && this.files[0];
-            if (!f) return;
-            const rd = new FileReader();
-            rd.onload = function(){
-                const p = mkParseBank(mkDecode(rd.result));
-                if (p.err){ say(p.err, '#c00'); return; }
-                const jobs = jobsLoad();
-                let add = 0, known = 0, other = 0;
-                p.rows.forEach(function (r){
-                    if (!r.mp) return;
-                    if (!r.ok){ other++; return; }
-                    known++;
-                    const k = r.ref || (r.txId || (r.date + '_' + r.amount));
-                    if (jobs[k] && jobs[k].status === 'done') return;
-                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
-                });
-                jobsSave(jobs);
-                say('Wczytano: ' + p.rows.length + ' wpłat, rozpoznanych obsługiwanych ' + known + ' (nowych zleceń ' + add + ')'
-                    + (other ? (', pozostałych marketplace’ów ' + other + ' — na razie poza zakresem') : '') + '.', '#0a7a2f');
-                render();
-            };
-            rd.readAsArrayBuffer(f);     // kodowanie rozpoznajemy sami — bywa UTF-16
+        function readBuf(f){
+            return new Promise(function (resolve, reject){
+                const rd = new FileReader();
+                rd.onload = function(){ resolve(rd.result); };
+                rd.onerror = function(){ reject(new Error('nie mogę odczytać pliku')); };
+                rd.readAsArrayBuffer(f);     // kodowanie rozpoznajemy sami — bywa UTF-16
+            });
+        }
+        // Jeden miesiac to czasem WIECEJ NIZ JEDEN wyciag: Vente BE i NL wplywaja na inne
+        // konto (Postbank) niz reszta (UBS). Pliki DOPISUJA sie do wspolnej listy zlecen,
+        // wiec mozna wskazac kilka naraz albo dokladac je pojedynczo, w dowolnej kolejnosci.
+        // Czytamy je po kolei, a nie rownolegle — kazdy plik robi wczytaj-zmien-zapisz na
+        // tym samym magazynie i przy rownoleglym odczycie ostatni zapis zjadlby wczesniejsze.
+        $('#mk-file').onchange = async function(){
+            const fs = Array.prototype.slice.call(this.files || []);
             try { this.value = ''; } catch (e){}
+            if (!fs.length) return;
+            let addT = 0, knownT = 0, otherT = 0;
+            const per = [], errs = [];
+            for (let i = 0; i < fs.length; i++){
+                const f = fs[i];
+                try {
+                    const p = mkParseBank(mkDecode(await readBuf(f)));
+                    if (p.err){ errs.push(f.name + ': ' + p.err); continue; }
+                    const jobs = jobsLoad();
+                    let add = 0, known = 0, other = 0;
+                    p.rows.forEach(function (r){
+                        if (!r.mp) return;
+                        if (!r.ok){ other++; return; }
+                        known++;
+                        const k = r.ref || (r.txId || (r.date + '_' + r.amount));
+                        if (jobs[k] && jobs[k].status === 'done') return;
+                        if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                    });
+                    jobsSave(jobs);
+                    addT += add; knownT += known; otherT += other;
+                    per.push(f.name.replace(/\.csv$/i, '').slice(0, 18) + ': ' + add);
+                } catch (e){ errs.push(f.name + ': ' + ((e && e.message) || e)); }
+            }
+            render();
+            say((fs.length > 1 ? ('Wczytane pliki: ' + fs.length + ' · ') : 'Wczytano: ')
+                + 'rozpoznanych obsługiwanych ' + knownT + ' (nowych zleceń ' + addT + ')'
+                + (fs.length > 1 ? (' — ' + per.join(', ')) : '')
+                + (otherT ? (', pozostałych marketplace’ów ' + otherT + ' — na razie poza zakresem') : '') + '.'
+                + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
+                errs.length ? '#c47f00' : '#0a7a2f');
         };
         // Rozliczenie Galaxusa wrzucane recznie. Dopasowanie idzie po SUMIE „Amount paid out",
         // bo to ona trafia na konto — referencja z przelewu (UUID) nie wystepuje w pliku.
