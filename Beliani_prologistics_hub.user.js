@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.69
+// @version      2.71
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17640,6 +17640,9 @@
     const onMirakl = /(^|\.)mirakl\.net$/i.test(location.hostname);
     const onVtex   = /(^|\.)myvtex\.com$/i.test(location.hostname);
     if (!onProlo && !onMirakl && !onVtex) return;
+    // Na stronach jednostronicowych modul potrafi wystartowac drugi raz przy zmianie
+    // widoku — bez tej blokady na ekranie robily sie dwa te same przyciski.
+    if (document.getElementById('mkt-btn')) return;
 
     const MK_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
 
@@ -18653,7 +18656,7 @@
     panel.style.cssText = 'display:none;position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:2147483001;width:min(1100px,96vw);max-height:88vh;overflow:auto;background:#fff;border:1px solid #ddd6fe;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.28);font:13px Arial,sans-serif;flex-direction:column';
     panel.innerHTML =
         '<div style="display:flex;justify-content:space-between;align-items:center;background:#f5f3ff;padding:12px 16px;border-bottom:1px solid #ddd6fe">'
-      +   '<div style="font-weight:700;color:#5b21b6">Księgowanie Marketplace\'s <span style="font-weight:400;font-size:11px;opacity:.6">v' + MK_VER + ' · ' + (onMirakl ? 'Mirakl' : 'prologistics') + '</span></div>'
+      +   '<div style="font-weight:700;color:#5b21b6">Księgowanie Marketplace\'s <span style="font-weight:400;font-size:11px;opacity:.6">v' + MK_VER + ' · ' + (onMirakl ? 'Mirakl' : (onVtex ? 'OBI' : 'prologistics')) + '</span></div>'
       +   '<button id="mk-close" style="padding:4px 12px;border:1px solid #ddd6fe;border-radius:6px;background:#fff;cursor:pointer">✕</button>'
       + '</div>'
       + '<div style="padding:12px 16px">'
@@ -18736,6 +18739,17 @@
         if (!jobs.length){ out.innerHTML = '<div style="color:#888;padding:8px">' + (onProlo ? 'Brak zleceń — wgraj wyciąg bankowy.' : 'Brak zleceń. Najpierw wgraj wyciąg w prologistics.') + '</div>'; return; }
         const nSel = selList().length;
         let h = '';
+        // Zlecen VTEX nie da sie pobrac z prologistics — ciasteczko sesji nie jedzie
+        // w zapytaniu miedzydomenowym. Mowimy to ZANIM ktos kliknie i zobaczy 404.
+        if (onProlo){
+            const vh = {};
+            jobs.forEach(function (j){ if (j.status === 'new' && j.ref && j.kind === 'vtex' && j.host) vh[j.host] = (vh[j.host] || 0) + 1; });
+            Object.keys(vh).forEach(function (host){
+                h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
+                  +  '<b>' + vh[host] + ' zleceń czeka na zestawienia z ' + esc(host) + '</b> — tej platformy nie pobiorę stąd, bo jej sesja nie działa międzydomenowo. '
+                  +  '<a href="https://' + esc(host) + '/" target="_blank" style="font-weight:700">Otwórz ' + esc(host) + ' ↗</a> i kliknij tam „⬇ Pobierz zestawienia".</div>';
+            });
+        }
         if (onProlo){
             let gs = 0, no = 0;
             selList().forEach(function (j){
@@ -19383,12 +19397,24 @@
             let reps;
             try { reps = await vtexReports(host, from, to); }
             catch (e){ say('OBI: ' + ((e && e.message) || e), '#c00'); return 0; }
+            // Bez tego przy braku dopasowania zostawala cisza: nie bylo wiadomo, czy
+            // raportow nie ma, czy sa, ale pod innymi nazwami niz referencja z przelewu.
+            const names = reps.map(function (r){ return String(r.payoutReportFileName || '(bez nazwy)'); });
+            if (!reps.length){
+                say('OBI: w okresie ' + from + ' … ' + to + ' nie ma żadnych raportów — sprawdź zakres dat w panelu OBI.', '#c47f00');
+                return 0;
+            }
 
             let ok = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                const rep = reps.filter(function (r){ return String(r.payoutReportFileName || '').trim() === j.ref; })[0];
-                if (!rep) continue;
+                // Porownujemy takze po sklejeniu spacji i bez wielkosci liter — nazwa
+                // raportu bywa zapisana inaczej niz referencja w wyciagu.
+                const want = j.ref.replace(/\s+/g, '').toUpperCase();
+                const rep = reps.filter(function (r){
+                    return String(r.payoutReportFileName || '').replace(/\s+/g, '').toUpperCase() === want;
+                })[0];
+                if (!rep){ j.msg = 'nie znalazłem raportu o nazwie ' + j.ref; jobsSave(jobs); continue; }
                 try {
                     const rows = vtexRows(rep);
                     const a = vtexAgg(rows);
@@ -19410,6 +19436,8 @@
                 } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
                 jobsSave(jobs); render();
             }
+            if (!ok) say('OBI: raportów w tym okresie ' + reps.length + ', ale żaden nie ma nazwy z przelewu. Widziane nazwy: '
+                + names.slice(0, 6).join(', ') + (names.length > 6 ? ' …' : ''), '#c47f00');
             return ok;
         }
 
@@ -19503,8 +19531,12 @@
             }
             // VTEX osobno: bez sklepow i bez przelaczania, jedno zapytanie na platforme.
             for (let vi = 0; vi < vhosts.length; vi++){
-                try { ok += await vtexPass(jobsLoad(), vhosts[vi]); }
-                catch (e){ problem.push(vhosts[vi] + ': ' + ((e && e.message) || e)); }
+                try {
+                    const got = await vtexPass(jobsLoad(), vhosts[vi]);
+                    ok += got;
+                    if (!got && mkHostsOf(jobsLoad(), 'vtex').indexOf(vhosts[vi]) >= 0)
+                        problem.push('otwórz ' + vhosts[vi] + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa');
+                } catch (e){ problem.push(vhosts[vi] + ': ' + ((e && e.message) || e)); }
             }
             // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
             // lepiej dowiedziec sie teraz niz przy potwierdzeniu ksiegowania.
