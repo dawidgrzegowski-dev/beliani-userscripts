@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.72
+// @version      2.73
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18368,6 +18368,10 @@
     const MK_VTEX_HASH = '0d6454a77362f9ca03196fca44c33dd3aa8cd53e367262a5be9a2e4f6b404261';
     const MK_VTEX_APP  = 'obi.seller-financial-commission@3.x';
     const MK_VTEX_BIND = '22f42e19-58d2-4e2a-86e6-64f9ad6df768';
+    // Sam adres domeny prowadzi do sklepu dla klientow („Storefront route not found").
+    // Panel sprzedawcy, w ktorym dziala sesja, jest pod /admin.
+    const MK_PANEL = { 'belianide860.myvtex.com': '/admin/commission-report/detail' };
+    function mkPanelUrl(host){ return 'https://' + host + (MK_PANEL[host] || '/'); }
     // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
     // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
     // docelowej i wysylamy WYLACZNIE do niej. Nigdzie tego nie zapisujemy.
@@ -18425,7 +18429,7 @@
             if (code !== 404) break;
         }
         if (code < 200 || code >= 300) throw new Error('HTTP ' + code + ' na ' + host
-            + (code === 404 ? ' — z prologistics ciasteczko sesji VTEX nie jest wysyłane; otwórz ' + host + ' i kliknij tam „Pobierz zestawienia"' : ''));
+            + (code === 404 ? ' — z prologistics ciasteczko sesji VTEX nie jest wysyłane; otwórz ' + mkPanelUrl(host) + ' i kliknij tam „Pobierz zestawienia"' : ''));
         let j = null;
         try { j = JSON.parse(txt); } catch (e){ throw new Error('z ' + host + ' przyszedł nie-JSON — zaloguj się tam w przeglądarce'); }
         const d = j && j.data && j.data.searchPayoutReport;
@@ -18800,7 +18804,7 @@
             Object.keys(vh).forEach(function (host){
                 h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
                   +  '<b>' + vh[host] + ' zleceń czeka na zestawienia z ' + esc(host) + '</b> — tej platformy nie pobiorę stąd, bo jej sesja nie działa międzydomenowo. '
-                  +  '<a href="https://' + esc(host) + '/" target="_blank" style="font-weight:700">Otwórz ' + esc(host) + ' ↗</a> i kliknij tam „⬇ Pobierz zestawienia".</div>';
+                  +  '<a href="' + esc(mkPanelUrl(host)) + '" target="_blank" style="font-weight:700">Otwórz panel ' + esc(host) + ' ↗</a> i kliknij tam „⬇ Pobierz zestawienia".</div>';
             });
         }
         if (onProlo){
@@ -19597,7 +19601,7 @@
                     const got = await vtexPass(jobsLoad(), vhosts[vi]);
                     ok += got;
                     if (!got && mkHostsOf(jobsLoad(), 'vtex').indexOf(vhosts[vi]) >= 0)
-                        problem.push('otwórz ' + vhosts[vi] + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa');
+                        problem.push('otwórz ' + mkPanelUrl(vhosts[vi]) + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa');
                 } catch (e){ problem.push(vhosts[vi] + ': ' + ((e && e.message) || e)); }
             }
             // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
