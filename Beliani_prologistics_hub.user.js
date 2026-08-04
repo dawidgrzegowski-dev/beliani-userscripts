@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.68
+// @version      2.69
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
 // @match        https://prologistics.info/*
 // @match        https://salescenter.allegro.com/*
 // @match        https://*.mirakl.net/*
+// @match        https://*.myvtex.com/*
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
 // @connect      fxds-public-exchange-rates-api.oanda.com
 // @connect      oanda.com
@@ -46,6 +47,9 @@
     // Mirakl to nie jeden host — kazdy operator ma swoj (venteunique-prod.mirakl.net,
     // …-prod.mirakl.net). Modul Marketplace dziala na wszystkich naraz.
     const onMirakl  = () => /(^|\.)mirakl\.net$/i.test(H);
+    // OBI stoi na VTEX-ie. Modul musi tam wchodzic, bo ciasteczko sesji nie jedzie
+    // w zapytaniu miedzydomenowym i z prologistics dostajemy 404.
+    const onVtex    = () => /(^|\.)myvtex\.com$/i.test(H);
 
     const HUB = 'beliani_hub_';
     const isOn = (id) => { try { return GM_getValue(HUB + id, true); } catch (e) { return true; } };
@@ -17634,7 +17638,8 @@
     'use strict';
     const onProlo  = /(^|\.)prologistics\.info$/i.test(location.hostname);
     const onMirakl = /(^|\.)mirakl\.net$/i.test(location.hostname);
-    if (!onProlo && !onMirakl) return;
+    const onVtex   = /(^|\.)myvtex\.com$/i.test(location.hostname);
+    if (!onProlo && !onMirakl && !onVtex) return;
 
     const MK_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
 
@@ -18394,7 +18399,7 @@
             if (code !== 404) break;
         }
         if (code < 200 || code >= 300) throw new Error('HTTP ' + code + ' na ' + host
-            + (code === 404 ? ' — brama GraphQL nie rozpoznała aplikacji; sprawdź, czy jesteś tam zalogowany' : ''));
+            + (code === 404 ? ' — z prologistics ciasteczko sesji VTEX nie jest wysyłane; otwórz ' + host + ' i kliknij tam „Pobierz zestawienia"' : ''));
         let j = null;
         try { j = JSON.parse(txt); } catch (e){ throw new Error('z ' + host + ' przyszedł nie-JSON — zaloguj się tam w przeglądarce'); }
         const d = j && j.data && j.data.searchPayoutReport;
@@ -18639,7 +18644,8 @@
     // ================= UI =================
     const btn = document.createElement('button');
     btn.id = 'mkt-btn';
-    btn.textContent = onMirakl ? '🧾 Księgowanie Marketplace (Mirakl)' : '🧾 Księgowanie Marketplace';
+    btn.textContent = onMirakl ? '🧾 Księgowanie Marketplace (Mirakl)'
+                    : (onVtex ? '🧾 Księgowanie Marketplace (OBI)' : '🧾 Księgowanie Marketplace');
     btn.style.cssText = 'position:fixed;top:300px;right:12px;z-index:2147483000;padding:9px 14px;border:none;border-radius:8px;background:#5b21b6;color:#fff;font:bold 13px Arial,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)';
 
     const panel = document.createElement('div');
@@ -18661,12 +18667,17 @@
               + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
               + '<div id="mk-set" style="display:none;margin-top:10px;padding:8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:8px"></div>'
-            : '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Dla każdego znajdę cykl rozliczeniowy po referencji z przelewu, pobiorę pozycje i policzę kwoty brutto per zamówienie. Sesja Mirakla widzi naraz tylko jeden sklep — „wszystkie sklepy" przełącza je po kolei i na koniec wraca tam, gdzie zacząłeś.</div>'
-              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-              + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz z tego sklepu</button>'
-              + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">🔄 Przeleć wszystkie sklepy</button>'
-              + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
-              + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>')
+            : (onVtex
+                ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Zestawienia OBI pobieram stąd, bo sesja tego panelu nie jedzie w zapytaniu z prologistics. Dopasowanie idzie po referencji PODE z przelewu.</div>'
+                  + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                  + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
+                  + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
+                : '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Dla każdego znajdę cykl rozliczeniowy po referencji z przelewu, pobiorę pozycje i policzę kwoty brutto per zamówienie. Sesja Mirakla widzi naraz tylko jeden sklep — „wszystkie sklepy" przełącza je po kolei i na koniec wraca tam, gdzie zacząłeś.</div>'
+                  + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                  + '<button id="mk-run" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz z tego sklepu</button>'
+                  + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">🔄 Przeleć wszystkie sklepy</button>'
+                  + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
+                  + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'))
       +   '<div id="mk-out" style="margin-top:12px"></div>'
       // Podglad postepu stoi POD lista i zwrotami — tam, gdzie klikasz — ale wciaz POZA
       // #mk-out, zeby przerysowanie listy go nie kasowalo.
@@ -19446,8 +19457,9 @@
             if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
-            const hosts = onMirakl ? [location.hostname] : mkHosts(jobs);
-            const vhosts = onMirakl ? [] : mkHostsOf(jobs, 'vtex');
+            // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
+            const hosts  = onMirakl ? [location.hostname] : (onVtex ? [] : mkHosts(jobs));
+            const vhosts = onVtex   ? [location.hostname] : (onMirakl ? [] : mkHostsOf(jobs, 'vtex'));
             if (!hosts.length && !vhosts.length){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             if (!confirm('Pobrać ' + mkLeft(jobs) + ' rozliczeń z ' + (hosts.length + vhosts.length) + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; }).join('\n')
@@ -20293,7 +20305,7 @@
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
-        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl(), init: init_mkt },
+        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
         { id: 'refund',   name: 'Refund Checker',            test: onProlo,   init: init_refund },
         { id: 'sepa',     name: 'SEPA Walidator IBAN',       test: onProlo,   init: init_sepa },
