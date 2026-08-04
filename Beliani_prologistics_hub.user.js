@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.60
+// @version      2.62
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17766,6 +17766,25 @@
         if (!cfg.on || !cfg.url || !cfg.secret || !list || !list.length) return null;
         return shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, action: 'refunded', rows: list }));
     }
+    // Czy ta wyplata jest juz w arkuszu. To najwazniejsza z trzech kontroli duplikatow,
+    // bo arkusz jest wspolny i czesc wierszy powstaje recznie — o cudzej pracy nie dowiemy
+    // sie z prologistics, skoro reczne ksiegowanie nie tworzy paczki importu.
+    const mkSheet = {};                    // ref -> { found, row, similar }
+    async function shCheck(list){
+        const cfg = shCfg();
+        if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (⚙ Konta)');
+        const r = await shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, action: 'check', rows: list }));
+        return Array.isArray(r.result) ? r.result : [];
+    }
+    async function shCheckJobs(jobs){
+        const list = jobs.map(function (j){
+            const c = setLoad()[setKey(j.mp, j.data && j.data.shop)] || {};
+            return shKey(j, c.acct);
+        });
+        const res = await shCheck(list);
+        jobs.forEach(function (j, i){ mkSheet[j.ref] = res[i] || null; });
+        return res;
+    }
     async function shPost(rows){
         const cfg = shCfg();
         if (!cfg.url) throw new Error('nie ustawiono adresu arkusza');
@@ -18576,6 +18595,9 @@
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
+                const sh = mkSheet[j.ref];
+                if (sh && sh.found) det += '<div style="color:#c00;font-weight:700">JEST JUŻ W ARKUSZU — wiersz ' + esc(sh.row.row) + ' (' + esc(sh.row.marketplace) + ', ' + esc(sh.row.comments || '') + ')</div>';
+                else if (sh && sh.similar && sh.similar.length) det += '<div style="color:#c47f00">w arkuszu jest podobny wpis: ' + esc(sh.similar.map(function (x){ return x.data + ' ' + x.marketplace + ' ' + f2(x.kwota); }).join('; ')) + '</div>';
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
                 if (j.msg) det += '<div style="color:#c47f00">' + esc(j.msg) + '</div>';
             }
@@ -18885,13 +18907,33 @@
         const keys = Object.keys(rows).sort();
         const bs = bsLoad(), bsN = Object.keys(bs).length;
         const bsKeys = Object.keys(bs).sort(function (a, b){ return (Number(a) || 0) - (Number(b) || 0); });
-        function bankSel(val, hl){
-            let o = '<option value="">— wybierz —</option>';
-            bsKeys.forEach(function (k){
-                o += '<option value="' + esc(k) + '"' + (String(val || '') === k ? ' selected' : '') + '>'
-                   + esc(k + ' — ' + String(bs[k]).slice(0, 70)) + '</option>';
+        // Zamiast listy rozwijanej — pole z podpowiedziami. Dzieki temu mozna szukac
+        // po NAZWIE („vente de"), a nie tylko przewijac dwiescie pozycji. Wartoscia
+        // podpowiedzi jest caly opis, bo przegladarka filtruje wlasnie po niej;
+        // przy zapisie bierzemy z niej sam numer z poczatku.
+        function numOf(v){ const m = String(v == null ? '' : v).match(/^\s*(\d+)/); return m ? m[1] : String(v || '').trim(); }
+        function dlBank(){
+            let o = '';
+            bsKeys.forEach(function (k){ o += '<option value="' + esc(k + ' — ' + String(bs[k]).slice(0, 70)) + '"></option>'; });
+            return '<datalist id="mk-dl-bank">' + o + '</datalist>';
+        }
+        function dlAcct(){
+            let o = '';
+            acc.forEach(function (a){
+                if (!a.on || !/^1\d{3}$/.test(a.n) || MK_NOT_BANK.test(a.nm)) return;
+                o += '<option value="' + esc(a.n + ' — ' + a.nm) + '"></option>';
             });
-            return '<select class="mk-s-bank" style="font-size:11px;max-width:240px' + (hl ? ';background:#fef9c3' : '') + '">' + o + '</select>';
+            return '<datalist id="mk-dl-acct">' + o + '</datalist>';
+        }
+        function fieldBank(val, hl){
+            const lbl = (val && bs[val]) ? (val + ' — ' + String(bs[val]).slice(0, 70)) : (val || '');
+            return '<input class="mk-s-bank" list="mk-dl-bank" value="' + esc(lbl) + '" placeholder="numer lub nazwa…"'
+                 + ' style="width:210px;font-size:11px' + (hl ? ';background:#fef9c3' : '') + '">';
+        }
+        function fieldAcct(val){
+            const a = acc.filter(function (x){ return x.n === String(val || ''); })[0];
+            const lbl = a ? (a.n + ' — ' + a.nm) : (val || '');
+            return '<input class="mk-s-acct" list="mk-dl-acct" value="' + esc(lbl) + '" placeholder="numer lub nazwa…" style="width:230px;font-size:11px">';
         }
         let h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
               + '<b style="font-size:11px;color:#5b21b6">Konta i ustawienia importu</b>'
@@ -18920,29 +18962,20 @@
             let sugN = 0;
             keys.forEach(function (k, i){
                 const c = rows[k];
-                const cur = acc.filter(function (a){ return a.n === String(c.acct || ''); })[0];
-                let opt = '<option value="">— wybierz —</option>';
-                acc.forEach(function (a){
-                    if (!a.on || !/^1\d{3}$/.test(a.n) || MK_NOT_BANK.test(a.nm)) return;
-                    opt += '<option value="' + esc(a.n) + '"' + (a.n === String(c.acct || '') ? ' selected' : '') + '>' + esc(a.n + ' — ' + a.nm) + '</option>';
-                });
                 // podpowiedz tylko gdy jednoznaczna; do zapisu i tak potrzebne klikniecie
                 const sug = c.bank ? '' : bsGuess(c.acct, bs, acc);
                 if (sug) sugN++;
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
-                  // Gdy mamy wykaz Bank settings, dajemy go do wyboru zamiast kazac
-                  // wpisywac numer z pamieci. Dopasowanie po nazwie bywa zawodne, a lista
-                  // jest pewna — wybierasz i widzisz, co wybierasz.
-                  +  '<td style="padding:3px 4px">' + (bsN ? bankSel(c.bank || sug, sug && !c.bank)
-                        : ('<input class="mk-s-bank" value="' + esc(c.bank || sug) + '" style="width:64px;font-size:11px' + (sug ? ';background:#fef9c3' : '') + '" placeholder="np. 157">')) + '</td>'
+                  +  '<td style="padding:3px 4px">' + fieldBank(c.bank || sug, sug && !c.bank) + '</td>'
                   +  '<td style="padding:3px 4px"><input class="mk-s-book" value="' + esc(c.booking || '9') + '" style="width:40px;font-size:11px"></td>'
-                  +  '<td style="padding:3px 4px"><select class="mk-s-acct" style="font-size:11px;width:250px">' + opt + '</select></td>'
+                  +  '<td style="padding:3px 4px">' + fieldAcct(c.acct) + '</td>'
                   +  '<td style="padding:3px 4px;white-space:nowrap;color:' + (c.bank ? '#0a7a2f' : (sug ? '#a16207' : '#c47f00')) + '">'
                   +  (c.bank ? '✓' : (sug ? 'podpowiedź — sprawdź i zapisz' : 'brak bank_setting')) + '</td></tr>';
-                void i; void cur;
+                void i;
             });
-            h += '</table></div><div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+            h += '</table></div>' + dlBank() + dlAcct()
+              +  '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               +  '<button id="mk-set-save" type="button" style="padding:5px 14px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">Zapisz</button>'
               +  '<span id="mk-set-msg" style="font-size:11px;color:#0a7a2f"></span>'
               +  '<span style="font-size:10px;color:#888">bank_setting to identyfikator konta w imporcie — nie numer konta. Vente DE = 157.</span></div>';
@@ -18959,9 +18992,11 @@
             box.querySelector('#mk-set-save').onclick = function(){
                 const out = {};
                 box.querySelectorAll('tr[data-k]').forEach(function (tr){
+                    // W polach siedzi pelny opis („157 — Vente Unique DE …"), bo po nim
+                    // filtruje przegladarka. Zapisujemy sam numer z poczatku.
                     out[tr.getAttribute('data-k')] = {
-                        acct: tr.querySelector('.mk-s-acct').value,
-                        bank: tr.querySelector('.mk-s-bank').value.trim(),
+                        acct: numOf(tr.querySelector('.mk-s-acct').value),
+                        bank: numOf(tr.querySelector('.mk-s-bank').value),
                         booking: tr.querySelector('.mk-s-book').value.trim() || '9'
                     };
                 });
@@ -19245,6 +19280,21 @@
     // pozycje ze statusem OK. Status nadaje system: OK gdy kwota wplaty rowna sie
     // open amount auftragu, CHECK gdy sie rozni, NOT FOUND gdy nie ma auftragu.
     const MK_BLOCK = 'booking_without_assign';     // = przycisk „Book on main account"
+    // Druga kontrola: czy ten sam plik nie zostal juz kiedys wgrany. Nazwy nadajemy
+    // deterministycznie, wiec powtorka jest rozpoznawalna PRZED utworzeniem paczki.
+    async function impSameFile(fname){
+        try {
+            const r = await fetch('/api/importPayments/index/?', {
+                credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+            if (!r.ok) return null;
+            const j = await r.json();
+            const list = Array.isArray(j.parsing_list) ? j.parsing_list : [];
+            const hit = list.filter(function (x){ return fname && String(x.filename || '').indexOf(fname) >= 0; })
+                            .sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });
+            return hit.length ? hit[0] : null;
+        } catch (e){ return null; }
+    }
+
     // Odpowiedz na import NIE zawiera numeru paczki — serwer oddaje szkielet strony React,
     // a numer dociaga dopiero JavaScript. Znajdujemy go wiec po fakcie na liscie importow:
     // po nazwie pliku, ktora sami nadalismy, a zapasowo po koncie.
@@ -19287,6 +19337,9 @@
         const by = {};
         rows.forEach(function (x){ const s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
         const ok = by['OK'] || [], chk = by['CHECK'] || [], nf = by['NOT FOUND'] || [];
+        // Trzecia zapora: prologistics samo oznacza pozycje, ktore juz kiedys wczytano.
+        // To jedyna kontrola dzialajaca niezaleznie od tego, kto i czym je wprowadzil.
+        const seen = rows.filter(function (x){ return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; });
         // Zwroty z tego samego cyklu tlumacza czesc „NOT FOUND": zamowienie zostalo
         // zwrocone w calosci, wiec auftragu moze juz nie byc i nie ma czego ksiegowac.
         const refs = (job.data && job.data.ref) || {};
@@ -19302,6 +19355,12 @@
         });
         h += '</div>';
 
+        if (seen.length){
+            h += '<div style="margin:6px 0;padding:5px 7px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px">'
+              +  '<b style="font-size:11px;color:#c2410c">Prologistics zna już ' + seen.length + ' z tych płatności</b>'
+              +  '<div style="font-size:10px;color:#7c2d12;margin-top:2px">Były wczytane wcześniej — sprawdź, czy nie księgujesz drugi raz: '
+              +  esc(seen.slice(0, 12).map(function (x){ return x.payment_descr; }).join(', ')) + (seen.length > 12 ? ' … +' + (seen.length - 12) : '') + '</div></div>';
+        }
         if (chk.length){
             h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c47f00">CHECK — kwota nie zgadza się z open amount (' + chk.length + ')</b>'
               +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
@@ -19386,15 +19445,40 @@
             say('Brakuje bank_setting dla: ' + miss.join(', ') + '. Uzupełnij w ⚙ Konta i spróbuj ponownie.', '#c47f00');
             return;
         }
+        // Trzy zapory przed powtorzeniem cudzej pracy — sprawdzane PRZED wyslaniem.
+        b.disabled = true; say('Sprawdzam, czy to już nie zostało zrobione…');
+        let dupSheet = [], dupFile = [];
+        try { await shCheckJobs(sel); } catch (e){ say('Arkusz: ' + ((e && e.message) || e) + ' — sprawdzam dalej bez niego.', '#c47f00'); }
+        for (let i = 0; i < sel.length; i++){
+            const s = mkSheet[sel[i].ref];
+            if (s && s.found) dupSheet.push(sel[i]);
+            const f = await impSameFile(fileName(sel[i]));
+            if (f) dupFile.push({ j: sel[i], f: f });
+        }
+        b.disabled = false;
+        render();
+
         let tot = 0, cnt = 0;
         const lines = sel.map(function (j){
             const n = Object.keys(j.data.ord).length;
             const c = sets[setKey(j.mp, j.data.shop)];
             tot = r2(tot + j.data.gross); cnt += n;
-            return '  • ' + j.data.shop + '  ' + j.date + '  ' + n + ' zam.  ' + f2(j.data.gross) + ' ' + j.cur + '  → konto ' + (c.acct || '?') + ' (bank_setting ' + c.bank + ')';
+            const s = mkSheet[j.ref];
+            const df = dupFile.filter(function (x){ return x.j.ref === j.ref; })[0];
+            let flag = '';
+            if (s && s.found) flag += '   ⚠ JEST JUŻ W ARKUSZU (wiersz ' + s.row.row + ', ' + s.row.marketplace + ')';
+            else if (s && s.similar && s.similar.length) flag += '   ⚠ w arkuszu jest podobny wpis: ' + s.similar[0].data + ' ' + s.similar[0].marketplace;
+            if (df) flag += '   ⚠ TEN PLIK BYŁ JUŻ IMPORTOWANY (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ')';
+            return '  • ' + j.data.shop + '  ' + j.date + '  ' + n + ' zam.  ' + f2(j.data.gross) + ' ' + j.cur + '  → konto ' + (c.acct || '?') + ' (bank_setting ' + c.bank + ')' + flag;
         });
+        const warn = (dupSheet.length || dupFile.length)
+            ? ('\n\n⚠ UWAGA: ' + (dupSheet.length ? (dupSheet.length + ' pozycji jest już w arkuszu') : '')
+               + (dupSheet.length && dupFile.length ? ', ' : '')
+               + (dupFile.length ? (dupFile.length + ' plików było już importowanych') : '')
+               + '.\nPrawdopodobnie ktoś to już zaksięgował. Sprawdź, zanim potwierdzisz.')
+            : '';
         if (!confirm('Zaksięgować ' + sel.length + ' zestawień, razem ' + cnt + ' zamówień na ' + f2(tot) + '?\n\n'
-            + lines.join('\n') + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            + lines.join('\n') + warn + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
         b.disabled = true;
         let ok = 0; const err = [];
         for (let i = 0; i < sel.length; i++){
