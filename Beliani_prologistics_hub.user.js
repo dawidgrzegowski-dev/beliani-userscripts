@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.75
+// @version      2.76
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19146,75 +19146,201 @@
             const def = pad2(prev.getMonth() + 1) + '/' + prev.getFullYear();
             box.innerHTML =
                 '<div style="font-size:11px;color:#5b21b6;font-weight:700;margin-bottom:4px">Salda — miesięczne zestawienie</div>'
-              + '<div style="font-size:10px;color:#666;margin-bottom:6px">Pobiera wszystkie dzienne raporty z wybranego miesiąca i składa je w jeden plik: nagłówek raz na górze, przed każdym raportem wiersz „=== nazwa.csv ===", na końcu wpłaty, zwroty i rozrachunek. Sumy liczone z danych, nie przepisywane.</div>'
+              + '<div style="font-size:10px;color:#666;margin-bottom:6px">Podaj miesiąc — pokażę listę zestawień. Te z miesiąca zaznaczę, po dwa z sąsiednich zostawię odznaczone: data zestawienia i data wpłaty rozjeżdżają się, gdy koniec miesiąca wypada w weekend. Plik składam z tego, co zaznaczysz — nagłówek raz na górze, przed każdym zestawieniem wiersz „=== nazwa.csv ===", na końcu sumy liczone z danych.</div>'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<select id="mk-sal-mp" style="font-size:11px"><option value="belianide860.myvtex.com">OBI DE</option></select>'
               + '<input id="mk-sal-m" value="' + def + '" placeholder="MM/RRRR" style="width:80px;font-size:11px;text-align:center">'
-              + '<button id="mk-sal-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬇ Zbuduj plik</button>'
+              + '<button id="mk-sal-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Pokaż zestawienia</button>'
               + '<span id="mk-sal-msg" style="font-size:11px;color:#666"></span></div>'
               + '<div id="mk-sal-out" style="margin-top:8px"></div>';
             box.querySelector('#mk-sal-go').onclick = function(){ saldaGo(this); };
         };
     })();
 
+    // Zestawienia z ostatniego wyszukania — zeby zaznaczanie i skladanie pliku
+    // nie musialy pobierac tego samego drugi raz.
+    let saldaFound = [], saldaMM = '', saldaYY = '', saldaLbl = 'OBI DE';
+
+    // Wlasne sumy jednego zestawienia — po nich widac, czy raport z przelomu
+    // w ogole warto dobrac do miesiaca.
+    function repSum(rep){
+        let credit = 0, debit = 0, n = 0;
+        vtexRows(rep).forEach(function (x){
+            n++;
+            if (mkIntern(x)) return;                       // ruch wewnetrzny nie jest obrotem
+            credit = r2(credit + (Number(x.grossCredit) || 0));
+            debit  = r2(debit  + (Number(x.grossDebit)  || 0));
+        });
+        return { n: n, credit: credit, debit: debit };
+    }
+    function repPl(iso){
+        const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        return m ? (m[3] + '.' + m[2] + '.' + m[1]) : '?';
+    }
+
     async function saldaGo(btn){
         const box = $('#mk-sal-box');
         const msg = box.querySelector('#mk-sal-msg'), out = box.querySelector('#mk-sal-out');
-        const host = box.querySelector('#mk-sal-mp').value;
+        const sel = box.querySelector('#mk-sal-mp');
+        const host = sel.value;
         const m = String(box.querySelector('#mk-sal-m').value || '').match(/^(\d{1,2})\s*[\/.-]\s*(\d{4})$/);
         if (!m){ msg.style.color = '#c00'; msg.textContent = 'podaj miesiąc jako MM/RRRR, np. 04/2026'; return; }
         const mm = pad2(+m[1]), yyyy = m[2];
         btn.disabled = true; msg.style.color = '#666'; msg.textContent = 'pobieram…'; out.innerHTML = '';
         try {
-            // Bierzemy szerzej niz miesiac, zeby pokazac takze raporty z przelomu —
-            // ich daty i daty wplywu nie pokrywaja sie, wiec ostatnie i pierwsze dni
-            // sa do wzrokowej weryfikacji, a nie do sumowania.
+            // Bierzemy szerzej niz miesiac, zeby bylo z czego dobrac przelom: daty
+            // zestawien i daty wplywu nie pokrywaja sie, zwlaszcza gdy koniec miesiaca
+            // wypada w weekend.
             const from = yyyy + '-' + mm + '-01';
-            const to = mkShift(yyyy + '-' + mm + '-28', 10);
-            let reps = [];
-            try { reps = await vtexReports(host, mkShift(from, -5), to); }
+            let reps = [], fromCache = false;
+            try { reps = await vtexReports(host, mkShift(from, -12), mkShift(yyyy + '-' + mm + '-28', 14)); }
             catch (e){
                 reps = vtexCacheGet(host);
                 if (!reps.length) throw e;
-                msg.style.color = '#c47f00'; msg.textContent = 'z odłożonej kopii (' + reps.length + ')…';
+                fromCache = true;
             }
-            reps = reps.filter(function (r){ return repDay(r); })
-                       .sort(function (a, b){ return repDay(a).localeCompare(repDay(b)); });
-            const inM = reps.filter(function (r){ return repDay(r).slice(0, 7) === yyyy + '-' + mm; });
-            const near = reps.filter(function (r){ return repDay(r).slice(0, 7) !== yyyy + '-' + mm; });
-            if (!inM.length){
-                msg.style.color = '#c00';
-                msg.textContent = 'nie ma raportów z ' + mm + '/' + yyyy + (reps.length ? (' — widzę ' + reps.length + ' z innych miesięcy') : '');
-                btn.disabled = false; return;
-            }
-            const s = saldaRows(inM, mm, yyyy);
-            const name = 'OBI DE ' + mm + yyyy + '.xlsx';
-            const blob = new Blob([xlsx(mm + yyyy, s.rows)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            saldaFound = reps.filter(function (r){ return repDay(r); })
+                             .sort(function (a, b){ return repDay(a).localeCompare(repDay(b)); });
+            saldaMM = mm; saldaYY = yyyy;
+            saldaLbl = (sel.options[sel.selectedIndex] || {}).text || 'OBI DE';
+            if (!saldaPick()){ btn.disabled = false; return; }   // komunikat ustawil saldaPick
+            if (fromCache){
+                msg.style.color = '#c47f00';
+                msg.textContent = 'z odłożonej kopii — wejdź na OBI, żeby odświeżyć';
+            } else { msg.style.color = '#666'; msg.textContent = ''; }
+        } catch (e){
+            msg.style.color = '#c00'; msg.textContent = (e && e.message) || String(e);
+        }
+        btn.disabled = false;
+    }
+
+    // Lista do zaznaczenia: caly miesiac zaznaczony, po dwa z sasiednich odznaczone.
+    function saldaPick(){
+        const box = $('#mk-sal-box'), out = box.querySelector('#mk-sal-out');
+        const msg = box.querySelector('#mk-sal-msg');
+        const key = saldaYY + '-' + saldaMM;
+        const inM    = saldaFound.filter(function (r){ return repDay(r).slice(0, 7) === key; });
+        const before = saldaFound.filter(function (r){ return repDay(r) <  key + '-01'; }).slice(-2);
+        const after  = saldaFound.filter(function (r){ return repDay(r) >  key + '-31'; }).slice(0, 2);
+        if (!inM.length && !before.length && !after.length){
+            msg.style.color = '#c00';
+            msg.textContent = 'nie widzę żadnych zestawień w okolicy ' + saldaMM + '/' + saldaYY;
+            out.innerHTML = ''; return false;
+        }
+        const row = function (r, on){
+            const s = repSum(r), d = repDay(r);
+            return '<label style="display:flex;gap:8px;align-items:center;padding:2px 4px;border-radius:4px;cursor:pointer"'
+                 + ' onmouseover="this.style.background=\'#ede9fe\'" onmouseout="this.style.background=\'\'">'
+                 + '<input type="checkbox" class="mk-sal-c" data-nm="' + esc(r.payoutReportFileName || '') + '"' + (on ? ' checked' : '') + '>'
+                 + '<span style="font-family:monospace;font-size:10px">' + esc(r.payoutReportFileName || r.id || '') + '</span>'
+                 + '<span style="font-size:10px;color:#444;min-width:66px">' + repPl(d) + '</span>'
+                 + '<span style="font-size:10px;color:#888;min-width:48px;text-align:right">' + s.n + ' poz.</span>'
+                 + '<span style="font-size:10px;color:#0a7a2f;min-width:74px;text-align:right">' + f2(s.credit) + '</span>'
+                 + '<span style="font-size:10px;color:#c00;min-width:66px;text-align:right">' + (s.debit ? '-' + f2(s.debit) : '') + '</span>'
+                 + '</label>';
+        };
+        const head = function (t){
+            return '<div style="font-size:10px;color:#5b21b6;font-weight:700;margin:6px 0 2px">' + t + '</div>';
+        };
+        let h = '';
+        if (before.length) h += head('Koniec ' + prevMon(saldaMM, saldaYY) + ' — odznaczone, dobierz jeśli wpłata przeszła na ten miesiąc')
+                              + before.map(function (r){ return row(r, false); }).join('');
+        h += head(saldaMM + '/' + saldaYY + ' — ' + inM.length + ' zestawień')
+           + inM.map(function (r){ return row(r, true); }).join('');
+        if (after.length) h += head('Początek ' + nextMon(saldaMM, saldaYY) + ' — odznaczone, dobierz jeśli dotyczą tego miesiąca')
+                             + after.map(function (r){ return row(r, false); }).join('');
+        h += '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">'
+           + '<button id="mk-sal-all" style="padding:3px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zaznacz wszystkie</button>'
+           + '<button id="mk-sal-none" style="padding:3px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">odznacz wszystkie</button>'
+           + '<button id="mk-sal-mon" style="padding:3px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">tylko ' + saldaMM + '/' + saldaYY + '</button>'
+           + '<button id="mk-sal-build" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬇ Zbuduj plik z zaznaczonych</button>'
+           + '<span id="mk-sal-cnt" style="font-size:11px;color:#666"></span></div>'
+           + '<div id="mk-sal-res" style="margin-top:8px"></div>';
+        out.innerHTML = h;
+
+        const boxes = function (){ return Array.prototype.slice.call(out.querySelectorAll('.mk-sal-c')); };
+        const cnt = out.querySelector('#mk-sal-cnt');
+        const tick = function (){
+            const on = boxes().filter(function (c){ return c.checked; });
+            let n = 0, cr = 0, db = 0;
+            on.forEach(function (c){
+                const r = saldaByName(c.dataset.nm);
+                if (!r) return;
+                const s = repSum(r); n += s.n; cr = r2(cr + s.credit); db = r2(db + s.debit);
+            });
+            cnt.textContent = on.length + ' zazn. · ' + n + ' poz. · ' + f2(cr) + ' / -' + f2(db)
+                            + ' · rozrachunek ' + f2(r2(cr - db));
+        };
+        boxes().forEach(function (c){ c.onchange = tick; });
+        const setAll = function (v, only){
+            boxes().forEach(function (c){
+                const r = saldaByName(c.dataset.nm);
+                c.checked = only ? (!!r && repDay(r).slice(0, 7) === key) : v;
+            });
+            tick();
+        };
+        out.querySelector('#mk-sal-all').onclick  = function (){ setAll(true); };
+        out.querySelector('#mk-sal-none').onclick = function (){ setAll(false); };
+        out.querySelector('#mk-sal-mon').onclick  = function (){ setAll(false, true); };
+        out.querySelector('#mk-sal-build').onclick = function (){ saldaBuild(this); };
+        tick();
+        return true;
+    }
+    function saldaByName(nm){
+        for (let i = 0; i < saldaFound.length; i++){
+            if (String(saldaFound[i].payoutReportFileName || '') === nm) return saldaFound[i];
+        }
+        return null;
+    }
+    function prevMon(mm, yyyy){
+        const n = +mm - 1;
+        return n < 1 ? ('12/' + (+yyyy - 1)) : (pad2(n) + '/' + yyyy);
+    }
+    function nextMon(mm, yyyy){
+        const n = +mm + 1;
+        return n > 12 ? ('01/' + (+yyyy + 1)) : (pad2(n) + '/' + yyyy);
+    }
+
+    function saldaBuild(btn){
+        const box = $('#mk-sal-box'), out = box.querySelector('#mk-sal-out');
+        const msg = box.querySelector('#mk-sal-msg'), res = out.querySelector('#mk-sal-res');
+        const pick = Array.prototype.slice.call(out.querySelectorAll('.mk-sal-c'))
+            .filter(function (c){ return c.checked; })
+            .map(function (c){ return saldaByName(c.dataset.nm); })
+            .filter(Boolean)
+            .sort(function (a, b){ return repDay(a).localeCompare(repDay(b)); });
+        if (!pick.length){ msg.style.color = '#c00'; msg.textContent = 'nic nie zaznaczono'; return; }
+        btn.disabled = true;
+        try {
+            const s = saldaRows(pick, saldaMM, saldaYY);
+            const name = saldaLbl + ' ' + saldaMM + saldaYY + '.xlsx';
+            const blob = new Blob([xlsx(saldaMM + saldaYY, s.rows)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob); a.download = name;
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
 
-            let h = '<div style="font-size:11px;color:#0a7a2f;font-weight:700">Zapisano ' + esc(name) + '</div>'
+            const key = saldaYY + '-' + saldaMM;
+            const extra = pick.filter(function (r){ return repDay(r).slice(0, 7) !== key; });
+            const missed = saldaFound.filter(function (r){
+                return repDay(r).slice(0, 7) === key && pick.indexOf(r) < 0;
+            });
+            res.innerHTML = '<div style="font-size:11px;color:#0a7a2f;font-weight:700">Zapisano ' + esc(name) + '</div>'
                   + '<table style="border-collapse:collapse;font-size:11px;margin-top:4px">'
-                  + '<tr><td style="padding:1px 8px">raportów</td><td style="padding:1px 8px;text-align:right"><b>' + inM.length + '</b></td></tr>'
+                  + '<tr><td style="padding:1px 8px">zestawień</td><td style="padding:1px 8px;text-align:right"><b>' + pick.length + '</b></td></tr>'
                   + '<tr><td style="padding:1px 8px">wierszy</td><td style="padding:1px 8px;text-align:right">' + s.nRows + '</td></tr>'
                   + '<tr><td style="padding:1px 8px">wpłaty</td><td style="padding:1px 8px;text-align:right">' + f2(s.credit) + '</td></tr>'
                   + '<tr><td style="padding:1px 8px">zwroty</td><td style="padding:1px 8px;text-align:right">' + f2(s.debit) + '</td></tr>'
                   + '<tr style="border-top:1px solid #ddd6fe"><td style="padding:1px 8px"><b>rozrachunek z kund.</b></td><td style="padding:1px 8px;text-align:right"><b>' + f2(r2(s.credit - s.debit)) + '</b></td></tr>'
                   + (s.sub ? '<tr><td style="padding:1px 8px;color:#666">abonament (poza zwrotami)</td><td style="padding:1px 8px;text-align:right;color:#666">' + f2(s.sub) + '</td></tr>' : '')
                   + (s.adj ? '<tr><td style="padding:1px 8px;color:#666">korekty wewn. (poza wpłatami)</td><td style="padding:1px 8px;text-align:right;color:#666">' + f2(s.adj) + '</td></tr>' : '')
-                  + '</table>';
-            // Przelom miesiaca — do sprawdzenia, nie do sumy.
-            const before = near.filter(function (r){ return repDay(r) < yyyy + '-' + mm + '-01'; }).slice(-3);
-            const after  = near.filter(function (r){ return repDay(r) > yyyy + '-' + mm + '-31'; }).slice(0, 3);
-            if (before.length || after.length){
-                h += '<div style="margin-top:8px;font-size:10px;color:#666"><b>Przełom miesiąca — nie wliczone, do Twojej weryfikacji:</b><br>'
-                  +  (before.length ? ('koniec poprzedniego: ' + esc(before.map(function (r){ return r.payoutReportFileName; }).join(', ')) + '<br>') : '')
-                  +  (after.length ? ('początek następnego: ' + esc(after.map(function (r){ return r.payoutReportFileName; }).join(', '))) : '')
-                  +  '</div>';
-            }
-            out.innerHTML = h;
+                  + '</table>'
+                  // Co odbiega od zwyklego miesiaca — zeby po tygodniu bylo wiadomo,
+                  // czemu ten plik ma inny zakres niz poprzedni.
+                  + (extra.length ? ('<div style="margin-top:6px;font-size:10px;color:#c47f00">dobrane spoza ' + saldaMM + '/' + saldaYY + ': '
+                        + esc(extra.map(function (r){ return r.payoutReportFileName + ' (' + repPl(repDay(r)) + ')'; }).join(', ')) + '</div>') : '')
+                  + (missed.length ? ('<div style="margin-top:4px;font-size:10px;color:#c00">pominięte z ' + saldaMM + '/' + saldaYY + ': '
+                        + esc(missed.map(function (r){ return r.payoutReportFileName + ' (' + repPl(repDay(r)) + ')'; }).join(', ')) + '</div>') : '');
             msg.style.color = '#0a7a2f'; msg.textContent = 'gotowe';
         } catch (e){
             msg.style.color = '#c00'; msg.textContent = (e && e.message) || String(e);
