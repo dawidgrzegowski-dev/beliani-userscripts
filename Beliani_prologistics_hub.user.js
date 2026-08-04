@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.88
+// @version      2.89
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21655,8 +21655,6 @@
         // Zwroty z tego samego cyklu tlumacza czesc „NOT FOUND": zamowienie zostalo
         // zwrocone w calosci, wiec auftragu moze juz nie byc i nie ma czego ksiegowac.
         const refs = (job.data && job.data.ref) || {};
-        const nfKnown = nf.filter(function (x){ return refs[String(x.payment_descr || '').trim()] != null; });
-        const nfNew   = nf.filter(function (x){ return refs[String(x.payment_descr || '').trim()] == null; });
 
         let h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
               + '<b style="font-size:11px;color:#5b21b6">Paczka importu ' + esc(job.impId) + '</b>'
@@ -21708,12 +21706,37 @@
               +  '<span id="mk-fix-msg" style="font-size:11px;color:#666"></span></div></div>';
         }
         if (nf.length){
-            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>';
-            if (nfKnown.length) h += '<div style="font-size:10px;color:#666;margin-top:2px">wyjaśnione zwrotem w tym samym cyklu — nie ma czego księgować: '
-                                  + esc(nfKnown.map(function (x){ return x.payment_descr; }).join(', ')) + '</div>';
-            if (nfNew.length) h += '<div style="font-size:11px;color:#c00;margin-top:2px;font-weight:700">bez wyjaśnienia — wpłata przyszła, a nie ma auftragu: '
-                                  + esc(nfNew.map(function (x){ return x.payment_descr + ' (' + x.amount + ')'; }).join(', ')) + '</div>';
-            h += '</div>';
+            // Numer fulfilmentu, wplata i zwrot z tego samego cyklu OBOK SIEBIE. Wczesniej
+            // byla to sama lista numerow i zeby sprawdzic, czy pozycja faktycznie sie znosi,
+            // trzeba bylo porownywac ja recznie z wierszem „rozliczone i zwrócone".
+            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>'
+              +  '<div style="font-size:10px;color:#888;margin-top:2px">Prologistics nie znalazł auftragu dla tych numerów. '
+              +  'Część tłumaczy zwrot z tego samego cyklu — wtedy wpłata i zwrot znoszą się i nie ma czego księgować.</div>'
+              +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Fulfilment</td>'
+              +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
+              +  '<td style="padding:1px 6px;text-align:right">Zwrot w tym cyklu</td>'
+              +  '<td style="padding:1px 6px">Co to znaczy</td></tr>';
+            nf.forEach(function (x){
+                const id = String(x.payment_descr == null ? '' : x.payment_descr).trim();
+                const a = impNum(x.amount);
+                const rv = (id && refs[id] != null) ? Math.abs(refs[id]) : null;
+                const full = (rv != null && a != null && Math.abs(rv - a) < 0.005);
+                const au = impAuction(x);
+                let msg, colr;
+                if (full){ msg = 'zwrócone w całości — pieniądze się znoszą'; colr = '#0a7a2f'; }
+                else if (rv != null && a != null){ msg = 'zwrot niepełny — zostaje ' + f2(r2(a - rv)) + ' bez auftragu'; colr = '#c47f00'; }
+                else if (rv != null){ msg = 'jest zwrot w tym cyklu, ale nie odczytałem wpłaty'; colr = '#c47f00'; }
+                else { msg = 'bez wyjaśnienia — wpłata przyszła, a auftragu nie ma'; colr = '#c00'; }
+                h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
+                  +  (id ? esc(id) : '<span style="color:#c00">brak numeru w paczce</span>')
+                  +  (au ? (' <a href="' + esc(au.url) + '" target="_blank" style="font-weight:400">' + esc(au.label) + '</a>') : '')
+                  +  '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (rv == null ? '—' : f2(rv)) + '</td>'
+                  +  '<td style="padding:2px 6px;color:' + colr + '">' + msg + '</td></tr>';
+            });
+            h += '</table></div>';
         }
         h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           +  '<button id="mk-book"' + (ok.length ? '' : ' disabled')
