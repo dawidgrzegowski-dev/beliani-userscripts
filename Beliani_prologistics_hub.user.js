@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.82
+// @version      2.83
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18236,6 +18236,7 @@
             return -1;
         };
         const c = { order: at(/^Galaxus Order ID$/i), qty: at(/^Quantity$/i),
+                    rate: at(/^Commission Rate$/i),
                     price: at(/^Sales Price$/i), com: at(/^Commission Amount$/i),
                     pay: at(/^Amount paid out$/i), payout: at(/^Payout ID$/i),
                     date: at(/^Payout Date$/i),
@@ -18288,9 +18289,17 @@
         // Po wstawieniu kolumny VAT wszystko na prawo od „Sales Price" przesuwa sie
         // o jedno pole — zapamietujemy nowe pozycje, zeby dalej nie liczyc tego w kolko.
         const sh = function (i){ return (c.vat < 0 && i >= c.price) ? i + 1 : i; };
+        const cVat = (c.vat >= 0) ? c.vat : c.price;      // kolumna N w gotowym pliku
+        // Ktore kolumny wolno sumowac przy scalaniu pozycji jednego zamowienia.
+        // Wylacznie po NAZWACH — po typie nie mozna, bo „03.08.2026" tez daje sie
+        // odczytac jako liczbe i data zamienilaby sie w 3.08.
+        const SUMY = /^(Quantity|Sales Price|Sales Price excl\..*|Commission Amount|Marketplace return shipping costs|Deduction on processing costs for returns (incl|excl)\.?|Amount paid out)$/i;
+        const cSum = [cVat];
+        outHdr.forEach(function (h, i){ if (SUMY.test(String(h || '').trim())) cSum.push(i); });
         return { hdr: outHdr, rows: rowsOf(rows, c, vat), ord: ord, ref: ref,
                  net: net, gross: gross, refund: refund, com: com, ded: ded,
                  payout: payout, pdate: pdate, cPay: sh(c.pay), cOrder: sh(c.order),
+                 cVat: cVat, cQty: sh(c.qty), cRate: sh(c.rate), cSum: cSum,
                  n: Object.keys(ord).length + Object.keys(ref).length };
     }
     // Te same wiersze, ale gotowe do zapisu — wydzielone, zeby parser czytalo sie liniowo.
@@ -18316,11 +18325,36 @@
         const isTot = function (r){ return /^total$/i.test(String(r[0] || '').trim()); };
         // Zwroty NIE ida do importu. Ksieguje sie je w tickecie, z listy zwrotow —
         // w paczce ladowaly jako wiersze ujemne i zostawaly tam na zawsze jako CHECK.
-        const keep = p.rows.filter(function (r){
+        let keep = p.rows.filter(function (r){
             if (isTot(r)) return false;
             const v = mkNum(r[p.cPay]);
             return v == null || v >= 0;
         });
+        // Jedno zamowienie potrafi miec kilka pozycji (rozne produkty w tej samej
+        // przesylce). Prologistics dopasowuje wplate do auftragu po NUMERZE ZAMOWIENIA,
+        // wiec dwa wiersze na ten sam numer zjadaly sobie „open amount": pierwszy go
+        // zerowal, a drugi zostawal jako CHECK na pelna kwote. Scalamy je w jeden wiersz.
+        const fmt = function (i, v){
+            if (i === p.cVat) return v.toFixed(2);
+            if (i === p.cQty) return String(Math.round(v));
+            return galxMoney(v);
+        };
+        const keep2 = [], at = {};
+        keep.forEach(function (r){
+            const id = String(r[p.cOrder] == null ? '' : r[p.cOrder]).trim();
+            if (!id){ keep2.push(r.slice()); return; }
+            if (at[id] == null){ at[id] = keep2.length; keep2.push(r.slice()); return; }
+            const t = keep2[at[id]];
+            (p.cSum || []).forEach(function (i){
+                const a = mkNum(t[i]), b = mkNum(r[i]);
+                if (a == null && b == null) return;
+                t[i] = fmt(i, r2((a || 0) + (b || 0)));
+            });
+            // Prowizja bywa inna dla kazdego produktu — wtedy jedna liczba juz nic
+            // nie znaczy i lepiej zostawic puste niz wpisac mylaca.
+            if (p.cRate >= 0 && String(t[p.cRate] || '') !== String(r[p.cRate] || '')) t[p.cRate] = '';
+        });
+        keep = keep2;
         const tot = p.rows.filter(isTot)[0];
         const lines = [p.hdr.map(q).join(';')];
         keep.forEach(function (r){ lines.push(r.map(q).join(';')); });
