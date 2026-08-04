@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.67
+// @version      2.68
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18353,6 +18353,7 @@
     // i zmienne w base64, dokladnie tak jak robi to ich wlasny panel.
     const MK_VTEX_HASH = '0d6454a77362f9ca03196fca44c33dd3aa8cd53e367262a5be9a2e4f6b404261';
     const MK_VTEX_APP  = 'obi.seller-financial-commission@3.x';
+    const MK_VTEX_BIND = '22f42e19-58d2-4e2a-86e6-64f9ad6df768';
     function gmPost(url, body, hdrs){
         return new Promise(function (resolve, reject){
             if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
@@ -18374,17 +18375,26 @@
         const body = JSON.stringify({ operationName: 'GET_PAYOUT_REPORTS', variables: {},
             extensions: { persistedQuery: { version: 1, sha256Hash: MK_VTEX_HASH, sender: MK_VTEX_APP, provider: MK_VTEX_APP },
                           variables: vars } });
-        const path = '/_v/private/graphql/v1?workspace=master&maxAge=long&appsEtag=remove&domain=admin&locale=de-DE';
+        // VTEX rozwiazuje aplikacje po „__bindingId" — bez niego brama GraphQL nie wie,
+        // czyja to zapytanie, i oddaje 404. Adres bez tego parametru zostaje jako druga
+        // proba, na wypadek gdyby na innym sklepie nie byl wymagany.
+        const base = '/_v/private/graphql/v1?workspace=master&maxAge=long&appsEtag=remove&domain=admin&locale=de-DE';
+        const paths = [base + '&__bindingId=' + MK_VTEX_BIND, base];
         let txt = '', code = 0;
-        if (location.hostname === host){
-            const r = await fetch(path, { method: 'POST', credentials: 'same-origin',
-                headers: { 'content-type': 'application/json' }, body: body });
-            code = r.status; txt = await r.text();
-        } else {
-            const r = await gmPost('https://' + host + path, body, { 'content-type': 'application/json', 'accept': '*/*' });
-            code = r.status; txt = String(r.responseText || '');
+        for (let i = 0; i < paths.length; i++){
+            if (location.hostname === host){
+                const r = await fetch(paths[i], { method: 'POST', credentials: 'same-origin',
+                    headers: { 'content-type': 'application/json' }, body: body });
+                code = r.status; txt = await r.text();
+            } else {
+                const r = await gmPost('https://' + host + paths[i], body,
+                    { 'content-type': 'application/json', 'accept': '*/*' });
+                code = r.status; txt = String(r.responseText || '');
+            }
+            if (code !== 404) break;
         }
-        if (code < 200 || code >= 300) throw new Error('HTTP ' + code + ' na ' + host);
+        if (code < 200 || code >= 300) throw new Error('HTTP ' + code + ' na ' + host
+            + (code === 404 ? ' — brama GraphQL nie rozpoznała aplikacji; sprawdź, czy jesteś tam zalogowany' : ''));
         let j = null;
         try { j = JSON.parse(txt); } catch (e){ throw new Error('z ' + host + ' przyszedł nie-JSON — zaloguj się tam w przeglądarce'); }
         const d = j && j.data && j.data.searchPayoutReport;
@@ -18642,10 +18652,10 @@
       + '</div>'
       + '<div style="padding:12px 16px">'
       +   (onProlo
-            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS, CSV) — rozpoznam wpłaty od marketplace\'ów. Rozliczenia dociągam prosto z Mirakla, stąd; musisz być tam zalogowany w przeglądarce.</div>'
+            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS albo Postbank, CSV) — rozpoznam wpłaty od marketplace\'ów. Zestawienia dociągam prosto z ich paneli, stąd; musisz być tam zalogowany w przeglądarce.</div>'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
-              + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz rozliczenia z Mirakla</button>'
+              + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
               + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
               + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
