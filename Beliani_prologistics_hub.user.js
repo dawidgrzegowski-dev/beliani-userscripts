@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.74
+// @version      2.75
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18470,10 +18470,13 @@
         reps.forEach(function (r){
             const nm = String(r.payoutReportFileName || '').trim();
             if (!nm) return;
+            // Trzymamy dokladnie te kolumny, ktore wychodza do pliku importu i do Sald —
+            // wczesniej lista byla krotsza i po odczycie z kopii ginela m.in. metoda
+            // platnosci, po ktorej poznajemy abonament.
             box[nm] = { id: r.id, rows: vtexRows(r).map(function (x){
-                return { orderId: x.orderId, grossCredit: x.grossCredit, grossDebit: x.grossDebit,
-                         netCredit: x.netCredit, netDebit: x.netDebit,
-                         transactionType: x.transactionType, chargebackType: x.chargebackType };
+                const o = {};
+                MK_OBI_HDR.forEach(function (k){ if (x[k] != null) o[k] = x[k]; });
+                return o;
             }) };
         });
         // ograniczamy do 80 najnowszych nazw, zeby pamiec nie rosla bez konca
@@ -18507,6 +18510,12 @@
             // O zwrocie decyduje TYP, a nie to, w ktorej kolumnie stoi kwota. Sprawdzone
             // na prawdziwym wierszu: „refunded" ma grossDebit 200 i netDebit 164.30,
             // a nie ujemny grossCredit — poleganie na samej kolumnie bylo by kruche.
+            // UWAGA: abonament ma typ „refunded", ale zwrotem nie jest. Raz w miesiacu,
+            // zawsze 47.54, z numerem faktury zamiast zamowienia (DE-100515-03/26).
+            // Rozstrzyga metoda platnosci, bo typ tu klamie. Tu odsiewamy TYLKO abonament:
+            // korekta wpieta pod numer zamowienia to prawdziwy ruch na tym zamowieniu
+            // i musi wejsc do rozliczenia, inaczej wplata przestanie sie spinac.
+            if (mkIntern(x) === 'sub'){ kinds['abonament'] = (kinds['abonament'] || 0) + 1; return; }
             const isRef = /refund|chargeback/i.test(ty) || gd > 0;
             const cb = String(x.chargebackType == null ? '' : x.chargebackType).trim();
             if (cb && cb !== '-') cbs.push(id + ' (' + cb + ')');
@@ -18720,6 +18729,167 @@
         return { list: all, total: total, full: full, pages: pages, how: how };
     }
 
+    // ================= SALDA: miesieczne zestawienie do xlsx =================
+    // Rreczne sciaganie i sklejanie trzydziestu dziennych raportow to praca, ktora
+    // komputer robi lepiej. Uklad odtwarzamy z pliku „OBI DE.xlsx": naglowek raz na
+    // gorze, przed kazdym raportem wiersz „=== nazwa.csv ===", a na koncu trzy sumy.
+    //
+    // Sumy licze SAM, a nie kopiuje zakresow z pliku wzorcowego — tam byly wpisywane
+    // recznie i sie rozjezdzaly (w kwietniu o 131.45, w maju zakresy urywaly sie
+    // w polowie miesiaca). „wplaty" to suma grossCredit, „zwroty" suma grossDebit.
+    function crcTable(){
+        const t = [];
+        for (let n = 0; n < 256; n++){
+            let c = n;
+            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            t[n] = c >>> 0;
+        }
+        return t;
+    }
+    const MK_CRC = crcTable();
+    function crc32(u8){
+        let c = 0xFFFFFFFF;
+        for (let i = 0; i < u8.length; i++) c = MK_CRC[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+        return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+    function utf8(s){ return new TextEncoder().encode(String(s)); }
+    // Archiwum bez kompresji — xlsx to nic innego niz zip z kilkoma plikami xml.
+    function mkZip(files){
+        const chunks = [], central = [];
+        let off = 0;
+        function u16(n){ return [n & 255, (n >>> 8) & 255]; }
+        function u32(n){ return [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]; }
+        files.forEach(function (f){
+            const name = utf8(f.name), data = utf8(f.data), crc = crc32(data);
+            const local = [].concat([0x50,0x4B,0x03,0x04], u16(20), u16(0x0800), u16(0), u16(0), u16(0),
+                                    u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0));
+            chunks.push(new Uint8Array(local), name, data);
+            central.push({ name: name, crc: crc, len: data.length, off: off });
+            off += local.length + name.length + data.length;
+        });
+        const cd = [];
+        central.forEach(function (c){
+            const h = [].concat([0x50,0x4B,0x01,0x02], u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0),
+                                u32(c.crc), u32(c.len), u32(c.len), u16(c.name.length),
+                                u16(0), u16(0), u16(0), u16(0), u32(0), u32(c.off));
+            cd.push(new Uint8Array(h), c.name);
+        });
+        let cdLen = 0; cd.forEach(function (x){ cdLen += x.length; });
+        const end = new Uint8Array([].concat([0x50,0x4B,0x05,0x06], u16(0), u16(0),
+                                   u16(central.length), u16(central.length), u32(cdLen), u32(off), u16(0)));
+        const all = chunks.concat(cd, [end]);
+        let total = 0; all.forEach(function (x){ total += x.length; });
+        const out = new Uint8Array(total);
+        let p = 0; all.forEach(function (x){ out.set(x, p); p += x.length; });
+        return out;
+    }
+    function xmlEsc(s){
+        // XML nie dopuszcza znakow sterujacych - odsiewamy je po kodzie znaku,
+        // zeby nie wpisywac ich doslownie do zrodla.
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .split('').filter(function (ch){
+                            const c = ch.charCodeAt(0);
+                            return c === 9 || c === 10 || c === 13 || c >= 32;
+                        }).join('');
+    }
+    function colName(i){
+        let s = '';
+        i++;
+        while (i > 0){ const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = (i - m - 1) / 26; }
+        return s;
+    }
+    // Teksty wstawiamy „w miejscu" (inlineStr), zeby nie budowac slownika lancuchow.
+    function xlsx(sheetName, rows){
+        let body = '';
+        rows.forEach(function (r, ri){
+            let cells = '';
+            (r || []).forEach(function (v, ci){
+                if (v === null || v === undefined || v === '') return;
+                const ref = colName(ci) + (ri + 1);
+                if (typeof v === 'number' && isFinite(v)) cells += '<c r="' + ref + '"><v>' + v + '</v></c>';
+                else cells += '<c r="' + ref + '" t="inlineStr"><is><t xml:space="preserve">' + xmlEsc(v) + '</t></is></c>';
+            });
+            if (cells) body += '<row r="' + (ri + 1) + '">' + cells + '</row>';
+        });
+        const sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            + body + '</sheetData></worksheet>';
+        return mkZip([
+            { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                + '<Default Extension="xml" ContentType="application/xml"/>'
+                + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                + '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>' },
+            { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+            { name: 'xl/workbook.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                + 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+                + '<sheet name="' + xmlEsc(sheetName) + '" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+            { name: 'xl/_rels/workbook.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>' },
+            { name: 'xl/worksheets/sheet1.xml', data: sheet }
+        ]);
+    }
+
+    // Ruch wewnetrzny OBI, ktory NIE jest obrotem z klientem. Rozstrzyga metoda platnosci,
+    // bo typ tu klamie: abonament ma transactionType „refunded", choc zwrotem nie jest.
+    //   sub — abonament, raz w miesiacu 47.54, z numerem faktury zamiast zamowienia
+    //   adj — korekta („Internal Transfer"/„adjustment"), bez numeru zamowienia
+    // Sprawdzone na kwietniu: po wylaczeniu obu sumy zgadzaja sie z reczna wersja
+    // co do grosza (wplaty 60107.49, zwroty 1414.89).
+    function mkIntern(x){
+        const pm = String(x.paymentMethod || ''), ty = String(x.transactionType || '');
+        if (/subscription/i.test(pm)) return 'sub';
+        if (/internal\s*transfer/i.test(pm) || /^adjustment$/i.test(ty.trim())) return 'adj';
+        return '';
+    }
+
+    // Data raportu siedzi w jego nazwie: PODE-RRRRMMDD-NNNN.
+    function repDay(rep){
+        const m = String(rep.payoutReportFileName || '').match(/PODE-(\d{4})(\d{2})(\d{2})/);
+        return m ? (m[1] + '-' + m[2] + '-' + m[3]) : '';
+    }
+    function saldaRows(reps, mm, yyyy){
+        const out = [];
+        const num = function (v){
+            const s = String(v == null ? '' : v).trim();
+            if (!s || s === '-') return null;
+            const n = Number(s.replace(',', '.'));
+            return isFinite(n) ? n : s;
+        };
+        let credit = 0, debit = 0, sub = 0, adj = 0, nRows = 0;
+        reps.forEach(function (rep, i){
+            out.push(['=== ' + (rep.id || rep.payoutReportFileName) + '.csv ===']);
+            if (i === 0) out.push(MK_OBI_HDR.slice());
+            vtexRows(rep).forEach(function (x){
+                nRows++;
+                const cr = Number(x.grossCredit) || 0, db = Number(x.grossDebit) || 0;
+                const k = mkIntern(x);
+                // Wiersz zostaje w pliku zawsze — zmienia sie tylko to, do ktorej sumy trafia.
+                if (k === 'sub')      sub = r2(sub + db - cr);   // abonament: nie zwrot
+                else if (k === 'adj') adj = r2(adj + cr - db);   // korekta wewn.: nie wplata
+                else { credit = r2(credit + cr); debit = r2(debit + db); }
+                out.push(MK_OBI_HDR.map(function (k){
+                    return (k === 'grossDebit' || k === 'grossCredit' || k === 'netCredit'
+                         || k === 'netDebit'   || k === 'commissionAmount' || k === 'exchangeRate')
+                        ? num(x[k]) : (x[k] == null ? '' : String(x[k]));
+                }));
+            });
+        });
+        out.push([]);
+        out.push([null, null, null, null, null, 'wpłaty', credit]);
+        out.push([null, null, null, null, null, 'zwroty', debit]);
+        out.push([null, null, null, null, null, 'rozrachunek z kund.', r2(credit - debit)]);
+        if (sub) out.push([null, null, null, null, null, 'abonament (poza zwrotami)', sub]);
+        if (adj) out.push([null, null, null, null, null, 'korekty wewn. (poza wpłatami)', adj]);
+        return { rows: out, credit: credit, debit: debit, sub: sub, adj: adj, nRows: nRows };
+    }
+
     // ================= UI =================
     const btn = document.createElement('button');
     btn.id = 'mkt-btn';
@@ -18744,6 +18914,7 @@
               + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
+              + '<button id="mk-sal" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">📊 Salda</button>'
               + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
               + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
@@ -18752,6 +18923,7 @@
                 ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Zestawienia OBI pobieram stąd, bo sesja tego panelu nie jedzie w zapytaniu z prologistics. Dopasowanie idzie po referencji PODE z przelewu.</div>'
                   + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
                   + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
+                  + '<button id="mk-sal" style="padding:5px 12px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">📊 Salda</button>'
                   + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
                 : '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Dla każdego znajdę cykl rozliczeniowy po referencji z przelewu, pobiorę pozycje i policzę kwoty brutto per zamówienie. Sesja Mirakla widzi naraz tylko jeden sklep — „wszystkie sklepy" przełącza je po kolei i na koniec wraca tam, gdzie zacząłeś.</div>'
                   + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
@@ -18759,6 +18931,7 @@
                   + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">🔄 Przeleć wszystkie sklepy</button>'
                   + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
                   + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'))
+      +   '<div id="mk-sal-box" style="display:none;margin-top:10px;padding:10px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px"></div>'
       +   '<div id="mk-out" style="margin-top:12px"></div>'
       // Podglad postepu stoi POD lista i zwrotami — tam, gdzie klikasz — ale wciaz POZA
       // #mk-out, zeby przerysowanie listy go nie kasowalo.
@@ -18958,6 +19131,95 @@
         if (sa) sa.onclick = function(){ selAll(true); };
         if (sn) sn.onclick = function(){ selAll(false); };
         renderRef();
+    }
+
+    // ---------- Salda: miesieczne zestawienie ----------
+    (function (){
+        const b = $('#mk-sal');
+        if (!b) return;
+        b.onclick = function(){
+            const box = $('#mk-sal-box');
+            if (box.style.display !== 'none'){ box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            const now = new Date();
+            const prev = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            const def = pad2(prev.getMonth() + 1) + '/' + prev.getFullYear();
+            box.innerHTML =
+                '<div style="font-size:11px;color:#5b21b6;font-weight:700;margin-bottom:4px">Salda — miesięczne zestawienie</div>'
+              + '<div style="font-size:10px;color:#666;margin-bottom:6px">Pobiera wszystkie dzienne raporty z wybranego miesiąca i składa je w jeden plik: nagłówek raz na górze, przed każdym raportem wiersz „=== nazwa.csv ===", na końcu wpłaty, zwroty i rozrachunek. Sumy liczone z danych, nie przepisywane.</div>'
+              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              + '<select id="mk-sal-mp" style="font-size:11px"><option value="belianide860.myvtex.com">OBI DE</option></select>'
+              + '<input id="mk-sal-m" value="' + def + '" placeholder="MM/RRRR" style="width:80px;font-size:11px;text-align:center">'
+              + '<button id="mk-sal-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬇ Zbuduj plik</button>'
+              + '<span id="mk-sal-msg" style="font-size:11px;color:#666"></span></div>'
+              + '<div id="mk-sal-out" style="margin-top:8px"></div>';
+            box.querySelector('#mk-sal-go').onclick = function(){ saldaGo(this); };
+        };
+    })();
+
+    async function saldaGo(btn){
+        const box = $('#mk-sal-box');
+        const msg = box.querySelector('#mk-sal-msg'), out = box.querySelector('#mk-sal-out');
+        const host = box.querySelector('#mk-sal-mp').value;
+        const m = String(box.querySelector('#mk-sal-m').value || '').match(/^(\d{1,2})\s*[\/.-]\s*(\d{4})$/);
+        if (!m){ msg.style.color = '#c00'; msg.textContent = 'podaj miesiąc jako MM/RRRR, np. 04/2026'; return; }
+        const mm = pad2(+m[1]), yyyy = m[2];
+        btn.disabled = true; msg.style.color = '#666'; msg.textContent = 'pobieram…'; out.innerHTML = '';
+        try {
+            // Bierzemy szerzej niz miesiac, zeby pokazac takze raporty z przelomu —
+            // ich daty i daty wplywu nie pokrywaja sie, wiec ostatnie i pierwsze dni
+            // sa do wzrokowej weryfikacji, a nie do sumowania.
+            const from = yyyy + '-' + mm + '-01';
+            const to = mkShift(yyyy + '-' + mm + '-28', 10);
+            let reps = [];
+            try { reps = await vtexReports(host, mkShift(from, -5), to); }
+            catch (e){
+                reps = vtexCacheGet(host);
+                if (!reps.length) throw e;
+                msg.style.color = '#c47f00'; msg.textContent = 'z odłożonej kopii (' + reps.length + ')…';
+            }
+            reps = reps.filter(function (r){ return repDay(r); })
+                       .sort(function (a, b){ return repDay(a).localeCompare(repDay(b)); });
+            const inM = reps.filter(function (r){ return repDay(r).slice(0, 7) === yyyy + '-' + mm; });
+            const near = reps.filter(function (r){ return repDay(r).slice(0, 7) !== yyyy + '-' + mm; });
+            if (!inM.length){
+                msg.style.color = '#c00';
+                msg.textContent = 'nie ma raportów z ' + mm + '/' + yyyy + (reps.length ? (' — widzę ' + reps.length + ' z innych miesięcy') : '');
+                btn.disabled = false; return;
+            }
+            const s = saldaRows(inM, mm, yyyy);
+            const name = 'OBI DE ' + mm + yyyy + '.xlsx';
+            const blob = new Blob([xlsx(mm + yyyy, s.rows)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob); a.download = name;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+
+            let h = '<div style="font-size:11px;color:#0a7a2f;font-weight:700">Zapisano ' + esc(name) + '</div>'
+                  + '<table style="border-collapse:collapse;font-size:11px;margin-top:4px">'
+                  + '<tr><td style="padding:1px 8px">raportów</td><td style="padding:1px 8px;text-align:right"><b>' + inM.length + '</b></td></tr>'
+                  + '<tr><td style="padding:1px 8px">wierszy</td><td style="padding:1px 8px;text-align:right">' + s.nRows + '</td></tr>'
+                  + '<tr><td style="padding:1px 8px">wpłaty</td><td style="padding:1px 8px;text-align:right">' + f2(s.credit) + '</td></tr>'
+                  + '<tr><td style="padding:1px 8px">zwroty</td><td style="padding:1px 8px;text-align:right">' + f2(s.debit) + '</td></tr>'
+                  + '<tr style="border-top:1px solid #ddd6fe"><td style="padding:1px 8px"><b>rozrachunek z kund.</b></td><td style="padding:1px 8px;text-align:right"><b>' + f2(r2(s.credit - s.debit)) + '</b></td></tr>'
+                  + (s.sub ? '<tr><td style="padding:1px 8px;color:#666">abonament (poza zwrotami)</td><td style="padding:1px 8px;text-align:right;color:#666">' + f2(s.sub) + '</td></tr>' : '')
+                  + (s.adj ? '<tr><td style="padding:1px 8px;color:#666">korekty wewn. (poza wpłatami)</td><td style="padding:1px 8px;text-align:right;color:#666">' + f2(s.adj) + '</td></tr>' : '')
+                  + '</table>';
+            // Przelom miesiaca — do sprawdzenia, nie do sumy.
+            const before = near.filter(function (r){ return repDay(r) < yyyy + '-' + mm + '-01'; }).slice(-3);
+            const after  = near.filter(function (r){ return repDay(r) > yyyy + '-' + mm + '-31'; }).slice(0, 3);
+            if (before.length || after.length){
+                h += '<div style="margin-top:8px;font-size:10px;color:#666"><b>Przełom miesiąca — nie wliczone, do Twojej weryfikacji:</b><br>'
+                  +  (before.length ? ('koniec poprzedniego: ' + esc(before.map(function (r){ return r.payoutReportFileName; }).join(', ')) + '<br>') : '')
+                  +  (after.length ? ('początek następnego: ' + esc(after.map(function (r){ return r.payoutReportFileName; }).join(', '))) : '')
+                  +  '</div>';
+            }
+            out.innerHTML = h;
+            msg.style.color = '#0a7a2f'; msg.textContent = 'gotowe';
+        } catch (e){
+            msg.style.color = '#c00'; msg.textContent = (e && e.message) || String(e);
+        }
+        btn.disabled = false;
     }
 
     // ---------- zwroty zbiorczo, per data i konto ----------
