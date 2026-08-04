@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.83
+// @version      2.85
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22,6 +22,7 @@
 // @connect      mirakl.net
 // @connect      myvtex.com
 // @connect      galaxus.ch
+// @connect      wayfair.com
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
@@ -17673,7 +17674,8 @@
     // wylacznie brakujace klucze.
     const MK_SET_SEED = {
         'Mirakl (Vente) · Beliani DE': { bank: '157', booking: '9', acct: '1114' },
-        'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' }
+        'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' },
+        'Wayfair · Wayfair DE':        { bank: '10',  booking: '9', acct: '1223' }
     };
     function setLoad(){
         let d = null;
@@ -17970,6 +17972,13 @@
         { mp: 'Galaxus',        ok: true,  payer: /Digitec\s*Galaxus/i,
           ref: /reason\s*for\s*payment:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{6,})/i,
           brand: 'Galaxus', short: 'Galaxus', host: 'partner.galaxus.ch', kind: 'galx', shop: 'Galaxus CH' },
+        // Wayfair placi jako „WAYFAIR STORES LIMITED", a w tytule podaje numer JEDNEJ
+        // z faktur rozliczenia („Reason for payment: IE665397453 CREDITOR ITEM") — nie
+        // numer wyplaty. Sam nie wskazuje wiec rozliczenia, ale wystepuje w nim jako
+        // pozycja, wiec swietnie nadaje sie na POTWIERDZENIE dopasowania po kwocie.
+        { mp: 'Wayfair',        ok: true,  payer: /WAYFAIR/i,
+          ref: /reason\s*for\s*payment:\s*((?:[A-Z]{2})?\d{6,})/i,
+          brand: 'Wayfair', short: 'Wayfair', host: 'partners.wayfair.com', kind: 'wayf', shop: 'Wayfair DE' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -18635,6 +18644,341 @@
         });
     }
 
+    // ================= WAYFAIR =================
+    // Rozliczenie („remittance") to CSV z portalu partnerskiego. Uklad NIE jest staly:
+    // kolumny „Allowance" pojawiaja sie tylko wtedy, gdy w danym rozliczeniu wystapilo
+    // takie potracenie — plik z 04.08 ma 10 kolumn, a z 29.07 dwanascie. Dlatego kazda
+    // kolumne szukamy po nazwie naglowka, nigdy po numerze.
+    //
+    // Plik ma trzy czesci:
+    //   1. naglowek adresowy z „Remittance #", data i „Total (EUR)",
+    //   2. tabela pozycji (jedna linia = jedna faktura),
+    //   3. bloki „Deduction" POD tabela — to sa zwroty i obciazenia.
+    // Zgodnosc sprawdzona na 7 plikach: suma „Payment Amount" + potracenia = Total,
+    // co do grosza.
+    //
+    // Brutto (to, co zaplacil klient) nie ma wlasnej kolumny — Beliani dolicza je samo
+    // jako „Product Amount + Tax/VAT" i wstawia bez naglowka zaraz za data. Sprawdzone
+    // na 106 wierszach ze 106.
+    const MK_WAYF_SHOP = 'Wayfair DE';
+    // Separator zalezy od ustawien konta w Wayfairze (pole „list_separator"), a nie od
+    // nas — ten sam eksport potrafi przyjsc raz z przecinkiem, raz ze srednikiem.
+    // Rozstrzygamy licznikiem znakow POZA cudzyslowami, bo w adresach siedza oba.
+    function wayfRows(text){
+        const s = String(text || '').replace(/^﻿/, '');
+        let semi = 0, comma = 0, q = false;
+        for (let i = 0; i < s.length; i++){
+            const c = s.charAt(i);
+            if (c === '"'){ q = !q; continue; }
+            if (q) continue;
+            if (c === ';') semi++; else if (c === ',') comma++;
+        }
+        const d = (semi > comma) ? ';' : ',';
+        const rows = []; let f = '', row = []; q = false;
+        for (let i = 0; i < s.length; i++){
+            const c = s.charAt(i);
+            if (q){
+                if (c !== '"'){ f += c; continue; }
+                if (s.charAt(i + 1) === '"'){ f += '"'; i++; continue; }
+                q = false; continue;
+            }
+            if (c === '"'){ q = true; continue; }
+            if (c === d){ row.push(f); f = ''; continue; }
+            if (c === '\r') continue;
+            if (c === '\n'){ row.push(f); rows.push(row); row = []; f = ''; continue; }
+            f += c;
+        }
+        if (f !== '' || row.length){ row.push(f); rows.push(row); }
+        return rows;
+    }
+    function wayfCols(hdr){
+        const at = function (re){
+            for (let i = 0; i < hdr.length; i++) if (re.test(String(hdr[i] || '').trim())) return i;
+            return -1;
+        };
+        const c = { inv: at(/^Invoice\s*#$/i), po: at(/^PO\s*#$/i), date: at(/^Invoice Date$/i),
+                    prod: at(/^Product Amount$/i), tax: at(/^Tax\/VAT$/i),
+                    pay: at(/^Payment Amount$/i) };
+        // Kolumna brutto to pusty naglowek miedzy data a „Product Amount". Gdy pliku nie
+        // przepuszczono jeszcze przez ten krok, trzeba ja WSTAWIC, a nie nadpisac sasiada.
+        c.gross = (c.prod > 0 && c.prod - 1 > c.date && !String(hdr[c.prod - 1] || '').trim()) ? (c.prod - 1) : -1;
+        return c;
+    }
+    function wayfMoney(v){ return Number(v).toFixed(2).replace('.', ','); }
+    // Data pozycji: portal daje 2026-06-25, a plik, ktory dotad wgrywano recznie, ma
+    // 25/06/2026. Trzymamy sie tego drugiego, zeby import dostawal to, co zawsze.
+    function wayfDate(s){
+        const m = String(s == null ? '' : s).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        return m ? (m[3] + '/' + m[2] + '/' + m[1]) : s;
+    }
+    // Tylko zapis z KROPKA dziesietna uznajemy za liczbe do przeliczenia. „25/06/2026"
+    // i „2116,45" (juz przeliczone) zostaja nietkniete.
+    function wayfIsMoney(s){
+        const t = String(s == null ? '' : s).trim();
+        return /^-?\d+(?:\.\d+)?$/.test(t) || /^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(t);
+    }
+    function mkParseWayf(src){
+        const rows = (Array.isArray(src) ? src : wayfRows(src)).filter(function (r){ return r && r.length; });
+        if (!rows.length) return { err: 'pusty plik' };
+        let hi = -1;
+        for (let i = 0; i < rows.length && i < 80; i++){
+            if (/^Invoice\s*#$/i.test(String(rows[i][0] || '').trim())){ hi = i; break; }
+        }
+        if (hi < 0) return { err: 'to nie wygląda na rozliczenie Wayfaira — nie ma nagłówka „Invoice #"' };
+        const hdr = rows[hi], c = wayfCols(hdr);
+        if (c.po < 0 || c.prod < 0 || c.tax < 0 || c.pay < 0)
+            return { err: 'w nagłówku brakuje kolumn PO # / Product Amount / Tax/VAT / Payment Amount' };
+        // Naglowek pliku — numer wyplaty, data i zadeklarowana suma. Suma sluzy do kontroli.
+        let remit = '', pdate = '', total = null;
+        for (let i = 0; i < hi; i++){
+            const line = rows[i].join(' ');
+            let m = line.match(/Remittance\s*#\s*:\s*(\d+)/i);   if (m && !remit) remit = m[1];
+            m = line.match(/Date:\s*(\d{4}-\d{2}-\d{2})/);       if (m && !pdate) pdate = m[1];
+            if (total == null && /Total\s*\(/i.test(line)){
+                for (let k = rows[i].length - 1; k >= 0; k--){ const v = mkNum(rows[i][k]); if (v != null){ total = v; break; } }
+            }
+        }
+        const META = /^(Item|Memo|Desc|Reason)\s*:/i;
+        const ord = {}, ref = {}, refNote = {}, ids = {}, credits = [];
+        const dat = [], tail = [], ded = [];
+        let sumPay = 0, gross = 0, refund = 0, creditSum = 0, dedSum = 0, nPos = 0;
+        for (let i = hi + 1; i < rows.length; i++){
+            const r = rows[i], first = String(r[0] || '').trim();
+            // ---- blok potracenia: wiersz „Deduction" + linie Item/Memo/Desc pod nim ----
+            if (/^Deduction$/i.test(first)){
+                // Kwota stoi w „Payment Amount", ale przy wezszym ukladzie kolumna ma inny
+                // numer — bierzemy OSTATNIA liczbe w wierszu, co dziala w obu przypadkach.
+                let amt = null;
+                for (let k = r.length - 1; k > 2; k--){ const v = mkNum(r[k]); if (v != null){ amt = v; break; } }
+                const txt = [r.filter(function (x){ return String(x || '').trim(); }).join('\t')];
+                let k2 = i + 1;
+                while (k2 < rows.length){
+                    const rr = rows[k2];
+                    if (!rr.join('').trim()) break;                       // pusty wiersz konczy blok
+                    if (!META.test(String(rr[0] || '').trim())) break;
+                    txt.push(rr.filter(function (x){ return String(x || '').trim(); }).join('\t'));
+                    k2++;
+                }
+                i = k2 - 1;
+                const id = String(r[c.po] == null ? '' : r[c.po]).trim();
+                if (id) ids[id] = 1;
+                ded.push({ id: id, amt: amt, text: txt.join('\n') });
+                if (amt != null) dedSum = r2(dedSum + amt);
+                continue;
+            }
+            // ---- pozycja tabeli ----
+            const inv = String(r[c.inv] == null ? '' : r[c.inv]).trim();
+            const pay = (c.pay < r.length) ? mkNum(r[c.pay]) : null;
+            const prod = (c.prod < r.length) ? mkNum(r[c.prod]) : null;
+            if (inv && !META.test(inv) && !/^(Please|Visit)/i.test(inv) && pay != null && prod != null){
+                const tax = mkNum(r[c.tax]);
+                const id = String(r[c.po] == null ? '' : r[c.po]).trim() || inv;
+                const g = r2(prod + (tax || 0));
+                ids[id] = 1; ids[inv] = 1;
+                nPos++; sumPay = r2(sumPay + pay);
+                if (g){ ord[id] = r2((ord[id] || 0) + g); gross = r2(gross + g); }
+                dat.push({ r: r, id: id, g: g });
+                continue;
+            }
+            tail.push(r);                                                 // Sub-total, Total, stopka
+        }
+        // Ujemne potracenie = zwrot do zaksiegowania w tickecie (ksiegujemy wartosc
+        // bezwzgledna). Dodatnie to oddanie wczesniejszego potracenia — pieniadze IDA
+        // do nas, wiec zwrotem nie jest i nic z niego nie ksiegujemy.
+        ded.forEach(function (d){
+            if (d.amt == null || !d.amt) return;
+            if (d.amt < 0){
+                const v = Math.abs(d.amt);
+                refund = r2(refund + v);
+                if (d.id){
+                    ref[d.id] = r2((ref[d.id] || 0) + v);
+                    refNote[d.id] = refNote[d.id] ? (refNote[d.id] + '\n\n' + d.text) : d.text;
+                }
+            } else { credits.push(d); creditSum = r2(creditSum + d.amt); }
+        });
+        const net = r2(sumPay + dedSum);
+        return { hdr: hdr, c: c, pre: rows.slice(0, hi), dat: dat, tail: tail, ded: ded,
+                 ord: ord, ref: ref, refNote: refNote, ids: ids, credits: credits,
+                 remit: remit, pdate: pdate, total: total, net: net, gross: gross,
+                 refund: refund, creditSum: creditSum, nPos: nPos,
+                 n: Object.keys(ord).length + Object.keys(ref).length };
+    }
+    // Plik do importu. Uklad taki, jaki wgrywano dotad recznie: srednik, przecinek
+    // dziesietny, data DD/MM/RRRR i kolumna brutto zaraz za data.
+    function mkCsvWayf(p){
+        const c = p.c;
+        const q = function (v){
+            const s = (v == null) ? '' : String(v);
+            return /[;"\n\r]/.test(s) ? ('"' + s.replace(/"/g, '""') + '"') : s;
+        };
+        // Naglowek: wstawiamy pusta kolumne brutto i — dla zgodnosci z plikami, ktore
+        // schodza przy europejskich ustawieniach konta — przecinek w „[5.00%]".
+        const ins = (c.gross < 0);
+        const hdr = p.hdr.map(function (h){ return String(h == null ? '' : h).replace(/\[(\d+)\.(\d+)%\]/g, '[$1,$2%]'); });
+        if (ins) hdr.splice(c.prod, 0, '');
+        const gi = ins ? c.prod : c.gross;                    // gdzie ostatecznie stoi brutto
+        const sh = function (i){ return (ins && i >= c.prod) ? i + 1 : i; };
+        const cInv = sh(c.inv), cPo = sh(c.po), cPay = sh(c.pay);
+        // Ktore kolumny wolno sumowac przy scalaniu — wylacznie po NAZWACH. Po typie nie
+        // wolno, bo „25/06/2026" tez da sie odczytac jako liczbe i data by sie rozjechala.
+        const SUMY = /^(Product Amount|Shipping|Other|Tax\/VAT|Payment Amount)$/i;
+        const sum = {};
+        sum[gi] = 1;
+        hdr.forEach(function (h, i){ const t = String(h || '').trim(); if (SUMY.test(t) || /Allowance/i.test(t)) sum[i] = 1; });
+        // Jedno zamowienie potrafi miec kilka pozycji (UK663821968 i UK663821968_1).
+        // Prologistics dopasowuje wplate po numerze zamowienia, wiec dwa wiersze na ten
+        // sam numer zjadaly sobie „open amount". Scalamy je w jeden wiersz.
+        const out = [], at = {};
+        let merged = 0;
+        p.dat.forEach(function (d){
+            const r = d.r.slice();
+            if (ins) r.splice(c.prod, 0, '');
+            r[gi] = (d.g == null) ? '' : wayfMoney(d.g);
+            // Po scaleniu numer w obu kolumnach ma byc ten sam i bez przyrostka „_1" —
+            // dopasowanie ma trafic niezaleznie od tego, ktora kolumne czyta import.
+            r[cInv] = d.id; r[cPo] = d.id;
+            if (at[d.id] == null){ at[d.id] = out.length; out.push(r); return; }
+            const t = out[at[d.id]];
+            merged++;
+            Object.keys(sum).forEach(function (k){
+                const i = +k, a = mkNum(t[i]), b = mkNum(r[i]);
+                if (a == null && b == null) return;
+                t[i] = wayfMoney(r2((a || 0) + (b || 0)));
+            });
+        });
+        const fix = function (r){
+            return r.map(function (v, i){
+                const s = String(v == null ? '' : v);
+                if (wayfIsMoney(s)) return wayfMoney(mkNum(s));
+                return wayfDate(s);
+            });
+        };
+        const lines = [];
+        p.pre.forEach(function (r){ lines.push(r.map(q).join(';')); });
+        lines.push(hdr.map(q).join(';'));
+        out.forEach(function (r){ lines.push(fix(r).map(q).join(';')); });
+        // Wiersze potracen do importu NIE ida — zwroty ksieguje sie w tickecie, z listy
+        // zwrotow. W paczce ladowalyby jako pozycje ujemne i zostawaly tam jako CHECK.
+        p.tail.forEach(function (r){
+            const t = r.slice();
+            if (ins && t.length > c.prod) t.splice(c.prod, 0, '');
+            lines.push(fix(t).map(q).join(';'));
+        });
+        return { text: lines.join('\r\n') + '\r\n', rows: out.length, merged: merged };
+    }
+
+    // ---------- rozmowa z portalem Wayfaira ----------
+    // Portal nie wystawia pliku pod stalym adresem — wszystko idzie przez GraphQL:
+    // najpierw lista wyplat, potem podpisany link do CSV dla wybranej wyplaty.
+    // Uwierzytelnia ciasteczko „bearer_token" z domeny wayfair.com, wiec wystarczy
+    // byc zalogowanym w przegladarce; zadnego tokenu nie przechowujemy.
+    const MK_WAYF_HOST = 'partners.wayfair.com';
+    const MK_WAYF_API  = 'https://api.wayfair.com/v1/partners/graph';
+    const MK_WAYF_SUP  = 'mkt_wayf_supplier';
+    const WAYF_Q_LIST =
+        'query supplierReceivablePayments($input: SupplierReceivablePaymentInput!) {\n'
+      + '  supplierReceivablePayments(input: $input) {\n'
+      + '    __typename\n'
+      + '    ... on SupplierReceivablePaymentConnection {\n'
+      + '      nodes { supplierId paymentId displayRemittanceNumber paymentDate paymentSystemSource paymentMethod paymentAmount currency __typename }\n'
+      + '      pageInfo { hasNextPage hasPreviousPage totalPages totalNodes __typename }\n'
+      + '      __typename\n'
+      + '    }\n'
+      + '    ... on SupplierReceivableError { errorType errorMessage __typename }\n'
+      + '  }\n'
+      + '}';
+    const WAYF_Q_URL =
+        'query getSupplierReceivableGcsSignedUrl($input: SupplierReceivableGcsSignedUrlInput!) {\n'
+      + '  supplierReceivableGcsSignedUrl(input: $input) {\n'
+      + '    __typename\n'
+      + '    ... on SupplierReceivableGcsSignedUrlResult { signedUrl __typename }\n'
+      + '    ... on SupplierReceivableError { errorMessage errorType __typename }\n'
+      + '  }\n'
+      + '}';
+    // Numer dostawcy siedzi w ciasteczku „supplierID" — bierzemy go stamtad zamiast
+    // wpisywac na sztywno, bo przy zmianie konta na sztywno wpisany kierowalby zapytania
+    // na cudze rozliczenia. Ostatni znany zostaje zapamietany na wypadek, gdyby
+    // ciasteczko akurat nie bylo widoczne.
+    async function wayfSupplier(){
+        let saved = '';
+        try { saved = String(GM_getValue(MK_WAYF_SUP, '') || '').trim(); } catch (e){}
+        const ck = await gmCookies('https://' + MK_WAYF_HOST + '/');
+        const m = String(ck || '').match(/(?:^|;\s*)supplierID=(\d+)/i);
+        if (m){
+            if (m[1] !== saved){ try { GM_setValue(MK_WAYF_SUP, m[1]); } catch (e){} }
+            return m[1];
+        }
+        if (saved) return saved;
+        throw new Error('nie widzę, na którego dostawcę jesteś zalogowany — otwórz ' + MK_WAYF_HOST + ' i zaloguj się');
+    }
+    async function wayfGql(op, query, variables){
+        const hdrs = { 'content-type': 'application/json', 'accept': '*/*',
+                       'apollographql-client-name': 'ph-ui-finance',
+                       'apollographql-client-version': 'v1.0',
+                       'origin': 'https://' + MK_WAYF_HOST,
+                       'referer': 'https://' + MK_WAYF_HOST + '/' };
+        const ck = await gmCookies('https://' + MK_WAYF_HOST + '/');
+        if (ck) hdrs['Cookie'] = ck;
+        const r = await gmPost(MK_WAYF_API, JSON.stringify({ operationName: op, variables: variables, query: query }), hdrs);
+        if (r.status === 401 || r.status === 403)
+            throw new Error('Wayfair odrzucił zapytanie (HTTP ' + r.status + ') — zaloguj się na ' + MK_WAYF_HOST);
+        if (r.status !== 200) throw new Error('Wayfair API: HTTP ' + r.status);
+        let j;
+        try { j = JSON.parse(r.responseText || '{}'); }
+        catch (e){ throw new Error('Wayfair API oddał coś, co nie jest JSON-em — najpewniej stronę logowania'); }
+        if (j.errors && j.errors.length) throw new Error('Wayfair API: ' + (j.errors[0].message || 'błąd zapytania'));
+        return j.data || {};
+    }
+    async function wayfList(from, to){
+        const sup = parseInt(await wayfSupplier(), 10);
+        const out = [];
+        for (let page = 1; page <= 10; page++){
+            const d = await wayfGql('supplierReceivablePayments', WAYF_Q_LIST, {
+                input: { filter: { supplierId: sup, paymentDateRange: { dateFrom: from, dateTo: to } },
+                         paging: { sortingColumn: 'PAYMENT_DATE', sortingDirection: 'DESCENDING',
+                                   page: page, pageSize: 50 } } });
+            const con = d.supplierReceivablePayments || {};
+            if (con.errorMessage) throw new Error('Wayfair: ' + con.errorMessage);
+            (con.nodes || []).forEach(function (n){ out.push(n); });
+            if (!con.pageInfo || !con.pageInfo.hasNextPage) break;
+        }
+        return out;
+    }
+    async function wayfCsv(paymentId){
+        const sup = parseInt(await wayfSupplier(), 10);
+        const d = await wayfGql('getSupplierReceivableGcsSignedUrl', WAYF_Q_URL,
+            { input: { paymentId: String(paymentId), supplierId: sup } });
+        const u = d.supplierReceivableGcsSignedUrl || {};
+        if (!u.signedUrl) throw new Error('Wayfair nie oddał linku do pliku' + (u.errorMessage ? (' — ' + u.errorMessage) : ''));
+        const r = await gmGet(u.signedUrl, {});
+        if (r.status !== 200) throw new Error('pobieranie rozliczenia: HTTP ' + r.status);
+        return String(r.responseText || '');
+    }
+    // Wspolne dla obu drog — portalu i pliku wgranego recznie: przepisanie rozliczenia
+    // do zlecenia i ocena, czy wszystko sie zgadza.
+    function wayfApply(j, p, how){
+        const both = Object.keys(p.ord).filter(function (k){ return p.ref[k] != null; });
+        j.data = { wayf: p, shop: j.shop || MK_WAYF_SHOP, gross: p.gross, refund: p.refund,
+                   net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
+                   refNote: p.refNote, unknown: {}, skipped: {}, full: true, both: both,
+                   pays: 1, split: false, rows: p.nPos, total: p.nPos, pages: 1, how: how };
+        const bad = [];
+        if (!eq(p.net, j.amount)) bad.push('suma z rozliczenia ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+        if (p.total != null && !eq(p.total, p.net)) bad.push('„Total" w pliku ' + f2(p.total) + ' ≠ policzone ' + f2(p.net));
+        // Numer z tytulu przelewu musi wystapic w rozliczeniu. To jedyna twarda kontrola,
+        // ze po kwocie trafilismy we WLASCIWA wyplate, a nie w inna o tej samej wartosci.
+        if (j.ref && !p.ids[j.ref]) bad.push('numeru ' + j.ref + ' z przelewu nie ma w tym rozliczeniu');
+        if (!p.nPos) bad.push('rozliczenie nie ma ani jednej pozycji — same potrącenia, nie ma czego importować');
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join('; ');
+        j.note = 'brutto = Product Amount + Tax/VAT'
+               + (p.remit ? (' · remittance ' + p.remit) : '')
+               + (p.refund ? (' · zwroty ' + Object.keys(p.ref).length + ' na ' + f2(p.refund) + ' — idą na listę zwrotów') : '')
+               + (p.credits.length ? (' · oddane potrącenia ' + p.credits.length + ' na ' + f2(p.creditSum)
+                                      + ' — to nie zwrot, nic z nich nie księguję') : '');
+        return bad;
+    }
+
     // Pliki Galaxusa sa w windows-1252 i tak wlasnie prologistics je dotad przyjmowal.
     // Gdybysmy wyslali UTF-8, umlauty w nazwach i apostrof tysiecy przyszlyby polamane,
     // wiec dla tego jednego marketplace'u kodujemy plik bajt po bajcie.
@@ -18653,13 +18997,19 @@
     }
     function csvBlob(j){
         const txt = csvFor(j);
-        return (j.kind === 'galx') ? new Blob([cp1252(txt)], { type: 'text/csv' })
-                                   : new Blob([txt], { type: 'text/csv;charset=utf-8' });
+        if (j.kind === 'galx') return new Blob([cp1252(txt)], { type: 'text/csv' });
+        // Pliki Wayfaira wgrywane dotad recznie mialy BOM — zostawiamy go, zeby import
+        // dostal naglowek dokladnie tak, jak go dotad widzial. Kwoty piszemy zawsze na
+        // dwa miejsca (0,00 zamiast 0), bo scalone wiersze i tak trzeba sformatowac od
+        // nowa, a jednolity zapis jest dla parsera latwiejszy niz obcinane koncowki.
+        if (j.kind === 'wayf') return new Blob(['﻿' + txt], { type: 'text/csv;charset=utf-8' });
+        return new Blob([txt], { type: 'text/csv;charset=utf-8' });
     }
 
     // Ktory uklad dla ktorego zlecenia.
     function csvFor(j){
         if (j.kind === 'galx' && j.data && j.data.galx) return mkCsvGalx(j.data.galx);
+        if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf).text;
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
         return mkCsvText(pairsOf(j));
     }
@@ -19381,6 +19731,10 @@
               // i wrzuca tutaj; zlecenie znajdujemy po sumie wyplaty.
               + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport Galaxus'
               + '<input type="file" id="mk-galx" accept=".csv,text/csv" style="display:none"></label>'
+              // Wayfair ma API i normalnie schodzi sam — reczne wgranie zostaje na wypadek
+              // wygaslej sesji w portalu albo rozliczenia spoza widocznego okresu.
+              + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport Wayfair'
+              + '<input type="file" id="mk-wayf" accept=".csv,text/csv" style="display:none"></label>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
               + '<button id="mk-sal" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">📊 Salda</button>'
               + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
@@ -19855,7 +20209,7 @@
             const key = String(j.date) + '|' + (c.acct || ('? ' + j.data.shop));
             if (!g[key]){
                 const a = acc.filter(function (x){ return x.n === String(c.acct || ''); })[0];
-                g[key] = { date: j.date, acct: c.acct || '', accNm: a ? a.nm : '', rows: [], shops: {}, sum: 0, keys: [], seen: {} };
+                g[key] = { key: key, date: j.date, acct: c.acct || '', accNm: a ? a.nm : '', rows: [], shops: {}, sum: 0, keys: [], seen: {} };
             }
             g[key].shops[j.data.shop] = 1;
             // jedno zestawienie = jeden wiersz w arkuszu, nawet gdy ma kilka zwrotow
@@ -19863,7 +20217,9 @@
             ids.forEach(function (id){
                 const v = Math.abs(j.data.ref[id]);
                 if (!v) return;                                  // zerowe wiersze wysylki pomijamy
-                g[key].rows.push({ id: id, amt: v, ref: j.ref });
+                // Opis potracenia (Wayfair) zostaje przy pozycji — bez niego przy
+                // ksiegowaniu nie widac, czego zwrot dotyczyl i skad sie wzial.
+                g[key].rows.push({ id: id, amt: v, ref: j.ref, note: (j.data.refNote || {})[id] || '' });
                 g[key].sum = r2(g[key].sum + v);
             });
         });
@@ -19872,11 +20228,69 @@
     function refTsv(rows){
         return 'Order number\tAmount\n' + rows.map(function (r){ return r.id + '\t' + f2(r.amt); }).join('\n');
     }
+    // To samo z opisem potracenia w trzeciej kolumnie. Do modulu ticketa NIE idzie —
+    // on rozpoznaje format po ukladzie kolumn i trzecia by go zmylila. To jest wyciag
+    // dla czlowieka: do arkusza, do maila, do komentarza w ticketcie.
+    function refTsvNote(rows){
+        return 'Order number\tAmount\tOpis\n' + rows.map(function (r){
+            return r.id + '\t' + f2(r.amt) + '\t' + String(r.note || '').replace(/[\t\r\n]+/g, ' ').trim();
+        }).join('\n');
+    }
+
+    // ---------- slad po zaksiegowanych zwrotach ----------
+    // Bez tego lista wygladala tak samo przed ksiegowaniem i po nim — nie bylo jak
+    // sprawdzic, czy dana grupa zostala juz zrobiona. Trzymamy NUMERY ZAMOWIEN,
+    // a nie sam fakt „zrobione", zeby po dolozeniu nowego zwrotu do tej samej daty
+    // bylo widac, ze zostalo cos nowego.
+    const MK_RDONE = 'mkt_refunds_done';
+    function rdLoad(){ try { return JSON.parse(GM_getValue(MK_RDONE, '{}')) || {}; } catch (e){ return {}; } }
+    function rdSave(o){
+        // Zapis rosnie bez konca, wiec po pol roku odcinamy stare wpisy.
+        const cut = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+        Object.keys(o).forEach(function (k){ if (String(k).slice(0, 10) < cut) delete o[k]; });
+        try { GM_setValue(MK_RDONE, JSON.stringify(o)); } catch (e){}
+    }
+    function rdMark(key, ids, sure){
+        if (!key || !ids || !ids.length) return;
+        const all = rdLoad(), prev = all[key] || { ids: [] };
+        const list = (prev.ids || []).slice();
+        ids.forEach(function (id){ if (list.indexOf(id) < 0) list.push(id); });
+        all[key] = { at: new Date().toISOString().slice(0, 16).replace('T', ' '), ids: list,
+                     sure: (prev.sure === false ? false : !!sure) };
+        rdSave(all);
+    }
+    function rdState(key, x){
+        const d = rdLoad()[key];
+        if (!d || !d.ids || !d.ids.length) return null;
+        const left = x.rows.filter(function (r){ return d.ids.indexOf(r.id) < 0; });
+        return { at: d.at, sure: d.sure !== false, done: x.rows.length - left.length, left: left };
+    }
+    // Ktore pozycje modul ticketa naprawde potwierdzil. Czytamy jego wlasny log —
+    // dzieki temu przy czesciowym niepowodzeniu nie oznaczymy calej grupy jako zrobionej.
+    function ksDone(x){
+        const list = document.getElementById('tm-t-progress-list');
+        if (!list) return [];
+        const txt = Array.prototype.slice.call(list.querySelectorAll('*'))
+            .map(function (e){ return String(e.textContent || ''); })
+            .filter(function (t){ return t && t.length < 400; });
+        const ok = [];
+        x.rows.forEach(function (r){
+            const hit = txt.some(function (t){
+                return t.indexOf(r.id) >= 0 && /zaksięgowan|zaksiegowan|już był|juz byl/i.test(t);
+            });
+            if (hit && ok.indexOf(r.id) < 0) ok.push(r.id);
+        });
+        return ok;
+    }
     function renderRef(){
         const box = $('#mk-ref'); if (!box) return;
         const g = refGroups(), keys = Object.keys(g).sort();
         if (!keys.length){ box.innerHTML = ''; return; }
-        const withAcc = keys.filter(function (k){ return g[k].acct; }).length;
+        // „Wszystkie" znaczy: te, ktore maja konto i w ktorych cos jeszcze zostalo.
+        const st = {};
+        keys.forEach(function (k){ st[k] = rdState(k, g[k]); });
+        const todo = keys.filter(function (k){ return g[k].acct && (!st[k] || st[k].left.length); });
+        const withAcc = todo.length;
         let h = '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ede9fe">'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">'
               + '<b style="font-size:11px;color:#5b21b6">Zwroty</b>'
@@ -19892,11 +20306,38 @@
               +  '<b style="font-size:11px">' + esc(x.date) + '</b>'
               +  '<span style="font-size:11px;color:#374151">' + (x.acct ? esc(x.acct + (x.accNm ? (' — ' + x.accNm) : '')) : '<span style="color:#c47f00">konto nieustawione (' + esc(Object.keys(x.shops).join(', ')) + ')</span>') + '</span>'
               +  '<span style="font-size:11px;color:#666">' + x.rows.length + ' poz. · ' + f2(x.sum) + '</span>'
-              +  '<button class="mk-rt" data-g="' + i + '"' + (x.acct ? '' : ' disabled') + ' style="padding:3px 10px;border:none;border-radius:6px;background:' + (x.acct ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (x.acct ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj</button>'
+              +  (function (){
+                    const s = st[k];
+                    if (!s) return '';
+                    if (!s.left.length) return '<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ zaksięgowane ' + esc(s.at)
+                        + (s.sure ? '' : ' <span style="font-weight:400;color:#c47f00">(bez potwierdzenia z logu)</span>') + '</span>';
+                    return '<span style="font-size:11px;color:#c47f00;font-weight:700">częściowo: ' + s.done + ' z ' + x.rows.length
+                        + ', zostało ' + s.left.length + '</span>';
+                 })()
+              +  '<button class="mk-rt" data-g="' + i + '"' + (x.acct ? '' : ' disabled') + ' style="padding:3px 10px;border:none;border-radius:6px;background:'
+              +  (x.acct ? ((st[k] && !st[k].left.length) ? '#9ca3af' : '#5b21b6') : '#c7c7c7')
+              +  ';color:#fff;font-weight:700;cursor:' + (x.acct ? 'pointer' : 'default') + ';font-size:11px">'
+              +  ((st[k] && !st[k].left.length) ? '↻ Zaksięguj ponownie' : '▶ Zaksięguj') + '</button>'
               +  '<button class="mk-rc" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj</button>'
+              +  (x.rows.some(function (r){ return r.note; })
+                    ? '<button class="mk-rd" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj z opisami</button>'
+                    : '')
               +  '</div>'
               +  (dupList.length ? '<div style="font-size:10px;color:#c47f00;margin-top:3px">ten sam order w kilku zestawieniach: ' + esc(dupList.join(', ')) + '</div>' : '')
               +  '<div style="font-size:10px;color:#888;margin-top:3px;font-family:monospace">' + esc(x.rows.slice(0, 6).map(function (r){ return r.id + ' ' + f2(r.amt); }).join('  ·  ')) + (x.rows.length > 6 ? '  … +' + (x.rows.length - 6) : '') + '</div>'
+              // Opis potracenia w calosci, tak jak przyszedl z rozliczenia — zwiniety,
+              // zeby lista zostala czytelna, ale pod reka przy ksiegowaniu.
+              +  (function (){
+                    const withNote = x.rows.filter(function (r){ return r.note; });
+                    if (!withNote.length) return '';
+                    return '<details style="margin-top:4px"><summary style="font-size:10px;color:#5b21b6;cursor:pointer">opisy potrąceń (' + withNote.length + ')</summary>'
+                         + withNote.map(function (r){
+                               return '<div style="margin:4px 0 0;padding:4px 6px;background:#fff;border:1px solid #ede9fe;border-radius:5px">'
+                                    + '<div style="font-size:10px;font-weight:700;color:#374151">' + esc(r.id) + ' · ' + f2(r.amt) + '</div>'
+                                    + '<pre style="margin:2px 0 0;font:10px/1.35 monospace;color:#555;white-space:pre-wrap;word-break:break-word">' + esc(r.note) + '</pre></div>';
+                           }).join('')
+                         + '</details>';
+                 })()
               +  '</div>';
         });
         box.innerHTML = h + '</div>';
@@ -19906,11 +20347,17 @@
             b.disabled = true;
             const r = await bookRefunds(g[keys[+b.getAttribute('data-g')]]);
             b.disabled = false;
+            renderRef();                                  // zeby od razu bylo widac „zaksięgowane"
             if (!r) say('Zwroty zaksięgowane — wynik w panelu Księgowanie w tickecie.', '#0a7a2f');
         }; });
         box.querySelectorAll('.mk-rc').forEach(function (b){ b.onclick = function(){
             const x = g[keys[+b.getAttribute('data-g')]];
             try { GM_setClipboard(refTsv(x.rows), 'text'); say('Skopiowane — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
+            catch (e){ say('Nie udało się skopiować.', '#c00'); }
+        }; });
+        box.querySelectorAll('.mk-rd').forEach(function (b){ b.onclick = function(){
+            const x = g[keys[+b.getAttribute('data-g')]];
+            try { GM_setClipboard(refTsvNote(x.rows), 'text'); say('Skopiowane z opisami — to wersja dla człowieka, moduł ticketa przyjmuje tylko dwie kolumny.', '#0a7a2f'); }
             catch (e){ say('Nie udało się skopiować.', '#c00'); }
         }; });
     }
@@ -19995,6 +20442,12 @@
         const r = await ksWait(ksBtn());
         ksMirror(null);
         if (r !== 'ok') return r;
+        // Zapisujemy, co POTWIERDZIL log ticketa. Gdy nic nie da sie z niego odczytac,
+        // a przebieg sie zakonczyl, oznaczamy calosc, ale z adnotacja — lepiej pokazac
+        // niepewnosc niz udawac, ze wiemy.
+        const done = ksDone(x);
+        if (done.length) rdMark(x.key, done, true);
+        else rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
         // Zwroty zaksiegowane — odhaczamy je w arkuszu. Niepowodzenie tego kroku nie
         // cofa ksiegowania, trafia tylko na pasek stanu.
         try {
@@ -20005,12 +20458,26 @@
         return '';
     }
     async function bookAllRefunds(b){
-        const g = refGroups(), keys = Object.keys(g).sort().filter(function (k){ return g[k].acct; });
-        if (!keys.length){ say('Żadna grupa nie ma ustawionego konta.', '#c47f00'); return; }
+        const g = refGroups(), all = Object.keys(g).sort().filter(function (k){ return g[k].acct; });
+        if (!all.length){ say('Żadna grupa nie ma ustawionego konta.', '#c47f00'); return; }
+        // Grupy juz zrobione pomijamy — inaczej przy kazdym uruchomieniu szlyby
+        // przez ticket od nowa tylko po to, zeby uslyszec „juz bylo".
+        const skip = all.filter(function (k){ const s = rdState(k, g[k]); return s && !s.left.length; });
+        const keys = all.filter(function (k){ return skip.indexOf(k) < 0; });
+        if (!keys.length){
+            say('Wszystkie grupy zwrotów są już zaksięgowane. Żeby powtórzyć którąś, użyj „↻ Zaksięguj ponownie" przy niej.', '#0a7a2f');
+            return;
+        }
         let n = 0, sum = 0;
         keys.forEach(function (k){ n += g[k].rows.length; sum = r2(sum + g[k].sum); });
         if (!confirm('Zaksięgować zwroty z ' + keys.length + ' grup — razem ' + n + ' pozycji na ' + f2(sum) + '?\n\n'
-            + keys.map(function (k){ return '  • ' + g[k].date + '  konto ' + g[k].acct + '  ' + g[k].rows.length + ' poz.  ' + f2(g[k].sum); }).join('\n')
+            + keys.map(function (k){
+                  const s = rdState(k, g[k]);
+                  return '  • ' + g[k].date + '  konto ' + g[k].acct + '  ' + g[k].rows.length + ' poz.  ' + f2(g[k].sum)
+                       + (s ? ('   (część już zaksięgowana: ' + s.done + ')') : '');
+              }).join('\n')
+            + (skip.length ? ('\n\nPomijam ' + skip.length + ' grup już zaksięgowanych: '
+                + skip.map(function (k){ return g[k].date + '/' + g[k].acct; }).join(', ')) : '')
             + '\n\nKażda grupa idzie przez moduł „Księgowanie w tickecie" i on jeszcze raz zapyta o potwierdzenie.')) return;
         b.disabled = true;
         // Pytamy raz, tutaj. Na czas przelotu wyciszamy pytanie modułu ticketa —
@@ -20025,7 +20492,10 @@
             }
         } finally { window.__MKT_AUTO = false; }
         b.disabled = false;
-        say('Zwroty: zaksięgowanych grup ' + ok + ' z ' + keys.length + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.', bad.length ? '#c47f00' : '#0a7a2f');
+        renderRef();
+        say('Zwroty: zaksięgowanych grup ' + ok + ' z ' + keys.length
+            + (skip.length ? (', pominiętych jako już zrobione ' + skip.length) : '')
+            + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.', bad.length ? '#c47f00' : '#0a7a2f');
     }
 
     // ---------- prologistics: wczytanie wyciagu ----------
@@ -20095,6 +20565,43 @@
                     + Object.keys(p.ord).length + ' zamówień brutto ' + f2(p.gross)
                     + (p.refund ? (', zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund)) : '')
                     + ', na konto ' + f2(p.net) + '. Kolumna N policzona.', '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
+        };
+        // Rozliczenie Wayfaira wrzucane recznie. Dopasowanie idzie po SUMIE wyplaty
+        // (pozycje + potracenia), bo to ona trafia na konto — numer z tytulu przelewu
+        // sluzy dopiero do potwierdzenia, ze to wlasciwy plik.
+        const wayfIn = $('#mk-wayf');
+        if (wayfIn) wayfIn.onchange = function(){
+            const f = this.files && this.files[0];
+            try { this.value = ''; } catch (e){}
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                const jobs = jobsLoad();
+                const waiting = Object.keys(jobs).filter(function (k){ return jobs[k].kind === 'wayf'; });
+                const p = mkParseWayf(mkDecode(rd.result));
+                if (p.err){ say(p.err, '#c00'); return; }
+                const hit = waiting.filter(function (k){ return eq(jobs[k].amount, p.net); });
+                if (!hit.length){
+                    say('Wczytałem rozliczenie ' + (p.remit ? ('nr ' + p.remit + ' ') : '')
+                        + 'na ' + f2(p.net) + ' — ale nie mam zlecenia z wyciągu na tę kwotę'
+                        + (waiting.length ? (' (czekają: ' + waiting.map(function (k){ return f2(jobs[k].amount); }).join(', ') + ')') : '')
+                        + '.', '#c47f00');
+                    return;
+                }
+                if (hit.length > 1){
+                    say('Ta sama kwota pasuje do ' + hit.length + ' wpłat — nie zgaduję, którą uzupełnić. Wyczyść zbędne zlecenia i powtórz.', '#c47f00');
+                    return;
+                }
+                const j = jobs[hit[0]];
+                const bad = wayfApply(j, p, 'plik ' + f.name);
+                jobsSave(jobs); render();
+                say('Rozliczenie ' + (p.remit || f.name) + ' wczytane: ' + Object.keys(p.ord).length
+                    + ' zamówień brutto ' + f2(p.gross)
+                    + (p.refund ? (', zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund)) : '')
+                    + ', na konto ' + f2(p.net) + '.' + (bad.length ? ' Uwaga: ' + bad.join('; ') : ''),
+                    bad.length ? '#c47f00' : '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
         };
@@ -20500,6 +21007,59 @@
             }
             return ok;
         }
+
+        // Przejscie po zleceniach Wayfaira. Portal nie zna numeru wyplaty z tytulu
+        // przelewu, wiec dopasowujemy po KWOCIE, zawezajac data — a numer faktury
+        // z przelewu sluzy potem do potwierdzenia, ze trafilismy w to rozliczenie.
+        async function wayfPass(jobs){
+            const left = Object.keys(jobs).filter(function (k){
+                return jobs[k].kind === 'wayf' && jobs[k].status === 'new';
+            });
+            if (!left.length) return 0;
+            // Jedno zapytanie na caly przelot: zakres rozciagamy na wszystkie czekajace
+            // wplaty. Zapas w tyl jest wiekszy, bo wyplata bywa ksiegowana pozniej.
+            let lo = '', up = '';
+            left.forEach(function (k){
+                const d = String(jobs[k].date || '');
+                if (!d) return;
+                if (!lo || d < lo) lo = d;
+                if (!up || d > up) up = d;
+            });
+            if (!lo){ say('Wayfair: zlecenia bez daty — nie mam czego szukać.', '#c47f00'); return 0; }
+            say('Wayfair — pobieram listę wypłat…');
+            let list;
+            try { list = await wayfList(mkShift(lo, -14), mkShift(up, 3)); }
+            catch (e){ say('Wayfair: ' + ((e && e.message) || e), '#c47f00'); return 0; }
+            if (!list.length){ say('Wayfair: w tym okresie portal nie pokazuje żadnej wypłaty.', '#c47f00'); return 0; }
+            let ok = 0;
+            for (let i = 0; i < left.length; i++){
+                const j = jobs[left[i]];
+                const same = list.filter(function (p){ return eq(mkNum(p.paymentAmount), j.amount); });
+                // Ta sama kwota potrafi sie powtorzyc — wtedy rozstrzyga data wplywu.
+                const exact = same.filter(function (p){ return String(p.paymentDate || '').slice(0, 10) === j.date; });
+                const hit = exact.length ? exact : same;
+                if (!hit.length){
+                    j.msg = 'nie ma wypłaty na ' + f2(j.amount) + ' wśród ' + list.length + ' z tego okresu';
+                    jobsSave(jobs); continue;
+                }
+                if (hit.length > 1){
+                    j.msg = 'kilka wypłat na tę samą kwotę i datę ('
+                          + hit.map(function (p){ return p.displayRemittanceNumber || p.paymentId; }).join(', ')
+                          + ') — wgraj rozliczenie ręcznie';
+                    jobsSave(jobs); continue;
+                }
+                try {
+                    const w = hit[0];
+                    say('Wayfair — rozliczenie ' + (w.displayRemittanceNumber || w.paymentId) + '…');
+                    const p = mkParseWayf(await wayfCsv(w.paymentId));
+                    if (p.err) throw new Error(p.err);
+                    wayfApply(j, p, 'remittance ' + (w.displayRemittanceNumber || w.paymentId));
+                    ok++;
+                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                jobsSave(jobs); render();
+            }
+            return ok;
+        }
         function mkLeft(jobs, host){
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
@@ -20511,6 +21071,11 @@
         function galxLeft(jobs){
             return Object.keys(jobs).filter(function (k){
                 return jobs[k].kind === 'galx' && jobs[k].status === 'new' && jobs[k].ref;
+            }).length;
+        }
+        function wayfLeft(jobs){
+            return Object.keys(jobs).filter(function (k){
+                return jobs[k].kind === 'wayf' && jobs[k].status === 'new' && jobs[k].ref;
             }).length;
         }
         // Ktore platformy wystepuja wsrod czekajacych zlecen — osobno Mirakl (sklepy
@@ -20546,8 +21111,8 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs);
-            if (!mkLeft(jobs) && !nGalx){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs);
+            if (!mkLeft(jobs) && !nGalx && !nWayf){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -20556,11 +21121,13 @@
             // Galaxus obslugujemy z prologistics i z wlasnej strony, ale nie z Mirakla
             // ani z OBI — tam nie ma po co siegac do trzeciej domeny.
             const galx = (onMirakl || onVtex) ? 0 : nGalx;
-            if (!hosts.length && !vhosts.length && !galx){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-            const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+            const wayf = (onMirakl || onVtex) ? 0 : nWayf;
+            if (!hosts.length && !vhosts.length && !galx && !wayf){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
-                    .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : []).join('\n')
+                    .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
+                    .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -20569,6 +21136,11 @@
                 seen++;
                 try { ok += await galxPass(jobsLoad()); }
                 catch (e){ problem.push(MK_GALX_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (wayf){
+                seen++;
+                try { ok += await wayfPass(jobsLoad()); }
+                catch (e){ problem.push(MK_WAYF_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
