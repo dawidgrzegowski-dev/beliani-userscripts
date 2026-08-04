@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.80
+// @version      2.81
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18285,9 +18285,12 @@
         }
         const outHdr = hdr.slice();
         if (c.vat < 0) outHdr.splice(c.price, 0, '');
+        // Po wstawieniu kolumny VAT wszystko na prawo od „Sales Price" przesuwa sie
+        // o jedno pole — zapamietujemy nowe pozycje, zeby dalej nie liczyc tego w kolko.
+        const sh = function (i){ return (c.vat < 0 && i >= c.price) ? i + 1 : i; };
         return { hdr: outHdr, rows: rowsOf(rows, c, vat), ord: ord, ref: ref,
                  net: net, gross: gross, refund: refund, com: com, ded: ded,
-                 payout: payout, pdate: pdate,
+                 payout: payout, pdate: pdate, cPay: sh(c.pay), cOrder: sh(c.order),
                  n: Object.keys(ord).length + Object.keys(ref).length };
     }
     // Te same wiersze, ale gotowe do zapisu — wydzielone, zeby parser czytalo sie liniowo.
@@ -18310,8 +18313,33 @@
             const s = (v == null) ? '' : String(v);
             return /[;"\n\r]/.test(s) ? ('"' + s.replace(/"/g, '""') + '"') : s;
         };
+        const isTot = function (r){ return /^total$/i.test(String(r[0] || '').trim()); };
+        // Zwroty NIE ida do importu. Ksieguje sie je w tickecie, z listy zwrotow —
+        // w paczce ladowaly jako wiersze ujemne i zostawaly tam na zawsze jako CHECK.
+        const keep = p.rows.filter(function (r){
+            if (isTot(r)) return false;
+            const v = mkNum(r[p.cPay]);
+            return v == null || v >= 0;
+        });
+        const tot = p.rows.filter(isTot)[0];
         const lines = [p.hdr.map(q).join(';')];
-        p.rows.forEach(function (r){ lines.push(r.map(q).join(';')); });
+        keep.forEach(function (r){ lines.push(r.map(q).join(';')); });
+        if (tot){
+            // Po odsianiu zwrotow stare podsumowanie przestaje pasowac do zawartosci,
+            // wiec liczymy je od nowa — z tego, co w pliku faktycznie zostalo.
+            const t = tot.slice();
+            for (let i = 0; i < t.length; i++){
+                if (!String(t[i] == null ? '' : t[i]).trim()) continue;
+                if (i === 0) continue;                       // slowo „Total"
+                let s = 0, any = false;
+                keep.forEach(function (r){
+                    const v = mkNum(r[i]);
+                    if (v != null){ s = r2(s + v); any = true; }
+                });
+                t[i] = any ? galxMoney(s) : '';
+            }
+            lines.push(t.map(q).join(';'));
+        }
         return lines.join('\r\n') + '\r\n';
     }
 
@@ -20599,6 +20627,15 @@
     // pozycje ze statusem OK. Status nadaje system: OK gdy kwota wplaty rowna sie
     // open amount auftragu, CHECK gdy sie rozni, NOT FOUND gdy nie ma auftragu.
     const MK_BLOCK = 'booking_without_assign';     // = przycisk „Book on main account"
+    const MK_BLOCK_SUB = 'booking_sub';            // = przycisk „Book & Assign on sub-account"
+    // Ile groszy roznicy w „open amount" wolno wyrownac. Zaokraglenia rzedu 0.01–0.04
+    // to normalny szum kursowy; wieksza roznica to juz realny problem i zostaje CHECK.
+    const MK_TOL_KEY = 'mkt_open_tol';
+    function tolGet(){
+        const v = Number(GM_getValue(MK_TOL_KEY, 0.05));
+        return isFinite(v) && v >= 0 ? v : 0.05;
+    }
+    function tolSet(v){ try { GM_setValue(MK_TOL_KEY, Number(v) || 0); } catch (e){} }
     // Druga kontrola: czy ten sam plik nie zostal juz kiedys wgrany. Nazwy nadajemy
     // deterministycznie, wiec powtorka jest rozpoznawalna PRZED utworzeniem paczki.
     async function impSameFile(fname){
@@ -20647,7 +20684,55 @@
         if (!r.ok) throw new Error('HTTP ' + r.status + ' przy księgowaniu');
         return r.text();
     }
-    function impNum(v){ const n = Number(String(v == null ? '' : v).replace(/[\s'’]/g, '').replace(',', '.')); return isFinite(n) ? n : null; }
+    // Open amount przychodzi raz jako „0.00", a raz jako „CHF 0.01" — z waluta w srodku
+    // Number() zwracalo NaN i kolumna pokazywala kreske zamiast kwoty. Odsiewamy wiec
+    // wszystko poza cyframi, znakiem i separatorem.
+    function impNum(v){
+        const s = String(v == null ? '' : v).replace(/[^\d.,+-]/g, '');
+        if (!s || !/\d/.test(s)) return null;
+        const dot = s.lastIndexOf('.'), com = s.lastIndexOf(',');
+        const t = (com > dot) ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+        const n = Number(t);
+        return isFinite(n) ? n : null;
+    }
+    // Link do auftragu: prologistics pokazuje go jako „15254075/3", a strona chce
+    // number + txnid osobno. Numer transakcji bywa w roznych polach albo doklejony
+    // ukosnikiem — bierzemy pierwszy, ktory sie znajdzie.
+    function impAuction(x){
+        const raw = String(x.auction_number == null ? '' : x.auction_number).trim();
+        if (!raw) return null;
+        const parts = raw.split('/');
+        let num = parts[0].trim(), txn = (parts[1] || '').trim();
+        if (!txn){
+            ['txnid', 'txn_id', 'txnId', 'auction_txnid', 'auction_txn_id', 'transaction_id', 'txn']
+                .forEach(function (k){ if (!txn && x[k] != null && String(x[k]).trim()) txn = String(x[k]).trim(); });
+        }
+        return { num: num, txn: txn,
+                 url: '/auction.php?number=' + encodeURIComponent(num) + (txn ? ('&txnid=' + encodeURIComponent(txn)) : ''),
+                 label: num + (txn ? ('/' + txn) : '') };
+    }
+    // Ustawienie statusu pojedynczego wiersza — odpowiednik recznej zmiany na „OK".
+    async function impState(fileId, rowId, state){
+        const body = 'id=' + encodeURIComponent(rowId) + '&state=' + encodeURIComponent(state)
+                   + '&block=state&file_id=' + encodeURIComponent(fileId);
+        const r = await fetch('/api/importPayments/save/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy ustawianiu statusu wiersza ' + rowId);
+        return r.text();
+    }
+    // „Book & Assign on sub-account" — inny przycisk niz ksiegowanie na koncie glownym.
+    async function impBookSub(id, ids){
+        const body = 'file_id=' + encodeURIComponent(id) + '&block=' + MK_BLOCK_SUB
+                   + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
+        const r = await fetch('/api/importPayments/save/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy księgowaniu na subkoncie');
+        return r.text();
+    }
 
     function impRender(job, d){
         const box = document.getElementById('mk-imp-box');
@@ -20680,6 +20765,13 @@
               +  '<div style="font-size:10px;color:#7c2d12;margin-top:2px">Były wczytane wcześniej — sprawdź, czy nie księgujesz drugi raz: '
               +  esc(seen.slice(0, 12).map(function (x){ return x.payment_descr; }).join(', ')) + (seen.length > 12 ? ' … +' + (seen.length - 12) : '') + '</div></div>';
         }
+        // Grosze roznicy to zaokraglenie, a nie blad — takie wiersze mozna wyrownac
+        // hurtem. Wieksza roznica zostaje do wyjasnienia i nikt jej nie rusza.
+        const tol = tolGet();
+        const near = chk.filter(function (x){
+            const o = impNum(x.open_amount);
+            return o != null && Math.abs(o) <= tol && String(x.auction_number || '').trim();
+        });
         if (chk.length){
             h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c47f00">CHECK — kwota nie zgadza się z open amount (' + chk.length + ')</b>'
               +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
@@ -20688,14 +20780,24 @@
             chk.forEach(function (x){
                 const a = impNum(x.amount), o = impNum(x.open_amount);
                 const df = (a != null && o != null) ? r2(a - o) : null;
-                h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
+                const au = impAuction(x);
+                const small = o != null && Math.abs(o) <= tol;
+                h += '<tr style="border-top:1px solid #f1f5f9' + (small ? ';background:#f0fdf4' : '') + '"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
-                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:#c00">' + (df == null ? '—' : f2(df)) + '</td>'
-                  +  '<td style="padding:2px 6px">' + (x.auction_number
-                        ? ('<a href="/auction.php?number=' + esc(x.auction_number) + '" target="_blank">' + esc(x.auction_number) + '</a>') : '—') + '</td></tr>';
+                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + (small ? '#0a7a2f' : '#c00') + '">'
+                  +  (df == null ? '—' : f2(df)) + (small ? ' ✓' : '') + '</td>'
+                  +  '<td style="padding:2px 6px">' + (au
+                        ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td></tr>';
             });
-            h += '</table></div>';
+            h += '</table>'
+              +  '<div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+              +  '<span style="font-size:10px;color:#666">grosze do wyrównania: do</span>'
+              +  '<input id="mk-tol" value="' + tol.toFixed(2) + '" style="width:46px;font-size:10px;text-align:right">'
+              +  '<button id="mk-tol-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
+              +  '<button id="mk-fix"' + (near.length ? '' : ' disabled')
+              +  ' style="padding:4px 10px;border:none;border-radius:6px;background:' + (near.length ? '#0a7a2f' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (near.length ? 'pointer' : 'default') + ';font-size:11px">✔ Ustaw OK i zaksięguj na subkoncie (' + near.length + ')</button>'
+              +  '<span id="mk-fix-msg" style="font-size:11px;color:#666"></span></div></div>';
         }
         if (nf.length){
             h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>';
@@ -20716,6 +20818,34 @@
 
         const re = box.querySelector('#mk-imp-re');
         if (re) re.onclick = function(){ impCheck(job.ref); };
+        const ts = box.querySelector('#mk-tol-set');
+        if (ts) ts.onclick = function(){
+            const v = Number(String(box.querySelector('#mk-tol').value || '').replace(',', '.'));
+            if (!isFinite(v) || v < 0){ say('Podaj liczbę, np. 0.05.', '#c47f00'); return; }
+            tolSet(v); impRender(job, d);
+        };
+        const fx = box.querySelector('#mk-fix');
+        if (fx) fx.onclick = async function(){
+            const m = box.querySelector('#mk-fix-msg');
+            if (!confirm('Ustawić status OK i zaksięgować ' + near.length + ' pozycji na subkoncie?\n\n'
+                + near.map(function (x){ return '  • ' + x.payment_descr + '  open ' + f2(impNum(x.open_amount)); }).join('\n')
+                + '\n\nOdpowiada to ręcznej zmianie statusu na OK, a potem przyciskowi „Book & Assign on sub-account".'
+                + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            fx.disabled = true; m.style.color = '#666'; m.textContent = 'ustawiam statusy…';
+            try {
+                for (let i = 0; i < near.length; i++){
+                    m.textContent = 'ustawiam statusy… ' + (i + 1) + '/' + near.length;
+                    await impState(job.impId, near[i].id, 'OK');
+                }
+                m.textContent = 'księguję na subkoncie…';
+                await impBookSub(job.impId, near.map(function (x){ return x.id; }));
+                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję wynik…';
+                await impCheck(job.ref);
+            } catch (e){
+                m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
+                fx.disabled = false;
+            }
+        };
         const bb = box.querySelector('#mk-book');
         if (bb) bb.onclick = async function(){
             const m = box.querySelector('#mk-book-msg');
