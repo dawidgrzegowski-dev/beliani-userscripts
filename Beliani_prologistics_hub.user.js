@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.79
+// @version      2.80
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21,6 +21,7 @@
 // @connect      raw.githubusercontent.com
 // @connect      mirakl.net
 // @connect      myvtex.com
+// @connect      galaxus.ch
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
@@ -18246,8 +18247,11 @@
         c.vat = (c.price > 0 && !String(hdr[c.price - 1] || '').trim()) ? (c.price - 1) : -1;
         return c;
     }
-    function mkParseGalx(text, shop){
-        const rows = mkCsvRows(text).filter(function (r){ return r && r.join('').trim(); });
+    function mkParseGalx(src, shop){
+        // Przyjmujemy jedno i drugie: tekst CSV (plik wrzucony recznie) albo gotowe
+        // wiersze z xlsx pobranego z portalu. Dalej przetwarzanie jest identyczne.
+        const rows = (Array.isArray(src) ? src : mkCsvRows(src))
+            .filter(function (r){ return r && r.join('').trim(); });
         if (!rows.length) return { err: 'pusty plik' };
         const hdr = rows[0], c = galxCols(hdr);
         if (c.order < 0 || c.price < 0 || c.pay < 0 || c.payout < 0){
@@ -18316,7 +18320,10 @@
     // jak zrobilby to czlowiek: search.php, radio „invoice_number", numer w pole.
     function galxIsInvoice(ref){ return /^\d{5,}$/.test(String(ref || '')); }
     function galxFindAuftrag(num, done){
-        let fin = false;
+        let fin = false, tried = 0;
+        // Dwa warianty adresu: „?express" to skrocony formularz, ale gdyby nie mial tego
+        // kryterium, probujemy pelnego. Bez tego jedna nieudana proba konczyla temat.
+        const urls = [location.origin + '/search.php?express', location.origin + '/search.php'];
         const fr = document.createElement('iframe');
         fr.style.cssText = 'position:fixed;left:-9999px;top:0;width:1200px;height:800px;opacity:0';
         const end = function (res){
@@ -18328,11 +18335,22 @@
         let sent = false;
         fr.onload = function(){
             let d, w;
-            try { d = fr.contentDocument; w = fr.contentWindow; }
+            try { d = fr.contentDocument || fr.contentWindow.document; w = fr.contentWindow; }
             catch (e){ end({ err: 'nie mam dostępu do ramki wyszukiwarki' }); return; }
+            // Swiezo wstawiona ramka zglasza „load" dla about:blank. Bez tego warunku
+            // szukalismy pola w PUSTEJ stronie i meldowalismy brak, zanim search.php
+            // zdazyl sie wczytac.
+            let href = '';
+            try { href = String(w.location.href || ''); } catch (e){}
+            if (!href || /^about:/i.test(href)) return;
             if (!sent){
                 const inp = d.querySelector('input[name="invoice_number"]');
-                if (!inp){ end({ err: 'nie widzę pola invoice_number na search.php' }); return; }
+                if (!inp){
+                    if (++tried < urls.length){ fr.src = urls[tried]; return; }
+                    end({ err: 'nie widzę pola invoice_number na ' + href.replace(location.origin, '')
+                              + ' (pól tekstowych na stronie: ' + d.querySelectorAll('input[type="text"]').length + ')' });
+                    return;
+                }
                 // Radio wlacza wlasciwe kryterium — bez niego formularz szuka po czym innym.
                 try { if (w.select_radio) w.select_radio('radio_49'); } catch (e){}
                 const rb = d.querySelector('input[name="what"][value="invoice_number"], #radio_49');
@@ -18356,8 +18374,225 @@
             end({ urls: hits });
         };
         document.body.appendChild(fr);
-        fr.src = location.origin + '/search.php?express';
+        fr.src = urls[0];
         setTimeout(function(){ end({ err: 'wyszukiwarka nie odpowiedziała w 30 s' }); }, 30000);
+    }
+
+    // ---------- czytanie xlsx ----------
+    // Portal Galaxusa oddaje rozliczenie jako xlsx, a to ZIP z kilkoma plikami XML.
+    // Rozpakowujemy go przegladarkowym DecompressionStream — bez zadnej biblioteki.
+    async function galxInflate(u8){
+        const s = new Blob([u8]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        return new Uint8Array(await new Response(s).arrayBuffer());
+    }
+    async function galxUnzip(buf){
+        const b = new Uint8Array(buf);
+        if (b.length < 22 || b[0] !== 0x50 || b[1] !== 0x4B) throw new Error('to nie jest plik xlsx');
+        const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+        let eocd = -1;
+        for (let i = b.length - 22; i >= 0 && i > b.length - 65558; i--){
+            if (dv.getUint32(i, true) === 0x06054b50){ eocd = i; break; }
+        }
+        if (eocd < 0) throw new Error('uszkodzony xlsx — brak katalogu ZIP');
+        const cnt = dv.getUint16(eocd + 10, true);
+        let off = dv.getUint32(eocd + 16, true);
+        const out = {};
+        for (let i = 0; i < cnt; i++){
+            if (off + 46 > b.length || dv.getUint32(off, true) !== 0x02014b50) break;
+            const method = dv.getUint16(off + 10, true);
+            const csize  = dv.getUint32(off + 20, true);
+            const nlen   = dv.getUint16(off + 28, true);
+            const elen   = dv.getUint16(off + 30, true);
+            const clen   = dv.getUint16(off + 32, true);
+            const lho    = dv.getUint32(off + 42, true);
+            const name   = new TextDecoder('utf-8').decode(b.subarray(off + 46, off + 46 + nlen));
+            // Naglowek lokalny ma WLASNE dlugosci pol — liczone z centralnego bywaja inne.
+            const ln = dv.getUint16(lho + 26, true), le = dv.getUint16(lho + 28, true);
+            const raw = b.subarray(lho + 30 + ln + le, lho + 30 + ln + le + csize);
+            out[name] = { method: method, raw: raw };
+            off += 46 + nlen + elen + clen;
+        }
+        return out;
+    }
+    async function galxPart(zip, name){
+        const e = zip[name];
+        if (!e) return '';
+        const data = (e.method === 0) ? e.raw : await galxInflate(e.raw);
+        return new TextDecoder('utf-8').decode(data);
+    }
+    // Liczby formatujemy tak, jak robi to Excel przy ich ustawieniach: apostrof tysiecy
+    // i dwa miejsca po przecinku. Dzieki temu plik wychodzi identyczny z tym, ktory
+    // do tej pory skladaliscie recznie.
+    function galxMoney(v){
+        const a = Math.abs(v).toFixed(2).split('.');
+        return (v < 0 ? '-' : '') + a[0].replace(/\B(?=(\d{3})+(?!\d))/g, '’') + '.' + a[1];
+    }
+    function galxDate(v){
+        const d = new Date(Math.round((Math.floor(v) - 25569) * 86400000));
+        return pad2(d.getUTCDate()) + '.' + pad2(d.getUTCMonth() + 1) + '.' + d.getUTCFullYear();
+    }
+    function galxColNo(ref){
+        const m = String(ref || '').match(/^([A-Z]+)/);
+        if (!m) return -1;
+        let n = 0;
+        for (let i = 0; i < m[1].length; i++) n = n * 26 + (m[1].charCodeAt(i) - 64);
+        return n - 1;
+    }
+    async function galxXlsx(buf){
+        const zip = await galxUnzip(buf);
+        const P = new DOMParser();
+        const ssXml = await galxPart(zip, 'xl/sharedStrings.xml');
+        const strs = [];
+        if (ssXml){
+            const d = P.parseFromString(ssXml, 'application/xml');
+            Array.prototype.forEach.call(d.getElementsByTagName('si'), function (si){
+                let t = '';
+                Array.prototype.forEach.call(si.getElementsByTagName('t'), function (x){ t += x.textContent; });
+                strs.push(t);
+            });
+        }
+        // Styl komorki -> format liczby. Po nim poznajemy daty i procenty.
+        const fmt = [];
+        const stXml = await galxPart(zip, 'xl/styles.xml');
+        if (stXml){
+            const d = P.parseFromString(stXml, 'application/xml');
+            const xfs = d.getElementsByTagName('cellXfs')[0];
+            if (xfs) Array.prototype.forEach.call(xfs.getElementsByTagName('xf'), function (xf){
+                fmt.push(parseInt(xf.getAttribute('numFmtId') || '0', 10));
+            });
+        }
+        const shXml = await galxPart(zip, 'xl/worksheets/sheet1.xml');
+        if (!shXml) throw new Error('w pliku nie ma arkusza');
+        const d = P.parseFromString(shXml, 'application/xml');
+        const rows = [], nums = [], sums = [];
+        let wide = 0;
+        Array.prototype.forEach.call(d.getElementsByTagName('row'), function (tr){
+            const cells = [], num = [], sum = [];
+            Array.prototype.forEach.call(tr.getElementsByTagName('c'), function (c){
+                const i = galxColNo(c.getAttribute('r'));
+                if (i < 0) return;
+                const t = c.getAttribute('t') || '';
+                const f = fmt[parseInt(c.getAttribute('s') || '0', 10)] || 0;
+                const vEl = c.getElementsByTagName('v')[0];
+                const v = vEl ? vEl.textContent : '';
+                if (!vEl && c.getElementsByTagName('f')[0]){ sum[i] = true; cells[i] = ''; return; }
+                if (t === 's'){ cells[i] = strs[parseInt(v, 10)] || ''; return; }
+                if (t === 'inlineStr'){
+                    const is = c.getElementsByTagName('t')[0];
+                    cells[i] = is ? is.textContent : ''; return;
+                }
+                if (v === ''){ cells[i] = ''; return; }
+                const n = Number(v);
+                if (!isFinite(n)){ cells[i] = v; return; }
+                num[i] = n;
+                if (f === 164 || f === 14 || f === 15 || f === 22) cells[i] = galxDate(n);
+                else if (f === 165 || f === 9 || f === 10) cells[i] = (n * 100).toFixed(1) + '%';
+                else if (f === 4 || f === 2 || f === 3 || f === 43 || f === 44) cells[i] = galxMoney(n);
+                else cells[i] = String(n);
+            });
+            rows.push(cells); nums.push(num); sums.push(sum);
+            if (cells.length > wide) wide = cells.length;
+        });
+        // Wiersz „Total" ma w pliku same formuly bez wynikow — Excel liczy je przy
+        // otwarciu. Liczymy je sami, zeby plik byl kompletny bez otwierania w Excelu.
+        for (let r = 0; r < rows.length; r++){
+            for (let c = 0; c < wide; c++){
+                if (!sums[r][c]) continue;
+                let s = 0, any = false;
+                for (let k = 0; k < rows.length; k++){
+                    if (k === r || nums[k][c] == null) continue;
+                    s = r2(s + nums[k][c]); any = true;
+                }
+                rows[r][c] = any ? galxMoney(s) : '';
+            }
+        }
+        return rows.map(function (rr){
+            const o = [];
+            for (let i = 0; i < wide; i++) o.push(rr[i] == null ? '' : String(rr[i]));
+            return o;
+        });
+    }
+
+    // ---------- pobieranie z portalu Galaxusa ----------
+    // Lista wyplat jest zwyklym HTML-em, wiec czytamy ja z tej samej strony, ktora
+    // widzisz w przegladarce. Adres pliku bierzemy z linku w wierszu, zamiast go
+    // sklejac — gdyby portal zmienil schemat, i tak trafimy.
+    const MK_GALX_HOST = 'partner.galaxus.ch';
+    async function galxHtml(){
+        const url = 'https://' + MK_GALX_HOST + '/en/ui/Receivables/PayoutOverviewCmi/Show';
+        const hdrs = { 'accept': 'text/html,application/xhtml+xml' };
+        if (location.hostname !== MK_GALX_HOST){
+            const ck = await gmCookies('https://' + MK_GALX_HOST + '/');
+            if (ck) hdrs['Cookie'] = ck;
+        }
+        const r = await gmGet(url, hdrs);
+        if (r.status !== 200) throw new Error('Payout overview: HTTP ' + r.status + ' — zaloguj się na partner.galaxus.ch');
+        return String(r.responseText || '');
+    }
+    function galxParseList(html){
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const out = [];
+        Array.prototype.forEach.call(doc.querySelectorAll('a[href]'), function (a){
+            const href = a.getAttribute('href') || '';
+            if (!/PayoutOverviewCmi\/Download/i.test(href)) return;
+            const tr = a.closest('tr');
+            const tds = tr ? Array.prototype.map.call(tr.querySelectorAll('td'), function (td){
+                return String(td.textContent || '').replace(/\s+/g, ' ').trim();
+            }) : [];
+            let amt = null;
+            tds.forEach(function (t){
+                if (amt == null && /[A-Z]{3}\s*-?[\d'’.,]+/.test(t)) amt = mkNum(t.replace(/[A-Z]{3}/, ''));
+            });
+            const nm = String(a.textContent || '').trim();
+            out.push({
+                url: href.indexOf('http') === 0 ? href : ('https://' + MK_GALX_HOST + (href.charAt(0) === '/' ? '' : '/') + href),
+                name: nm,
+                id: (nm.match(/_(\d+)_/) || [])[1] || '',
+                amount: amt,
+                cells: tds
+            });
+        });
+        return out;
+    }
+    async function galxDownload(url){
+        const hdrs = {};
+        if (location.hostname !== MK_GALX_HOST){
+            const ck = await gmCookies('https://' + MK_GALX_HOST + '/');
+            if (ck) hdrs['Cookie'] = ck;
+        }
+        return new Promise(function (resolve, reject){
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, headers: hdrs, responseType: 'arraybuffer', timeout: 90000,
+                onload: function (r){
+                    if (r.status !== 200){ reject(new Error('pobieranie raportu: HTTP ' + r.status)); return; }
+                    resolve(r.response);
+                },
+                onerror: function (){ reject(new Error('nie mogę połączyć się z ' + MK_GALX_HOST)); },
+                ontimeout: function (){ reject(new Error(MK_GALX_HOST + ' nie odpowiedział na czas')); }
+            });
+        });
+    }
+
+    // Pliki Galaxusa sa w windows-1252 i tak wlasnie prologistics je dotad przyjmowal.
+    // Gdybysmy wyslali UTF-8, umlauty w nazwach i apostrof tysiecy przyszlyby polamane,
+    // wiec dla tego jednego marketplace'u kodujemy plik bajt po bajcie.
+    const MK_1252 = { 0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85,
+        0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A, 0x2039: 0x8B,
+        0x0152: 0x8C, 0x017D: 0x8E, 0x2018: 0x91, 0x2019: 0x92, 0x201C: 0x93, 0x201D: 0x94,
+        0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97, 0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A,
+        0x203A: 0x9B, 0x0153: 0x9C, 0x017E: 0x9E, 0x0178: 0x9F };
+    function cp1252(s){
+        const t = String(s), out = new Uint8Array(t.length);
+        for (let i = 0; i < t.length; i++){
+            const c = t.charCodeAt(i);
+            out[i] = (c < 0x100) ? c : (MK_1252[c] || 0x3F);   // czego nie ma w 1252 -> „?"
+        }
+        return out;
+    }
+    function csvBlob(j){
+        const txt = csvFor(j);
+        return (j.kind === 'galx') ? new Blob([cp1252(txt)], { type: 'text/csv' })
+                                   : new Blob([txt], { type: 'text/csv;charset=utf-8' });
     }
 
     // Ktory uklad dla ktorego zlecenia.
@@ -20159,23 +20394,61 @@
             return ok;
         }
 
-        // Zlecenia Galaxusa czekaja na plik, a nie na pobranie — bez tej podpowiedzi
-        // „nie ma zlecen do pobrania" wygladaloby jak zgubienie wplaty.
-        function galxHint(jobs){
-            const n = Object.keys(jobs).filter(function (k){
+        // Przejscie po zleceniach Galaxusa: lista wyplat z portalu, dopasowanie po kwocie,
+        // pobranie xlsx, doliczenie VAT. Zwraca liczbe zamknietych zlecen.
+        async function galxPass(jobs){
+            const left = Object.keys(jobs).filter(function (k){
                 return jobs[k].kind === 'galx' && jobs[k].status === 'new';
-            }).length;
-            return n ? (' Czeka ' + n + ' wpłat Galaxusa — pobierz ich rozliczenia z „Payout overview" i wrzuć przez „📄 Raport Galaxus".') : '';
+            });
+            if (!left.length) return 0;
+            say('Galaxus — pobieram listę wypłat…');
+            let list;
+            try { list = galxParseList(await galxHtml()); }
+            catch (e){ say('Galaxus: ' + ((e && e.message) || e), '#c47f00'); return 0; }
+            if (!list.length){ say('Galaxus: nie widzę żadnego linku do raportu na „Payout overview".', '#c47f00'); return 0; }
+            let ok = 0;
+            for (let i = 0; i < left.length; i++){
+                const j = jobs[left[i]];
+                const hit = list.filter(function (p){ return p.amount != null && eq(p.amount, j.amount); });
+                if (!hit.length){
+                    j.msg = 'nie ma wypłaty na ' + f2(j.amount) + ' wśród ' + list.length + ' widocznych w portalu';
+                    jobsSave(jobs); continue;
+                }
+                if (hit.length > 1){
+                    j.msg = 'kilka wypłat na tę samą kwotę (' + hit.map(function (p){ return p.id; }).join(', ') + ') — wgraj raport ręcznie';
+                    jobsSave(jobs); continue;
+                }
+                try {
+                    say('Galaxus — raport ' + (hit[0].id || hit[0].name) + '…');
+                    const rows = await galxXlsx(await galxDownload(hit[0].url));
+                    const p = mkParseGalx(rows, j.shop || 'Galaxus CH');
+                    if (p.err) throw new Error(p.err);
+                    const both = Object.keys(p.ord).filter(function (k){ return p.ref[k] != null; });
+                    j.data = { galx: p, shop: j.shop || 'Galaxus CH', gross: p.gross, refund: p.refund,
+                               net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
+                               unknown: {}, skipped: {}, full: true, both: both, pays: 1, split: false,
+                               rows: p.rows.length, total: p.rows.length, pages: 1, how: hit[0].name };
+                    j.note = 'VAT ' + (galxVat(j.shop || 'Galaxus CH') * 100).toFixed(1).replace('.', ',') + '% w kolumnie N'
+                           + (p.ded ? (' · potrącenia za obsługę zwrotów ' + f2(p.ded) + ' — już w wypłacie') : '');
+                    j.status = eq(p.net, j.amount) ? 'ready' : 'partial';
+                    j.msg = eq(p.net, j.amount) ? '' : ('suma z raportu ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+                    ok++;
+                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                jobsSave(jobs); render();
+            }
+            return ok;
         }
         function mkLeft(jobs, host){
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
                 if (j.status !== 'new' || !j.ref) return false;
-                // Galaxus nie ma czego pobierac — jego rozliczenie wgrywa sie recznie,
-                // wiec nie moze podbijac licznika „do pobrania".
-                if ((j.kind || 'mirakl') === 'galx') return false;
                 if ((j.kind || 'mirakl') !== 'mirakl') return host ? false : true;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
+            }).length;
+        }
+        function galxLeft(jobs){
+            return Object.keys(jobs).filter(function (k){
+                return jobs[k].kind === 'galx' && jobs[k].status === 'new' && jobs[k].ref;
             }).length;
         }
         // Ktore platformy wystepuja wsrod czekajacych zlecen — osobno Mirakl (sklepy
@@ -20211,19 +20484,30 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.' + galxHint(jobs), '#c47f00'); return; }
+            const nGalx = galxLeft(jobs);
+            if (!mkLeft(jobs) && !nGalx){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
             const hosts  = onMirakl ? [location.hostname] : (onVtex ? [] : mkHosts(jobs));
             const vhosts = onVtex   ? [location.hostname] : (onMirakl ? [] : mkHostsOf(jobs, 'vtex'));
-            if (!hosts.length && !vhosts.length){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-            if (!confirm('Pobrać ' + mkLeft(jobs) + ' rozliczeń z ' + (hosts.length + vhosts.length) + ' platform?\n\n'
-                + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; }).join('\n')
+            // Galaxus obslugujemy z prologistics i z wlasnej strony, ale nie z Mirakla
+            // ani z OBI — tam nie ma po co siegac do trzeciej domeny.
+            const galx = (onMirakl || onVtex) ? 0 : nGalx;
+            if (!hosts.length && !vhosts.length && !galx){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+                + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
+                    .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
             let ok = 0, seen = 0; const problem = [];
+            if (galx){
+                seen++;
+                try { ok += await galxPass(jobsLoad()); }
+                catch (e){ problem.push(MK_GALX_HOST + ': ' + ((e && e.message) || e)); }
+            }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
                 let home = '';
@@ -20299,7 +20583,7 @@
     }
     function doCsv(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
-        const blob = new Blob([csvFor(j)], { type: 'text/csv;charset=utf-8' });
+        const blob = csvBlob(j);
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
         say('Zapisano ' + fileName(j));
@@ -20596,7 +20880,7 @@
         const pairs = pairsOf(j);
         try {
             const fd = new FormData();
-            fd.append('imgs[]', new Blob([csvFor(j)], { type: 'text/csv' }), fileName(j));
+            fd.append('imgs[]', csvBlob(j), fileName(j));
             fd.append('data', JSON.stringify({ booking_setting: c.booking, date_overwrite_to: dateIso, bank_setting: c.bank, import_type: 'manual' }));
             const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
             const txt = await r.text();
