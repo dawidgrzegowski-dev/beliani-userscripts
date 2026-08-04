@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.73
+// @version      2.74
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18181,6 +18181,25 @@
         });
         return '﻿' + lines.join('\n') + '\n';
     }
+    // OBI ma WLASNY uklad pliku — dokladnie taki, jaki eksportuje ich panel. Ustawienia
+    // importu w prologistics (bank_setting) sa dopasowane do TYCH kolumn, wiec podanie
+    // ukladu Mirakla trafiloby danymi w niewlasciwe pola.
+    const MK_OBI_HDR = ['sellerId','paymentMethod','creationDate','transactionType','grossCurrency',
+        'grossDebit','grossCredit','exchangeRate','netCurrency','netCredit','netDebit',
+        'commissionAmount','orderId','invoiceId','chargebackType','reserved1','reserved2'];
+    function mkCsvObi(rows){
+        const v = function (x){ return (x == null) ? '' : String(x); };
+        const lines = [MK_OBI_HDR.join(';')];
+        (rows || []).forEach(function (r){
+            lines.push(MK_OBI_HDR.map(function (k){ return v(r[k]); }).join(';'));
+        });
+        return '﻿' + lines.join('\n') + '\n';
+    }
+    // Ktory uklad dla ktorego zlecenia.
+    function csvFor(j){
+        if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
+        return mkCsvText(pairsOf(j));
+    }
 
     // ================= ROZMOWA Z MIRAKLEM =================
     // Modul dziala z obu stron. Na Miraklu idzie zwyklym fetch-em. Z prologistics to
@@ -18719,7 +18738,9 @@
       + '<div style="padding:12px 16px">'
       +   (onProlo
             ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS albo Postbank, CSV) — rozpoznam wpłaty od marketplace\'ów. Zestawienia dociągam prosto z ich paneli, stąd; musisz być tam zalogowany w przeglądarce.</div>'
-              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              // Pasek narzedzi jedzie z przewijaniem — przy kilkudziesieciu zleceniach
+              // guziki byly poza ekranem i trzeba bylo wracac na gore.
+              + '<div style="position:sticky;top:0;z-index:6;background:#fff;padding:4px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<input type="file" id="mk-file" accept=".csv,text/csv" style="font-size:11px">'
               + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
@@ -18815,7 +18836,8 @@
                 if (!c || !c.bank) no++;
             });
             const nRdy = jobs.filter(function (j){ return j.status === 'ready'; }).length;
-            h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            // Drugi pasek trzyma sie tuz pod pierwszym, zeby oba byly zawsze pod reka.
+            h += '<div style="position:sticky;top:34px;z-index:5;background:#fff;padding:4px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
               +  '<button id="mk-imp-all"' + (nSel ? '' : ' disabled')
               +  ' style="padding:6px 14px;border:none;border-radius:6px;background:' + (nSel ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (nSel ? 'pointer' : 'default') + ';font-size:12px">⬆ Zaksięguj zaznaczone (' + nSel + ')</button>'
               +  (nRdy ? ('<button id="mk-sel-all"' + (nSel >= nRdy ? ' disabled' : '') + ' style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">☑ Zaznacz wszystkie</button>'
@@ -19487,7 +19509,9 @@
                     const nRef = Object.keys(a.ref).length;
                     let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + a.ref[k]); });
                     const both = Object.keys(a.ord).filter(function (k){ return a.ref[k] != null; });
-                    j.data = { cycle: rep.id, shop: j.shop || 'OBI', gross: a.gross, refund: refund,
+                    // Surowe wiersze zostaja przy zleceniu — z nich powstaje plik
+                    // do importu w ukladzie OBI, jeden do jednego z ich eksportem.
+                    j.data = { raw: rows, cycle: rep.id, shop: j.shop || 'OBI', gross: a.gross, refund: refund,
                                net: a.net, netOk: eq(a.net, j.amount), ord: a.ord, ref: a.ref,
                                unknown: a.unknown, skipped: a.kinds, full: true, both: both,
                                pays: 1, split: false, rows: rows.length, total: rows.length, pages: 1, how: '' };
@@ -19636,7 +19660,7 @@
     }
     function doCsv(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
-        const blob = new Blob([mkCsvText(pairsOf(j))], { type: 'text/csv;charset=utf-8' });
+        const blob = new Blob([csvFor(j)], { type: 'text/csv;charset=utf-8' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
         say('Zapisano ' + fileName(j));
@@ -19933,7 +19957,7 @@
         const pairs = pairsOf(j);
         try {
             const fd = new FormData();
-            fd.append('imgs[]', new Blob([mkCsvText(pairs)], { type: 'text/csv' }), fileName(j));
+            fd.append('imgs[]', new Blob([csvFor(j)], { type: 'text/csv' }), fileName(j));
             fd.append('data', JSON.stringify({ booking_setting: c.booking, date_overwrite_to: dateIso, bank_setting: c.bank, import_type: 'manual' }));
             const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
             const txt = await r.text();
