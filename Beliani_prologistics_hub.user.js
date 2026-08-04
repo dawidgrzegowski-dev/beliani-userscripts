@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.81
+// @version      2.82
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20604,10 +20604,16 @@
         Object.keys(j.data.ord).sort().forEach(function (id){ out.push({ id: id, amt: j.data.ord[id] }); });
         return out;
     }
-    function fileName(j){
+    // Data i sklep nie wystarczaja, zeby po tygodniu poznac, ktore to zestawienie —
+    // rozpoznaje sie je po KWOCIE z wyciagu, wiec ona tez wchodzi do nazwy.
+    function fileBase(j){
         const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
         const ds = d ? (d[3] + '.' + d[2] + '.' + d[1]) : 'export';
-        return ds + ' ' + (j.data.shop || 'marketplace') + ' do prolo.csv';
+        return ds + ' ' + (j.data && j.data.shop ? j.data.shop : (j.shop || 'marketplace'));
+    }
+    function fileName(j){
+        const a = isFinite(j.amount) ? (' ' + Number(j.amount).toFixed(2) + (j.cur ? (' ' + j.cur) : '')) : '';
+        return fileBase(j) + a + ' do prolo.csv';
     }
     function doCsv(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
@@ -20638,16 +20644,26 @@
     function tolSet(v){ try { GM_setValue(MK_TOL_KEY, Number(v) || 0); } catch (e){} }
     // Druga kontrola: czy ten sam plik nie zostal juz kiedys wgrany. Nazwy nadajemy
     // deterministycznie, wiec powtorka jest rozpoznawalna PRZED utworzeniem paczki.
-    async function impSameFile(fname){
+    // Szukamy po DACIE I SKLEPIE, a nie po pelnej nazwie: do nazw doszla kwota, wiec
+    // paczki wgrane wczesniej maja inna i po pelnej nazwie przestalyby sie znajdowac.
+    // Gdy w nazwie siedzi ta sama kwota, duplikat jest pewny; sama zgodnosc dnia
+    // i sklepu to juz tylko sygnal do sprawdzenia.
+    async function impSameFile(j){
         try {
+            const base = fileBase(j);
+            const amt = isFinite(j.amount) ? Number(j.amount).toFixed(2) : '';
             const r = await fetch('/api/importPayments/index/?', {
                 credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
             if (!r.ok) return null;
-            const j = await r.json();
-            const list = Array.isArray(j.parsing_list) ? j.parsing_list : [];
-            const hit = list.filter(function (x){ return fname && String(x.filename || '').indexOf(fname) >= 0; })
+            const d = await r.json();
+            const list = Array.isArray(d.parsing_list) ? d.parsing_list : [];
+            const hit = list.filter(function (x){ return base && String(x.filename || '').indexOf(base) >= 0; })
                             .sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });
-            return hit.length ? hit[0] : null;
+            if (!hit.length) return null;
+            const exact = amt ? hit.filter(function (x){ return String(x.filename || '').indexOf(amt) >= 0; }) : [];
+            const out = exact.length ? exact[0] : hit[0];
+            out.exact = !!exact.length;
+            return out;
         } catch (e){ return null; }
     }
 
@@ -20959,7 +20975,7 @@
         for (let i = 0; i < sel.length; i++){
             const s = mkSheet[sel[i].ref];
             if (s && s.found) dupSheet.push(sel[i]);
-            const f = await impSameFile(fileName(sel[i]));
+            const f = await impSameFile(sel[i]);
             if (f) dupFile.push({ j: sel[i], f: f });
         }
         b.disabled = false;
@@ -20975,7 +20991,9 @@
             let flag = '';
             if (s && s.found) flag += '   ⚠ JEST JUŻ W ARKUSZU (wiersz ' + s.row.row + ', ' + s.row.marketplace + ')';
             else if (s && s.similar && s.similar.length) flag += '   ⚠ w arkuszu jest podobny wpis: ' + s.similar[0].data + ' ' + s.similar[0].marketplace;
-            if (df) flag += '   ⚠ TEN PLIK BYŁ JUŻ IMPORTOWANY (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ')';
+            if (df) flag += df.f.exact
+                ? ('   ⚠ TEN PLIK BYŁ JUŻ IMPORTOWANY (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ')')
+                : ('   ⚠ tego dnia szedł już import z tego sklepu, ale na inną kwotę (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ') — sprawdź');
             return '  • ' + j.data.shop + '  ' + j.date + '  ' + n + ' zam.  ' + f2(j.data.gross) + ' ' + j.cur + '  → konto ' + (c.acct || '?') + ' (bank_setting ' + c.bank + ')' + flag;
         });
         const warn = (dupSheet.length || dupFile.length)
