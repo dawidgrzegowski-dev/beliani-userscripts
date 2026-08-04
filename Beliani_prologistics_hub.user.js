@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.65
+// @version      2.67
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17936,7 +17936,9 @@
         // Kluczem jest referencja PODE-RRRRMMDD-NNNN z tytulu przelewu, rowna dokladnie
         // polu payoutReportFileName w raporcie. Data w niej to dzien rozliczenia,
         // a nie ksiegowania — wyplaty z weekendu wplywaja w poniedzialek.
-        { mp: 'OBI',            ok: true,  payer: /OBI\s*Home/i, ref: /\b(PODE-\d{8}-\d+)\b/,
+        // Wzorzec BEZ \b na poczatku: po sklejeniu spacji referencja przykleja sie do
+        // slowa „KUNDENREFERENZ" i granica slowa miedzy „Z" a „P" nie istnieje.
+        { mp: 'OBI',            ok: true,  payer: /OBI\s*Home/i, ref: /(PODE-\d{8}-\d+)/i,
           brand: 'OBI', short: 'OBI', host: 'belianide860.myvtex.com', kind: 'vtex', shop: 'OBI DE' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
@@ -17957,7 +17959,17 @@
             if (!r.payer.test(payer)) continue;
             const base = { mp: r.mp, ok: r.ok, brand: r.brand || '', short: r.short || '',
                            host: r.host || '', kind: r.kind || 'mirakl', shop: r.shop || '' };
-            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; base.ref = m[1]; return base; }
+            if (r.ref){
+                // Wyciagi lamia dlugie opisy co kilkadziesiat znakow i wstawiaja spacje
+                // W SRODKU referencji: „PODE-2026070 1-0248" zamiast „PODE-20260701-0248".
+                // Dlatego probujemy najpierw tekstu oryginalnego, a potem sklejonego —
+                // w tej kolejnosci, bo sklejenie psuje wzorce oparte na granicy slowa
+                // (np. „VEN291390 MIRAKL" po sklejeniu przestaje pasowac).
+                const raw = String(reason || '');
+                const m = raw.match(r.ref) || raw.replace(/\s+/g, '').match(r.ref);
+                if (!m) continue;
+                base.ref = m[1]; return base;
+            }
             base.ref = ''; return base;
         }
         return null;
@@ -18386,21 +18398,30 @@
     // Brutto = grossCredit; zwrot = grossDebit. Kontrola idzie po netto, bo to ono
     // wplywa na konto — commissionAmount jest poza zakresem, tak jak prowizje Mirakla.
     function vtexAgg(rows){
-        const ord = {}, ref = {}, unknown = {}, kinds = {};
+        const ord = {}, ref = {}, unknown = {}, kinds = {}, cbs = [];
         let net = 0, gross = 0;
         (rows || []).forEach(function (x){
             const gc = Number(x.grossCredit) || 0, gd = Number(x.grossDebit) || 0;
             const nc = Number(x.netCredit) || 0,  nd = Number(x.netDebit) || 0;
             net = r2(net + nc - nd);
-            if (x.transactionType) kinds[x.transactionType] = (kinds[x.transactionType] || 0) + 1;
+            const ty = String(x.transactionType || '').trim();
+            if (ty) kinds[ty] = (kinds[ty] || 0) + 1;
             // Wiersze „adjustment" maja myslnik zamiast pustego pola — i w kwotach, i w
             // numerze zamowienia. Bez tego powstawalby order o nazwie „-".
             const id = String(x.orderId == null ? '' : x.orderId).trim();
             if (!id || id === '-'){ if (gc || gd) unknown['pozycja bez numeru zamówienia'] = (unknown['pozycja bez numeru zamówienia'] || 0) + 1; return; }
-            if (gd > 0) ref[id] = r2((ref[id] || 0) + gd);
-            else { ord[id] = r2((ord[id] || 0) + gc); gross = r2(gross + gc); }
+            // O zwrocie decyduje TYP, a nie to, w ktorej kolumnie stoi kwota. Sprawdzone
+            // na prawdziwym wierszu: „refunded" ma grossDebit 200 i netDebit 164.30,
+            // a nie ujemny grossCredit — poleganie na samej kolumnie bylo by kruche.
+            const isRef = /refund|chargeback/i.test(ty) || gd > 0;
+            const cb = String(x.chargebackType == null ? '' : x.chargebackType).trim();
+            if (cb && cb !== '-') cbs.push(id + ' (' + cb + ')');
+            if (isRef){
+                const amt = gd > 0 ? gd : Math.abs(gc);
+                if (amt) ref[id] = r2((ref[id] || 0) + amt);
+            } else { ord[id] = r2((ord[id] || 0) + gc); gross = r2(gross + gc); }
         });
-        return { ord: ord, ref: ref, unknown: unknown, kinds: kinds, net: net, gross: gross };
+        return { ord: ord, ref: ref, unknown: unknown, kinds: kinds, cbs: cbs, net: net, gross: gross };
     }
 
     // --- przelaczanie sklepow ---
@@ -19358,7 +19379,8 @@
                                unknown: a.unknown, skipped: a.kinds, full: true, both: both,
                                pays: 1, split: false, rows: rows.length, total: rows.length, pages: 1, how: '' };
                     const bad = [];
-                    j.note = '';
+                    // Obciazenie zwrotne to nie zwyczajny zwrot — warto je zobaczyc osobno.
+                    j.note = a.cbs.length ? ('obciążenia zwrotne: ' + a.cbs.join(', ')) : '';
                     if (Object.keys(a.unknown).length) bad.push('nierozpoznane pozycje w raporcie');
                     if (!eq(a.net, j.amount)) bad.push('netto z raportu ' + f2(a.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
                     j.status = bad.length ? 'partial' : 'ready';
