@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.62
+// @version      2.63
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5108,7 +5108,10 @@
         const vErr = validateBooking(items, bookingDate, accountNum);
         if (vErr) { alert(vErr); return; }
 
-        if (!confirm(`⚙️ Księgowanie równoległe\n\nPozycji: ${items.length}\nWorkerów równolegle: ${workersCount}\n× timeout: ${timeoutMult} (load=${Math.round(20*timeoutMult)}s, akcje=${Math.round(12*timeoutMult)}s)\nKonto: ${accountNum}\nData: ${bookingDate}\n\nKażdy worker pracuje we własnym iframe. Pozycje już zaksięgowane (pojedynczo lub rozbite) są pomijane.\n\nUWAGA: kilka równoległych requestów do serwera. Jeśli zauważysz błędy lub spowolnienie, zmniejsz liczbę workerów.\n\nKontynuować?`)) {
+        // Gdy uruchamia to moduł Marketplace (zwroty z kilku kont po kolei), pytanie
+        // pada raz — tam, w oknie zbiorczym. Powtarzanie go przy każdej grupie tylko
+        // zmuszałoby do klikania OK przy koncie, które i tak zostało wcześniej ustawione.
+        if (!window.__MKT_AUTO && !confirm(`⚙️ Księgowanie równoległe\n\nPozycji: ${items.length}\nWorkerów równolegle: ${workersCount}\n× timeout: ${timeoutMult} (load=${Math.round(20*timeoutMult)}s, akcje=${Math.round(12*timeoutMult)}s)\nKonto: ${accountNum}\nData: ${bookingDate}\n\nKażdy worker pracuje we własnym iframe. Pozycje już zaksięgowane (pojedynczo lub rozbite) są pomijane.\n\nUWAGA: kilka równoległych requestów do serwera. Jeśli zauważysz błędy lub spowolnienie, zmniejsz liczbę workerów.\n\nKontynuować?`)) {
             return;
         }
 
@@ -18546,6 +18549,8 @@
     const mkSel = {};
     function selOn(j){ const v = mkSel[j.ref]; return (v === undefined) ? (j.status === 'ready') : !!v; }
     function selList(){ return jobList().filter(function (j){ return j.status === 'ready' && selOn(j); }); }
+    // Paczki gotowe do zaksiegowania: zaimportowane, znany numer, jeszcze niezaksiegowane.
+    function bookList(){ return jobList().filter(function (j){ return j.status === 'done' && j.impId && !j.booked; }); }
 
     function render(){
         const out = $('#mk-out');
@@ -18567,6 +18572,7 @@
               +  (nRdy ? ('<button id="mk-sel-all"' + (nSel >= nRdy ? ' disabled' : '') + ' style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">☑ Zaznacz wszystkie</button>'
                        + '<button id="mk-sel-none"' + (nSel ? '' : ' disabled') + ' style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">☐ Odznacz wszystkie</button>') : '')
               +  (nSel ? '<span style="font-size:11px;color:#666">razem ' + f2(gs) + '</span>' : '')
+              +  (bookList().length ? ('<button id="mk-book-all" style="padding:6px 14px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">▶ Zaksięguj paczki (' + bookList().length + ')</button>') : '')
               +  (no ? '<span style="font-size:11px;color:#c47f00">' + no + ' bez bank_setting — uzupełnij w ⚙ Konta</span>' : '')
               +  '</div>';
         }
@@ -18578,6 +18584,20 @@
             const st = j.status || 'new';
             const col = st === 'done' ? '#0a7a2f' : (st === 'ready' ? '#5b21b6' : (st === 'err' ? '#c00' : (st === 'partial' ? '#c47f00' : '#666')));
             const lbl = { 'new': 'czeka na dane', 'ready': 'gotowe do importu', 'partial': 'wymaga sprawdzenia', 'done': 'zaimportowane', 'err': 'błąd', 'skip': 'poza zakresem' }[st] || st;
+            // Sciezka ma trzy kroki i latwo zgubic sie, ktory juz wykonano — zwlaszcza
+            // ze import NIE ksieguje. Dlatego kazdy wiersz pokazuje je wprost.
+            const stepDone = function (on, txt){
+                return '<span style="padding:1px 5px;border-radius:4px;font-size:10px;white-space:nowrap;'
+                     + (on ? 'background:#dcfce7;color:#166534;font-weight:700' : 'background:#f1f5f9;color:#94a3b8') + '">'
+                     + (on ? '✓ ' : '○ ') + txt + '</span>';
+            };
+            const steps = (st === 'done' || st === 'ready' || st === 'partial')
+                ? ('<div style="display:flex;gap:4px;margin-top:3px;flex-wrap:wrap">'
+                   + stepDone(st === 'done', 'zaimportowane')
+                   + stepDone(!!j.checked, 'sprawdzone')
+                   + stepDone(!!j.booked, 'zaksięgowane')
+                   + '</div>')
+                : '';
             let det = esc(j.msg || '');
             if (j.data){
                 const n = Object.keys(j.data.ord || {}).length, nr = Object.keys(j.data.ref || {}).length;
@@ -18609,7 +18629,7 @@
               +  '<td style="padding:3px 5px">' + esc(j.mp || '—') + '</td>'
               +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—') + '</td>'
               +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur) + '</td>'
-              +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + '</td>'
+              +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + steps + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
             if (onProlo && st === 'done' && !j.impId){
                 // Awaryjnie: numer paczki z adresu strony importu, wpisany recznie.
@@ -18655,6 +18675,8 @@
         });
         const ba = out.querySelector('#mk-imp-all');
         if (ba) ba.onclick = function(){ doImportAll(ba); };
+        const bk = out.querySelector('#mk-book-all');
+        if (bk) bk.onclick = function(){ bookAllPackages(bk); };
         // Zaznaczanie hurtem dotyczy tylko wierszy „gotowe do importu" — reszta i tak
         // nie ma checkboxa, wiec nie ma jej po co ruszac.
         function selAll(v){
@@ -18838,12 +18860,17 @@
             + keys.map(function (k){ return '  • ' + g[k].date + '  konto ' + g[k].acct + '  ' + g[k].rows.length + ' poz.  ' + f2(g[k].sum); }).join('\n')
             + '\n\nKażda grupa idzie przez moduł „Księgowanie w tickecie" i on jeszcze raz zapyta o potwierdzenie.')) return;
         b.disabled = true;
+        // Pytamy raz, tutaj. Na czas przelotu wyciszamy pytanie modułu ticketa —
+        // konta sa juz ustawione, wiec potwierdzanie kazdej grupy z osobna nic nie wnosi.
+        window.__MKT_AUTO = true;
         let ok = 0; const bad = [];
-        for (let i = 0; i < keys.length; i++){
-            say('Grupa ' + (i + 1) + '/' + keys.length + ' — konto ' + g[keys[i]].acct + '…');
-            const r = await bookRefunds(g[keys[i]]);
-            if (r) bad.push('konto ' + g[keys[i]].acct + ': ' + r); else ok++;
-        }
+        try {
+            for (let i = 0; i < keys.length; i++){
+                say('Grupa ' + (i + 1) + '/' + keys.length + ' — konto ' + g[keys[i]].acct + '…');
+                const r = await bookRefunds(g[keys[i]]);
+                if (r) bad.push('konto ' + g[keys[i]].acct + ': ' + r); else ok++;
+            }
+        } finally { window.__MKT_AUTO = false; }
         b.disabled = false;
         say('Zwroty: zaksięgowanych grup ' + ok + ' z ' + keys.length + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.', bad.length ? '#c47f00' : '#0a7a2f');
     }
@@ -19241,10 +19268,19 @@
                     if (home){ try { await mkSwitch(home); } catch (e){} }
                 }
             }
+            // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
+            // lepiej dowiedziec sie teraz niz przy potwierdzeniu ksiegowania.
+            const fresh = jobList().filter(function (x){ return x.status === 'ready'; });
+            if (fresh.length){
+                say('Sprawdzam w arkuszu, czy to już nie zostało zrobione…');
+                try { await shCheckJobs(fresh); } catch (e){ /* arkusz nieustawiony albo niedostepny */ }
+            }
             b.disabled = false; if (b2) b2.disabled = false;
             render();
+            const dup = fresh.filter(function (x){ const s = mkSheet[x.ref]; return s && s.found; }).length;
             const left = mkLeft(jobsLoad());
-            say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
+            if (dup) say('UWAGA: ' + dup + ' z pobranych jest już w arkuszu — sprawdź, zanim zaksięgujesz.', '#c00');
+            else say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
                 + (left ? (', nieznalezionych ' + left) : '')
                 + (problem.length ? ('. Problemy: ' + problem.join('; ')) : '.'),
                 (left || problem.length) ? '#c47f00' : '#0a7a2f');
@@ -19406,7 +19442,10 @@
             bb.disabled = true; m.style.color = '#666'; m.textContent = 'księguję…';
             try {
                 await impBook(job.impId, ok.map(function (x){ return x.id; }));
+                const jobs = jobsLoad();
+                if (jobs[job.ref]){ jobs[job.ref].booked = true; jobs[job.ref].checked = true; jobsSave(jobs); }
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję wynik…';
+                render();
                 await impCheck(job.ref);                 // stan po ksiegowaniu, prosto z systemu
             } catch (e){
                 m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
@@ -19415,13 +19454,68 @@
         };
     }
 
+    // Zbiorcze ksiegowanie paczek. Kazda paczka jest najpierw ODCZYTYWANA, wiec ksiegujemy
+    // to, co system faktycznie ma za OK — a nie to, co wysylalismy. Pozycje CHECK i NOT FOUND
+    // zostaja nietkniete i trafiaja do podsumowania.
+    async function bookAllPackages(b){
+        const list = bookList();
+        if (!list.length) return;
+        b.disabled = true;
+        const plan = [];
+        say('Czytam ' + list.length + ' paczek…');
+        for (let i = 0; i < list.length; i++){
+            try {
+                const d = await impRows(list[i].impId);
+                const ok = d.rows.filter(function (x){ return String(x.state) === 'OK'; });
+                const chk = d.rows.filter(function (x){ return String(x.state) === 'CHECK'; }).length;
+                const nf = d.rows.filter(function (x){ return String(x.state) === 'NOT FOUND'; }).length;
+                const dup = d.rows.filter(function (x){ return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; }).length;
+                plan.push({ j: list[i], ok: ok, chk: chk, nf: nf, dup: dup });
+            } catch (e){ plan.push({ j: list[i], err: (e && e.message) || String(e) }); }
+        }
+        const good = plan.filter(function (p){ return p.ok && p.ok.length; });
+        if (!good.length){ b.disabled = false; say('Nie ma czego księgować — żadna paczka nie ma pozycji OK.', '#c47f00'); render(); return; }
+        const txt = plan.map(function (p){
+            if (p.err) return '  • paczka ' + p.j.impId + ' — BŁĄD ODCZYTU: ' + p.err;
+            return '  • paczka ' + p.j.impId + '  ' + (p.j.data ? p.j.data.shop : '') + '  OK ' + p.ok.length
+                 + (p.chk ? (', CHECK ' + p.chk) : '') + (p.nf ? (', NOT FOUND ' + p.nf) : '')
+                 + (p.dup ? ('   ⚠ ' + p.dup + ' już znanych systemowi') : '');
+        }).join('\n');
+        if (!confirm('Zaksięgować pozycje OK z ' + good.length + ' paczek?\n\n' + txt
+            + '\n\nCHECK i NOT FOUND zostaną nietknięte.\nOdpowiada to przyciskowi „Book on main account".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')){
+            b.disabled = false; return;
+        }
+        let done = 0; const bad = [];
+        for (let i = 0; i < good.length; i++){
+            const p = good[i];
+            say('Księguję paczkę ' + (i + 1) + '/' + good.length + ' — ' + p.j.impId + '…');
+            try {
+                await impBook(p.j.impId, p.ok.map(function (x){ return x.id; }));
+                const jobs = jobsLoad();
+                if (jobs[p.j.ref]){
+                    jobs[p.j.ref].booked = true;
+                    jobs[p.j.ref].checked = true;
+                    jobs[p.j.ref].msg = String(jobs[p.j.ref].msg || '') + ' · zaksięgowane ' + p.ok.length + ' poz.';
+                    jobsSave(jobs);
+                }
+                done++;
+            } catch (e){ bad.push(p.j.impId + ': ' + ((e && e.message) || e)); }
+            render();
+        }
+        b.disabled = false;
+        say('Zaksięgowanych paczek ' + done + ' z ' + good.length + (bad.length ? ('. Nie poszło: ' + bad.join('; ')) : '.'), bad.length ? '#c00' : '#0a7a2f');
+    }
+
     async function impCheck(ref){
         const j = jobsLoad()[ref];
         if (!j || !j.impId){ say('Ta pozycja nie ma numeru paczki — otwórz Import payments ręcznie.', '#c47f00'); return; }
         say('Czytam paczkę ' + j.impId + '…');
         try {
             const d = await impRows(j.impId);
+            const jobs = jobsLoad();
+            if (jobs[ref]){ jobs[ref].checked = true; jobsSave(jobs); }
             impRender(j, d);
+            render();
             const n = d.rows.filter(function (x){ return String(x.state) === 'OK'; }).length;
             say('Paczka ' + j.impId + ': ' + d.rows.length + ' wierszy, OK ' + n + '.', '#0a7a2f');
         } catch (e){ say('Nie mogę odczytać paczki: ' + ((e && e.message) || e), '#c00'); }
