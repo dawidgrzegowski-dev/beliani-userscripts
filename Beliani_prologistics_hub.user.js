@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.85
+// @version      2.86
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23,6 +23,8 @@
 // @connect      myvtex.com
 // @connect      galaxus.ch
 // @connect      wayfair.com
+// @connect      storage.googleapis.com
+// @connect      googleapis.com
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
@@ -18944,14 +18946,31 @@
         }
         return out;
     }
+    // Podpisany link prowadzi do magazynu Google (stad „Gcs" w nazwie zapytania), a nie
+    // do wayfair.com — potrzebuje wiec wlasnego @connect. Ma tez wlasna obsluge bledu,
+    // bo wspolny gmGet ma w komunikacie zaszyta nazwe hosta Mirakla i przy blokadzie
+    // pokazywal „nie mogę połączyć się z venteunique-prod.mirakl.net", co mylilo trop.
+    function wayfGet(url){
+        const host = String(url || '').split('/')[2] || 'magazyn pliku';
+        return new Promise(function (resolve, reject){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 90000,
+                onload: function (r){ resolve(r); },
+                onerror: function (){ reject(new Error('nie mogę pobrać pliku z ' + host
+                    + ' — jeśli to nowy adres, dopisz go do @connect w nagłówku skryptu')); },
+                ontimeout: function (){ reject(new Error(host + ' nie odpowiedział na czas')); }
+            });
+        });
+    }
     async function wayfCsv(paymentId){
         const sup = parseInt(await wayfSupplier(), 10);
         const d = await wayfGql('getSupplierReceivableGcsSignedUrl', WAYF_Q_URL,
             { input: { paymentId: String(paymentId), supplierId: sup } });
         const u = d.supplierReceivableGcsSignedUrl || {};
         if (!u.signedUrl) throw new Error('Wayfair nie oddał linku do pliku' + (u.errorMessage ? (' — ' + u.errorMessage) : ''));
-        const r = await gmGet(u.signedUrl, {});
-        if (r.status !== 200) throw new Error('pobieranie rozliczenia: HTTP ' + r.status);
+        const r = await wayfGet(u.signedUrl);
+        if (r.status !== 200) throw new Error('pobieranie rozliczenia z ' + (String(u.signedUrl).split('/')[2] || '?') + ': HTTP ' + r.status);
         return String(r.responseText || '');
     }
     // Wspolne dla obu drog — portalu i pliku wgranego recznie: przepisanie rozliczenia
@@ -21012,8 +21031,11 @@
         // przelewu, wiec dopasowujemy po KWOCIE, zawezajac data — a numer faktury
         // z przelewu sluzy potem do potwierdzenia, ze trafilismy w to rozliczenie.
         async function wayfPass(jobs){
+            // Bierzemy takze zlecenia z bledem. Tu najczestsza przyczyna jest przejsciowa
+            // (zerwane polaczenie, wygasla sesja w portalu), a bez tego jedyna droga
+            // powrotu byloby wyczyszczenie WSZYSTKICH zlecen i wgranie wyciagu od nowa.
             const left = Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'wayf' && jobs[k].status === 'new';
+                return jobs[k].kind === 'wayf' && (jobs[k].status === 'new' || jobs[k].status === 'err');
             });
             if (!left.length) return 0;
             // Jedno zapytanie na caly przelot: zakres rozciagamy na wszystkie czekajace
@@ -21075,7 +21097,7 @@
         }
         function wayfLeft(jobs){
             return Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'wayf' && jobs[k].status === 'new' && jobs[k].ref;
+                return jobs[k].kind === 'wayf' && (jobs[k].status === 'new' || jobs[k].status === 'err') && jobs[k].ref;
             }).length;
         }
         // Ktore platformy wystepuja wsrod czekajacych zlecen — osobno Mirakl (sklepy
