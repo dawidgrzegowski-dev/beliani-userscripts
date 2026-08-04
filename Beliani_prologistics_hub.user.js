@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.63
+// @version      2.65
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19,6 +19,7 @@
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
 // @connect      mirakl.net
+// @connect      myvtex.com
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
@@ -17931,6 +17932,12 @@
         // z tytulu: „PAYOUT FOR INVOICE 318628 FOR SHOP 3481".
         { mp: 'Mirakl (Home24)', ok: true, payer: /HOME\s?24/i, ref: /INVOICE\s+(\d+)/i,
           brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        // OBI to nie Mirakl, tylko VTEX — inne API (GraphQL), wiec ma wlasna sciezke.
+        // Kluczem jest referencja PODE-RRRRMMDD-NNNN z tytulu przelewu, rowna dokladnie
+        // polu payoutReportFileName w raporcie. Data w niej to dzien rozliczenia,
+        // a nie ksiegowania — wyplaty z weekendu wplywaja w poniedzialek.
+        { mp: 'OBI',            ok: true,  payer: /OBI\s*Home/i, ref: /\b(PODE-\d{8}-\d+)\b/,
+          brand: 'OBI', short: 'OBI', host: 'belianide860.myvtex.com', kind: 'vtex', shop: 'OBI DE' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -17948,8 +17955,10 @@
         for (let i = 0; i < MK_RULES.length; i++){
             const r = MK_RULES[i];
             if (!r.payer.test(payer)) continue;
-            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; return { mp: r.mp, ok: r.ok, ref: m[1], brand: r.brand || '', short: r.short || '', host: r.host || '' }; }
-            return { mp: r.mp, ok: r.ok, ref: '', brand: r.brand || '', short: r.short || '', host: r.host || '' };
+            const base = { mp: r.mp, ok: r.ok, brand: r.brand || '', short: r.short || '',
+                           host: r.host || '', kind: r.kind || 'mirakl', shop: r.shop || '' };
+            if (r.ref){ const m = String(reason || '').match(r.ref); if (!m) continue; base.ref = m[1]; return base; }
+            base.ref = ''; return base;
         }
         return null;
     }
@@ -17975,17 +17984,75 @@
         if (f !== '' || row.length) { row.push(f); rows.push(row); }
         return rows;
     }
+    // UBS pisze 1'234.56, Postbank 1.234,56 — te same znaki znacza co innego.
+    // Rozstrzyga KOLEJNOSC: jesli przecinek stoi po kropce, to on jest przecinkiem
+    // dziesietnym, a kropki sa tysiacami. Bez tego „1.749,69" czytalo sie jako 1.749.
     function mkNum(s){
-        const t = String(s == null ? '' : s).replace(/[\s'’]/g, '');
+        let t = String(s == null ? '' : s).replace(/[\s'’ ]/g, '');
         if (!t || !/\d/.test(t)) return null;
-        const v = parseFloat(t.replace(',', '.'));
+        const dot = t.lastIndexOf('.'), com = t.lastIndexOf(',');
+        if (com > dot) t = t.replace(/\./g, '').replace(',', '.');   // zapis niemiecki
+        else t = t.replace(/,/g, '');                                // zapis angielski
+        const v = parseFloat(t);
         return isFinite(v) ? v : null;
     }
+    // Wyciagi bywaja w UTF-16 (Postbank), a wtedy odczyt jako UTF-8 daje tekst
+    // z zerami miedzy znakami. Rozpoznajemy po znaczniku albo po samych zerach.
+    function mkDecode(buf){
+        const b = new Uint8Array(buf);
+        if (b.length > 1 && b[0] === 0xFF && b[1] === 0xFE) return new TextDecoder('utf-16le').decode(buf);
+        if (b.length > 1 && b[0] === 0xFE && b[1] === 0xFF) return new TextDecoder('utf-16be').decode(buf);
+        let z = 0, n = Math.min(b.length, 600);
+        for (let i = 1; i < n; i += 2) if (b[i] === 0) z++;
+        if (z > n / 4) return new TextDecoder('utf-16le').decode(buf);
+        return new TextDecoder('utf-8').decode(buf);
+    }
+    // Postbank „Umsatzliste": Kontonummer;Buchungsdatum;Valuta;Verwendungszweck;Betrag;Waehrung
+    // Jedna kolumna kwoty ze znakiem, platnik i tytul razem w Verwendungszweck.
+    function mkParsePostbank(rows, hi){
+        const hdr = rows[hi].map(function (h){ return String(h || '').trim().toLowerCase(); });
+        const iD = hdr.indexOf('buchungsdatum'), iT = hdr.indexOf('verwendungszweck'),
+              iA = hdr.indexOf('betrag'), iC = hdr.indexOf('waehrung');
+        if (iD < 0 || iT < 0 || iA < 0) return { err: 'w nagłówku Postbank brakuje kolumn Buchungsdatum / Verwendungszweck / Betrag' };
+        const out = [];
+        for (let i = hi + 1; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || !r.join('').trim()) continue;
+            const amt = mkNum(r[iA]);
+            if (amt == null || amt <= 0) continue;                    // tylko wplaty
+            const t = String(r[iT] || '').replace(/\s+/g, ' ').trim();
+            // Platnik to poczatek opisu, do slowa kluczowego; reszta jest tytulem.
+            const payer = t.replace(/^(?:SEPA-GUTSCHRIFT|ECHTZEITGUTSCHRIFT|GUTSCHRIFT)\s+/i, '')
+                           .replace(/^IM\s+AUFTR\.?V\.?\s+/i, '')
+                           .split(/\s+KUNDENREFERENZ\s+/i)[0].trim();
+            const dRaw = String(r[iD] || '').trim();
+            out.push({
+                date: mkIso(dRaw) || dRaw, cur: String(r[iC] || 'EUR').trim(),
+                amount: r2(amt), payer: payer, reason: t, txId: ''
+            });
+        }
+        return { rows: out };
+    }
+
     function mkParseBank(text){
         const rows = mkCsvRows(text);
-        let hi = -1;
-        for (let i = 0; i < rows.length && i < 60; i++){ if (/^Trade date$/i.test(String(rows[i][0] || '').trim())) { hi = i; break; } }
-        if (hi < 0) return { err: 'nie znalazłem nagłówka „Trade date" — czy to na pewno wyciąg UBS w CSV?' };
+        let hi = -1, kind = '';
+        for (let i = 0; i < rows.length && i < 60; i++){
+            const c0 = String(rows[i][0] || '').trim();
+            if (/^Trade date$/i.test(c0)) { hi = i; kind = 'ubs'; break; }
+            if (/^Kontonummer$/i.test(c0)) { hi = i; kind = 'postbank'; break; }
+        }
+        if (kind === 'postbank'){
+            const p = mkParsePostbank(rows, hi);
+            if (p.err) return p;
+            p.rows.forEach(function (x){
+                const d = mkDetect(x.payer, x.reason);
+                x.mp = d ? d.mp : ''; x.ok = !!(d && d.ok); x.ref = d ? d.ref : '';
+                x.brand = d ? (d.brand || '') : ''; x.short = d ? (d.short || '') : ''; x.host = d ? (d.host || '') : '';
+            });
+            return p;
+        }
+        if (hi < 0) return { err: 'nie rozpoznaję nagłówka — obsługuję wyciągi UBS („Trade date") i Postbank („Kontonummer")' };
         const hdr = rows[hi].map(function (h){ return String(h || '').trim().toLowerCase(); });
         const ix = {};
         ['booking date', 'currency', 'debit', 'credit', 'transaction no.', 'description1', 'description3'].forEach(function (k){ ix[k] = hdr.indexOf(k); });
@@ -18009,7 +18076,8 @@
                 amount: r2(cr), payer: payer, reason: reason,
                 txId: String(r[ix['transaction no.']] || '').trim(),
                 mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : '',
-                brand: d ? (d.brand || '') : '', short: d ? (d.short || '') : '', host: d ? (d.host || '') : ''
+                brand: d ? (d.brand || '') : '', short: d ? (d.short || '') : '', host: d ? (d.host || '') : '',
+                kind: d ? (d.kind || 'mirakl') : '', shop: d ? (d.shop || '') : ''
             });
         }
         return { rows: out };
@@ -18265,6 +18333,74 @@
             if (near.length === 1) return near[0];
         }
         return mkMatchIn(list || [], ref);
+    }
+
+    // ================= OBI / VTEX =================
+    // Zupelnie inna platforma niz Mirakl: jedno GraphQL zamiast listy cykli, bez sklepow
+    // do przelaczania. Zapytanie jest „utrwalone" (persisted query) — wysylamy sam skrot
+    // i zmienne w base64, dokladnie tak jak robi to ich wlasny panel.
+    const MK_VTEX_HASH = '0d6454a77362f9ca03196fca44c33dd3aa8cd53e367262a5be9a2e4f6b404261';
+    const MK_VTEX_APP  = 'obi.seller-financial-commission@3.x';
+    function gmPost(url, body, hdrs){
+        return new Promise(function (resolve, reject){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({ method: 'POST', url: url, headers: hdrs || {}, data: body, timeout: 90000,
+                onload: function (r){ resolve(r); },
+                onerror: function (){ reject(new Error('nie mogę połączyć się z ' + url.split('/')[2])); },
+                ontimeout: function (){ reject(new Error(url.split('/')[2] + ' nie odpowiedział na czas')); } });
+        });
+    }
+    function mkShift(iso, days){
+        const t = mkDay(iso);
+        if (t == null) return iso;
+        const d = new Date(t + days * 86400000);
+        return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate());
+    }
+    async function vtexReports(host, from, to){
+        const vars = btoa(JSON.stringify({ params: { sellerId: '', dates: { startDate: from, endDate: to },
+                                                     pagination: { page: 1, pageSize: 100 } } }));
+        const body = JSON.stringify({ operationName: 'GET_PAYOUT_REPORTS', variables: {},
+            extensions: { persistedQuery: { version: 1, sha256Hash: MK_VTEX_HASH, sender: MK_VTEX_APP, provider: MK_VTEX_APP },
+                          variables: vars } });
+        const path = '/_v/private/graphql/v1?workspace=master&maxAge=long&appsEtag=remove&domain=admin&locale=de-DE';
+        let txt = '', code = 0;
+        if (location.hostname === host){
+            const r = await fetch(path, { method: 'POST', credentials: 'same-origin',
+                headers: { 'content-type': 'application/json' }, body: body });
+            code = r.status; txt = await r.text();
+        } else {
+            const r = await gmPost('https://' + host + path, body, { 'content-type': 'application/json', 'accept': '*/*' });
+            code = r.status; txt = String(r.responseText || '');
+        }
+        if (code < 200 || code >= 300) throw new Error('HTTP ' + code + ' na ' + host);
+        let j = null;
+        try { j = JSON.parse(txt); } catch (e){ throw new Error('z ' + host + ' przyszedł nie-JSON — zaloguj się tam w przeglądarce'); }
+        const d = j && j.data && j.data.searchPayoutReport;
+        return (d && Array.isArray(d.data)) ? d.data : [];
+    }
+    // Pozycje raportu siedza w polu jsonData jako TEKST z JSON-em w srodku.
+    function vtexRows(rep){
+        try { const a = JSON.parse(rep.jsonData || '[]'); return Array.isArray(a) ? a : []; }
+        catch (e){ return []; }
+    }
+    // Brutto = grossCredit; zwrot = grossDebit. Kontrola idzie po netto, bo to ono
+    // wplywa na konto — commissionAmount jest poza zakresem, tak jak prowizje Mirakla.
+    function vtexAgg(rows){
+        const ord = {}, ref = {}, unknown = {}, kinds = {};
+        let net = 0, gross = 0;
+        (rows || []).forEach(function (x){
+            const gc = Number(x.grossCredit) || 0, gd = Number(x.grossDebit) || 0;
+            const nc = Number(x.netCredit) || 0,  nd = Number(x.netDebit) || 0;
+            net = r2(net + nc - nd);
+            if (x.transactionType) kinds[x.transactionType] = (kinds[x.transactionType] || 0) + 1;
+            // Wiersze „adjustment" maja myslnik zamiast pustego pola — i w kwotach, i w
+            // numerze zamowienia. Bez tego powstawalby order o nazwie „-".
+            const id = String(x.orderId == null ? '' : x.orderId).trim();
+            if (!id || id === '-'){ if (gc || gd) unknown['pozycja bez numeru zamówienia'] = (unknown['pozycja bez numeru zamówienia'] || 0) + 1; return; }
+            if (gd > 0) ref[id] = r2((ref[id] || 0) + gd);
+            else { ord[id] = r2((ord[id] || 0) + gc); gross = r2(gross + gc); }
+        });
+        return { ord: ord, ref: ref, unknown: unknown, kinds: kinds, net: net, gross: gross };
     }
 
     // --- przelaczanie sklepow ---
@@ -18882,7 +19018,7 @@
             if (!f) return;
             const rd = new FileReader();
             rd.onload = function(){
-                const p = mkParseBank(String(rd.result || ''));
+                const p = mkParseBank(mkDecode(rd.result));
                 if (p.err){ say(p.err, '#c00'); return; }
                 const jobs = jobsLoad();
                 let add = 0, known = 0, other = 0;
@@ -18892,14 +19028,14 @@
                     known++;
                     const k = r.ref || (r.txId || (r.date + '_' + r.amount));
                     if (jobs[k] && jobs[k].status === 'done') return;
-                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                    if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
                 });
                 jobsSave(jobs);
                 say('Wczytano: ' + p.rows.length + ' wpłat, rozpoznanych obsługiwanych ' + known + ' (nowych zleceń ' + add + ')'
                     + (other ? (', pozostałych marketplace’ów ' + other + ' — na razie poza zakresem') : '') + '.', '#0a7a2f');
                 render();
             };
-            rd.readAsText(f, 'utf-8');
+            rd.readAsArrayBuffer(f);     // kodowanie rozpoznajemy sami — bywa UTF-16
             try { this.value = ''; } catch (e){}
         };
         $('#mk-clear').onclick = function(){
@@ -19186,24 +19322,76 @@
             }
             return ok;
         }
+        // Przejscie dla VTEX. Referencja z przelewu rowna sie nazwie raportu, wiec nie ma
+        // tu zadnego zgadywania po dacie — albo trafiamy dokladnie, albo wcale.
+        // Okno dat jest szerokie wstecz, bo data w referencji to dzien rozliczenia,
+        // a przelew ksieguje sie pozniej (weekend wplywa w poniedzialek).
+        async function vtexPass(jobs, host){
+            const todo = Object.keys(jobs).filter(function (k){
+                return jobs[k].status === 'new' && jobs[k].ref && jobs[k].kind === 'vtex' && (jobs[k].host || '') === host;
+            });
+            if (!todo.length) return 0;
+            let from = '9999-12-31', to = '0000-01-01';
+            todo.forEach(function (k){
+                const d = jobs[k].date;
+                if (mkShift(d, -10) < from) from = mkShift(d, -10);
+                if (mkShift(d, 2) > to) to = mkShift(d, 2);
+            });
+            say(host + ' — pobieram raporty ' + from + ' … ' + to + '…');
+            let reps;
+            try { reps = await vtexReports(host, from, to); }
+            catch (e){ say('OBI: ' + ((e && e.message) || e), '#c00'); return 0; }
+
+            let ok = 0;
+            for (let i = 0; i < todo.length; i++){
+                const j = jobs[todo[i]];
+                const rep = reps.filter(function (r){ return String(r.payoutReportFileName || '').trim() === j.ref; })[0];
+                if (!rep) continue;
+                try {
+                    const rows = vtexRows(rep);
+                    const a = vtexAgg(rows);
+                    const nRef = Object.keys(a.ref).length;
+                    let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + a.ref[k]); });
+                    const both = Object.keys(a.ord).filter(function (k){ return a.ref[k] != null; });
+                    j.data = { cycle: rep.id, shop: j.shop || 'OBI', gross: a.gross, refund: refund,
+                               net: a.net, netOk: eq(a.net, j.amount), ord: a.ord, ref: a.ref,
+                               unknown: a.unknown, skipped: a.kinds, full: true, both: both,
+                               pays: 1, split: false, rows: rows.length, total: rows.length, pages: 1, how: '' };
+                    const bad = [];
+                    j.note = '';
+                    if (Object.keys(a.unknown).length) bad.push('nierozpoznane pozycje w raporcie');
+                    if (!eq(a.net, j.amount)) bad.push('netto z raportu ' + f2(a.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+                    j.status = bad.length ? 'partial' : 'ready';
+                    j.msg = bad.join('; ');
+                    ok++;
+                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                jobsSave(jobs); render();
+            }
+            return ok;
+        }
+
         function mkLeft(jobs, host){
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
                 if (j.status !== 'new' || !j.ref) return false;
+                if ((j.kind || 'mirakl') !== 'mirakl') return host ? false : true;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
             }).length;
         }
-        // Ktore platformy w ogole wystepuja wsrod czekajacych zlecen.
-        function mkHosts(jobs){
+        // Ktore platformy wystepuja wsrod czekajacych zlecen — osobno Mirakl (sklepy
+        // do przelaczania) i VTEX (jedno zapytanie, bez sklepow).
+        function mkHostsOf(jobs, kind){
             const o = {}, out = [];
             Object.keys(jobs).forEach(function (k){
                 const j = jobs[k];
                 if (j.status !== 'new' || !j.ref) return;
-                const h = j.host || 'venteunique-prod.mirakl.net';
-                if (!o[h]){ o[h] = 1; out.push(h); }
+                if ((j.kind || 'mirakl') !== kind) return;
+                const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
+                if (h && !o[h]){ o[h] = 1; out.push(h); }
             });
             return out;
         }
+        function mkHosts(jobs){ return mkHostsOf(jobs, 'mirakl'); }
         async function mkShopName(){ const s = await mkShop(); return String(s.name || s.shopName || ''); }
 
         const bRun = $('#mk-run'), bAll = $('#mk-all');
@@ -19227,9 +19415,10 @@
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             const hosts = onMirakl ? [location.hostname] : mkHosts(jobs);
-            if (!hosts.length){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-            if (!confirm('Pobrać ' + mkLeft(jobs) + ' rozliczeń z ' + hosts.length + ' platform?\n\n'
-                + hosts.map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; }).join('\n')
+            const vhosts = onMirakl ? [] : mkHostsOf(jobs, 'vtex');
+            if (!hosts.length && !vhosts.length){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            if (!confirm('Pobrać ' + mkLeft(jobs) + ' rozliczeń z ' + (hosts.length + vhosts.length) + ' platform?\n\n'
+                + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; }).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -19267,6 +19456,11 @@
                     // sesje na przypadkowym sklepie, a strona pokazywalaby stary.
                     if (home){ try { await mkSwitch(home); } catch (e){} }
                 }
+            }
+            // VTEX osobno: bez sklepow i bez przelaczania, jedno zapytanie na platforme.
+            for (let vi = 0; vi < vhosts.length; vi++){
+                try { ok += await vtexPass(jobsLoad(), vhosts[vi]); }
+                catch (e){ problem.push(vhosts[vi] + ': ' + ((e && e.message) || e)); }
             }
             // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
             // lepiej dowiedziec sie teraz niz przy potwierdzeniu ksiegowania.
