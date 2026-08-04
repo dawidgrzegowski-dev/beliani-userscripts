@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.71
+// @version      2.72
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -31,6 +31,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_setClipboard
+// @grant        GM_cookie
 // @run-at       document-idle
 // @updateURL   https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
 // @downloadURL https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
@@ -17640,8 +17641,10 @@
     const onMirakl = /(^|\.)mirakl\.net$/i.test(location.hostname);
     const onVtex   = /(^|\.)myvtex\.com$/i.test(location.hostname);
     if (!onProlo && !onMirakl && !onVtex) return;
-    // Na stronach jednostronicowych modul potrafi wystartowac drugi raz przy zmianie
-    // widoku — bez tej blokady na ekranie robily sie dwa te same przyciski.
+    // Dwa te same przyciski braly sie stad, ze panel VTEX osadza aplikacje w ramce —
+    // skrypt startowal i w oknie glownym, i w ramce, a kazde ma wlasny dokument, wiec
+    // sprawdzanie samego identyfikatora nic nie dawalo. Pracujemy tylko w oknie glownym.
+    if (window.top !== window.self) return;
     if (document.getElementById('mkt-btn')) return;
 
     const MK_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
@@ -18069,6 +18072,9 @@
                 const d = mkDetect(x.payer, x.reason);
                 x.mp = d ? d.mp : ''; x.ok = !!(d && d.ok); x.ref = d ? d.ref : '';
                 x.brand = d ? (d.brand || '') : ''; x.short = d ? (d.short || '') : ''; x.host = d ? (d.host || '') : '';
+                // BEZ tych dwoch pol zlecenia OBI mialy host, ale nie mialy rodzaju —
+                // a po nim wlasnie filtruje sie przejscie VTEX. Efekt: cisza zamiast bledu.
+                x.kind = d ? (d.kind || 'mirakl') : ''; x.shop = d ? (d.shop || '') : '';
             });
             return p;
         }
@@ -18362,6 +18368,20 @@
     const MK_VTEX_HASH = '0d6454a77362f9ca03196fca44c33dd3aa8cd53e367262a5be9a2e4f6b404261';
     const MK_VTEX_APP  = 'obi.seller-financial-commission@3.x';
     const MK_VTEX_BIND = '22f42e19-58d2-4e2a-86e6-64f9ad6df768';
+    // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
+    // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
+    // docelowej i wysylamy WYLACZNIE do niej. Nigdzie tego nie zapisujemy.
+    function gmCookies(url){
+        return new Promise(function (resolve){
+            try {
+                if (typeof GM_cookie === 'undefined' || !GM_cookie.list){ resolve(''); return; }
+                GM_cookie.list({ url: url }, function (arr, err){
+                    if (err || !Array.isArray(arr) || !arr.length){ resolve(''); return; }
+                    resolve(arr.map(function (c){ return c.name + '=' + c.value; }).join('; '));
+                });
+            } catch (e){ resolve(''); }
+        });
+    }
     function gmPost(url, body, hdrs){
         return new Promise(function (resolve, reject){
             if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
@@ -18395,8 +18415,11 @@
                     headers: { 'content-type': 'application/json' }, body: body });
                 code = r.status; txt = await r.text();
             } else {
-                const r = await gmPost('https://' + host + paths[i], body,
-                    { 'content-type': 'application/json', 'accept': '*/*' });
+                const ck = await gmCookies('https://' + host + '/');
+                const hh = { 'content-type': 'application/json', 'accept': '*/*',
+                             'referer': 'https://' + host + '/admin/commission-report/detail' };
+                if (ck) hh['cookie'] = ck;
+                const r = await gmPost('https://' + host + paths[i], body, hh);
                 code = r.status; txt = String(r.responseText || '');
             }
             if (code !== 404) break;
@@ -18410,8 +18433,38 @@
     }
     // Pozycje raportu siedza w polu jsonData jako TEKST z JSON-em w srodku.
     function vtexRows(rep){
+        if (Array.isArray(rep.rows)) return rep.rows;              // z odlozonej kopii
         try { const a = JSON.parse(rep.jsonData || '[]'); return Array.isArray(a) ? a : []; }
         catch (e){ return []; }
+    }
+    // Odkladamy zestawienia, gdy jestes na stronie OBI — wtedy praca z prologistics
+    // dziala takze wtedy, gdy sesja nie przechodzi miedzy domenami. Trzymamy tylko pola,
+    // ktorych uzywamy, zeby nie zapychac pamieci calymi raportami.
+    const MK_VTEX_CACHE = 'mkt_vtex_reports';
+    function vtexCacheSave(host, reps){
+        const all = mapGet(MK_VTEX_CACHE);
+        const box = all[host] || {};
+        reps.forEach(function (r){
+            const nm = String(r.payoutReportFileName || '').trim();
+            if (!nm) return;
+            box[nm] = { id: r.id, rows: vtexRows(r).map(function (x){
+                return { orderId: x.orderId, grossCredit: x.grossCredit, grossDebit: x.grossDebit,
+                         netCredit: x.netCredit, netDebit: x.netDebit,
+                         transactionType: x.transactionType, chargebackType: x.chargebackType };
+            }) };
+        });
+        // ograniczamy do 80 najnowszych nazw, zeby pamiec nie rosla bez konca
+        const names = Object.keys(box).sort().slice(-80);
+        const trimmed = {};
+        names.forEach(function (n){ trimmed[n] = box[n]; });
+        all[host] = trimmed;
+        try { GM_setValue(MK_VTEX_CACHE, JSON.stringify(all)); } catch (e){}
+    }
+    function vtexCacheGet(host){
+        const box = mapGet(MK_VTEX_CACHE)[host] || {};
+        return Object.keys(box).map(function (n){
+            return { payoutReportFileName: n, id: box[n].id, rows: box[n].rows };
+        });
     }
     // Brutto = grossCredit; zwrot = grossDebit. Kontrola idzie po netto, bo to ono
     // wplywa na konto — commissionAmount jest poza zakresem, tak jak prowizje Mirakla.
@@ -19394,9 +19447,17 @@
                 if (mkShift(d, 2) > to) to = mkShift(d, 2);
             });
             say(host + ' — pobieram raporty ' + from + ' … ' + to + '…');
-            let reps;
-            try { reps = await vtexReports(host, from, to); }
-            catch (e){ say('OBI: ' + ((e && e.message) || e), '#c00'); return 0; }
+            let reps = null, fromCache = false;
+            try {
+                reps = await vtexReports(host, from, to);
+                if (location.hostname === host) vtexCacheSave(host, reps);   // odkladamy na potem
+            } catch (e){
+                // Zapas: zestawienia odlozone przy ostatniej wizycie na stronie OBI.
+                reps = vtexCacheGet(host);
+                fromCache = true;
+                if (!reps.length){ say('OBI: ' + ((e && e.message) || e), '#c00'); return 0; }
+                say('OBI: nie mogę zapytać wprost, używam zestawień odłożonych przy ostatniej wizycie (' + reps.length + ').', '#c47f00');
+            }
             // Bez tego przy braku dopasowania zostawala cisza: nie bylo wiadomo, czy
             // raportow nie ma, czy sa, ale pod innymi nazwami niz referencja z przelewu.
             const names = reps.map(function (r){ return String(r.payoutReportFileName || '(bez nazwy)'); });
@@ -19404,6 +19465,7 @@
                 say('OBI: w okresie ' + from + ' … ' + to + ' nie ma żadnych raportów — sprawdź zakres dat w panelu OBI.', '#c47f00');
                 return 0;
             }
+            void fromCache;
 
             let ok = 0;
             for (let i = 0; i < todo.length; i++){
