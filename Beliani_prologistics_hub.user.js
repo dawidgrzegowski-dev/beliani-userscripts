@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.86
+// @version      2.87
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -3974,6 +3974,35 @@
         await sleep(1500);
         return { ok: true };
     }
+
+    // Most dla modułu „Księgowanie Marketplace's". Po zaksięgowaniu zwrotu potrafi on
+    // dopisać do ticketu opis potrącenia z rozliczenia — ale całego szukania ticketu
+    // nie ma po co pisać drugi raz, bo druga implementacja tego samego prędzej czy
+    // później rozjedzie się z pierwszą. Wystawiamy więc TO JEDNO działanie.
+    // Pracuje we własnej ramce, żeby nie wchodzić w drogę temu, co akurat robi panel.
+    window.__TM_TICKET_COMMENT = async function (ffNumber, text) {
+        const ff = String(ffNumber || '').trim();
+        const body = String(text || '').trim();
+        if (!ff || !body) return { ok: false, error: 'brak numeru zamówienia albo treści komentarza' };
+        const ctx = createFrameCtx();
+        try {
+            const found = await findBestTicketForOrder(ff, ctx);
+            // Gdy nie ma ticketu „poprawnego" (Solution=7 + credit note), komentarz i tak
+            // ma sens — bierzemy wtedy najlepszego kandydata, którego moduł już obejrzał.
+            const href = (found.ok && found.ticket && found.ticket.href)
+                      || (found.noSolutionTickets && found.noSolutionTickets[0] && found.noSolutionTickets[0].href)
+                      || '';
+            if (!href) return { ok: false, error: found.error || 'nie znalazłem ticketu dla ' + ff };
+            await loadInFrame(href, 20000, ctx);
+            await sleep(600);
+            const r = await addEscalationComment(ctx, body);
+            return r.ok ? { ok: true, href: href } : { ok: false, error: r.error, href: href };
+        } catch (e) {
+            return { ok: false, error: (e && e.message) || String(e) };
+        } finally {
+            destroyFrameCtx(ctx);
+        }
+    };
 
     async function reassignTicketToUser(ctx, ticketHref, openedByName) {
         // v3.19: WRACAMY do zawsze-reload (jak v3.13). Conditional reload (v3.14 Opt #2)
@@ -18979,7 +19008,8 @@
         const both = Object.keys(p.ord).filter(function (k){ return p.ref[k] != null; });
         j.data = { wayf: p, shop: j.shop || MK_WAYF_SHOP, gross: p.gross, refund: p.refund,
                    net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
-                   refNote: p.refNote, unknown: {}, skipped: {}, full: true, both: both,
+                   refNote: p.refNote, credits: p.credits, unknown: {}, skipped: {},
+                   full: true, both: both,
                    pays: 1, split: false, rows: p.nPos, total: p.nPos, pages: 1, how: how };
         const bad = [];
         if (!eq(p.net, j.amount)) bad.push('suma z rozliczenia ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
@@ -18987,7 +19017,8 @@
         // Numer z tytulu przelewu musi wystapic w rozliczeniu. To jedyna twarda kontrola,
         // ze po kwocie trafilismy we WLASCIWA wyplate, a nie w inna o tej samej wartosci.
         if (j.ref && !p.ids[j.ref]) bad.push('numeru ' + j.ref + ' z przelewu nie ma w tym rozliczeniu');
-        if (!p.nPos) bad.push('rozliczenie nie ma ani jednej pozycji — same potrącenia, nie ma czego importować');
+        if (!p.nPos) bad.push('rozliczenie nie ma pozycji do importu — całą kwotę stanowią potrącenia'
+                            + (p.credits.length ? ' · oddane potrącenia księgujesz niżej, wprost na auftragu' : ''));
         j.status = bad.length ? 'partial' : 'ready';
         j.msg = bad.join('; ');
         j.note = 'brutto = Product Amount + Tax/VAT'
@@ -19949,7 +19980,7 @@
                   +  '</td></tr>';
             }
         });
-        out.innerHTML = h + '</table><div id="mk-ref"></div>';
+        out.innerHTML = h + '</table><div id="mk-ref"></div><div id="mk-cr"></div>';
         out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-chk').forEach(function (b){ b.onclick = function(){ impCheck(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-impset').forEach(function (b){ b.onclick = function(){
@@ -19998,6 +20029,7 @@
         if (sa) sa.onclick = function(){ selAll(true); };
         if (sn) sn.onclick = function(){ selAll(false); };
         renderRef();
+        renderCr();
     }
 
     // ---------- Salda: miesieczne zestawienie ----------
@@ -20380,6 +20412,187 @@
             catch (e){ say('Nie udało się skopiować.', '#c00'); }
         }; });
     }
+    // ---------- oddane potracenia: prosto na auftrag ----------
+    // Dodatnie „Deduction" (Wayfair: „Deduction Payback") to nie zwrot, tylko oddanie
+    // wczesniej potraconej kwoty — pieniadze WRACAJA do nas. Bywa, ze cale rozliczenie
+    // sklada sie z jednego takiego wiersza i wtedy nie ma czego importowac, a mimo to
+    // wplata siedzi na koncie. Takie cos ksieguje sie wprost na auftragu: szukamy go po
+    // numerze fulfilmentu z potracenia i sprawdzamy „Auftrag value - Total of Payments".
+    const mkCrState = {};                    // ff -> { num, open, nPay, deleted, err, booked }
+    function crList(){
+        const out = [], sets = setLoad();
+        jobList().forEach(function (j){
+            const cs = (j.data && j.data.credits) || [];
+            cs.forEach(function (c){
+                if (!c || !c.id || !(c.amt > 0)) return;
+                const s = sets[setKey(j.mp, j.data.shop)] || {};
+                out.push({ ff: c.ff || c.id, amt: c.amt, text: c.text || '', date: j.date,
+                           acct: s.acct || '', shop: j.data.shop, ref: j.ref });
+            });
+        });
+        return out;
+    }
+    // Paycomment to zwykly <input>, wiec wielolinijkowy opis trzeba splaszczyc.
+    function crFlat(t){ return String(t || '').replace(/\s+/g, ' ').trim().slice(0, 250); }
+    async function crFind(ff){
+        // Tak samo jak „Ksiegowanie w auftragu": search.php po numerze FF. Przy jednym
+        // trafieniu serwer przekierowuje prosto na auftrag, przy kilku oddaje liste.
+        let res, html = '';
+        try {
+            res = await fetch('/search.php?what=ff_number&ff_number=' + encodeURIComponent(ff), { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { nums: [], err: 'brak połączenia z prologistics' }; }
+        const nums = [], m = String((res && res.url) || '').match(/auction\.php\?number=(\d+)/i);
+        if (m) nums.push(m[1]);
+        if (!nums.length){
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            doc.querySelectorAll('a[href*="auction.php?number="]').forEach(function (a){
+                const h = a.getAttribute('href') || '';
+                if (h.indexOf('shipping_auction.php') >= 0) return;
+                const mm = h.match(/number=(\d+)/);
+                if (mm && nums.indexOf(mm[1]) < 0) nums.push(mm[1]);
+            });
+        }
+        return { nums: nums, err: nums.length ? '' : 'nie znajduję auftragu dla ' + ff };
+    }
+    // „Auftrag value - Total of Payments" stoi na stronie DWA razy: w podsumowaniu tabeli
+    // Payments (w <b>) i jako zwykly tekst w komentarzu wczesniejszego ksiegowania.
+    // Bierzemy wylacznie ten z <b>, i to ostatni — komentarz <b> nie ma.
+    function crOpen(d){
+        const bs = d.querySelectorAll('b');
+        let node = null;
+        for (let i = 0; i < bs.length; i++) if (/Auftrag value\s*-\s*Total of Payments/i.test(bs[i].textContent || '')) node = bs[i];
+        if (!node) return null;
+        const box = (node.closest && node.closest('td')) || node.parentNode;
+        const t = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
+        const m = t.match(/-?\s*\d[\d'’\s]*(?:[.,]\d{1,2})?/);
+        return m ? mkNum(m[0]) : null;
+    }
+    async function crRead(num){
+        let html = '';
+        try {
+            const res = await fetch('/auction.php?number=' + encodeURIComponent(num) + '&txnid=3', { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { ok: false, err: 'nie otwarto auftragu ' + num }; }
+        const d = new DOMParser().parseFromString(html, 'text/html');
+        if (!d.querySelector('form#book')) return { ok: false, err: 'na stronie auftragu ' + num + ' nie ma formularza płatności' };
+        return { ok: true, open: crOpen(d), nPay: d.querySelectorAll('a[href*="delpay="]').length,
+                 deleted: !!d.querySelector('.auftrag-status--deleted') };
+    }
+    // Formularz #book nie ma tokenu CSRF ani onsubmit, wiec POST z osmioma polami
+    // odtwarza dokladnie to, co wysyla przegladarka po kliknieciu „Make payment".
+    // Przyciskow „safer" i „paypal" NIE wolno dosylac — oznaczaja platnosc karta.
+    async function crBook(num, dateISO, account, amount, comment){
+        const m = String(dateISO || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!m) return { ok: false, err: 'zła data księgowania' };
+        const b = [];
+        const add = function (k, v){ b.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); };
+        add('number', String(num));
+        add('txnid', '3');
+        add('Date_Month', m[2]);
+        add('Date_Day', String(parseInt(m[3], 10)));      // select ma 1..31, bez zera wiodacego
+        add('Date_Year', m[1]);
+        add('account', String(account));
+        add('amount', Number(amount).toFixed(2));
+        add('paycomment', crFlat(comment));
+        try {
+            const res = await fetch('/auction.php', { method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: b.join('&') });
+            if (!res || !res.ok) return { ok: false, err: 'HTTP ' + (res ? res.status : '?') };
+            return { ok: true };
+        } catch (e){ return { ok: false, err: (e && e.message) || 'błąd wysyłki' }; }
+    }
+    async function crCheck(b){
+        const list = crList();
+        if (!list.length) return;
+        b.disabled = true;
+        say('Szukam auftragów dla ' + list.length + ' oddanych potrąceń…');
+        for (let i = 0; i < list.length; i++){
+            const x = list[i], st = mkCrState[x.ff] || (mkCrState[x.ff] = {});
+            if (st.booked) continue;
+            const f = await crFind(x.ff);
+            if (f.err){ st.err = f.err; st.num = ''; renderCr(); continue; }
+            if (f.nums.length > 1){ st.err = 'kilka auftragów (' + f.nums.join(', ') + ') — zaksięguj ręcznie'; st.num = ''; renderCr(); continue; }
+            const r = await crRead(f.nums[0]);
+            if (!r.ok){ st.err = r.err; st.num = f.nums[0]; renderCr(); continue; }
+            st.num = f.nums[0]; st.open = r.open; st.nPay = r.nPay; st.deleted = r.deleted; st.err = '';
+            renderCr();
+        }
+        b.disabled = false;
+        say('Sprawdzone.', '#0a7a2f');
+    }
+    async function crDoBook(x, b){
+        const st = mkCrState[x.ff] || {};
+        if (!st.num){ say('Najpierw „Sprawdź auftragi".', '#c47f00'); return; }
+        if (!x.acct){ say('Nie ma konta dla ' + x.shop + ' — uzupełnij w ⚙ Konta.', '#c47f00'); return; }
+        const rozn = (st.open == null) ? null : r2(st.open - x.amt);
+        if (!confirm('Zaksięgować oddane potrącenie na auftragu?\n\n'
+            + '  fulfilment : ' + x.ff + '\n'
+            + '  auftrag    : ' + st.num + '\n'
+            + '  kwota      : ' + f2(x.amt) + '\n'
+            + '  open amount: ' + (st.open == null ? 'nie odczytałem' : f2(st.open))
+            + (rozn ? ('   ⚠ różnica ' + f2(rozn)) : (st.open != null ? '   (zgadza się)' : '')) + '\n'
+            + '  konto      : ' + x.acct + '\n'
+            + '  data       : ' + x.date + '\n'
+            + '  komentarz  : ' + crFlat(x.text).slice(0, 90) + '…\n'
+            + (st.deleted ? '\n⚠ AUFTRAG MA STATUS DELETED.\n' : '')
+            + (st.nPay ? ('\nNa tym auftragu są już ' + st.nPay + ' płatności.\n') : '')
+            + '\nTego się nie cofa jednym kliknięciem.')) return;
+        b.disabled = true;
+        const r = await crBook(st.num, x.date, x.acct, x.amt, x.text);
+        b.disabled = false;
+        if (!r.ok){ say('Nie zaksięgowano: ' + r.err, '#c00'); return; }
+        // Potwierdzamy odczytem, a nie samym HTTP 200 — strona oddaje 200 takze wtedy,
+        // gdy formularz odrzucil dane.
+        const after = await crRead(st.num);
+        st.booked = true;
+        st.open = after.ok ? after.open : st.open;
+        st.nPay = after.ok ? after.nPay : st.nPay;
+        renderCr();
+        say('Zaksięgowane na auftragu ' + st.num + (after.ok ? (', open amount po księgowaniu ' + f2(after.open)) : ''), '#0a7a2f');
+    }
+    function renderCr(){
+        const box = $('#mk-cr'); if (!box) return;
+        const list = crList();
+        if (!list.length){ box.innerHTML = ''; return; }
+        let h = '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ede9fe">'
+              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">'
+              + '<b style="font-size:11px;color:#5b21b6">Oddane potrącenia</b>'
+              + '<button id="mk-cr-chk" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź auftragi</button></div>'
+              + '<div style="font-size:10px;color:#888;margin-bottom:6px">To nie zwroty — Wayfair oddaje wcześniej potrąconą kwotę, więc pieniądze wracają do nas. '
+              + 'Szukam auftragu po numerze fulfilmentu i porównuję z jego „open amount". Księguje się wprost na auftragu, nie przez ticket.</div>';
+        list.forEach(function (x, i){
+            const st = mkCrState[x.ff] || {};
+            const ok = st.num && !st.err;
+            const rozn = (ok && st.open != null) ? r2(st.open - x.amt) : null;
+            h += '<div style="margin:6px 0;padding:6px 8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:6px">'
+              +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              +  '<b style="font-size:11px">' + esc(x.ff) + '</b>'
+              +  '<span style="font-size:11px;color:#374151">' + f2(x.amt) + ' · ' + esc(x.date) + '</span>'
+              +  (st.num ? ('<a href="/auction.php?number=' + esc(st.num) + '&txnid=3" target="_blank" style="font-size:11px;color:#2563eb">auftrag ' + esc(st.num) + '</a>') : '')
+              +  (ok && st.open != null
+                    ? ('<span style="font-size:11px;color:' + (rozn ? '#c47f00' : '#0a7a2f') + ';font-weight:700">open amount ' + f2(st.open)
+                       + (rozn ? (' — różnica ' + f2(rozn)) : ' — zgadza się') + '</span>')
+                    : '')
+              +  (st.deleted ? '<span style="font-size:11px;color:#c00;font-weight:700">DELETED</span>' : '')
+              +  (st.err ? ('<span style="font-size:11px;color:#c47f00">' + esc(st.err) + '</span>') : '')
+              +  (st.booked ? '<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ zaksięgowane</span>' : '')
+              +  '<button class="mk-cr-b" data-i="' + i + '"' + ((ok && !st.booked && x.acct) ? '' : ' disabled')
+              +  ' style="padding:3px 10px;border:none;border-radius:6px;background:' + ((ok && !st.booked && x.acct) ? '#5b21b6' : '#c7c7c7')
+              +  ';color:#fff;font-weight:700;cursor:' + ((ok && !st.booked && x.acct) ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj na auftragu</button>'
+              +  (x.acct ? '' : '<span style="font-size:11px;color:#c47f00">brak konta dla ' + esc(x.shop) + '</span>')
+              +  '</div>'
+              +  '<pre style="margin:3px 0 0;font:10px/1.35 monospace;color:#555;white-space:pre-wrap;word-break:break-word">' + esc(x.text) + '</pre>'
+              +  '</div>';
+        });
+        box.innerHTML = h + '</div>';
+        const cb = box.querySelector('#mk-cr-chk');
+        if (cb) cb.onclick = function(){ crCheck(cb); };
+        box.querySelectorAll('.mk-cr-b').forEach(function (b){
+            b.onclick = function(){ crDoBook(list[+b.getAttribute('data-i')], b); };
+        });
+    }
+
     // Zwrotow nie ksiegujemy wlasnym kodem — oddajemy je modulowi „Ksiegowanie w tickecie".
     // On juz umie znalezc ticket, wykryc duplikat platnosci i rozbic pozycje, a druga
     // implementacja tego samego predzej czy pozniej rozjechalaby sie z pierwsza.
@@ -20452,6 +20665,32 @@
         draw();
         _mirIv = setInterval(draw, 500);
     }
+    // Komentarz do ticketu zwrotu. Dopisujemy tylko przy pozycjach, ktore MAJA opis
+    // (dzis: Wayfair) i tylko przy tych, ktore log ticketa potwierdzil jako zaksiegowane —
+    // komentarz przy pozycji, ktora nie przeszla, mowilby nieprawde.
+    // Samego ticketu nie szukamy: robi to modul „Ksiegowanie w tickecie" przez most
+    // __TM_TICKET_COMMENT, ta sama droga, ktora dopisuje „Please add solution".
+    async function refComment(x, done){
+        const want = x.rows.filter(function (r){
+            return r.note && (!done.length || done.indexOf(r.id) >= 0);
+        });
+        if (!want.length) return;
+        if (typeof window.__TM_TICKET_COMMENT !== 'function'){
+            say('Zwroty zaksięgowane, ale opisów nie dopiszę — moduł „Księgowanie w tickecie" jest wyłączony w launcherze.', '#c47f00');
+            return;
+        }
+        let ok = 0; const bad = [];
+        for (let i = 0; i < want.length; i++){
+            say('Dopisuję opis potrącenia do ticketu ' + (i + 1) + '/' + want.length + ' — ' + want[i].id + '…');
+            try {
+                const r = await window.__TM_TICKET_COMMENT(want[i].id, want[i].note);
+                if (r && r.ok) ok++;
+                else bad.push(want[i].id + ': ' + ((r && r.error) || 'nie powiodło się'));
+            } catch (e){ bad.push(want[i].id + ': ' + ((e && e.message) || e)); }
+        }
+        say('Opisy potrąceń: dopisane do ' + ok + ' z ' + want.length + ' ticketów'
+            + (bad.length ? ('. Bez komentarza: ' + bad.join('; ')) : '.'), bad.length ? '#c47f00' : '#0a7a2f');
+    }
     async function bookRefunds(x){
         const err = ksFill(x);
         if (err){ say(err, '#c47f00'); return err; }
@@ -20467,6 +20706,9 @@
         const done = ksDone(x);
         if (done.length) rdMark(x.key, done, true);
         else rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
+        // Opis potracenia z rozliczenia trafia do ticketu jako komentarz — tam go szuka
+        // ksiegowosc, gdy pyta, skad sie wzial ten zwrot.
+        await refComment(x, done);
         // Zwroty zaksiegowane — odhaczamy je w arkuszu. Niepowodzenie tego kroku nie
         // cofa ksiegowania, trafia tylko na pasek stanu.
         try {
