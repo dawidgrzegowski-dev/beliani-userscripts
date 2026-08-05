@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.97
+// @version      2.98
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23199,7 +23199,9 @@
     //
     // Nie steruje formularzem na ekranie. Search i Export to zwykle POST-y
     // formularzowe na export.php, wiec lecimy nimi w tle — nic nie przeladowuje sie
-    // uzytkownikowi pod rekami i mozna sledzic postep.
+    // uzytkownikowi pod rekami i mozna sledzic postep. Z tego samego powodu panel
+    // dziala z KAZDEJ strony prologistics: skoro i tak rozmawiamy z export.php
+    // przez siec, nie trzeba na niej stac.
     //
     // Pliku z eksportu NIE czytamy. Serwer oddaje binarny XLS (OLE2, nazwa zawsze
     // „payments_export.xls"), a przy innym „system" odda co innego — wiec bierzemy
@@ -23212,10 +23214,30 @@
 (function () {
     'use strict';
     if (window.top !== window.self) return;
-    if (!/\/export\.php$/i.test(location.pathname)) return;
     if (document.getElementById('exp-btn')) return;
 
     const EXP_KEY = 'expp_profiles';
+
+    // Panel dziala z KAZDEJ strony prologistics, nie tylko z /export.php. Listy
+    // sprzedawcow, ich sklepow i planu kont zyja jednak wylacznie w tamtym
+    // formularzu — wiec stojac gdzie indziej dociagamy te strone w tle i czytamy
+    // z niej. DOMParser nie wykonuje skryptow, wiec nic stamtad nie ozywa.
+    // Na samym export.php czytamy ZYWY dokument: panel ma pokazywac to, co
+    // uzytkownik widzi przed soba, a nie osobna kopie sprzed chwili.
+    // Wczytana kopie trzymamy tylko na czas zycia strony — nie zapisujemy jej,
+    // zeby nowe konto albo nowy sprzedawca nie chowaly sie za wczorajszym cache'em.
+    const onExportPage = /\/export\.php$/i.test(location.pathname);
+    let EXP_DOC = onExportPage ? document : null;
+    async function expLoadDoc(){
+        if (EXP_DOC) return EXP_DOC;
+        const res = await fetch('/export.php', { credentials: 'same-origin' });
+        if (!res.ok) throw new Error('nie mogę wczytać export.php (HTTP ' + res.status + ')');
+        const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+        if (!doc.querySelector('select[name="account"]'))
+            throw new Error('w odpowiedzi z export.php nie ma formularza — wygląda na stronę logowania');
+        EXP_DOC = doc;
+        return EXP_DOC;
+    }
 
     function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
     function pad2(n){ return (n < 10 ? '0' : '') + n; }
@@ -23228,7 +23250,7 @@
     // sprzedawca albo nowe konto pojawia sie w module same, bez zadnej listy w kodzie.
     function expSellers(){
         const out = [];
-        document.querySelectorAll('label.seller-name').forEach(function (lab){
+        EXP_DOC.querySelectorAll('label.seller-name').forEach(function (lab){
             const i = lab.querySelector('input[name="username[]"]');
             if (!i || !i.value) return;
             const txt = (lab.textContent || '').replace(/\s+/g, ' ').trim();
@@ -23244,7 +23266,7 @@
     // source sellery. Bez tego wyslalibysmy sklepy, ktorych nikt nie wybral,
     // i wynik po cichu by sie rozjechal.
     function expSources(user){
-        const box = document.getElementById('sourceseller[' + user + ']');
+        const box = EXP_DOC.getElementById('sourceseller[' + user + ']');
         if (!box) return [];
         const out = [];
         box.querySelectorAll('input[name="source_seller_id[]"]').forEach(function (i){
@@ -23255,7 +23277,7 @@
     }
     function expOptions(sel){
         const out = [];
-        document.querySelectorAll(sel + ' option').forEach(function (o){
+        EXP_DOC.querySelectorAll(sel + ' option').forEach(function (o){
             out.push({ v: o.value, txt: (o.textContent || '').replace(/\s+/g, ' ').trim() });
         });
         return out;
@@ -23471,9 +23493,19 @@
                         + 'font:12px Arial,sans-serif;color:#111';
     document.body.appendChild(btn);
     document.body.appendChild(panel);
-    btn.onclick = function (){
-        panel.style.display = (panel.style.display === 'none') ? 'block' : 'none';
-        if (panel.style.display === 'block') render();
+    btn.onclick = async function (){
+        if (panel.style.display === 'block'){ panel.style.display = 'none'; return; }
+        panel.style.display = 'block';
+        if (!EXP_DOC){
+            panel.innerHTML = '<div style="padding:12px;color:#666">Wczytuję listy sprzedawców i kont z export.php…</div>';
+            try { await expLoadDoc(); }
+            catch (e){
+                panel.innerHTML = '<div style="padding:12px;color:#c00">' + esc((e && e.message) || e)
+                                + '<div style="margin-top:6px;color:#666">Otwórz <b>Export payments</b> w menu po lewej i spróbuj stamtąd.</div></div>';
+                return;
+            }
+        }
+        render();
     };
 
     function $(s){ return panel.querySelector(s); }
