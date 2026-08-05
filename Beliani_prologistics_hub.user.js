@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.98
+// @version      2.99
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23309,7 +23309,7 @@
                        '3266', '3267', '3268', '3269', '3270', '3271', '3273'],
             dateField: 'payment', range: 'prev', from: '', to: '',
             country: '', clearing: '0', inv: '2', paid: '',
-            fname: '', minamount: '', maxamount: '', system: 'excel'
+            fname: '', minamount: '', maxamount: '', system: 'excel', par: '5'
         }]
     };
     function profLoad(){
@@ -23530,6 +23530,7 @@
            +     d.list.map(function (x){ return '<option value="' + esc(x.id) + '"' + (x.id === p.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; }).join('')
            +   '</select>'
            +   '<button id="exp-run" style="padding:5px 12px;border:none;border-radius:6px;background:#0f766e;color:#fff;font-weight:700;cursor:pointer">▶ Uruchom</button>'
+           +   '<button id="exp-stop" style="display:none;padding:5px 12px;border:none;border-radius:6px;background:#b91c1c;color:#fff;font-weight:700;cursor:pointer">■ Przerwij</button>'
            +   '<button id="exp-new" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Nowy</button>'
            +   '<button id="exp-del" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Usuń</button>'
            +   '<button id="exp-copy" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Kopiuj</button>'
@@ -23603,6 +23604,9 @@
            +   '<label>Invoice status <select id="exp-inv" style="font-size:12px">' + selOpt(expOptions('select[name="inv_status"]'), p.inv) + '</select></label>'
            +   '<label>Paid <select id="exp-paid" style="font-size:12px">' + selOpt(expOptions('select[name="paid_status"]'), p.paid) + '</select></label>'
            +   '<label>Format <select id="exp-sys" style="font-size:12px">' + selOpt(expOptions('select[name="system"]'), p.system) + '</select></label>'
+           +   '<label title="ile kont pobierać naraz — przy 5 przelot jest kilka razy krótszy, ale serwer dostaje pięć zapytań jednocześnie">Równolegle <select id="exp-par" style="font-size:12px">'
+           +     ['1', '3', '5', '8'].map(function (n){ return '<option value="' + n + '"' + (String(p.par || '5') === n ? ' selected' : '') + '>' + n + '</option>'; }).join('')
+           +   '</select></label>'
            + '</div>'
            + '<div style="margin-top:8px"><button id="exp-save" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer">Zapisz profil</button></div>'
            + '<div id="exp-prog" style="margin-top:10px"></div>';
@@ -23666,6 +23670,7 @@
         bind('#exp-range', 'range'); bind('#exp-df', 'dateField'); bind('#exp-state', 'state');
         bind('#exp-st', 'sellerType'); bind('#exp-inv', 'inv'); bind('#exp-paid', 'paid');
         bind('#exp-sys', 'system'); bind('#exp-from', 'from'); bind('#exp-to', 'to');
+        bind('#exp-par', 'par');
 
         $('#exp-save').onclick = function (){ say('Zapisane.', '#0a7a2f'); };
         $('#exp-new').onclick = function (){
@@ -23708,6 +23713,11 @@
     }
 
     // ---------- przelot ----------
+    // Konta lecą kilka naraz. Search po calym miesiacu potrafi chodzic kilkanascie
+    // sekund, wiec szeregowo pietnascie kont to kilka minut patrzenia w nieruchomy
+    // ekran. Liczbe rownoleglych ustawia profil (domyslnie 5) — gdyby serwer zaczal
+    // sie dlawic, wystarczy zejsc do 3 albo 1.
+    let expAbort = false;
     async function runAll(b){
         if (running) return;
         const p = profCur(profLoad());
@@ -23716,64 +23726,121 @@
         if (!(p.users || []).length){ say('Nie wybrałeś żadnego sprzedawcy.', '#c47f00'); return; }
         const r = expRange(p);
         if (!r[0] || !r[1]){ say('Uzupełnij zakres dat.', '#c47f00'); return; }
+        const par = Math.max(1, Math.min(8, Number(p.par) || 5));
         if (!confirm('Pobrać ' + accs.length + ' zestawień?\n\n'
                    + 'Okres: ' + r[0] + ' … ' + r[1] + ' (' + (p.dateField === 'invoice' ? 'Invoice date' : 'Payment date') + ')\n'
                    + 'Sprzedawców: ' + p.users.length + '\n'
-                   + 'Format: ' + p.system + '\n\n'
+                   + 'Format: ' + p.system + '\n'
+                   + 'Równolegle: ' + par + '\n\n'
                    + 'Nic nie zostanie oznaczone jako wyeksportowane.')) return;
 
-        running = true; b.disabled = true;
+        running = true; expAbort = false;
+        b.disabled = true;
+        const stop = $('#exp-stop');
+        if (stop){ stop.style.display = ''; stop.onclick = function (){ expAbort = true; say('Przerywam — kończę to, co już poszło w sieć…', '#c47f00'); }; }
+
         const prog = $('#exp-prog');
-        const st = accs.map(function (a){ return { a: a, rows: null, note: 'czeka' }; });
-        const draw = function (done){
-            let h = '<div style="font-size:11px;color:#666;margin-bottom:4px">konto ' + done + ' z ' + accs.length + '</div>'
+        const st = accs.map(function (a){ return { a: a, rows: null, note: 'czeka', t0: 0, ms: 0 }; });
+        // Pliki trzymamy pod indeksem konta, nie doklejamy na koniec listy — inaczej
+        // przy pracy rownoleglej kolejnosc w archiwum zalezalaby od tego, co szybciej
+        // wroci z serwera, a ma odpowiadac kolejnosci kont w profilu.
+        const files = new Array(accs.length);
+        const problems = [];
+        let done = 0, next = 0;
+        const t0 = Date.now();
+
+        const secs = function (ms){ return (ms / 1000).toFixed(1).replace('.', ',') + ' s'; };
+        const draw = function (){
+            const live = { 'szukam': 1, 'pobieram plik': 1 };
+            let h = '<div style="display:flex;justify-content:space-between;font-size:11px;color:#666;margin-bottom:3px">'
+                  + '<span>gotowe <b>' + done + '</b> z ' + accs.length
+                  + (expAbort ? ' · przerywam' : (done < accs.length ? ' · w toku ' + st.filter(function (x){ return live[x.note]; }).length : '')) + '</span>'
+                  + '<span>' + Math.round((Date.now() - t0) / 1000) + ' s</span></div>'
+                  + '<div style="height:5px;background:#eee;border-radius:99px;overflow:hidden;margin-bottom:6px">'
+                  + '<div style="width:' + Math.round(done / accs.length * 100) + '%;height:100%;background:#0f766e;transition:width .2s"></div></div>'
                   + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
-                  + '<tr style="color:#999"><td>konto</td><td style="text-align:right">wierszy</td><td style="text-align:right">stan</td></tr>';
+                  + '<tr style="color:#999"><td>konto</td><td style="text-align:right">wierszy</td>'
+                  + '<td style="text-align:right">czas</td><td style="text-align:right">stan</td></tr>';
             st.forEach(function (x){
-                const col = x.note === 'pobrane' ? '#0a7a2f' : (x.note === 'pusto' ? '#999' : (x.note === 'czeka' || x.note === 'szukam' ? '#666' : '#c00'));
-                h += '<tr style="border-top:1px solid #f0f0f0"><td style="padding:2px 0">' + esc(expAccLabel(x.a)) + '</td>'
+                const col = x.note === 'pobrane' ? '#0a7a2f'
+                          : (x.note === 'pusto' ? '#999'
+                          : (live[x.note] ? '#0f766e'
+                          : (x.note === 'czeka' ? '#aaa' : '#c00')));
+                const t = live[x.note] ? secs(Date.now() - x.t0) : (x.ms ? secs(x.ms) : '');
+                h += '<tr style="border-top:1px solid #f0f0f0">'
+                   + '<td style="padding:2px 0">' + esc(expAccLabel(x.a)) + '</td>'
                    + '<td style="text-align:right">' + (x.rows == null ? '—' : x.rows) + '</td>'
-                   + '<td style="text-align:right;color:' + col + '">' + esc(x.note) + '</td></tr>';
+                   + '<td style="text-align:right;color:#999">' + t + '</td>'
+                   + '<td style="text-align:right;color:' + col + ';white-space:nowrap">'
+                   + (live[x.note] ? '● ' : '') + esc(x.note) + '</td></tr>';
             });
             prog.innerHTML = h + '</table>';
         };
-        draw(0);
+        // Przerysowanie co pol sekundy: bez tego przy jednym dlugim koncie ekran stoi
+        // i nie wiadomo, czy cokolwiek sie dzieje.
+        const timer = setInterval(draw, 500);
+        draw();
 
-        const files = [], problems = [];
-        for (let i = 0; i < accs.length; i++){
+        async function one(i){
             const a = accs[i];
-            st[i].note = 'szukam'; draw(i);
+            st[i].t0 = Date.now();
             try {
+                st[i].note = 'szukam';
                 const html = await expPost(expSearchBody(p, a), false);
+                if (expAbort){ st[i].note = 'przerwane'; return; }
                 const rows = expRows(html);
                 st[i].rows = rows.length;
-                if (!rows.length){ st[i].note = 'pusto'; draw(i + 1); continue; }
+                if (!rows.length){ st[i].note = 'pusto'; return; }
+                st[i].note = 'pobieram plik';
                 const f = await expPost(expFileBody(p, a, rows), true);
-                // Serwer oddaje plik. Strona HTML w odpowiedzi oznacza, ze eksport
-                // sie nie udal — do archiwum tego nie wkladamy, zeby nikt nie otworzyl
+                if (expAbort){ st[i].note = 'przerwane'; return; }
+                // Serwer oddaje plik. Strona HTML w odpowiedzi oznacza, ze eksport sie
+                // nie udal — do archiwum tego nie wkladamy, zeby nikt nie otworzyl
                 // „zestawienia", ktore w srodku jest komunikatem o bledzie.
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
-                const ext = expExt(f.cd, '.xls');
-                files.push({ name: safeName(expAccLabel(a)) + ext, data: f.buf });
+                files[i] = { name: safeName(expAccLabel(a)) + expExt(f.cd, '.xls'), data: f.buf };
                 st[i].note = 'pobrane';
             } catch (e){
                 st[i].note = 'błąd';
-                problems.push(a + ': ' + ((e && e.message) || e));
+                problems.push(expAccLabel(a) + ': ' + ((e && e.message) || e));
+            } finally {
+                st[i].ms = Date.now() - st[i].t0;
+                done++;
             }
-            draw(i + 1);
         }
+        async function worker(){
+            while (!expAbort){
+                const i = next++;
+                if (i >= accs.length) return;
+                await one(i);
+            }
+        }
+        const crew = [];
+        for (let k = 0; k < par; k++) crew.push(worker());
+        await Promise.all(crew);
 
+        clearInterval(timer); draw();
         running = false; b.disabled = false;
-        if (!files.length){
-            say('Nie pobrałem żadnego pliku' + (problems.length ? (' — ' + problems.join('; ')) : ' — we wszystkich kontach pusto.') , problems.length ? '#c00' : '#c47f00');
+        if (stop) stop.style.display = 'none';
+
+        const got = files.filter(Boolean);
+        const el = Math.round((Date.now() - t0) / 1000);
+        if (!got.length){
+            // Rozrozniamy trzy powody pustych rak — inaczej po przerwaniu przelotu
+            // komunikat twierdzilby, ze wszystkie konta sa puste, co nieprawda.
+            const why = problems.length ? (' — ' + problems.join('; '))
+                      : (expAbort ? ' — przerwane, zanim cokolwiek zdążyło dojść.'
+                                  : ' — we wszystkich kontach pusto.');
+            say('Nie pobrałem żadnego pliku' + why, problems.length ? '#c00' : '#c47f00');
             return;
         }
-        const zipName = r[0] + ' — ' + r[1] + '.zip';
-        expDownload(expZip(files), zipName);
-        say('Gotowe: ' + files.length + ' plików w „' + zipName + '"'
+        const zipName = r[0] + ' — ' + r[1] + (expAbort ? ' (niepełne)' : '') + '.zip';
+        expDownload(expZip(got), zipName);
+        say((expAbort ? 'Przerwane — pakuję to, co zdążyło. ' : '')
+            + 'Gotowe: ' + got.length + ' plików w „' + zipName + '", ' + el + ' s'
             + (problems.length ? (' · problemy: ' + problems.join('; ')) : '') + '.',
-            problems.length ? '#c47f00' : '#0a7a2f');
+            (problems.length || expAbort) ? '#c47f00' : '#0a7a2f');
     }
 })();
     }
