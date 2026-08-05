@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.95
+// @version      2.97
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18239,8 +18239,13 @@
         // Do przelewu wchodza takze dokumenty BEZ prefiksu — same cyfry (247638, 8578773),
         // w panelu typu MANUAL_CREDIT. Dlatego „docs" nie zaklada ksztaltu numeru, tylko
         // bierze wszystko, co stoi w tytule jako „NR.<numer>/<data>".
+        // „ref" MUSI dopuszczac te same ksztalty co „docs". Wczesniej wymagal prefiksu
+        // IN/CN, wiec przelew regulujacy WYLACZNIE dokument bezprefiksowy (MANUAL_CREDIT,
+        // np. samo 247638) nie trafial w te regule, spadal do zapasowej z /ROC/ — a ta nie
+        // ma „docs" — i konczyl z komunikatem o „SIEHE AVIS", chociaz numery staly
+        // w tytule przelewu. Fakture i tak promujemy na klucz nizej, w mkDetect.
         { mp: 'Manor',          ok: true,  payer: /MANOR\s*AG/i,
-          ref:  /\b((?:IN|CN)\d{3,6}[A-Z]-\d+)\b/,
+          ref:  /NR\s*\.?\s*([A-Z0-9-]{4,20}?)\s*\/\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{4}/i,
           docs: /NR\s*\.?\s*([A-Z0-9-]{4,20}?)\s*\/\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{4}/gi,
           brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH' },
         // Raz na kilka miesiecy Manor nie wypisuje numerow, tylko „SIEHE AVIS VOM …"
@@ -21833,6 +21838,11 @@
                     }
                     const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: allFull };
                     let a = mkAggregate(tx.list, j.ref), split = false;
+                    // Liczbe wyplat zapamietujemy PRZED ewentualnym podzialem. Po nim
+                    // w „a" zostaje juz tylko jedna wyplata, wiec warunek „a.pays.length > 1
+                    // && split" nie mial prawa sie wykonac i adnotacja o wybraniu jednej
+                    // z kilku wyplat nigdy nie trafiala na ekran.
+                    const paysAll = a.pays.length;
                     // Cykl z kilkoma wyplatami: jesli pozycje niosa odnosnik do wyplaty,
                     // bierzemy tylko te z naszego przelewu. Jesli nie niosa — nie zgadujemy.
                     // Przy Manorze tego nie robimy: kazdy z polaczonych cykli ma wlasna
@@ -21889,8 +21899,8 @@
                         ? ('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji')
                         : ('pobrano ' + tx.list.length + ' pozycji i nie umiem przewinąć dalej — to nie musi być komplet'));
                     if (unk) bad.push('nierozpoznane typy pozycji');
-                    if (!manor && a.pays.length > 1 && !split) bad.push('cykl ma ' + a.pays.length + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
-                    if (!manor && a.pays.length > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + a.pays.length + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
+                    if (!manor && paysAll > 1 && !split) bad.push('cykl ma ' + paysAll + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
+                    if (!manor && paysAll > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + paysAll + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
                     if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłaty ' + f2(a.payAll));
                     if (!manor && a.pays.length && a.pay == null) bad.push('nie wiem, która z wypłat odpowiada temu przelewowi');
                     if (!manor && full && a.pay != null && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
@@ -22098,13 +22108,21 @@
             }
             return ok;
         }
+        // Ile zlecen zostalo do pobrania na platformach obslugiwanych PETLA PO HOSTACH
+        // (Mirakl i VTEX). Galaxus i Wayfair maja wlasne liczniki i sa dokladane osobno —
+        // liczenie ich takze tutaj dawalo podwojenie: przy 6 zleceniach okno potwierdzenia
+        // pytalo „Pobrać 10 rozliczeń", a rozpiska pod spodem sumowala sie do 6.
+        // Host porownujemy dla KAZDEGO rodzaju, nie tylko dla Mirakla — wczesniej wiersz
+        // dla OBI zawsze pokazywal „0 szt.", chociaz host trafial na liste wlasnie dlatego,
+        // ze mial zlecenia.
         function mkLeft(jobs, host){
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
                 if (!mkTodo(j) || !j.ref) return false;
-                if (j.kind === 'joy') return false;      // nie ma rozliczenia do pobrania
-                if ((j.kind || 'mirakl') !== 'mirakl') return host ? false : true;
-                return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
+                const kind = j.kind || 'mirakl';
+                if (kind === 'joy' || kind === 'galx' || kind === 'wayf') return false;
+                const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
+                return host ? (h === host) : true;
             }).length;
         }
         function galxLeft(jobs){
@@ -22195,6 +22213,12 @@
                         // sprawdzic — przy jednym sklepie to zalatwia sprawe w calosci.
                         say(host + ' — nie znam listy sklepów, sprawdzam bieżący…');
                         seen++;
+                        // Migawke MUSIMY odswiezyc. mkPass zapisuje CALY przekazany obiekt
+                        // przez jobsSave, a galxPass i wayfPass zdazyly juz zapisac swoje
+                        // wyniki na wlasnych kopiach — bez tego pierwszy zapis z mkPass
+                        // cofnalby pobrane rozliczenie Galaxusa i Wayfaira do „czeka na dane".
+                        // Petla po sklepach nizej robi to samo w kazdej iteracji (22203).
+                        jobs = jobsLoad();
                         ok += await mkPass(jobs, await mkShopName(), host);
                         if (mkLeft(jobsLoad(), host)) problem.push(host + ': zostały rozliczenia na innych sklepach — wejdź tam raz na stronę Mirakla, moduł zapamięta ich listę');
                         continue;
@@ -22234,7 +22258,10 @@
             b.disabled = false; if (b2) b2.disabled = false;
             render();
             const dup = fresh.filter(function (x){ const s = mkSheet[x.ref]; return s && s.found; }).length;
-            const left = mkLeft(jobsLoad());
+            // „Nieznalezione" musi liczyc tak samo jak okno potwierdzenia — czyli razem
+            // z Galaxusem i Wayfairem, ktore mkLeft celowo pomija.
+            const jl = jobsLoad();
+            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl);
             if (dup) say('UWAGA: ' + dup + ' z pobranych jest już w arkuszu — sprawdź, zanim zaksięgujesz.', '#c00');
             else say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
                 + (left ? (', nieznalezionych ' + left) : '')
@@ -23163,6 +23190,562 @@
 })();
     }
 
+    // ===================== Export payments =====================
+    // Strona /export.php pozwala wskazac tylko JEDNO konto naraz, wiec zestawienie
+    // miesieczne po pietnastu kontach to pietnascie recznych przelotow: te same
+    // ptaszki, te same daty, za kazdym razem od nowa. Modul zapamietuje komplet
+    // ustawien jako PROFIL i przelatuje konta po kolei, a pliki pakuje w jedno
+    // archiwum nazwane zakresem dat.
+    //
+    // Nie steruje formularzem na ekranie. Search i Export to zwykle POST-y
+    // formularzowe na export.php, wiec lecimy nimi w tle — nic nie przeladowuje sie
+    // uzytkownikowi pod rekami i mozna sledzic postep.
+    //
+    // Pliku z eksportu NIE czytamy. Serwer oddaje binarny XLS (OLE2, nazwa zawsze
+    // „payments_export.xls"), a przy innym „system" odda co innego — wiec bierzemy
+    // bajty tak jak przyszly i wkladamy do archiwum pod numerem konta. Dzieki temu
+    // zmiana formatu w profilu nie wymaga zmiany kodu.
+    //
+    // Modul nie dotyka przyciskow „Mark as exported" i „Mark as not exported" —
+    // one zmieniaja stan po stronie prologistics, a tu tylko czytamy.
+    function init_export() {
+(function () {
+    'use strict';
+    if (window.top !== window.self) return;
+    if (!/\/export\.php$/i.test(location.pathname)) return;
+    if (document.getElementById('exp-btn')) return;
+
+    const EXP_KEY = 'expp_profiles';
+
+    function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function pad2(n){ return (n < 10 ? '0' : '') + n; }
+    function iso(d){ return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+    // Nazwa pliku w archiwum musi przezyc rozpakowanie na Windowsie.
+    function safeName(s){ return String(s || '').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim(); }
+
+    // ---------- co strona wie o sobie ----------
+    // Wszystko czytamy z formularza, ktory i tak jest na ekranie — dzieki temu nowy
+    // sprzedawca albo nowe konto pojawia sie w module same, bez zadnej listy w kodzie.
+    function expSellers(){
+        const out = [];
+        document.querySelectorAll('label.seller-name').forEach(function (lab){
+            const i = lab.querySelector('input[name="username[]"]');
+            if (!i || !i.value) return;
+            const txt = (lab.textContent || '').replace(/\s+/g, ' ').trim();
+            const m = txt.match(/^(.*?)\s*=\s*(.*)$/);
+            out.push({ v: i.value, txt: txt,
+                       firm: (m ? m[2] : '').trim() || '(bez spółki)',
+                       active: lab.classList.contains('active') });
+        });
+        return out;
+    }
+    // Source sellery sa przypisane do sprzedawcy przez id kontenera. Odtwarzamy to
+    // tak samo, jak robi to skrypt strony: odznaczenie sprzedawcy odznacza jego
+    // source sellery. Bez tego wyslalibysmy sklepy, ktorych nikt nie wybral,
+    // i wynik po cichu by sie rozjechal.
+    function expSources(user){
+        const box = document.getElementById('sourceseller[' + user + ']');
+        if (!box) return [];
+        const out = [];
+        box.querySelectorAll('input[name="source_seller_id[]"]').forEach(function (i){
+            const g = String(i.id || '').match(/^group\[(.*)\]$/);
+            if (i.value) out.push({ v: i.value, group: g ? g[1] : '' });
+        });
+        return out;
+    }
+    function expOptions(sel){
+        const out = [];
+        document.querySelectorAll(sel + ' option').forEach(function (o){
+            out.push({ v: o.value, txt: (o.textContent || '').replace(/\s+/g, ' ').trim() });
+        });
+        return out;
+    }
+    function expAccounts(){
+        return expOptions('select[name="account"]').filter(function (o){ return o.v && o.v !== '0'; });
+    }
+    function expAccLabel(v){
+        const a = expAccounts().filter(function (x){ return x.v === v; })[0];
+        return a ? a.txt : v;
+    }
+
+    // ---------- profile ----------
+    // Zestaw Marty wchodzi jako gotowiec — do uzycia od razu i do edycji. To NIE jest
+    // filtr po spolce: obok sklepow Beliani (DE) GmbH sa tam „Beliani (International)"
+    // i „Beliani DE alternative", ktore do niej nie naleza. Dlatego profil trzyma
+    // dokladna liste, a przyciski spolek sluza tylko do szybkiego zaznaczania.
+    const EXP_SEED = {
+        cur: 'marta',
+        list: [{
+            id: 'marta',
+            name: 'Marta — Beliani DE, B2B intra-comm',
+            state: '2', sellerType: 'active', group: '0',
+            users: ['Beliani AT', 'Beliani CZ', 'Beliani DE', 'Beliani (International) GmbH',
+                    'Beliani DE alternative', 'Beliani DK', 'Beliani SP', 'Beliani SP Alternative Seller',
+                    'Beliani FI', 'Beliani FR', 'Beliani HU', 'Beliani IT', 'Beliani PT',
+                    'Beliani SE', 'Beliani SK'],
+            accounts: ['3214', '3215', '3218', '3222', '3230', '3263', '3264', '3265',
+                       '3266', '3267', '3268', '3269', '3270', '3271', '3273'],
+            dateField: 'payment', range: 'prev', from: '', to: '',
+            country: '', clearing: '0', inv: '2', paid: '',
+            fname: '', minamount: '', maxamount: '', system: 'excel'
+        }]
+    };
+    function profLoad(){
+        let d = null;
+        try { d = JSON.parse(GM_getValue(EXP_KEY, 'null')); } catch (e){}
+        if (!d || !d.list || !d.list.length) d = JSON.parse(JSON.stringify(EXP_SEED));
+        return d;
+    }
+    function profSave(d){ try { GM_setValue(EXP_KEY, JSON.stringify(d)); } catch (e){} }
+    function profCur(d){ return d.list.filter(function (p){ return p.id === d.cur; })[0] || d.list[0]; }
+    function profNewId(){ return 'p' + Math.random().toString(36).slice(2, 9); }
+
+    // ---------- zakres dat ----------
+    function expRange(p){
+        const now = new Date();
+        if (p.range === 'cur'){
+            const a = new Date(now.getFullYear(), now.getMonth(), 1);
+            const b = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+            return [iso(a), iso(b)];
+        }
+        if (p.range === 'prev'){
+            const a = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            const b = new Date(now.getFullYear(), now.getMonth(), 0);
+            return [iso(a), iso(b)];
+        }
+        return [p.from || '', p.to || ''];
+    }
+
+    // ---------- rozmowa z export.php ----------
+    // Kolejnosc pol jest taka sama jak w formularzu strony. Nie dlatego, ze serwer
+    // tego wymaga, tylko zeby przy porownywaniu ze zrzutem z przegladarki widac bylo
+    // od razu, czy czegos nie brakuje.
+    function expSearchBody(p, account){
+        const q = new URLSearchParams();
+        const r = expRange(p);
+        q.append('order', ''); q.append('dir', '');
+        q.append('state', p.state);
+        q.append('seller-type', p.sellerType || 'active');
+        (p.users || []).forEach(function (u){ q.append('username[]', u); });
+        q.append('source_seller_group', p.group || '0');
+        (p.users || []).forEach(function (u){
+            expSources(u).forEach(function (s){
+                if (!p.group || p.group === '0' || s.group === p.group) q.append('source_seller_id[]', s.v);
+            });
+        });
+        q.append('name', p.fname || '');
+        q.append('minamount', p.minamount || '');
+        q.append('maxamount', p.maxamount || '');
+        const byInv = p.dateField === 'invoice';
+        q.append('mindatei', byInv ? r[0] : '');
+        q.append('maxdatei', byInv ? r[1] : '');
+        q.append('mindate', byInv ? '' : r[0]);
+        q.append('maxdate', byInv ? '' : r[1]);
+        q.append('country', p.country || '');
+        q.append('account', account);
+        q.append('clearing_account', p.clearing || '0');
+        q.append('inv_status', p.inv);
+        q.append('paid_status', p.paid || '');
+        return q.toString();
+    }
+    async function expPost(body, binary){
+        const res = await fetch('/export.php', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: body
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (!binary) return res.text();
+        return { ct: (res.headers.get('content-type') || '').toLowerCase(),
+                 cd: res.headers.get('content-disposition') || '',
+                 buf: new Uint8Array(await res.arrayBuffer()) };
+    }
+    // Wiersze rozpoznajemy po checkboxach — ich wartosc („{'mode':'1','payment_id':…}")
+    // jest jedynym, czego eksport naprawde potrzebuje. Odpowiedz parsujemy w oderwanym
+    // dokumencie: DOMParser nie wykonuje skryptow, wiec nic z tamtej strony nie ozywa.
+    function expRows(html){
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const out = [];
+        doc.querySelectorAll('input[name="selected[]"]').forEach(function (i){
+            if (i.value) out.push(i.value);
+        });
+        return out;
+    }
+    // Eksport idzie po WYBRANYCH WIERSZACH, nie po filtrach — sprawdzone na zrzucie
+    // z przegladarki. Pozostale pola dokladamy w tym samym komplecie, co strona.
+    function expFileBody(p, account, rows){
+        const q = new URLSearchParams();
+        const r = expRange(p);
+        rows.forEach(function (v){ q.append('selected[]', v); });
+        q.append('system', p.system || 'excel');
+        q.append('name', p.fname || '');
+        q.append('state', p.state);
+        q.append('minamount', p.minamount || '');
+        q.append('maxamount', p.maxamount || '');
+        q.append('mindate', p.dateField === 'invoice' ? '' : r[0]);
+        q.append('maxdate', p.dateField === 'invoice' ? '' : r[1]);
+        q.append('country', p.country || '');
+        q.append('account', account);
+        q.append('paid_status', p.paid || '');
+        return q.toString();
+    }
+    function expExt(cd, fallback){
+        const m = String(cd).match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+        let n = '';
+        try { n = m ? decodeURIComponent(m[1]) : ''; } catch (e){ n = m ? m[1] : ''; }
+        const e = n.match(/(\.[A-Za-z0-9]{2,5})$/);
+        return e ? e[1] : fallback;
+    }
+
+    // ---------- archiwum ----------
+    // Wlasny ZIP bez kompresji — tak samo jak w pozostalych modulach HUB-a. Zadnej
+    // biblioteki do dociagania, wiec firmowe proxy nie ma czego zablokowac.
+    let EXP_CRCT = null;
+    function crcTable(){
+        if (EXP_CRCT) return EXP_CRCT;
+        EXP_CRCT = new Uint32Array(256);
+        for (let n = 0; n < 256; n++){
+            let c = n;
+            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            EXP_CRCT[n] = c >>> 0;
+        }
+        return EXP_CRCT;
+    }
+    function crc32(u8){
+        const t = crcTable();
+        let c = 0xFFFFFFFF;
+        for (let i = 0; i < u8.length; i++) c = t[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+        return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+    function utf8(s){ return new TextEncoder().encode(String(s)); }
+    function expZip(files){
+        const enc = files.map(function (f){
+            const d = f.data;
+            return { n: utf8(f.name), d: d, crc: crc32(d), off: 0 };
+        });
+        let total = 22;
+        enc.forEach(function (f){ total += 30 + f.n.length + f.d.length + 46 + f.n.length; });
+        const out = new Uint8Array(total), dv = new DataView(out.buffer);
+        let p = 0;
+        const u16 = function (v){ dv.setUint16(p, v & 0xFFFF, true); p += 2; };
+        const u32 = function (v){ dv.setUint32(p, v >>> 0, true); p += 4; };
+        const put = function (a){ out.set(a, p); p += a.length; };
+        enc.forEach(function (f){
+            f.off = p;
+            u32(0x04034B50); u16(20); u16(0x0800); u16(0); u16(0); u16(0);
+            u32(f.crc); u32(f.d.length); u32(f.d.length); u16(f.n.length); u16(0);
+            put(f.n); put(f.d);
+        });
+        const cdStart = p;
+        enc.forEach(function (f){
+            u32(0x02014B50); u16(20); u16(20); u16(0x0800); u16(0); u16(0); u16(0);
+            u32(f.crc); u32(f.d.length); u32(f.d.length);
+            u16(f.n.length); u16(0); u16(0); u16(0); u16(0); u32(0); u32(f.off);
+            put(f.n);
+        });
+        u32(0x06054B50); u16(0); u16(0); u16(enc.length); u16(enc.length);
+        u32(p - cdStart); u32(cdStart); u16(0);
+        return out;
+    }
+    function expDownload(bytes, name){
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ try { URL.revokeObjectURL(url); } catch (e){} }, 8000);
+    }
+
+    // ---------- UI ----------
+    const btn = document.createElement('button');
+    btn.id = 'exp-btn';
+    btn.textContent = '📤 Export payments';
+    btn.style.cssText = 'position:fixed;top:356px;right:12px;z-index:2147483000;padding:9px 14px;border:none;'
+                      + 'border-radius:8px;background:#0f766e;color:#fff;font:bold 13px Arial,sans-serif;'
+                      + 'cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)';
+
+    const panel = document.createElement('div');
+    panel.id = 'exp-panel';
+    panel.style.cssText = 'position:fixed;top:60px;right:12px;width:760px;max-height:86vh;overflow:auto;'
+                        + 'z-index:2147483001;background:#fff;border:1px solid #ddd;border-radius:10px;'
+                        + 'box-shadow:0 6px 24px rgba(0,0,0,.2);padding:12px;display:none;'
+                        + 'font:12px Arial,sans-serif;color:#111';
+    document.body.appendChild(btn);
+    document.body.appendChild(panel);
+    btn.onclick = function (){
+        panel.style.display = (panel.style.display === 'none') ? 'block' : 'none';
+        if (panel.style.display === 'block') render();
+    };
+
+    function $(s){ return panel.querySelector(s); }
+    function say(t, c){ const e = $('#exp-status'); if (e){ e.textContent = t || ''; e.style.color = c || '#666'; } }
+
+    let running = false;
+    let uiFirm = '', uiSellerQ = '', uiAccQ = '';
+
+    function render(){
+        const d = profLoad(), p = profCur(d);
+        const sellers = expSellers(), accounts = expAccounts();
+        const firms = {};
+        sellers.forEach(function (s){ firms[s.firm] = (firms[s.firm] || 0) + 1; });
+        const chosen = {}; (p.users || []).forEach(function (u){ chosen[u] = 1; });
+        const accSel = {}; (p.accounts || []).forEach(function (a){ accSel[a] = 1; });
+        const r = expRange(p);
+
+        let h = '';
+        h += '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;border-bottom:1px solid #eee;padding-bottom:8px">'
+           +   '<b style="font-size:13px">Export payments</b>'
+           +   '<select id="exp-prof" style="flex:1;min-width:220px;font-size:12px">'
+           +     d.list.map(function (x){ return '<option value="' + esc(x.id) + '"' + (x.id === p.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; }).join('')
+           +   '</select>'
+           +   '<button id="exp-run" style="padding:5px 12px;border:none;border-radius:6px;background:#0f766e;color:#fff;font-weight:700;cursor:pointer">▶ Uruchom</button>'
+           +   '<button id="exp-new" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Nowy</button>'
+           +   '<button id="exp-del" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Usuń</button>'
+           +   '<button id="exp-copy" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Kopiuj</button>'
+           +   '<button id="exp-paste" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Wklej</button>'
+           + '</div>'
+           + '<div style="margin:6px 0"><input id="exp-name" value="' + esc(p.name) + '" placeholder="nazwa profilu" style="width:100%;font-size:12px;padding:3px 5px;border:1px solid #ddd;border-radius:5px"></div>'
+           + '<div id="exp-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>';
+
+        h += '<div style="display:flex;gap:10px;align-items:flex-start">';
+
+        h += '<div style="flex:1;min-width:0">'
+           +   '<div style="font-weight:700;margin-bottom:4px">Sprzedawcy <span style="color:#888;font-weight:400">(' + (p.users || []).length + ')</span></div>'
+           +   '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:5px">'
+           +     Object.keys(firms).sort().map(function (f){
+                     return '<button class="exp-firm" data-f="' + esc(f) + '" style="font-size:10px;padding:2px 7px;border-radius:99px;cursor:pointer;'
+                          + 'border:1px solid ' + (uiFirm === f ? '#0f766e' : '#ddd') + ';background:' + (uiFirm === f ? '#ccfbf1' : '#f9fafb') + '">'
+                          + esc(f) + ' · ' + firms[f] + '</button>';
+                 }).join('')
+           +   '</div>'
+           +   '<input id="exp-sq" value="' + esc(uiSellerQ) + '" placeholder="szukaj sprzedawcy…" style="width:100%;font-size:11px;padding:3px 5px;border:1px solid #ddd;border-radius:5px;margin-bottom:4px">'
+           +   '<div style="margin-bottom:4px"><button id="exp-son" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz widoczne</button> '
+           +     '<button id="exp-soff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz widoczne</button></div>'
+           +   '<div id="exp-slist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px">'
+           +     sellers.filter(function (s){
+                     if (uiFirm && s.firm !== uiFirm) return false;
+                     if (uiSellerQ && s.txt.toLowerCase().indexOf(uiSellerQ.toLowerCase()) < 0) return false;
+                     return true;
+                 }).map(function (s){
+                     return '<label style="display:block;font-size:11px;line-height:1.6;' + (s.active ? '' : 'color:#999') + '">'
+                          + '<input type="checkbox" class="exp-s" value="' + esc(s.v) + '"' + (chosen[s.v] ? ' checked' : '') + '> ' + esc(s.txt) + '</label>';
+                 }).join('')
+           +   '</div>'
+           + '</div>';
+
+        h += '<div style="flex:1;min-width:0">'
+           +   '<div style="font-weight:700;margin-bottom:4px">Konta <span style="color:#888;font-weight:400">(' + (p.accounts || []).length + ') — przelot po kolei</span></div>'
+           +   '<input id="exp-aq" value="' + esc(uiAccQ) + '" placeholder="szukaj konta, np. B2B Intra-comm…" style="width:100%;font-size:11px;padding:3px 5px;border:1px solid #ddd;border-radius:5px;margin-bottom:4px">'
+           +   '<div style="margin-bottom:4px"><button id="exp-aon" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz widoczne</button> '
+           +     '<button id="exp-aoff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz widoczne</button></div>'
+           +   '<div id="exp-alist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px">'
+           +     accounts.filter(function (a){
+                     return !uiAccQ || a.txt.toLowerCase().indexOf(uiAccQ.toLowerCase()) >= 0;
+                 }).map(function (a){
+                     return '<label style="display:block;font-size:11px;line-height:1.6">'
+                          + '<input type="checkbox" class="exp-a" value="' + esc(a.v) + '"' + (accSel[a.v] ? ' checked' : '') + '> ' + esc(a.txt) + '</label>';
+                 }).join('')
+           +   '</div>'
+           + '</div>';
+
+        h += '</div>';
+
+        const selOpt = function (list, cur){
+            return list.map(function (o){ return '<option value="' + esc(o.v) + '"' + (String(cur) === String(o.v) ? ' selected' : '') + '>' + esc(o.txt) + '</option>'; }).join('');
+        };
+        h += '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;padding-top:8px;border-top:1px solid #eee">'
+           +   '<label>Okres <select id="exp-range" style="font-size:12px">'
+           +     '<option value="prev"' + (p.range === 'prev' ? ' selected' : '') + '>poprzedni miesiąc</option>'
+           +     '<option value="cur"' + (p.range === 'cur' ? ' selected' : '') + '>bieżący miesiąc</option>'
+           +     '<option value="fix"' + (p.range === 'fix' ? ' selected' : '') + '>zakres ręczny</option>'
+           +   '</select></label>'
+           +   '<label>od <input id="exp-from" value="' + esc(r[0]) + '" size="10" style="font-size:12px"' + (p.range === 'fix' ? '' : ' disabled') + '></label>'
+           +   '<label>do <input id="exp-to" value="' + esc(r[1]) + '" size="10" style="font-size:12px"' + (p.range === 'fix' ? '' : ' disabled') + '></label>'
+           +   '<label>data <select id="exp-df" style="font-size:12px">'
+           +     '<option value="payment"' + (p.dateField === 'payment' ? ' selected' : '') + '>Payment date</option>'
+           +     '<option value="invoice"' + (p.dateField === 'invoice' ? ' selected' : '') + '>Invoice date</option>'
+           +   '</select></label>'
+           + '</div>'
+           + '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:6px">'
+           +   '<label>State <select id="exp-state" style="font-size:12px">' + selOpt(expOptions('select[name="state"]'), p.state) + '</select></label>'
+           +   '<label>Sellers <select id="exp-st" style="font-size:12px">' + selOpt(expOptions('select[name="seller-type"]'), p.sellerType) + '</select></label>'
+           +   '<label>Invoice status <select id="exp-inv" style="font-size:12px">' + selOpt(expOptions('select[name="inv_status"]'), p.inv) + '</select></label>'
+           +   '<label>Paid <select id="exp-paid" style="font-size:12px">' + selOpt(expOptions('select[name="paid_status"]'), p.paid) + '</select></label>'
+           +   '<label>Format <select id="exp-sys" style="font-size:12px">' + selOpt(expOptions('select[name="system"]'), p.system) + '</select></label>'
+           + '</div>'
+           + '<div style="margin-top:8px"><button id="exp-save" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer">Zapisz profil</button></div>'
+           + '<div id="exp-prog" style="margin-top:10px"></div>';
+
+        panel.innerHTML = h;
+        wire();
+    }
+
+    // Zmiane zapisujemy do profilu od razu, bez „Zapisz" — inaczej po kliknieciu
+    // Uruchom lecialby stary zestaw, a to najgorszy rodzaj niespodzianki.
+    function patch(fn){
+        const d = profLoad(), p = profCur(d);
+        fn(p, d);
+        profSave(d);
+    }
+
+    function wire(){
+        $('#exp-prof').onchange = function (){ patch(function (p, d){ d.cur = this.value; }.bind(this)); render(); };
+        $('#exp-name').onchange = function (){ const v = this.value; patch(function (p){ p.name = v; }); render(); };
+
+        panel.querySelectorAll('.exp-firm').forEach(function (b){
+            b.onclick = function (){ const f = b.getAttribute('data-f'); uiFirm = (uiFirm === f) ? '' : f; render(); };
+        });
+        $('#exp-sq').oninput = function (){ uiSellerQ = this.value; render(); $('#exp-sq').focus(); };
+        $('#exp-aq').oninput = function (){ uiAccQ = this.value; render(); $('#exp-aq').focus(); };
+
+        const bulk = function (sel, on){
+            const vals = [];
+            panel.querySelectorAll(sel).forEach(function (c){ vals.push(c.value); });
+            return function (){
+                patch(function (p){
+                    const key = (sel === '.exp-s') ? 'users' : 'accounts';
+                    const cur = {}; (p[key] || []).forEach(function (x){ cur[x] = 1; });
+                    vals.forEach(function (v){ if (on) cur[v] = 1; else delete cur[v]; });
+                    p[key] = Object.keys(cur);
+                });
+                render();
+            };
+        };
+        $('#exp-son').onclick = bulk('.exp-s', true);
+        $('#exp-soff').onclick = bulk('.exp-s', false);
+        $('#exp-aon').onclick = bulk('.exp-a', true);
+        $('#exp-aoff').onclick = bulk('.exp-a', false);
+
+        panel.querySelectorAll('.exp-s, .exp-a').forEach(function (c){
+            c.onchange = function (){
+                const key = c.classList.contains('exp-s') ? 'users' : 'accounts';
+                patch(function (p){
+                    const cur = {}; (p[key] || []).forEach(function (x){ cur[x] = 1; });
+                    if (c.checked) cur[c.value] = 1; else delete cur[c.value];
+                    p[key] = Object.keys(cur);
+                });
+                render();
+            };
+        });
+
+        const bind = function (id, field){
+            const e = $(id);
+            if (e) e.onchange = function (){ const v = e.value; patch(function (p){ p[field] = v; }); render(); };
+        };
+        bind('#exp-range', 'range'); bind('#exp-df', 'dateField'); bind('#exp-state', 'state');
+        bind('#exp-st', 'sellerType'); bind('#exp-inv', 'inv'); bind('#exp-paid', 'paid');
+        bind('#exp-sys', 'system'); bind('#exp-from', 'from'); bind('#exp-to', 'to');
+
+        $('#exp-save').onclick = function (){ say('Zapisane.', '#0a7a2f'); };
+        $('#exp-new').onclick = function (){
+            const nm = prompt('Nazwa nowego profilu:', 'Mój zestaw');
+            if (!nm) return;
+            const d = profLoad(), cur = profCur(d);
+            const p = JSON.parse(JSON.stringify(cur));
+            p.id = profNewId(); p.name = nm;
+            d.list.push(p); d.cur = p.id;
+            profSave(d); render();
+            say('Nowy profil to kopia poprzedniego — popraw, co trzeba.', '#666');
+        };
+        $('#exp-del').onclick = function (){
+            const d = profLoad();
+            if (d.list.length < 2){ say('To jedyny profil — nie ma czego usuwać.', '#c47f00'); return; }
+            const p = profCur(d);
+            if (!confirm('Usunąć profil „' + p.name + '"?')) return;
+            d.list = d.list.filter(function (x){ return x.id !== p.id; });
+            d.cur = d.list[0].id;
+            profSave(d); render();
+        };
+        $('#exp-copy').onclick = function (){
+            try { GM_setClipboard(JSON.stringify(profCur(profLoad()), null, 2)); say('Profil w schowku — możesz go komuś podesłać.', '#0a7a2f'); }
+            catch (e){ say('Nie mogę zapisać do schowka: ' + ((e && e.message) || e), '#c00'); }
+        };
+        $('#exp-paste').onclick = function (){
+            const t = prompt('Wklej profil (JSON):', '');
+            if (!t) return;
+            let p = null;
+            try { p = JSON.parse(t); } catch (e){ say('To nie jest poprawny JSON.', '#c00'); return; }
+            if (!p || !p.accounts || !p.users){ say('W tym JSON-ie nie ma ani sprzedawców, ani kont — nie przyjmuję.', '#c00'); return; }
+            const d = profLoad();
+            p.id = profNewId(); p.name = (p.name || 'Wklejony profil') + ' (wklejony)';
+            d.list.push(p); d.cur = p.id;
+            profSave(d); render();
+            say('Wklejone jako nowy profil.', '#0a7a2f');
+        };
+
+        $('#exp-run').onclick = function (){ runAll(this); };
+    }
+
+    // ---------- przelot ----------
+    async function runAll(b){
+        if (running) return;
+        const p = profCur(profLoad());
+        const accs = (p.accounts || []).slice();
+        if (!accs.length){ say('Nie wybrałeś żadnego konta.', '#c47f00'); return; }
+        if (!(p.users || []).length){ say('Nie wybrałeś żadnego sprzedawcy.', '#c47f00'); return; }
+        const r = expRange(p);
+        if (!r[0] || !r[1]){ say('Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (!confirm('Pobrać ' + accs.length + ' zestawień?\n\n'
+                   + 'Okres: ' + r[0] + ' … ' + r[1] + ' (' + (p.dateField === 'invoice' ? 'Invoice date' : 'Payment date') + ')\n'
+                   + 'Sprzedawców: ' + p.users.length + '\n'
+                   + 'Format: ' + p.system + '\n\n'
+                   + 'Nic nie zostanie oznaczone jako wyeksportowane.')) return;
+
+        running = true; b.disabled = true;
+        const prog = $('#exp-prog');
+        const st = accs.map(function (a){ return { a: a, rows: null, note: 'czeka' }; });
+        const draw = function (done){
+            let h = '<div style="font-size:11px;color:#666;margin-bottom:4px">konto ' + done + ' z ' + accs.length + '</div>'
+                  + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+                  + '<tr style="color:#999"><td>konto</td><td style="text-align:right">wierszy</td><td style="text-align:right">stan</td></tr>';
+            st.forEach(function (x){
+                const col = x.note === 'pobrane' ? '#0a7a2f' : (x.note === 'pusto' ? '#999' : (x.note === 'czeka' || x.note === 'szukam' ? '#666' : '#c00'));
+                h += '<tr style="border-top:1px solid #f0f0f0"><td style="padding:2px 0">' + esc(expAccLabel(x.a)) + '</td>'
+                   + '<td style="text-align:right">' + (x.rows == null ? '—' : x.rows) + '</td>'
+                   + '<td style="text-align:right;color:' + col + '">' + esc(x.note) + '</td></tr>';
+            });
+            prog.innerHTML = h + '</table>';
+        };
+        draw(0);
+
+        const files = [], problems = [];
+        for (let i = 0; i < accs.length; i++){
+            const a = accs[i];
+            st[i].note = 'szukam'; draw(i);
+            try {
+                const html = await expPost(expSearchBody(p, a), false);
+                const rows = expRows(html);
+                st[i].rows = rows.length;
+                if (!rows.length){ st[i].note = 'pusto'; draw(i + 1); continue; }
+                const f = await expPost(expFileBody(p, a, rows), true);
+                // Serwer oddaje plik. Strona HTML w odpowiedzi oznacza, ze eksport
+                // sie nie udal — do archiwum tego nie wkladamy, zeby nikt nie otworzyl
+                // „zestawienia", ktore w srodku jest komunikatem o bledzie.
+                if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
+                    throw new Error('zamiast pliku przyszła strona HTML');
+                const ext = expExt(f.cd, '.xls');
+                files.push({ name: safeName(expAccLabel(a)) + ext, data: f.buf });
+                st[i].note = 'pobrane';
+            } catch (e){
+                st[i].note = 'błąd';
+                problems.push(a + ': ' + ((e && e.message) || e));
+            }
+            draw(i + 1);
+        }
+
+        running = false; b.disabled = false;
+        if (!files.length){
+            say('Nie pobrałem żadnego pliku' + (problems.length ? (' — ' + problems.join('; ')) : ' — we wszystkich kontach pusto.') , problems.length ? '#c00' : '#c47f00');
+            return;
+        }
+        const zipName = r[0] + ' — ' + r[1] + '.zip';
+        expDownload(expZip(files), zipName);
+        say('Gotowe: ' + files.length + ' plików w „' + zipName + '"'
+            + (problems.length ? (' · problemy: ' + problems.join('; ')) : '') + '.',
+            problems.length ? '#c47f00' : '#0a7a2f');
+    }
+})();
+    }
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
@@ -23174,6 +23757,7 @@
         { id: 'klient',   name: 'Zmiana typu klienta',       test: onProlo,   init: init_klient },
         { id: 'allegro',  name: 'Allegro CZ/HU/SK',          test: onAllegro, init: init_allegro },
         { id: 'deposit',  name: 'Chinskie', test: onProlo, init: init_deposit },
+        { id: 'export',   name: 'Export payments',           test: onProlo,   init: init_export },
     ];
 
     MODULES.forEach(function (m) {
@@ -23228,6 +23812,7 @@
             { id:'vies',     icon:svgIco('<path d="M11.46 20.85a12 12 0 0 1 -7.96 -14.85a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3a12 12 0 0 1 -.09 7.06"/><path d="M15 19l2 2l4 -4"/>'), label:'VIES / KRS / GUS', sel:'#viesBtn' },
             { id:'klient',   icon:svgIco('<circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2"/>'), label:'Zmiana typu klienta', sel:'#klient-btn' },
             { id:'sepa',     icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M9 13h6"/><path d="M9 17h6"/>'), label:'Walidator SEPA', sel:'#sepa-btn' },
+            { id:'export',   icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M12 11v6"/><path d="M9.5 14.5l2.5 2.5l2.5 -2.5"/>'), label:'Export payments', sel:'#exp-btn' },
             { id:'issuelog', icon:svgIco('<rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><path d="M9 12h.01"/><path d="M13 12h2"/><path d="M9 16h.01"/><path d="M13 16h2"/>'), label:'Issue / PAID', sel:'#ilp-btn' },
             { id:'issuelog', icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Issue — Szukaj', sel:'#ilp-search-btn' },
             { id:'deposit',  icon:svgIco('<path d="M12 3l8 4.5v9l-8 4.5l-8 -4.5v-9z"/><path d="M12 12l8 -4.5"/><path d="M12 12v9"/><path d="M12 12l-8 -4.5"/>'), label:'Chińskie', sel:'#chinskie-btn' },
