@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.92
+// @version      2.94
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17701,6 +17701,12 @@
     const MK_KEY = 'mkt_jobs';
     function jobsLoad(){ try { return JSON.parse(GM_getValue(MK_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function jobsSave(j){ try { GM_setValue(MK_KEY, JSON.stringify(j)); } catch (e){} }
+    // Zlecenie „do wziecia" to takze to, ktore wczesniej padlo. Prawie kazdy blad jest
+    // przejsciowy — wygasla sesja, zerwane polaczenie, chwilowy 500 — a bez ponawiania
+    // jedyna droga powrotu bylo wyczyszczenie WSZYSTKICH zlecen i wgranie wyciagu od nowa.
+    // KAZDE przejscie po marketplace — takze te dopisane w przyszlosci — ma wybierac
+    // zlecenia tym predykatem, a nie porownywac status z 'new' na wlasna reke.
+    function mkTodo(j){ return !!j && (j.status === 'new' || j.status === 'err'); }
     // Ustawienia importu per sklep. Klucz zawiera marketplace, bo „Beliani DE" wystepuje
     // na kilku platformach naraz i sam numer sklepu by nie wystarczyl.
     //   acct — numer konta z planu kont (informacyjnie, do kontroli wzrokowej)
@@ -17716,6 +17722,7 @@
         'Mirakl (Vente) · Beliani DE': { bank: '157', booking: '9', acct: '1114' },
         'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' },
         'Wayfair · Wayfair DE':        { bank: '10',  booking: '9', acct: '1223' },
+        'Manor · Manor CH':            { bank: '149', booking: '9', acct: '1092' },
         // Joybuy nie ma importu, wiec bank_setting jest mu niepotrzebny — liczy sie
         // samo konto, na ktore idzie platnosc ksiegowana wprost na auftragu.
         'Joybuy · Joybuy DE':          { bank: '',    booking: '9', acct: '1169' }
@@ -18172,8 +18179,12 @@
     function withLogin(j, msg){
         const t = String(msg == null ? '' : (msg.message || msg));
         if (!MK_SESS_RE.test(t)) return t;
+        // Czesc komunikatow niesie juz adres — i to celniejszy, bo prosto na strone
+        // z raportami (mkPanelUrl), a nie na sama sciane logowania. Wtedy nie doklejamy
+        // niczego, zeby w jednym zdaniu nie wisialy dwa odsylacze.
+        if (/https?:\/\//i.test(t)) return t;
         const u = mkLoginUrl(j);
-        return (u && t.indexOf(u) < 0) ? (t + ' → ' + u) : t;
+        return u ? (t + ' → ' + u) : t;
     }
 
     // ===== rozpoznawanie wplat w wyciagu =====
@@ -18218,6 +18229,28 @@
         { mp: 'Joybuy',         ok: true,  payer: /JINGDONG/i,
           ref: /reason\s*for\s*payment:\s*(\d{5,})/i,
           brand: 'Joybuy', short: 'Joybuy', kind: 'joy', shop: 'Joybuy DE' },
+        // Manor stoi na Miraklu, ale placi sam i inaczej sie tlumaczy: w tytule przelewu
+        // NIE MA numeru cyklu, tylko numery DOKUMENTOW ksiegowych — faktura IN… i noty
+        // kredytowe CN…, a kazdy z nich nalezy do innego cyklu rozliczeniowego.
+        // Dlatego oprocz „ref" (klucz zlecenia) zbieramy „docs" — komplet numerow.
+        // Wzorzec nie moze opierac sie na tym, co stoi przed numerem: w wyciagu bywa
+        // „NR.IN2858A-80 /1.7.2026NR.CN2858A-68/15.7.2026NR. CN2858A-69/22.7.2026",
+        // czyli raz sklejone z data, raz ze spacja po kropce.
+        // Do przelewu wchodza takze dokumenty BEZ prefiksu — same cyfry (247638, 8578773),
+        // w panelu typu MANUAL_CREDIT. Dlatego „docs" nie zaklada ksztaltu numeru, tylko
+        // bierze wszystko, co stoi w tytule jako „NR.<numer>/<data>".
+        { mp: 'Manor',          ok: true,  payer: /MANOR\s*AG/i,
+          ref:  /\b((?:IN|CN)\d{3,6}[A-Z]-\d+)\b/,
+          docs: /NR\s*\.?\s*([A-Z0-9-]{4,20}?)\s*\/\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{4}/gi,
+          brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH' },
+        // Raz na kilka miesiecy Manor nie wypisuje numerow, tylko „SIEHE AVIS VOM …"
+        // (2 razy na 47 przelewow w roku). Bez tej reguly taka wplata nie utworzylaby
+        // ZADNEGO zlecenia i po prostu by zniknela — a cicho pominieta wplata to
+        // najgorszy blad, jaki ten modul moze popelnic. Kluczem jest numer zlecenia
+        // platniczego Manora z „/ROC/", ktory wystepuje w kazdym ich przelewie.
+        { mp: 'Manor',          ok: true,  payer: /MANOR\s*AG/i,
+          ref:  /\/ROC\/(\d+)/,
+          brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -18246,7 +18279,30 @@
                 const raw = String(reason || '');
                 const m = raw.match(r.ref) || raw.replace(/\s+/g, '').match(r.ref);
                 if (!m) continue;
-                base.ref = m[1]; return base;
+                base.ref = m[1];
+                // Manor: jeden przelew reguluje kilka dokumentow naraz. Zbieramy komplet
+                // z obu wariantow tekstu — surowego i sklejonego — bo wyciag lamie dlugi
+                // opis i numer potrafi sie rozpasc na dwa wiersze.
+                if (r.docs){
+                    // Bierzemy GRUPE, nie cale trafienie — wzorzec obejmuje takze „NR."
+                    // i date, a interesuje nas sam numer w srodku.
+                    const grab = function (s){
+                        const re = new RegExp(r.docs.source, r.docs.flags), out = [];
+                        let m;
+                        while ((m = re.exec(s)) !== null){
+                            out.push((m[1] != null ? m[1] : m[0]).trim());
+                            if (m.index === re.lastIndex) re.lastIndex++;   // zabezpieczenie przed pustym trafieniem
+                        }
+                        return out;
+                    };
+                    const all = grab(raw).concat(grab(raw.replace(/\s+/g, '')));
+                    base.docs = all.filter(function (x, i){ return x && all.indexOf(x) === i; });
+                    // Kluczem zlecenia ma byc FAKTURA, nie pierwszy lepszy dokument —
+                    // po niej czlowiek rozpoznaje przelew i po niej szukamy w arkuszu.
+                    const inv = base.docs.filter(function (x){ return /^IN/i.test(x); })[0];
+                    if (inv) base.ref = inv;
+                }
+                return base;
             }
             base.ref = ''; return base;
         }
@@ -18328,6 +18384,53 @@
         return { rows: out };
     }
 
+    // PostFinance: blok metadanych („Date from:", „Account:", „Currency:"), a naglowek
+    // dopiero przy „Date;Notification text;…". Waluta siedzi w NAZWIE kolumny kwoty
+    // („Credit in CHF"), nie w osobnym polu. Platnik i tytul sa razem w jednym polu,
+    // jak u Postbanku, tyle ze rozdziela je slowo „COMMENTS:".
+    function mkParsePostfinance(rows, hi){
+        const hdr = rows[hi].map(function (h){ return String(h || '').trim().toLowerCase(); });
+        const iD = hdr.indexOf('date'), iT = hdr.indexOf('notification text');
+        let iA = -1, cur = '';
+        hdr.forEach(function (h, k){
+            const m = h.match(/^credit in ([a-z]{3})$/);
+            if (m){ iA = k; cur = m[1].toUpperCase(); }
+        });
+        if (iD < 0 || iT < 0 || iA < 0) return { err: 'w nagłówku PostFinance brakuje kolumn Date / Notification text / Credit in …' };
+        const iV = hdr.indexOf('value');
+        const out = [];
+        for (let i = hi + 1; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || !r.join('').trim()) continue;
+            // Stopka („Disclaimer:") nie ma daty w pierwszej kolumnie — odsiewa ja
+            // wymog kwoty, ale sprawdzamy tez date, zeby nie liczyc na przypadek.
+            const amt = mkNum(r[iA]);
+            if (amt == null || amt <= 0) continue;                    // tylko wplywy
+            const t = String(r[iT] || '').replace(/\s+/g, ' ').trim();
+            // „CREDIT MAILER: MANOR AG … COMMENTS: /ROC/… REFERENCES: …" — platnik stoi
+            // przed slowem COMMENTS, cala reszta jest tytulem.
+            const payer = t.split(/\bCOMMENTS:/i)[0].replace(/^CREDIT\s+MAILER:\s*/i, '').trim();
+            // Data waluty jest tym, co widac na wyciagu jako dzien wplywu; gdyby jej
+            // nie bylo, zostaje data ksiegowania.
+            const dRaw = String(r[iV] || r[iD] || '').trim();
+            out.push({
+                date: mkIso(dRaw) || dRaw, cur: cur,
+                amount: r2(amt), payer: payer || t, reason: t, txId: ''
+            });
+        }
+        return { rows: out };
+    }
+    // Przepisanie wyniku rozpoznania na wiersz wyciagu. W JEDNYM miejscu, bo formatow
+    // wyciagow jest juz trzy i przy dokladaniu pola latwo pominac jedna galaz — tak
+    // wlasnie zlecenia OBI zostaly kiedys bez rodzaju i przejscie VTEX ich nie widzialo.
+    function mkApplyDetect(x, d){
+        x.mp = d ? d.mp : ''; x.ok = !!(d && d.ok); x.ref = d ? d.ref : '';
+        x.brand = d ? (d.brand || '') : ''; x.short = d ? (d.short || '') : ''; x.host = d ? (d.host || '') : '';
+        x.kind = d ? (d.kind || 'mirakl') : ''; x.shop = d ? (d.shop || '') : '';
+        x.docs = (d && d.docs && d.docs.length) ? d.docs : null;
+        return x;
+    }
+
     function mkParseBank(text){
         const rows = mkCsvRows(text);
         let hi = -1, kind = '';
@@ -18335,21 +18438,19 @@
             const c0 = String(rows[i][0] || '').trim();
             if (/^Trade date$/i.test(c0)) { hi = i; kind = 'ubs'; break; }
             if (/^Kontonummer$/i.test(c0)) { hi = i; kind = 'postbank'; break; }
+            // „Date" musi byc DOKLADNE — pierwsza linia pliku to „Date from:" i naiwne
+            // dopasowanie zabieraloby blok metadanych za naglowek tabeli.
+            if (/^Date$/i.test(c0) && rows[i].join(';').toLowerCase().indexOf('notification text') >= 0){
+                hi = i; kind = 'postfinance'; break;
+            }
         }
-        if (kind === 'postbank'){
-            const p = mkParsePostbank(rows, hi);
+        if (kind === 'postbank' || kind === 'postfinance'){
+            const p = (kind === 'postbank') ? mkParsePostbank(rows, hi) : mkParsePostfinance(rows, hi);
             if (p.err) return p;
-            p.rows.forEach(function (x){
-                const d = mkDetect(x.payer, x.reason);
-                x.mp = d ? d.mp : ''; x.ok = !!(d && d.ok); x.ref = d ? d.ref : '';
-                x.brand = d ? (d.brand || '') : ''; x.short = d ? (d.short || '') : ''; x.host = d ? (d.host || '') : '';
-                // BEZ tych dwoch pol zlecenia OBI mialy host, ale nie mialy rodzaju —
-                // a po nim wlasnie filtruje sie przejscie VTEX. Efekt: cisza zamiast bledu.
-                x.kind = d ? (d.kind || 'mirakl') : ''; x.shop = d ? (d.shop || '') : '';
-            });
+            p.rows.forEach(function (x){ mkApplyDetect(x, mkDetect(x.payer, x.reason)); });
             return p;
         }
-        if (hi < 0) return { err: 'nie rozpoznaję nagłówka — obsługuję wyciągi UBS („Trade date") i Postbank („Kontonummer")' };
+        if (hi < 0) return { err: 'nie rozpoznaję nagłówka — obsługuję wyciągi UBS („Trade date"), Postbank („Kontonummer") i PostFinance („Date;Notification text")' };
         const hdr = rows[hi].map(function (h){ return String(h || '').trim().toLowerCase(); });
         const ix = {};
         ['booking date', 'currency', 'debit', 'credit', 'transaction no.', 'description1', 'description3'].forEach(function (k){ ix[k] = hdr.indexOf(k); });
@@ -18367,15 +18468,12 @@
             // RRRR-MM-DD (dopasowanie cyklu, import, arkusz), wiec kazde inne wejscie
             // musi zostac znormalizowane u zrodla, a nie w kilku miejscach osobno.
             const dRaw = String(r[ix['booking date']] || '').trim();
-            out.push({
+            out.push(mkApplyDetect({
                 date: mkIso(dRaw) || dRaw,
                 cur: String(r[ix['currency']] || '').trim(),
                 amount: r2(cr), payer: payer, reason: reason,
-                txId: String(r[ix['transaction no.']] || '').trim(),
-                mp: d ? d.mp : '', ok: !!(d && d.ok), ref: d ? d.ref : '',
-                brand: d ? (d.brand || '') : '', short: d ? (d.short || '') : '', host: d ? (d.host || '') : '',
-                kind: d ? (d.kind || 'mirakl') : '', shop: d ? (d.shop || '') : ''
-            });
+                txId: String(r[ix['transaction no.']] || '').trim()
+            }, d));
         }
         return { rows: out };
     }
@@ -18394,6 +18492,14 @@
         const ref = /REFUND/.test(s);
         if (/^PAYMENT$/.test(s)) return { k: 'payment', ref: false };
         if (/REMITTED/.test(s))  return { k: 'skip', ref: ref };   // znosi podatek — nie liczy sie do brutto
+        // Model dropshipowy (Manor, ONE_CREDITOR): oprocz pozycji zamowienia cykl niesie
+        // strone ZAKUPOWA operatora — „Purchase commission", „Purchase tax", „Purchase
+        // shipping commission", „Purchase shipping tax". To nie jest to, co zaplacil klient,
+        // wiec do brutto nie wchodzi; do kontroli netto owszem, bo tworzy kwote faktury.
+        // MUSI stac przed regula od SHIPPING, inaczej „Purchase shipping tax" wpadloby
+        // do brutta bocznymi drzwiami, a „Purchase tax" zostaloby nierozpoznane —
+        // czyli dwie pozycje tej samej rodziny trafialyby w dwa rozne miejsca.
+        if (/(^|_)PURCHASE_/.test(s)) return { k: 'skip', ref: ref };
         if (/COMMISSION/.test(s)) return { k: 'skip', ref: ref };
         if (/SUBSCRIPTION/.test(s)) return { k: 'skip', ref: ref };
         if (/OPEN_AMOUNT/.test(s)) return { k: 'skip', ref: ref };
@@ -19353,6 +19459,105 @@
     async function mkCycles(){
         return mkArr(await mkApi('/sellerpayment/private/shop-billing-cycles?limit=100&sort=dateCreated%2CDESC'));
     }
+
+    // ===== Manor: z numeru dokumentu na cykl rozliczeniowy =====
+    // Manor reguluje naraz komplet dokumentow — fakture i noty kredytowe — i w tytule
+    // przelewu podaje ICH numery, a nie numer cyklu. Kazdy dokument nalezy przy tym do
+    // innego cyklu (faktura z 1.7, noty z 15.7 i 22.7), wiec z jednej wplaty wychodzi
+    // kilka cykli, ktore trzeba potem zlaczyc w jedna paczke importu.
+    // Zapytanie jest tej samej rodziny co reszta panelu, wiec idzie przez mkApi i dziala
+    // zarowno ze strony Mirakla, jak i z prologistics.
+    const MANOR_DOC = '/document-request/private/accounting-document/to-operator';
+    // Nazwy pol w odpowiedzi znam z EKRANU panelu (kolumny „Billing cycle ID" i
+    // „Incl. taxes"), nie z dokumentacji. Dlatego szukamy ich po kilku prawdopodobnych
+    // nazwach — najpierw doklane trafienie, potem fragment — a gdy zadna nie pasuje,
+    // do komunikatu trafia lista kluczy, ktore naprawde przyszly. Zgadywanie w ciemno
+    // byloby gorsze niz brak: zle odczytana kwota to blad ksiegowy, nie usterka.
+    function manorKey(o, want){
+        const keys = Object.keys(o || {});
+        const norm = function (s){ return String(s).toLowerCase().replace(/[^a-z]/g, ''); };
+        for (let i = 0; i < want.length; i++){
+            const k = keys.filter(function (x){ return norm(x) === want[i]; })[0];
+            if (k != null) return k;
+        }
+        for (let i = 0; i < want.length; i++){
+            const k = keys.filter(function (x){ return norm(x).indexOf(want[i]) >= 0; })[0];
+            if (k != null) return k;
+        }
+        return '';
+    }
+    // Wartosc bywa opakowana („amount": { "value": 16265.81, "currency": "CHF" }),
+    // wiec po znalezieniu klucza schodzimy jeszcze o poziom nizej.
+    function manorVal(o, want){
+        const k = manorKey(o, want);
+        if (!k) return null;
+        const v = o[k];
+        if (v && typeof v === 'object'){
+            if (v.value != null) return v.value;
+            if (v.amount != null) return v.amount;
+            if (v.id != null) return v.id;
+            if (v.uuid != null) return v.uuid;
+            return null;
+        }
+        return v;
+    }
+    // Jeden dokument -> { nr, cyc, val }. „val" jest ZE ZNAKIEM: nota kredytowa pomniejsza
+    // przelew, faktura go tworzy. Nazwy pol sa z prawdziwej odpowiedzi panelu Manora:
+    //   number, shopBillingCycleId, totalAmountIncludingTaxes, documentRequestType,
+    //   currencyCode — reszta listy w manorVal to zapas na wypadek zmiany po ich stronie.
+    async function manorDoc(nr){
+        const j = await mkApi(MANOR_DOC + '?documentNumber=' + encodeURIComponent(nr)
+                            + '&limit=25&sort=dateCreated%2CDESC');
+        const list = mkArr(j);
+        // Numer z wyciagu i numer z panelu nie sa zapisane tak samo: Manor podaje
+        // w przelewie „247638", a API oddaje „000000247638" dopelnione zerami.
+        // Porownujemy wiec bez wiodacych zer — inaczej trafienie wypadaloby z filtra
+        // i braliby smy pierwszy z brzegu wynik, co przy dwoch wynikach byloby loteria.
+        const same = function (a, b){
+            return String(a == null ? '' : a).toUpperCase().replace(/^0+/, '')
+                === String(b == null ? '' : b).toUpperCase().replace(/^0+/, '');
+        };
+        const hit = list.filter(function (x){
+            return same(manorVal(x, ['number', 'documentnumber']), nr);
+        })[0];
+        if (!hit) return { nr: nr, err: 'panel nie zna takiego dokumentu' };
+        const out = { nr: nr, keys: Object.keys(hit) };
+        out.cyc = String(manorVal(hit, ['shopbillingcycleid', 'billingcycleid', 'billingcycle', 'cycle']) || '');
+        out.cur = String(manorVal(hit, ['currencycode', 'currency']) || '');
+        out.typ = String(manorVal(hit, ['documentrequesttype', 'documenttype', 'type']) || '').toUpperCase();
+        const amt = mkNum(manorVal(hit, ['totalamountincludingtaxes', 'amountincludingtaxes',
+                                         'totalincludingtaxes', 'incltaxes', 'totalamount']));
+        // Znak z DWOCH niezaleznych zrodel: typu dokumentu z API i prefiksu numeru.
+        // Prefiks nie zawsze jest — Manor wrzuca do przelewu takze dokumenty o samych
+        // cyfrach (247638, 8578773) — i wtedy rozstrzyga typ. Gdy oba sa znane i sie
+        // KLOCA, nie zgadujemy: zly znak przy kwocie to blad ksiegowy, nie usterka.
+        //
+        // MANUAL_CREDIT to pieniadze DLA NAS — Manor nas uznaje, wiec przelew rosnie.
+        // (W module ticketowym ta sama kwota idzie ze znakiem minus, bo tam dodatnia
+        // oznacza zwrot; to inna konwencja tego samego zdarzenia, nie sprzecznosc.)
+        // MANUAL_INVOICE to odwrotnie: faktura operatora na nas, wiec przelew maleje —
+        // tak samo traktuje ja klasyfikator pozycji w mkCls.
+        const byType = /MANUAL_CREDIT/.test(out.typ) ? 1
+                     : (/MANUAL_INVOICE/.test(out.typ) ? -1
+                     : (/CREDIT/.test(out.typ) ? -1
+                     : (/INVOICE|DEBIT/.test(out.typ) ? 1 : 0)));
+        const byNr = /^CN/i.test(nr) ? -1 : (/^IN/i.test(nr) ? 1 : 0);
+        if (byType && byNr && byType !== byNr){
+            out.err = 'typ dokumentu („' + out.typ + '") kłóci się z jego numerem — nie wiem, czy dodaje, czy odejmuje';
+            return out;
+        }
+        const sgn = byType || byNr;
+        out.val = (amt == null || !sgn) ? null : r2(sgn * Math.abs(amt));
+        if (!out.cyc) out.err = 'w odpowiedzi nie widzę numeru cyklu';
+        else if (amt == null) out.err = 'w odpowiedzi nie widzę kwoty brutto';
+        else if (!sgn) out.err = 'nie rozpoznaję typu dokumentu („' + out.typ + '") — nie wiem, czy dodaje, czy odejmuje';
+        return out;
+    }
+    async function manorDocs(nrs){
+        const out = [];
+        for (let i = 0; i < nrs.length; i++) out.push(await manorDoc(nrs[i]));
+        return out;
+    }
     // Cykl rozliczeniowy zamyka sie w dniu wyplaty: okres 11/07-21/07 zostal utworzony
     // 21 lipca o 00:02 i tego samego dnia przyszedl przelew. Dlatego zamiast przegladac
     // caly wykaz (razem z archiwum sprzed lat) patrzymy najpierw na cykle z okolic daty
@@ -20067,6 +20272,25 @@
     // Paczki gotowe do zaksiegowania: zaimportowane, znany numer, jeszcze niezaksiegowane.
     function bookList(){ return jobList().filter(function (j){ return j.status === 'done' && j.impId && !j.booked; }); }
 
+    // Pole na recznie wpisane numery dokumentow Manora. Potrzebne w dwoch sytuacjach,
+    // obu potwierdzonych na roku wyciagow: gdy Manor napisal w tytule „SIEHE AVIS"
+    // zamiast numerow (2 przelewy na 47), i gdy suma dokumentow nie schodzi sie z wplata,
+    // bo w tytule zabraklo jednego. Wtedy przepisujesz numery z awiza, a modul liczy
+    // od nowa. Pokazujemy je TYLKO na prologistics — tam stoi lista zlecen.
+    function manorBox(j){
+        if (!onProlo || String(j.mp || '') !== 'Manor') return '';
+        const st = j.status || 'new';
+        if (st !== 'partial' && st !== 'err' && st !== 'new') return '';
+        return '<div style="margin-top:4px;padding:4px 6px;background:#fff7ed;border:1px solid #fed7aa;border-radius:5px">'
+             + '<span style="font-size:10px;color:#7c2d12">numery dokumentów z przelewu (po przecinku):</span> '
+             + '<input class="mk-mdoc" data-ref="' + esc(j.ref) + '" value="' + esc((j.docs || []).join(', ')) + '" '
+             + 'placeholder="IN2858A-80, CN2858A-68, 247638" '
+             + 'style="width:280px;font-size:11px;padding:2px 4px;border:1px solid #fdba74;border-radius:4px">'
+             + ' <button class="mk-mdocb" data-ref="' + esc(j.ref) + '" '
+             + 'style="padding:2px 8px;border:none;border-radius:4px;background:#ea580c;color:#fff;'
+             + 'font-size:11px;cursor:pointer">zapisz numery</button></div>';
+    }
+
     function render(){
         const out = $('#mk-out');
         const jobs = jobList();
@@ -20077,7 +20301,7 @@
         // w zapytaniu miedzydomenowym. Mowimy to ZANIM ktos kliknie i zobaczy 404.
         if (onProlo){
             const vh = {};
-            jobs.forEach(function (j){ if (j.status === 'new' && j.ref && j.kind === 'vtex' && j.host) vh[j.host] = (vh[j.host] || 0) + 1; });
+            jobs.forEach(function (j){ if (mkTodo(j) && j.ref && j.kind === 'vtex' && j.host) vh[j.host] = (vh[j.host] || 0) + 1; });
             Object.keys(vh).forEach(function (host){
                 h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
                   +  '<b>' + vh[host] + ' zleceń czeka na zestawienia z ' + esc(host) + '</b> — tej platformy nie pobiorę stąd, bo jej sesja nie działa międzydomenowo. '
@@ -20130,6 +20354,7 @@
                    + '</div>')
                 : '';
             let det = linkify(j.msg || '');
+            if (!j.data) det += manorBox(j);
             if (j.data){
                 const n = Object.keys(j.data.ord || {}).length, nr = Object.keys(j.data.ref || {}).length;
                 det = 'zamówień: <b>' + n + '</b> na ' + f2(j.data.gross) + (nr ? (' · zwrotów: <b>' + nr + '</b> na ' + f2(j.data.refund)) : '') +
@@ -20150,6 +20375,7 @@
                 if (sh && sh.found) det += '<div style="color:#c00;font-weight:700">JEST JUŻ W ARKUSZU — wiersz ' + esc(sh.row.row) + ' (' + esc(sh.row.marketplace) + ', ' + esc(sh.row.comments || '') + ')</div>';
                 else if (sh && sh.similar && sh.similar.length) det += '<div style="color:#c47f00">w arkuszu jest podobny wpis: ' + esc(sh.similar.map(function (x){ return x.data + ' ' + x.marketplace + ' ' + f2(x.kwota); }).join('; ')) + '</div>';
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
+                det += manorBox(j);
                 if (j.msg) det += '<div style="color:#c47f00">' + linkify(j.msg) + '</div>';
             }
             h += '<tr style="border-top:1px solid #eee">'
@@ -20229,6 +20455,29 @@
         }; });
         out.querySelectorAll('.mk-ck').forEach(function (c){
             c.onchange = function(){ mkSel[c.getAttribute('data-ref')] = c.checked; render(); };
+        });
+        // Zapis recznie wpisanych numerow Manora. Zlecenie wraca na „czeka na dane",
+        // wiec podniesie je zwykle „Pobierz zestawienia" — nie robimy osobnej sciezki
+        // pobierania, zeby byla jedna droga i jeden komplet kontroli.
+        out.querySelectorAll('.mk-mdocb').forEach(function (b){
+            b.onclick = function(){
+                const ref = b.getAttribute('data-ref');
+                const inp = out.querySelector('.mk-mdoc[data-ref="' + ref + '"]');
+                if (!inp) return;
+                const nrs = String(inp.value || '').split(/[,;\s]+/)
+                    .map(function (x){ return x.trim().toUpperCase(); })
+                    .filter(function (x, i, a){ return x && a.indexOf(x) === i; });
+                if (!nrs.length){ say('Nie wpisałeś żadnego numeru.', '#c47f00'); return; }
+                const jobs = jobsLoad();
+                if (!jobs[ref]) return;
+                jobs[ref].docs = nrs;
+                jobs[ref].status = 'new';
+                jobs[ref].msg = '';
+                jobs[ref].note = '';
+                delete jobs[ref].data;
+                jobsSave(jobs); render();
+                say('Zapisane: ' + nrs.join(', ') + '. Kliknij „⬇ Pobierz zestawienia".', '#0a7a2f');
+            };
         });
         const ba = out.querySelector('#mk-imp-all');
         if (ba) ba.onclick = function(){ doImportAll(ba); };
@@ -21182,7 +21431,7 @@
                         known++;
                         const k = r.ref || (r.txId || (r.date + '_' + r.amount));
                         if (jobs[k] && jobs[k].status === 'done') return;
-                        if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                        if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, docs: r.docs || null, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
                     });
                     jobsSave(jobs);
                     addT += add; knownT += known; otherT += other;
@@ -21483,24 +21732,109 @@
         // Jedno przejscie po aktualnie ustawionym sklepie. Liste cykli pobieramy RAZ
         // i dopasowujemy do niej wszystkie czekajace referencje — inaczej przy 13 sklepach
         // i 7 zleceniach bylo by 91 zapytan zamiast 13.
-        async function mkPass(jobs, shopName){
+        async function mkPass(jobs, shopName, host){
             let cycles;
             try { cycles = await mkCycles(); }
             catch (e){ say('Nie mogę pobrać listy cykli: ' + ((e && e.message) || e), '#c00'); return 0; }
-            const todo = Object.keys(jobs).filter(function (k){ return jobs[k].status === 'new' && jobs[k].ref; });
+            // Tylko zlecenia Mirakla i tylko z instancji, na ktorej wlasnie stoimy.
+            // mkMatchCycle potrafi dobrac cykl SAMA DATA (+-3 dni, gdy w oknie stoi
+            // dokladnie jeden — tak lapiemy Home24, ktory nie podaje referencji), wiec
+            // zlecenie Wayfaira albo zlecenie z innej instancji wpuszczone do tej puli
+            // moglo by dostac cudzy cykl. Kontrola netto zatrzymalaby to potem na
+            // „wymaga sprawdzenia", ale lepiej w ogole nie dopuscic do pomylki.
+            // Ten sam warunek co w mkLeft — obie strony musza liczyc tak samo.
+            const todo = Object.keys(jobs).filter(function (k){
+                const j = jobs[k];
+                if (!mkTodo(j) || !j.ref || (j.kind || 'mirakl') !== 'mirakl') return false;
+                return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
+            });
             let ok = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                const cyc = mkMatchCycle(cycles, j.ref, j.date, j.amount, j.tried);
-                if (!cyc) continue;
-                const byRef = !!mkMatchIn([cyc], j.ref);   // czy trafilismy po numerze, czy po dacie
-                say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
+                // Manor idzie inna droga do cyklu: nie dopasowaniem po dacie i kwocie,
+                // tylko przez numery dokumentow wypisane w tytule przelewu. Z jednej
+                // wplaty wychodzi kilka cykli — i to one lacza sie w JEDNA paczke.
+                const manor = String(j.mp || '') === 'Manor';
+                const nrs = (j.docs || []).filter(Boolean);
+                let cycIds = [], byRef = true, docs = null, docSum = null;
+                // Manor bez numerow w tytule („SIEHE AVIS VOM …"). Nie zgadujemy cyklu po
+                // dacie — przy tym operatorze data przelewu i data cyklu rozjezdzaja sie
+                // o tygodnie. Zlecenie ma powstac i czekac na numery przepisane z awiza.
+                if (manor && !nrs.length){
+                    j.status = 'partial';
+                    j.msg = 'Manor nie podał w przelewie numerów dokumentów — w tytule stoi „SIEHE AVIS". '
+                          + 'Weź je z awiza z poczty i wpisz niżej, po przecinku.';
+                    j.note = '';
+                    jobsSave(jobs); render();
+                    continue;
+                }
+                if (manor){
+                    say((j.brand || 'Manor') + ' — sprawdzam dokumenty ' + nrs.join(', ') + '…');
+                    try { docs = await manorDocs(nrs); }
+                    catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); jobsSave(jobs); render(); continue; }
+                    const nogo = docs.filter(function (d){ return d.err; });
+                    if (nogo.length){
+                        // Do komunikatu dokladamy klucze, ktore przyszly w odpowiedzi —
+                        // bez nich poprawa nazw pol byla by zgadywanka na slepo.
+                        j.status = 'err';
+                        j.msg = nogo.map(function (d){ return d.nr + ': ' + d.err; }).join('; ')
+                              + (nogo[0].keys ? (' · pola w odpowiedzi: ' + nogo[0].keys.join(', ')) : '');
+                        jobsSave(jobs); render(); continue;
+                    }
+                    docSum = 0;
+                    docs.forEach(function (d){ docSum = r2(docSum + d.val); });
+                    cycIds = docs.map(function (d){ return d.cyc; })
+                                 .filter(function (c, k, arr){ return c && arr.indexOf(c) === k; });
+                } else {
+                    const cyc = mkMatchCycle(cycles, j.ref, j.date, j.amount, j.tried);
+                    if (!cyc) continue;
+                    byRef = !!mkMatchIn([cyc], j.ref);     // czy trafilismy po numerze, czy po dacie
+                    cycIds = [cyc.id];
+                    say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
+                }
                 try {
-                    const tx = await mkCycleTx(cyc.id);
+                    // Kilka cykli zlewamy w jedna liste pozycji — dalej wszystko liczy sie
+                    // tak samo jak przy jednym cyklu, wiec import, zwroty i arkusz nie
+                    // wymagaja osobnej sciezki dla Manora.
+                    let list = [], total = 0, totalKnown = true, pages = 0, how = '', full = true;
+                    for (let c = 0; c < cycIds.length; c++){
+                        if (manor && cycIds.length > 1) say((j.brand || 'Manor') + ' — cykl ' + (c + 1) + '/' + cycIds.length + '…');
+                        const one = await mkCycleTx(cycIds[c]);
+                        list = list.concat(one.list);
+                        if (one.total == null) totalKnown = false; else total += one.total;
+                        pages += (one.pages || 1);
+                        how = how || one.how;
+                        if (!one.full) full = false;
+                    }
+                    // Manor: JEDEN CYKL KARMI KILKA PRZELEWOW. Cykl 00517a73 niesie
+                    // i fakture IN2858A-80 (zaplacona 31.07), i osobny dokument 247638
+                    // (zaplacony 08.07) — biorac caly cykl policzylibysmy cudza pozycje.
+                    // Na szczescie kazda pozycja niesie numer faktury, wiec zawezamy je
+                    // do dokumentow Z TEGO przelewu. Sprawdzone na eksporcie cyklu:
+                    // 880 pozycji z IN2858A-80 sumuje sie dokladnie do 16 265.81, czyli
+                    // do kwoty brutto tego dokumentu.
+                    if (manor){
+                        const want = {};
+                        nrs.forEach(function (d){ want[String(d).toUpperCase().replace(/^0+/, '')] = 1; });
+                        let seen = 0;
+                        const only = list.filter(function (x){
+                            const v = manorVal(x, ['invoicenumber', 'accountingdocumentnumber',
+                                                   'accountingdocument', 'documentnumber']);
+                            if (v == null || v === '') return false;
+                            seen++;
+                            return !!want[String(v).toUpperCase().replace(/^0+/, '')];
+                        });
+                        if (!seen) throw new Error('pozycje z cyklu nie niosą numeru dokumentu — nie rozdzielę ich między przelewy · pola pozycji: '
+                            + (list.length ? Object.keys(list[0]).join(', ') : 'cykl nie zwrócił pozycji'));
+                        list = only;
+                    }
+                    const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: full };
                     let a = mkAggregate(tx.list, j.ref), split = false;
                     // Cykl z kilkoma wyplatami: jesli pozycje niosa odnosnik do wyplaty,
                     // bierzemy tylko te z naszego przelewu. Jesli nie niosa — nie zgadujemy.
-                    if (a.pays.length > 1 && j.ref){
+                    // Przy Manorze tego nie robimy: kazdy z polaczonych cykli ma wlasna
+                    // wyplate, a odnosnikiem jest numer dokumentu, nie numer wyplaty.
+                    if (!manor && a.pays.length > 1 && j.ref){
                         const sub = tx.list.filter(function (x){ return mkPayRef(x).indexOf(j.ref) >= 0; });
                         if (sub.length){ a = mkAggregate(sub, j.ref); split = true; }
                     }
@@ -21508,7 +21842,10 @@
                     let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
                     // Netto rozliczenia = wiersz Payment (a gdy go jeszcze nie ma —
                     // suma skladnikow). To ono ma sie zgadzac z kwota z wyciagu.
-                    const net = (a.pay != null) ? Math.abs(a.pay) : a.comp;
+                    // Przy Manorze zawsze suma skladnikow: platnosc idzie poza Miraklem
+                    // (model ONE_CREDITOR), a poszczegolne wiersze Payment — jesli w ogole
+                    // sa — dotycza pojedynczych cykli, nie calego przelewu.
+                    const net = manor ? a.comp : ((a.pay != null) ? Math.abs(a.pay) : a.comp);
                     // Cykl dobrany po SAMEJ DACIE to kandydat, nie dowod. Cykle wszystkich
                     // sklepow tej platformy powstaja tego samego dnia, wiec bez tej kontroli
                     // pierwszy przegladany sklep zabralby zlecenie nalezace do innego —
@@ -21516,7 +21853,7 @@
                     // Kwota wyplaty rozstrzyga, czyj to cykl. Jesli nie pasuje, zlecenie
                     // zostaje nieprzypisane i szukamy dalej, pomijajac juz sprawdzone cykle.
                     if (!byRef && a.pay != null && !eq(net, j.amount)){
-                        j.tried = (j.tried || []).concat([cyc.id]);
+                        j.tried = (j.tried || []).concat([cycIds[0]]);
                         jobsSave(jobs);
                         continue;
                     }
@@ -21531,7 +21868,8 @@
                     // a to blad ksiegowy, nie kosmetyka.
                     const full = tx.full;
                     const unk = Object.keys(a.unknown).length;
-                    j.data = { cycle: cyc.id, shop: shopName, gross: gross, refund: refund, net: net,
+                    j.data = { cycle: cycIds.join(', '), shop: manor ? (j.shop || shopName) : shopName,
+                               gross: gross, refund: refund, net: net,
                                netOk: full && eq(net, j.amount), ord: a.ord, ref: a.ref,
                                unknown: a.unknown, skipped: a.skipped, full: full,
                                both: both, pays: a.pays.length, split: split,
@@ -21540,7 +21878,7 @@
                     // Rozliczony cykl ZAWSZE ma wiersz wyplaty. Jego brak oznacza, ze
                     // pobralismy tylko czesc pozycji — i to dowod mocniejszy niz liczenie
                     // stron, bo nie zalezy od tego, czy API podaje liczbe pozycji.
-                    if (!a.pays.length) bad.push('w pobranych pozycjach nie ma wiersza wypłaty — to nie jest komplet rozliczenia');
+                    if (!manor && !a.pays.length) bad.push('w pobranych pozycjach nie ma wiersza wypłaty — to nie jest komplet rozliczenia');
                     // kasujemy uwage z poprzedniego przebiegu i zaznaczamy, jesli cykl
                     // zostal dobrany po dacie, a nie po numerze z przelewu
                     j.note = byRef ? '' : 'cykl dobrany po dacie — rozliczenie nie zawiera numeru z przelewu';
@@ -21548,11 +21886,36 @@
                         ? ('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji')
                         : ('pobrano ' + tx.list.length + ' pozycji i nie umiem przewinąć dalej — to nie musi być komplet'));
                     if (unk) bad.push('nierozpoznane typy pozycji');
-                    if (a.pays.length > 1 && !split) bad.push('cykl ma ' + a.pays.length + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
-                    if (a.pays.length > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + a.pays.length + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
+                    if (!manor && a.pays.length > 1 && !split) bad.push('cykl ma ' + a.pays.length + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
+                    if (!manor && a.pays.length > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + a.pays.length + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
                     if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłaty ' + f2(a.payAll));
-                    if (a.pays.length && a.pay == null) bad.push('nie wiem, która z wypłat odpowiada temu przelewowi');
-                    if (full && a.pay != null && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+                    if (!manor && a.pays.length && a.pay == null) bad.push('nie wiem, która z wypłat odpowiada temu przelewowi');
+                    if (!manor && full && a.pay != null && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+                    if (manor){
+                        // Kontrola Manora stoi na DOKUMENTACH, nie na wierszu wyplaty.
+                        // Dwa progi, oba musza przejsc: suma dokumentow ma sie rownac
+                        // wplacie, a pozycje sciagniete z cykli — sumie dokumentow.
+                        // Drugi z nich wylapie sytuacje, w ktorej cykl noty kredytowej
+                        // niesie cos wiecej niz sama nota; wtedy paczka byla by za duza,
+                        // wiec zlecenie zostaje na „wymaga sprawdzenia" i nie idzie do importu.
+                        if (!eq(docSum, j.amount)){
+                            let why = '';
+                            // Gdy roznica rowna sie DOKLADNIE podwojonej kwocie jednego
+                            // z dokumentow, to nie brakuje pozycji — tylko ten jeden
+                            // dokument policzylismy z odwrotnym znakiem. Warto to
+                            // powiedziec wprost, bo inaczej trzeba by tego szukac recznie.
+                            docs.forEach(function (d){
+                                if (!why && d.val && eq(Math.abs(r2(docSum - j.amount)), Math.abs(r2(2 * d.val))))
+                                    why = ' — różnica to dokładnie podwójna kwota ' + d.nr
+                                        + ' (typ „' + (d.typ || '?') + '"), czyli ten dokument ma odwrotny znak, a nie brakuje pozycji';
+                            });
+                            bad.push('suma dokumentów ' + f2(docSum) + ' ≠ ' + f2(j.amount) + ' z wyciągu' + why);
+                        }
+                        else if (full && !eq(net, docSum)) bad.push('pozycje z cykli ' + f2(net) + ' ≠ suma dokumentów ' + f2(docSum)
+                            + ' — cykl noty kredytowej niesie coś ponad samą notę, nie zaimportuję tego na ślepo');
+                        j.note = 'dokumenty: ' + docs.map(function (d){ return d.nr + ' ' + f2(d.val); }).join(' · ')
+                               + ' · cykli: ' + cycIds.length;
+                    }
                     j.status = bad.length ? 'partial' : 'ready';
                     j.msg = bad.join('; ');
                     ok++;
@@ -21567,7 +21930,7 @@
         // a przelew ksieguje sie pozniej (weekend wplywa w poniedzialek).
         async function vtexPass(jobs, host){
             const todo = Object.keys(jobs).filter(function (k){
-                return jobs[k].status === 'new' && jobs[k].ref && jobs[k].kind === 'vtex' && (jobs[k].host || '') === host;
+                return mkTodo(jobs[k]) && jobs[k].ref && jobs[k].kind === 'vtex' && (jobs[k].host || '') === host;
             });
             if (!todo.length) return 0;
             let from = '9999-12-31', to = '0000-01-01';
@@ -21639,7 +22002,7 @@
         // pobranie xlsx, doliczenie VAT. Zwraca liczbe zamknietych zlecen.
         async function galxPass(jobs){
             const left = Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'galx' && jobs[k].status === 'new';
+                return jobs[k].kind === 'galx' && mkTodo(jobs[k]);
             });
             if (!left.length) return 0;
             say('Galaxus — pobieram listę wypłat…');
@@ -21684,11 +22047,8 @@
         // przelewu, wiec dopasowujemy po KWOCIE, zawezajac data — a numer faktury
         // z przelewu sluzy potem do potwierdzenia, ze trafilismy w to rozliczenie.
         async function wayfPass(jobs){
-            // Bierzemy takze zlecenia z bledem. Tu najczestsza przyczyna jest przejsciowa
-            // (zerwane polaczenie, wygasla sesja w portalu), a bez tego jedyna droga
-            // powrotu byloby wyczyszczenie WSZYSTKICH zlecen i wgranie wyciagu od nowa.
             const left = Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'wayf' && (jobs[k].status === 'new' || jobs[k].status === 'err');
+                return jobs[k].kind === 'wayf' && mkTodo(jobs[k]);
             });
             if (!left.length) return 0;
             // Jedno zapytanie na caly przelot: zakres rozciagamy na wszystkie czekajace
@@ -21738,7 +22098,7 @@
         function mkLeft(jobs, host){
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
-                if (j.status !== 'new' || !j.ref) return false;
+                if (!mkTodo(j) || !j.ref) return false;
                 if (j.kind === 'joy') return false;      // nie ma rozliczenia do pobrania
                 if ((j.kind || 'mirakl') !== 'mirakl') return host ? false : true;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
@@ -21746,12 +22106,12 @@
         }
         function galxLeft(jobs){
             return Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'galx' && jobs[k].status === 'new' && jobs[k].ref;
+                return jobs[k].kind === 'galx' && mkTodo(jobs[k]) && jobs[k].ref;
             }).length;
         }
         function wayfLeft(jobs){
             return Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'wayf' && (jobs[k].status === 'new' || jobs[k].status === 'err') && jobs[k].ref;
+                return jobs[k].kind === 'wayf' && mkTodo(jobs[k]) && jobs[k].ref;
             }).length;
         }
         // Ktore platformy wystepuja wsrod czekajacych zlecen — osobno Mirakl (sklepy
@@ -21760,7 +22120,7 @@
             const o = {}, out = [];
             Object.keys(jobs).forEach(function (k){
                 const j = jobs[k];
-                if (j.status !== 'new' || !j.ref) return;
+                if (!mkTodo(j) || !j.ref) return;
                 if ((j.kind || 'mirakl') !== kind) return;
                 const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
                 if (h && !o[h]){ o[h] = 1; out.push(h); }
@@ -21777,7 +22137,7 @@
                 const jobs = jobsLoad();
                 if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
                 const nm = await mkShopName();
-                const ok = await mkPass(jobs, nm);
+                const ok = await mkPass(jobs, nm, location.hostname);
                 const left = mkLeft(jobsLoad());
                 say('Sklep ' + (nm || '?') + ': pobranych ' + ok + (left ? (', zostało ' + left + ' na innych sklepach — użyj „Przeleć wszystkie sklepy"') : '') + '.', left ? '#c47f00' : '#0a7a2f');
             } catch (e){ say('Błąd: ' + ((e && e.message) || e), '#c00'); }
@@ -21832,7 +22192,7 @@
                         // sprawdzic — przy jednym sklepie to zalatwia sprawe w calosci.
                         say(host + ' — nie znam listy sklepów, sprawdzam bieżący…');
                         seen++;
-                        ok += await mkPass(jobs, await mkShopName());
+                        ok += await mkPass(jobs, await mkShopName(), host);
                         if (mkLeft(jobsLoad(), host)) problem.push(host + ': zostały rozliczenia na innych sklepach — wejdź tam raz na stronę Mirakla, moduł zapamięta ich listę');
                         continue;
                     }
@@ -21843,7 +22203,7 @@
                         try { await mkSwitch(ids[i]); } catch (e){ continue; }
                         seen++;
                         const nm = await mkShopName();
-                        ok += await mkPass(jobs, nm);
+                        ok += await mkPass(jobs, nm, host);
                     }
                 } catch (e){ problem.push(host + ': ' + ((e && e.message) || e)); }
                 finally {
