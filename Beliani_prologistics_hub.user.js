@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.99
+// @version      3.00
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23514,6 +23514,41 @@
     let running = false;
     let uiFirm = '', uiSellerQ = '', uiAccQ = '';
 
+    // Filtrowanie NIE przerysowuje panelu. Wczesniej kazdy znak w polu szukania
+    // budowal panel od nowa i ustawial kursor na poczatku swiezego pola — przez co
+    // „1232" wpisywalo sie jako „2321". Teraz listy sa w DOM-ie w calosci, a szukanie
+    // tylko chowa i pokazuje wiersze. Przy okazji nie skacze suwak ani zaznaczenia.
+    function expFilter(){
+        const q = uiSellerQ.toLowerCase(), qa = uiAccQ.toLowerCase();
+        panel.querySelectorAll('#exp-slist label').forEach(function (lab){
+            const okF = !uiFirm || lab.getAttribute('data-firm') === uiFirm;
+            const okQ = !q || (lab.getAttribute('data-txt') || '').indexOf(q) >= 0;
+            lab.style.display = (okF && okQ) ? 'block' : 'none';
+        });
+        panel.querySelectorAll('#exp-alist label').forEach(function (lab){
+            lab.style.display = (!qa || (lab.getAttribute('data-txt') || '').indexOf(qa) >= 0) ? 'block' : 'none';
+        });
+        panel.querySelectorAll('.exp-firm').forEach(function (b){
+            const on = b.getAttribute('data-f') === uiFirm;
+            b.style.borderColor = on ? '#0f766e' : '#ddd';
+            b.style.background  = on ? '#ccfbf1' : '#f9fafb';
+        });
+    }
+    // „Zaznacz widoczne" ma znaczyc dokladnie to — a skoro odfiltrowane wiersze
+    // zostaja w DOM-ie, trzeba je odsiac po widocznosci, nie po samej klasie.
+    function expVisible(cls){
+        return [].slice.call(panel.querySelectorAll('.' + cls)).filter(function (c){
+            const lab = c.parentNode;
+            return lab && lab.style.display !== 'none';
+        });
+    }
+    function expCounts(){
+        const p = profCur(profLoad());
+        const a = $('#exp-scount'), b = $('#exp-acount');
+        if (a) a.textContent = '(' + (p.users || []).length + ')';
+        if (b) b.textContent = '(' + (p.accounts || []).length + ')';
+    }
+
     function render(){
         const d = profLoad(), p = profCur(d);
         const sellers = expSellers(), accounts = expAccounts();
@@ -23542,7 +23577,7 @@
         h += '<div style="display:flex;gap:10px;align-items:flex-start">';
 
         h += '<div style="flex:1;min-width:0">'
-           +   '<div style="font-weight:700;margin-bottom:4px">Sprzedawcy <span style="color:#888;font-weight:400">(' + (p.users || []).length + ')</span></div>'
+           +   '<div style="font-weight:700;margin-bottom:4px">Sprzedawcy <span id="exp-scount" style="color:#888;font-weight:400">(' + (p.users || []).length + ')</span></div>'
            +   '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:5px">'
            +     Object.keys(firms).sort().map(function (f){
                      return '<button class="exp-firm" data-f="' + esc(f) + '" style="font-size:10px;padding:2px 7px;border-radius:99px;cursor:pointer;'
@@ -23554,27 +23589,22 @@
            +   '<div style="margin-bottom:4px"><button id="exp-son" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz widoczne</button> '
            +     '<button id="exp-soff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz widoczne</button></div>'
            +   '<div id="exp-slist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px">'
-           +     sellers.filter(function (s){
-                     if (uiFirm && s.firm !== uiFirm) return false;
-                     if (uiSellerQ && s.txt.toLowerCase().indexOf(uiSellerQ.toLowerCase()) < 0) return false;
-                     return true;
-                 }).map(function (s){
-                     return '<label style="display:block;font-size:11px;line-height:1.6;' + (s.active ? '' : 'color:#999') + '">'
+           +     sellers.map(function (s){
+                     return '<label data-firm="' + esc(s.firm) + '" data-txt="' + esc(s.txt.toLowerCase()) + '"'
+                          + ' style="display:block;font-size:11px;line-height:1.6;' + (s.active ? '' : 'color:#999') + '">'
                           + '<input type="checkbox" class="exp-s" value="' + esc(s.v) + '"' + (chosen[s.v] ? ' checked' : '') + '> ' + esc(s.txt) + '</label>';
                  }).join('')
            +   '</div>'
            + '</div>';
 
         h += '<div style="flex:1;min-width:0">'
-           +   '<div style="font-weight:700;margin-bottom:4px">Konta <span style="color:#888;font-weight:400">(' + (p.accounts || []).length + ') — przelot po kolei</span></div>'
+           +   '<div style="font-weight:700;margin-bottom:4px">Konta <span id="exp-acount" style="color:#888;font-weight:400">(' + (p.accounts || []).length + ')</span><span style="color:#888;font-weight:400"> — przelot po kolei</span></div>'
            +   '<input id="exp-aq" value="' + esc(uiAccQ) + '" placeholder="szukaj konta, np. B2B Intra-comm…" style="width:100%;font-size:11px;padding:3px 5px;border:1px solid #ddd;border-radius:5px;margin-bottom:4px">'
            +   '<div style="margin-bottom:4px"><button id="exp-aon" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz widoczne</button> '
            +     '<button id="exp-aoff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz widoczne</button></div>'
            +   '<div id="exp-alist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px">'
-           +     accounts.filter(function (a){
-                     return !uiAccQ || a.txt.toLowerCase().indexOf(uiAccQ.toLowerCase()) >= 0;
-                 }).map(function (a){
-                     return '<label style="display:block;font-size:11px;line-height:1.6">'
+           +     accounts.map(function (a){
+                     return '<label data-txt="' + esc(a.txt.toLowerCase()) + '" style="display:block;font-size:11px;line-height:1.6">'
                           + '<input type="checkbox" class="exp-a" value="' + esc(a.v) + '"' + (accSel[a.v] ? ' checked' : '') + '> ' + esc(a.txt) + '</label>';
                  }).join('')
            +   '</div>'
@@ -23628,28 +23658,27 @@
         $('#exp-name').onchange = function (){ const v = this.value; patch(function (p){ p.name = v; }); render(); };
 
         panel.querySelectorAll('.exp-firm').forEach(function (b){
-            b.onclick = function (){ const f = b.getAttribute('data-f'); uiFirm = (uiFirm === f) ? '' : f; render(); };
+            b.onclick = function (){ const f = b.getAttribute('data-f'); uiFirm = (uiFirm === f) ? '' : f; expFilter(); };
         });
-        $('#exp-sq').oninput = function (){ uiSellerQ = this.value; render(); $('#exp-sq').focus(); };
-        $('#exp-aq').oninput = function (){ uiAccQ = this.value; render(); $('#exp-aq').focus(); };
+        $('#exp-sq').oninput = function (){ uiSellerQ = this.value; expFilter(); };
+        $('#exp-aq').oninput = function (){ uiAccQ = this.value; expFilter(); };
 
-        const bulk = function (sel, on){
-            const vals = [];
-            panel.querySelectorAll(sel).forEach(function (c){ vals.push(c.value); });
+        const bulk = function (cls, key, on){
             return function (){
+                const vis = expVisible(cls);
                 patch(function (p){
-                    const key = (sel === '.exp-s') ? 'users' : 'accounts';
                     const cur = {}; (p[key] || []).forEach(function (x){ cur[x] = 1; });
-                    vals.forEach(function (v){ if (on) cur[v] = 1; else delete cur[v]; });
+                    vis.forEach(function (c){ if (on) cur[c.value] = 1; else delete cur[c.value]; });
                     p[key] = Object.keys(cur);
                 });
-                render();
+                vis.forEach(function (c){ c.checked = on; });
+                expCounts();
             };
         };
-        $('#exp-son').onclick = bulk('.exp-s', true);
-        $('#exp-soff').onclick = bulk('.exp-s', false);
-        $('#exp-aon').onclick = bulk('.exp-a', true);
-        $('#exp-aoff').onclick = bulk('.exp-a', false);
+        $('#exp-son').onclick = bulk('exp-s', 'users', true);
+        $('#exp-soff').onclick = bulk('exp-s', 'users', false);
+        $('#exp-aon').onclick = bulk('exp-a', 'accounts', true);
+        $('#exp-aoff').onclick = bulk('exp-a', 'accounts', false);
 
         panel.querySelectorAll('.exp-s, .exp-a').forEach(function (c){
             c.onchange = function (){
@@ -23659,7 +23688,7 @@
                     if (c.checked) cur[c.value] = 1; else delete cur[c.value];
                     p[key] = Object.keys(cur);
                 });
-                render();
+                expCounts();
             };
         });
 
@@ -23710,6 +23739,9 @@
         };
 
         $('#exp-run').onclick = function (){ runAll(this); };
+
+        // Panel powstal od nowa — przywracamy filtry, ktore uzytkownik mial ustawione.
+        expFilter();
     }
 
     // ---------- przelot ----------
