@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.94
+// @version      2.95
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21796,7 +21796,10 @@
                     // Kilka cykli zlewamy w jedna liste pozycji — dalej wszystko liczy sie
                     // tak samo jak przy jednym cyklu, wiec import, zwroty i arkusz nie
                     // wymagaja osobnej sciezki dla Manora.
-                    let list = [], total = 0, totalKnown = true, pages = 0, how = '', full = true;
+                    // UWAGA: nie nazywac tego „full" — kilkanascie linii nizej stoi juz
+                    // `const full = tx.full` w TYM SAMYM bloku, a dwie deklaracje tej samej
+                    // nazwy to blad skladni, ktory wywala CALY skrypt (nie tylko ten modul).
+                    let list = [], total = 0, totalKnown = true, pages = 0, how = '', allFull = true;
                     for (let c = 0; c < cycIds.length; c++){
                         if (manor && cycIds.length > 1) say((j.brand || 'Manor') + ' — cykl ' + (c + 1) + '/' + cycIds.length + '…');
                         const one = await mkCycleTx(cycIds[c]);
@@ -21804,7 +21807,7 @@
                         if (one.total == null) totalKnown = false; else total += one.total;
                         pages += (one.pages || 1);
                         how = how || one.how;
-                        if (!one.full) full = false;
+                        if (!one.full) allFull = false;
                     }
                     // Manor: JEDEN CYKL KARMI KILKA PRZELEWOW. Cykl 00517a73 niesie
                     // i fakture IN2858A-80 (zaplacona 31.07), i osobny dokument 247638
@@ -21828,7 +21831,7 @@
                             + (list.length ? Object.keys(list[0]).join(', ') : 'cykl nie zwrócił pozycji'));
                         list = only;
                     }
-                    const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: full };
+                    const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: allFull };
                     let a = mkAggregate(tx.list, j.ref), split = false;
                     // Cykl z kilkoma wyplatami: jesli pozycje niosa odnosnik do wyplaty,
                     // bierzemy tylko te z naszego przelewu. Jesli nie niosa — nie zgadujemy.
