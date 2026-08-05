@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.00
+// @version      3.01
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23244,6 +23244,11 @@
     function iso(d){ return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
     // Nazwa pliku w archiwum musi przezyc rozpakowanie na Windowsie.
     function safeName(s){ return String(s || '').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim(); }
+    // 1 zestawienie, 2-4 zestawienia, 5+ zestawien — z wyjatkiem nastolatkow (12-14).
+    function plural(n, one, few, many){
+        const d = n % 10, s = n % 100;
+        return n === 1 ? one : (d >= 2 && d <= 4 && (s < 12 || s > 14) ? few : many);
+    }
 
     // ---------- co strona wie o sobie ----------
     // Wszystko czytamy z formularza, ktory i tak jest na ekranie — dzieki temu nowy
@@ -23309,7 +23314,7 @@
                        '3266', '3267', '3268', '3269', '3270', '3271', '3273'],
             dateField: 'payment', range: 'prev', from: '', to: '',
             country: '', clearing: '0', inv: '2', paid: '',
-            fname: '', minamount: '', maxamount: '', system: 'excel', par: '5'
+            fname: '', minamount: '', maxamount: '', system: 'excel', par: '5', allUsers: false
         }]
     };
     function profLoad(){
@@ -23342,15 +23347,22 @@
     // Kolejnosc pol jest taka sama jak w formularzu strony. Nie dlatego, ze serwer
     // tego wymaga, tylko zeby przy porownywaniu ze zrzutem z przegladarki widac bylo
     // od razu, czy czegos nie brakuje.
+    // Kogo naprawde wysylamy. Przy „wszyscy sprzedawcy" bierzemy komplet z formularza,
+    // a nie zapisana liste — dzieki temu nowy sprzedawca wchodzi do zestawienia sam,
+    // bez poprawiania profilu. To odpowiednik ptaszka „All" na tamtej stronie.
+    function expUsers(p){
+        return p.allUsers ? expSellers().map(function (s){ return s.v; }) : (p.users || []);
+    }
     function expSearchBody(p, account){
         const q = new URLSearchParams();
         const r = expRange(p);
+        const users = expUsers(p);
         q.append('order', ''); q.append('dir', '');
         q.append('state', p.state);
         q.append('seller-type', p.sellerType || 'active');
-        (p.users || []).forEach(function (u){ q.append('username[]', u); });
+        users.forEach(function (u){ q.append('username[]', u); });
         q.append('source_seller_group', p.group || '0');
-        (p.users || []).forEach(function (u){
+        users.forEach(function (u){
             expSources(u).forEach(function (s){
                 if (!p.group || p.group === '0' || s.group === p.group) q.append('source_seller_id[]', s.v);
             });
@@ -23469,8 +23481,8 @@
         u32(p - cdStart); u32(cdStart); u16(0);
         return out;
     }
-    function expDownload(bytes, name){
-        const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
+    function expDownload(bytes, name, mime){
+        const url = URL.createObjectURL(new Blob([bytes], { type: mime || 'application/zip' }));
         const a = document.createElement('a');
         a.href = url; a.download = name;
         document.body.appendChild(a); a.click(); a.remove();
@@ -23507,6 +23519,11 @@
         }
         render();
     };
+    // Escape zamyka panel — ale nie w trakcie przelotu, zeby przypadkowe
+    // stukniecie nie schowalo tabelki z postepem.
+    document.addEventListener('keydown', function (e){
+        if (e.key === 'Escape' && panel.style.display === 'block' && !running) panel.style.display = 'none';
+    });
 
     function $(s){ return panel.querySelector(s); }
     function say(t, c){ const e = $('#exp-status'); if (e){ e.textContent = t || ''; e.style.color = c || '#666'; } }
@@ -23570,6 +23587,8 @@
            +   '<button id="exp-del" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Usuń</button>'
            +   '<button id="exp-copy" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Kopiuj</button>'
            +   '<button id="exp-paste" style="padding:4px 9px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer">Wklej</button>'
+           +   '<button id="exp-close" title="zamknij (Esc)" style="margin-left:auto;width:24px;height:24px;line-height:1;'
+           +     'border:1px solid #ddd;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:14px;color:#666">×</button>'
            + '</div>'
            + '<div style="margin:6px 0"><input id="exp-name" value="' + esc(p.name) + '" placeholder="nazwa profilu" style="width:100%;font-size:12px;padding:3px 5px;border:1px solid #ddd;border-radius:5px"></div>'
            + '<div id="exp-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>';
@@ -23578,6 +23597,9 @@
 
         h += '<div style="flex:1;min-width:0">'
            +   '<div style="font-weight:700;margin-bottom:4px">Sprzedawcy <span id="exp-scount" style="color:#888;font-weight:400">(' + (p.users || []).length + ')</span></div>'
+           +   '<label style="display:block;margin-bottom:5px;font-size:11px;background:#f0fdfa;border:1px solid #99f6e4;border-radius:5px;padding:3px 6px">'
+           +     '<input type="checkbox" id="exp-all"' + (p.allUsers ? ' checked' : '') + '> '
+           +     '<b>wszyscy sprzedawcy</b> <span style="color:#666">— jak ptaszek „All" na stronie; lista niżej jest wtedy nieużywana</span></label>'
            +   '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:5px">'
            +     Object.keys(firms).sort().map(function (f){
                      return '<button class="exp-firm" data-f="' + esc(f) + '" style="font-size:10px;padding:2px 7px;border-radius:99px;cursor:pointer;'
@@ -23588,7 +23610,8 @@
            +   '<input id="exp-sq" value="' + esc(uiSellerQ) + '" placeholder="szukaj sprzedawcy…" style="width:100%;font-size:11px;padding:3px 5px;border:1px solid #ddd;border-radius:5px;margin-bottom:4px">'
            +   '<div style="margin-bottom:4px"><button id="exp-son" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz widoczne</button> '
            +     '<button id="exp-soff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz widoczne</button></div>'
-           +   '<div id="exp-slist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px">'
+           +   '<div id="exp-slist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px'
+           +     (p.allUsers ? ';opacity:.45;pointer-events:none' : '') + '">'
            +     sellers.map(function (s){
                      return '<label data-firm="' + esc(s.firm) + '" data-txt="' + esc(s.txt.toLowerCase()) + '"'
                           + ' style="display:block;font-size:11px;line-height:1.6;' + (s.active ? '' : 'color:#999') + '">'
@@ -23739,6 +23762,12 @@
         };
 
         $('#exp-run').onclick = function (){ runAll(this); };
+        $('#exp-close').onclick = function (){ panel.style.display = 'none'; };
+        $('#exp-all').onchange = function (){
+            const v = this.checked;
+            patch(function (p){ p.allUsers = v; });
+            render();
+        };
 
         // Panel powstal od nowa — przywracamy filtry, ktore uzytkownik mial ustawione.
         expFilter();
@@ -23755,13 +23784,18 @@
         const p = profCur(profLoad());
         const accs = (p.accounts || []).slice();
         if (!accs.length){ say('Nie wybrałeś żadnego konta.', '#c47f00'); return; }
-        if (!(p.users || []).length){ say('Nie wybrałeś żadnego sprzedawcy.', '#c47f00'); return; }
+        const users = expUsers(p);
+        if (!users.length){
+            say(p.allUsers ? 'Formularz nie oddał ani jednego sprzedawcy — odśwież stronę.'
+                           : 'Nie wybrałeś żadnego sprzedawcy.', '#c47f00');
+            return;
+        }
         const r = expRange(p);
         if (!r[0] || !r[1]){ say('Uzupełnij zakres dat.', '#c47f00'); return; }
         const par = Math.max(1, Math.min(8, Number(p.par) || 5));
-        if (!confirm('Pobrać ' + accs.length + ' zestawień?\n\n'
+        if (!confirm('Pobrać ' + accs.length + ' ' + plural(accs.length, 'zestawienie', 'zestawienia', 'zestawień') + '?\n\n'
                    + 'Okres: ' + r[0] + ' … ' + r[1] + ' (' + (p.dateField === 'invoice' ? 'Invoice date' : 'Payment date') + ')\n'
-                   + 'Sprzedawców: ' + p.users.length + '\n'
+                   + 'Sprzedawców: ' + users.length + (p.allUsers ? ' (wszyscy)' : '') + '\n'
                    + 'Format: ' + p.system + '\n'
                    + 'Równolegle: ' + par + '\n\n'
                    + 'Nic nie zostanie oznaczone jako wyeksportowane.')) return;
@@ -23867,10 +23901,23 @@
             say('Nie pobrałem żadnego pliku' + why, problems.length ? '#c00' : '#c47f00');
             return;
         }
-        const zipName = r[0] + ' — ' + r[1] + (expAbort ? ' (niepełne)' : '') + '.zip';
-        expDownload(expZip(got), zipName);
-        say((expAbort ? 'Przerwane — pakuję to, co zdążyło. ' : '')
-            + 'Gotowe: ' + got.length + ' plików w „' + zipName + '", ' + el + ' s'
+        const stem = r[0] + ' — ' + r[1] + (expAbort ? ' (niepełne)' : '');
+        let name, what;
+        if (got.length === 1){
+            // Jeden plik nie potrzebuje archiwum — zdarza sie za kazdym razem,
+            // gdy w profilu stoi jedno konto. Oddajemy go wprost, z nazwa konta
+            // doklejona do zakresu dat, zeby bylo wiadomo, co to.
+            const dot = got[0].name.lastIndexOf('.');
+            const ext = dot > 0 ? got[0].name.slice(dot) : '.xls';
+            name = stem + ' · ' + got[0].name.slice(0, dot > 0 ? dot : undefined) + ext;
+            expDownload(got[0].data, name, 'application/vnd.ms-excel');
+            what = 'Gotowe: „' + name + '"';
+        } else {
+            name = stem + '.zip';
+            expDownload(expZip(got), name);
+            what = 'Gotowe: ' + got.length + ' ' + plural(got.length, 'plik', 'pliki', 'plików') + ' w „' + name + '"';
+        }
+        say((expAbort ? 'Przerwane — biorę to, co zdążyło. ' : '') + what + ', ' + el + ' s'
             + (problems.length ? (' · problemy: ' + problems.join('; ')) : '') + '.',
             (problems.length || expAbort) ? '#c47f00' : '#0a7a2f');
     }
