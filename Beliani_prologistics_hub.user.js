@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.01
+// @version      3.02
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23489,6 +23489,136 @@
         setTimeout(function (){ try { URL.revokeObjectURL(url); } catch (e){} }, 8000);
     }
 
+    // ---------- oznaczanie jako wyeksportowane ----------
+    //
+    // Guziki „Mark as exported" na stronie NIE wysylaja formularza wynikow. Skrypt
+    // strony przechwytuje klikniecie, dokleja pola do formularza WYSZUKIWARKI
+    // (exportForm) i wysyla jego. Sprawdzone w zrodle export.php:
+    //     evt.preventDefault();
+    //     addHiddenInput('exported', 'Mark as exported');
+    //     addHiddenInput('system', systemSelect.value);
+    //     ...selected[] z zaznaczonych checkboxow...
+    //     exportForm.submit();
+    // Dlatego cialo oznaczenia to komplet filtrow wyszukiwania + te trzy doklejki,
+    // a NIE to, co idzie przy pobieraniu pliku.
+    const EXP_SNAP_KEY = 'expp_lastexport';
+    // Zmierzone na prawdziwym eksporcie: jedno zadanie przeszlo z ~1230 polami
+    // (plik payments_export.xls, 1220 wierszy). Zostawiamy zapas pod tym pomiarem.
+    const EXP_VARS_MAX = 1200;
+
+    let EXP_SNAP = null;
+    let EXP_MARKREP = '';
+
+    function snapLoad(){
+        try { return JSON.parse(GM_getValue(EXP_SNAP_KEY, 'null')); } catch (e){ return null; }
+    }
+    function snapSave(s){
+        try { GM_setValue(EXP_SNAP_KEY, JSON.stringify(s)); EXP_SNAP = s; return true; }
+        catch (e){ EXP_SNAP = s; return false; }
+    }
+
+    // Wartosc checkboxa wyglada tak:
+    //     {'mode':'1','payment_id':'5146828','auction_number':'15388619'}
+    // To NIE jest JSON — pojedyncze apostrofy. Zadnego JSON.parse, zadnego eval.
+    // Do porownan bierzemy payment_id: „exported" jest cecha platnosci, a nie
+    // sposobu wyrysowania wiersza, wiec reszta pol moze sie zmienic bez znaczenia.
+    function expKey(v){
+        const m = String(v).match(/'payment_id'\s*:\s*'([^']+)'/);
+        return m ? m[1] : null;
+    }
+    function expAuc(v){
+        const m = String(v).match(/'auction_number'\s*:\s*'([^']+)'/);
+        return m ? m[1] : '';
+    }
+    // Wielozbior, nie zbior: to samo payment_id moze wystapic w wyniku wiecej niz raz.
+    function expBag(vals){
+        const b = new Map();
+        (vals || []).forEach(function (v){
+            const k = expKey(v);
+            if (k) b.set(k, (b.get(k) || 0) + 1);
+        });
+        return b;
+    }
+    // Zamrozone cialo wyszukiwania ma stan z chwili przelotu. Do weryfikacji
+    // podmieniamy WYLACZNIE „state", zeby zapytac o ten sam zbior innym filtrem.
+    function expWithState(body, st){
+        const q = new URLSearchParams(body);
+        q.set('state', st);
+        return q.toString();
+    }
+    function expMarkBody(body, vals, undo, system){
+        const q = new URLSearchParams(body);
+        q.append(undo ? 'not_exported' : 'exported',
+                 undo ? 'Mark as not exported' : 'Mark as exported');
+        q.append('system', system || 'excel');
+        vals.forEach(function (v){ q.append('selected[]', v); });   // surowe, bez przerabiania
+        return q.toString();
+    }
+    function expChunkSize(body){
+        return Math.max(20, EXP_VARS_MAX - (body.split('&').length + 2));
+    }
+    // Odpowiedz musi byc lista wynikow. Wygasla sesja oddaje strone logowania,
+    // ktora dla expRows jest po prostu „zero wierszy" — a zero wierszy przy
+    // sprawdzaniu obecnosci wygladaloby jak komplet porazki, przy sprawdzaniu
+    // nieobecnosci jak komplet sukcesu. Dlatego pytamy wprost, czy to formularz.
+    function expAssertForm(html){
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        if (!doc.querySelector('select[name="account"]') && !doc.querySelector('#form-export'))
+            throw new Error('w odpowiedzi nie ma formularza — wygląda na stronę logowania');
+        return html;
+    }
+
+    // Ile WIERSZY DANYCH ma pobrany plik. Chodzi o jedna rzecz: gdyby serwer po
+    // cichu ucial zadanie eksportu, plik bylby krotszy niz lista, ktora wyslalismy,
+    // a pozniejsze oznaczenie zaklepaloby w prologistics platnosci, ktorych
+    // ksiegowosc nigdy nie zobaczy — i to z zielonym potwierdzeniem. Nie parsujemy
+    // arkusza: szukamy rekordow komorkowych BIFF i najwiekszego numeru wiersza.
+    //
+    // Wiersz 0 to naglowek — sprawdzone na dwoch prawdziwych eksportach
+    // (payments_export.xls: wiersz 0 = 17 komorek LABELSST z nazwami kolumn,
+    // dane od wiersza 1 do 1219). Dlatego najwiekszy indeks wiersza JEST liczba
+    // wierszy danych. Gdy cokolwiek nie gra, zwracamy null („nie umiem policzyc"),
+    // nigdy zgadnietej liczby.
+    function expXlsRows(bytes){
+        try {
+            if (!bytes || bytes.length < 512) return null;
+            const CELL = { 0x0204:1, 0x00FD:1, 0x0203:1, 0x027E:1, 0x00BD:1,
+                           0x0201:1, 0x0006:1, 0x00BE:1 };
+            const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            let start = -1;
+            for (let i = 0; i + 4 <= bytes.length; i++){
+                if (bytes[i] === 0x09 && bytes[i + 1] === 0x08){
+                    const ln = dv.getUint16(i + 2, true);
+                    if (ln === 16 || ln === 8 || ln === 6){ start = i; break; }
+                }
+            }
+            if (start < 0) return null;
+            let p = start, maxRow = -1, bof = 0, eof = 0;
+            while (p + 4 <= bytes.length){
+                const rec = dv.getUint16(p, true), ln = dv.getUint16(p + 2, true);
+                p += 4;
+                if (p + ln > bytes.length) return null;    // strumien pofragmentowany
+                if (rec === 0x0809) bof++;
+                else if (rec === 0x000A) eof++;
+                else if (CELL[rec] && ln >= 4){
+                    const r = dv.getUint16(p, true);
+                    if (r > maxRow) maxRow = r;
+                }
+                p += ln;
+            }
+            if (!bof || bof !== eof || maxRow < 0) return null;
+            return maxRow;                 // wiersz 0 = naglowek, wiec to liczba danych
+        } catch (e){ return null; }
+    }
+
+    function snapTotal(s){
+        return (s && s.accs || []).reduce(function (n, a){ return n + a.vals.length; }, 0);
+    }
+    function expWhen(ts){
+        const d = new Date(ts);
+        return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '. ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }
+
     // ---------- UI ----------
     const btn = document.createElement('button');
     btn.id = 'exp-btn';
@@ -23566,6 +23696,72 @@
         if (b) b.textContent = '(' + (p.accounts || []).length + ')';
     }
 
+    // Pudelko „co jest do oznaczenia". Rysowane osobno od reszty panelu, zeby
+    // dalo sie je odswiezyc bez przerysowywania calego formularza (a wiec bez
+    // gubienia tego, co ktos ma wpisane w polach).
+    function markRender(){
+        const box = $('#exp-markbox');
+        if (!box) return;
+        const S = EXP_SNAP || snapLoad();
+        EXP_SNAP = S;
+        if (!S || !S.accs || !S.accs.length){ box.innerHTML = ''; return; }
+
+        const total = snapTotal(S);
+        const wiek = Math.floor((Date.now() - S.ts) / 86400000);
+        const m = S.mark;
+        const zrobione = !!(m && m.done && m.dir === 'exported' && !(m.bad || []).length);
+        const doCofniecia = (S.accs || []).some(function (a){ return (a.flipped || []).length; });
+        const krotkie = (S.accs || []).filter(function (a){ return a.bad; });
+
+        let h = '<div style="border:1px solid ' + (zrobione ? '#86efac' : '#99f6e4') + ';border-radius:8px;'
+              + 'background:' + (zrobione ? '#f0fdf4' : '#f0fdfa') + ';padding:8px">'
+              + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+              + '<div style="flex:1;min-width:260px">'
+              +   '<div style="font-weight:700">' + esc(S.fileName) + '</div>'
+              +   '<div style="font-size:11px;color:#555">pobrany ' + esc(expWhen(S.ts))
+              +     ' · ' + total + ' ' + plural(total, 'wiersz', 'wiersze', 'wierszy')
+              +     ' w ' + S.accs.length + ' ' + plural(S.accs.length, 'koncie', 'kontach', 'kontach')
+              +     ' · profil ' + esc(S.profName || '?') + '</div>'
+              + '</div>';
+
+        if (zrobione){
+            h += '<div style="font-weight:700;color:#0a7a2f">✔ oznaczone ' + m.ok + ' z ' + m.need + '</div>';
+        } else {
+            h += '<button id="exp-mark" style="padding:8px 14px;border:none;border-radius:8px;background:#0f766e;'
+               + 'color:#fff;font:bold 12px Arial,sans-serif;cursor:pointer">✔ Oznacz jako wyeksportowane</button>';
+        }
+        h += '</div>';
+
+        // Ostrzezenia — kazde mowi wprost, co z tym zrobic.
+        if (krotkie.length)
+            h += '<div style="margin-top:6px;font-size:11px;color:#c00">⚠ ' + krotkie.length + ' '
+               + plural(krotkie.length, 'konto zostanie pominięte', 'konta zostaną pominięte', 'kont zostanie pominiętych')
+               + ': ' + esc(krotkie.map(function (a){ return a.label + ' — ' + a.bad; }).join('; '))
+               + '. Pobierz je jeszcze raz, zanim oznaczysz.</div>';
+        if (S.partial)
+            h += '<div style="margin-top:6px;font-size:11px;color:#c47f00">⚠ Ten przelot był przerwany — w pliku są tylko konta, które zdążyły dojść.</div>';
+        if (wiek >= 7)
+            h += '<div style="margin-top:6px;font-size:11px;color:#c47f00">⚠ Ten plik ma ' + wiek
+               + ' dni. Upewnij się, że oznaczasz właśnie ten, który wszedł do księgowości.</div>';
+        if (S.profId && S.profId !== profLoad().cur)
+            h += '<div style="margin-top:6px;font-size:11px;color:#c47f00">⚠ Powstał na profilu „' + esc(S.profName)
+               + '", a teraz masz wybrany inny.</div>';
+        if (!zrobione)
+            h += '<div style="margin-top:6px;font-size:11px;color:#555">Klikaj dopiero wtedy, gdy plik jest już'
+               + ' wciągnięty do programu księgowego — eksport sam z siebie niczego nie zmienia.</div>';
+
+        h += '<div id="exp-markrep" style="margin-top:6px;font-size:11px">' + EXP_MARKREP + '</div>';
+        if (doCofniecia)
+            h += '<div style="margin-top:6px"><button id="exp-unmark" style="padding:2px 7px;border:1px solid #ddd;'
+               + 'border-radius:5px;background:#fff;color:#888;font-size:10px;cursor:pointer">cofnij oznaczenie</button>'
+               + '<span style="font-size:10px;color:#aaa;margin-left:6px">tylko te wiersze, które ten panel oznaczył</span></div>';
+        h += '</div>';
+        box.innerHTML = h;
+
+        const bm = $('#exp-mark');   if (bm) bm.onclick = function (){ expDoMark(false, this); };
+        const bu = $('#exp-unmark'); if (bu) bu.onclick = function (){ expDoMark(true,  this); };
+    }
+
     function render(){
         const d = profLoad(), p = profCur(d);
         const sellers = expSellers(), accounts = expAccounts();
@@ -23591,7 +23787,11 @@
            +     'border:1px solid #ddd;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:14px;color:#666">×</button>'
            + '</div>'
            + '<div style="margin:6px 0"><input id="exp-name" value="' + esc(p.name) + '" placeholder="nazwa profilu" style="width:100%;font-size:12px;padding:3px 5px;border:1px solid #ddd;border-radius:5px"></div>'
-           + '<div id="exp-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>';
+           + '<div id="exp-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
+           // Pudelko oznaczania stoi NAD ustawieniami, a nie pod tabelka postepu —
+           // ktos wraca do niego po godzinie, z programu ksiegowego, i ma je zobaczyc
+           // od razu po otwarciu panelu, bez przewijania.
+           + '<div id="exp-markbox" style="margin-bottom:10px"></div>';
 
         h += '<div style="display:flex;gap:10px;align-items:flex-start">';
 
@@ -23771,6 +23971,7 @@
 
         // Panel powstal od nowa — przywracamy filtry, ktore uzytkownik mial ustawione.
         expFilter();
+        markRender();
     }
 
     // ---------- przelot ----------
@@ -23779,6 +23980,190 @@
     // ekran. Liczbe rownoleglych ustawia profil (domyslnie 5) — gdyby serwer zaczal
     // sie dlawic, wystarczy zejsc do 3 albo 1.
     let expAbort = false;
+    // Oznaczanie idzie SEKWENCYJNIE, konto po koncie. Przy pobieraniu plikow
+    // rownoleglosc jest nieszkodliwa, bo to odczyt. Tu kazde zadanie zmienia stan
+    // po drugiej stronie — wolimy wiedziec dokladnie, ktore poszlo i w jakiej
+    // kolejnosci, niz zaoszczedzic kilkanascie sekund raz w miesiacu.
+    async function expDoMark(undo, b){
+        if (running) return;
+        const disk = snapLoad();
+        if (!disk || !disk.accs || !disk.accs.length){
+            say('Nie ma czego oznaczać — najpierw pobierz plik.', '#c47f00'); return;
+        }
+        // Dwie karty prologistics dziela jeden zapis. Jesli panel pokazuje inny
+        // przelot niz ten zapisany, nie zgadujemy ktory jest wlasciwy.
+        if (EXP_SNAP && EXP_SNAP.ts !== disk.ts){
+            EXP_SNAP = disk; markRender();
+            say('W innej karcie zrobiono nowy eksport — odświeżyłem opis. Sprawdź go i kliknij jeszcze raz.', '#c47f00');
+            return;
+        }
+        const S = disk;
+        const target = undo ? '0' : '1';        // stan, w ktorym wiersze maja sie ZNALEZC
+
+        let plan;
+        if (undo){
+            plan = S.accs.map(function (a){ return { a: a, vals: (a.flipped || []).slice() }; })
+                         .filter(function (x){ return x.vals.length; });
+            if (!plan.length){
+                say('Nie ma czego cofać — żadne z tych kont nie zostało przez panel oznaczone.', '#c47f00');
+                return;
+            }
+        } else {
+            const skipped = S.accs.filter(function (a){ return a.bad; });
+            plan = S.accs.filter(function (a){ return !a.bad; })
+                         .map(function (a){ return { a: a, vals: a.vals.slice() }; });
+            if (!plan.length){
+                say('Żadnego konta nie wolno oznaczyć: ' + skipped.map(function (a){ return a.label + ' — ' + a.bad; }).join('; '), '#c00');
+                return;
+            }
+            if (skipped.length)
+                say('Pomijam ' + skipped.length + ' ' + plural(skipped.length, 'konto', 'konta', 'kont')
+                    + ', bo plik był krótszy niż lista wysłanych wierszy.', '#c47f00');
+        }
+
+        // Wiersz, ktorego nie umiemy zidentyfikowac, jest wierszem, ktorego nie
+        // umiemy potwierdzic. Lepiej nie wyslac nic, niz oddac zielony ekran.
+        const nokey = plan.reduce(function (n, x){
+            return n + x.vals.filter(function (v){ return !expKey(v); }).length; }, 0);
+        if (nokey){
+            say('Nie rozpoznaję formatu ' + nokey + ' ' + plural(nokey, 'wiersza', 'wierszy', 'wierszy')
+                + ' — nie wyślę czegoś, czego potem nie potwierdzę.', '#c00');
+            return;
+        }
+
+        const total = plan.reduce(function (n, x){ return n + x.vals.length; }, 0);
+        const czas = expWhen(S.ts);
+        if (!confirm((undo ? 'Cofnąć oznaczenie ' : 'Oznaczyć jako wyeksportowane ')
+                   + total + ' ' + plural(total, 'wiersz', 'wiersze', 'wierszy') + '?\n\n'
+                   + 'Z pliku: ' + S.fileName + '\n'
+                   + 'Pobranego: ' + czas + '\n'
+                   + 'Kont: ' + plan.length + '\n'
+                   + 'Profil: ' + S.profName + '\n\n'
+                   + (undo ? 'Cofnę wyłącznie te wiersze, które ten panel wcześniej oznaczył.'
+                           : 'To zmienia stan w prologistics. Rób to dopiero wtedy,\n'
+                           + 'gdy plik jest już w programie księgowym.'))) return;
+
+        running = true;
+        if (b) b.disabled = true;
+        const other = $(undo ? '#exp-mark' : '#exp-unmark'); if (other) other.disabled = true;
+        const run = $('#exp-run'); if (run) run.disabled = true;
+        const rep = $('#exp-markrep');
+        const lines = [];
+        const t0 = Date.now();
+        const draw = function (extra){
+            // Raport trzymamy tez poza DOM-em, bo markRender() przerysowuje pudelko
+            // po zakonczeniu i inaczej skasowalby wlasnie to, po co ktos przyszedl.
+            EXP_MARKREP = '<div style="font-size:11px;color:#666;margin-bottom:4px">'
+                        + esc(extra || '') + '</div>' + lines.join('');
+            if (rep) rep.innerHTML = EXP_MARKREP;
+        };
+        let okAll = 0, alreadyAll = 0, badAll = [];
+
+        try {
+            for (let i = 0; i < plan.length; i++){
+                const x = plan[i], a = x.a;
+                const head = '<div style="border-top:1px solid #eee;padding:3px 0"><b>' + esc(a.label) + '</b> ';
+                draw('konto ' + (i + 1) + ' z ' + plan.length + ' — ' + a.label + ': sprawdzam stan przed');
+
+                const NEED = expBag(x.vals);
+                let BEFORE;
+                try {
+                    BEFORE = expBag(expRows(expAssertForm(await expPost(expWithState(a.body, target), false))));
+                } catch (e){
+                    lines.push(head + '<span style="color:#c00">nie sprawdziłem stanu przed: '
+                             + esc((e && e.message) || e) + ' — nic nie wysłałem</span></div>');
+                    badAll.push({ label: a.label, kind: 'pre', n: x.vals.length });
+                    draw(''); continue;
+                }
+                // Juz w docelowym stanie -> nie wysylamy ich ponownie i nie liczymy
+                // jako „nasze", zeby pozniejsze cofniecie ich nie ruszylo.
+                const todo = x.vals.filter(function (v){
+                    const k = expKey(v);
+                    return !((BEFORE.get(k) || 0) >= (NEED.get(k) || 0));
+                });
+                const already = x.vals.length - todo.length;
+                alreadyAll += already;
+                if (!todo.length){
+                    lines.push(head + '<span style="color:#0a7a2f">wszystkie ' + x.vals.length
+                             + ' już ' + (undo ? 'nieoznaczone' : 'oznaczone') + ' — nic nie wysyłałem</span></div>');
+                    okAll += x.vals.length;
+                    draw(''); continue;
+                }
+
+                // wysylka w paczkach — nigdy pusta
+                const size = expChunkSize(a.body);
+                let sent = 0, err = null;
+                for (let p = 0; p < todo.length && !err; p += size){
+                    const chunk = todo.slice(p, p + size);
+                    if (!chunk.length) continue;
+                    draw('konto ' + (i + 1) + ' z ' + plan.length + ' — ' + a.label
+                       + ': wysyłam ' + (sent + chunk.length) + ' z ' + todo.length);
+                    try {
+                        expAssertForm(await expPost(expMarkBody(a.body, chunk, undo, S.system), false));
+                        sent += chunk.length;
+                    } catch (e){ err = (e && e.message) || e; }
+                }
+
+                draw('konto ' + (i + 1) + ' z ' + plan.length + ' — ' + a.label + ': sprawdzam, czy się zapisało');
+                let AFTER;
+                try {
+                    AFTER = expBag(expRows(expAssertForm(await expPost(expWithState(a.body, target), false))));
+                } catch (e){
+                    lines.push(head + '<span style="color:#c00">wysłałem ' + sent
+                             + ', ale nie potwierdziłem: ' + esc((e && e.message) || e) + '</span></div>');
+                    badAll.push({ label: a.label, kind: 'post', n: todo.length });
+                    draw(''); continue;
+                }
+                const good = [], bad = [];
+                todo.forEach(function (v){
+                    const k = expKey(v);
+                    if ((AFTER.get(k) || 0) >= (NEED.get(k) || 0)) good.push(v); else bad.push(v);
+                });
+                // Cofac wolno tylko to, co to klikniecie naprawde przestawilo.
+                if (!undo) a.flipped = good.slice();
+                else a.flipped = (a.flipped || []).filter(function (v){ return bad.indexOf(v) >= 0; });
+                okAll += good.length + already;
+                if (bad.length){
+                    badAll.push({ label: a.label, kind: 'nieudane', n: bad.length,
+                                  ids: bad.slice(0, 8).map(function (v){ return expKey(v) + '/' + expAuc(v); }) });
+                    lines.push(head + '<span style="color:#c00">potwierdzone ' + good.length
+                             + ' z ' + todo.length + (err ? (', błąd wysyłki: ' + esc(err)) : '')
+                             + '</span> <span style="color:#888">' + (already ? ('· już wcześniej ' + already) : '') + '</span></div>');
+                } else {
+                    lines.push(head + '<span style="color:#0a7a2f">potwierdzone ' + good.length + '</span> '
+                             + '<span style="color:#888">' + (already ? ('· już wcześniej ' + already) : '') + '</span></div>');
+                }
+                draw('');
+            }
+
+            S.mark = { ts: Date.now(), dir: undo ? 'not_exported' : 'exported',
+                       need: total, ok: okAll, already: alreadyAll,
+                       bad: badAll, done: true };
+            snapSave(S);
+
+            const el = Math.round((Date.now() - t0) / 1000);
+            if (!badAll.length){
+                say((undo ? 'Cofnięte i potwierdzone: ' : 'Oznaczone i potwierdzone: ')
+                    + okAll + ' z ' + total + ' ' + plural(total, 'wiersza', 'wierszy', 'wierszy')
+                    + (alreadyAll ? (' (w tym ' + alreadyAll + ' już wcześniej)') : '')
+                    + ', ' + el + ' s. Sprawdzone ponownym wyszukaniem, nie tylko odpowiedzią serwera.', '#0a7a2f');
+            } else {
+                say('Potwierdzone ' + okAll + ' z ' + total + '. Nie udało się: '
+                    + badAll.map(function (x){ return x.label + ' (' + x.n + ')'; }).join('; ')
+                    + '. Szczegóły niżej — te wiersze NIE są ' + (undo ? 'cofnięte' : 'oznaczone')
+                    + ', możesz kliknąć jeszcze raz.', '#c00');
+            }
+        } catch (e){
+            say('Przerwane błędem: ' + ((e && e.message) || e) + '. To, co zdążyło pójść, jest opisane niżej.', '#c00');
+        } finally {
+            running = false;
+            if (b) b.disabled = false;
+            if (other) other.disabled = false;
+            if (run) run.disabled = false;
+            markRender();
+        }
+    }
+
     async function runAll(b){
         if (running) return;
         const p = profCur(profLoad());
@@ -23798,7 +24183,8 @@
                    + 'Sprzedawców: ' + users.length + (p.allUsers ? ' (wszyscy)' : '') + '\n'
                    + 'Format: ' + p.system + '\n'
                    + 'Równolegle: ' + par + '\n\n'
-                   + 'Nic nie zostanie oznaczone jako wyeksportowane.')) return;
+                   + 'Nic nie zostanie oznaczone jako wyeksportowane.\n'
+                   + 'Oznaczysz je osobnym guzikiem, gdy plik wejdzie do księgowości.')) return;
 
         running = true; expAbort = false;
         b.disabled = true;
@@ -23811,6 +24197,7 @@
         // przy pracy rownoleglej kolejnosc w archiwum zalezalaby od tego, co szybciej
         // wroci z serwera, a ma odpowiadac kolejnosci kont w profilu.
         const files = new Array(accs.length);
+        const snaps = new Array(accs.length);
         const problems = [];
         let done = 0, next = 0;
         const t0 = Date.now();
@@ -23852,7 +24239,13 @@
             st[i].t0 = Date.now();
             try {
                 st[i].note = 'szukam';
-                const html = await expPost(expSearchBody(p, a), false);
+                // Cialo zamrazamy TUTAJ i trzymamy dalej doslownie. expSearchBody
+                // czyta zywy formularz i zywa date („poprzedni miesiac"), wiec
+                // zbudowane ponownie za godzine — albo pierwszego dnia miesiaca —
+                // dalo by inny zakres. Oznaczanie musi trafic dokladnie w to,
+                // co poszlo do pliku, wiec pyta tym samym napisem.
+                const body = expSearchBody(p, a);
+                const html = await expPost(body, false);
                 if (expAbort){ st[i].note = 'przerwane'; return; }
                 const rows = expRows(html);
                 st[i].rows = rows.length;
@@ -23866,7 +24259,22 @@
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
                 files[i] = { name: safeName(expAccLabel(a)) + expExt(f.cd, '.xls'), data: f.buf };
-                st[i].note = 'pobrane';
+                // Ile wierszy naprawde przyszlo w pliku. Gdyby serwer po cichu ucial
+                // zadanie, plik bylby krotszy od listy, ktora wyslalismy — a wtedy
+                // pozniejsze oznaczenie zaklepaloby platnosci, ktorych ksiegowosc
+                // nigdy nie zobaczy, i to z zielonym potwierdzeniem. Takie konto
+                // wchodzi do migawki z zakazem oznaczania.
+                const nx = expXlsRows(f.buf);
+                snaps[i] = { acc: a, label: expAccLabel(a), body: body, vals: rows,
+                             file: files[i].name, xls: nx, flipped: [] };
+                if (nx !== null && nx < rows.length){
+                    snaps[i].bad = 'w pliku ' + nx + ' ' + plural(nx, 'wiersz', 'wiersze', 'wierszy')
+                                 + ', a wysłałem ' + rows.length;
+                    st[i].note = 'plik krótszy!';
+                    problems.push(expAccLabel(a) + ': ' + snaps[i].bad);
+                } else {
+                    st[i].note = 'pobrane';
+                }
             } catch (e){
                 st[i].note = 'błąd';
                 problems.push(expAccLabel(a) + ': ' + ((e && e.message) || e));
@@ -23917,9 +24325,26 @@
             expDownload(expZip(got), name);
             what = 'Gotowe: ' + got.length + ' ' + plural(got.length, 'plik', 'pliki', 'plików') + ' w „' + name + '"';
         }
+        // Migawka: co dokladnie weszlo do pliku, jakim zapytaniem i kiedy. Zyje dalej
+        // niz panel i dalej niz karta — ktos wraca do niej po wciagnieciu pliku do
+        // ksiegowosci, czasem nastepnego dnia.
+        const prev = snapLoad();
+        const zapomniane = prev && prev.accs && prev.accs.length
+                         && !(prev.mark && prev.mark.done) ? snapTotal(prev) : 0;
+        const snapAccs = snaps.filter(Boolean);
+        snapSave({
+            v: 1, ts: Date.now(), fileName: name, partial: !!expAbort,
+            profId: p.id, profName: p.name, system: p.system || 'excel',
+            range: [r[0], r[1]], dateField: p.dateField, accs: snapAccs
+        });
+        EXP_MARKREP = '';
+        markRender();
+
         say((expAbort ? 'Przerwane — biorę to, co zdążyło. ' : '') + what + ', ' + el + ' s'
-            + (problems.length ? (' · problemy: ' + problems.join('; ')) : '') + '.',
-            (problems.length || expAbort) ? '#c47f00' : '#0a7a2f');
+            + (problems.length ? (' · problemy: ' + problems.join('; ')) : '')
+            + '. Nic nie zostało oznaczone — zrobisz to guzikiem wyżej, gdy plik wejdzie do księgowości.'
+            + (zapomniane ? (' UWAGA: poprzedni plik (' + zapomniane + ' wierszy) nie został oznaczony i właśnie go zastąpiłem.') : ''),
+            (problems.length || expAbort || zapomniane) ? '#c47f00' : '#0a7a2f');
     }
 })();
     }
