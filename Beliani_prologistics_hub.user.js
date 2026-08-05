@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.90
+// @version      2.92
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17683,6 +17683,15 @@
     const MK_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
 
     function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    // Komunikat o wygaslej sesji konczy sie adresem panelu, na ktory trzeba sie zalogowac.
+    // Jako goly tekst byl do przepisania recznie, wiec zamieniamy adresy na odsylacze.
+    // Escapowanie idzie PRZED podmiana, wiec tresc dalej jest traktowana jak tekst;
+    // wszyscy dotychczasowi wolajacy podaja czysty tekst i nic im sie nie zmienia.
+    function linkify(s){
+        return esc(s).replace(/https?:\/\/[^\s<>"')]+/g, function (u){
+            return '<a href="' + u + '" target="_blank" rel="noopener" style="color:#2563eb">' + u + '</a>';
+        });
+    }
     function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
     function r2(n){ return Math.round(Number(n) * 100) / 100; }
     function eq(a, b){ return isFinite(a) && isFinite(b) && Math.abs(a - b) < 0.005; }
@@ -17799,10 +17808,14 @@
     // Nazwa marketu MUSI zgadzac sie z lista rozwijana w arkuszu, bo kolumna „Konto"
     // to formula VLOOKUP po tej wlasnie nazwie. W arkuszu etykiety maja postac
     // „Vente Unique DE" (pelna nazwa + kraj), a nie „Vente DE".
+    // Nazwa sklepu bierze sie normalnie z pobranego rozliczenia. Joybuy zadnego nie ma —
+    // jego sklep znamy juz z reguly rozpoznajacej wplate, wiec siegamy tam zapasowo.
+    // Dla pozostalych nic sie nie zmienia: `data.shop` jest ustawiane pierwsze.
     function mkShort(j){
-        const cc = String((j.data && j.data.shop) || '').match(/\b([A-Z]{2})\s*$/);
+        const shop = (j.data && j.data.shop) || j.shop || '';
+        const cc = String(shop).match(/\b([A-Z]{2})\s*$/);
         const s = j.brand || j.short || j.mp || '';
-        return cc ? (s + ' ' + cc[1]).trim() : (s || (j.data && j.data.shop) || '');
+        return cc ? (s + ' ' + cc[1]).trim() : (s || shop || '');
     }
     function shRow(j, c){
         const rf = (j.data && j.data.ref) || {};
@@ -17978,6 +17991,189 @@
         const re = new RegExp(brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s+' + cc[1] + '\\b', 'i');
         const hit = (list || []).filter(function (a){ return a.on && /^1\d{3}$/.test(a.n) && !MK_NOT_BANK.test(a.nm) && re.test(a.nm); });
         return hit.length === 1 ? hit[0] : null;   // dwa trafienia = wskazujesz recznie
+    }
+
+    // ===== adresy paneli marketplace'ow =====
+    // Lista utrzymywana przez dzial — sluzy do jednego: gdy pobieranie padnie na braku
+    // sesji, komunikat konczy sie adresem, pod ktorym trzeba sie zalogowac, zamiast
+    // kazac go szukac. Sa tu takze marketplace'y, ktorych modul jeszcze nie obsluguje;
+    // stoja na zapas, zeby przy dokladaniu kolejnego nie zbierac adresow od nowa.
+    // Klucz: NAZWA|KRAJ, wielkimi literami. Kraj z nazwy („OBI DE") ma pierwszenstwo
+    // przed kolumna kraju, bo w zrodle bywa ona przestawiona (XXXLutz AT stoi przy DE).
+    const MK_LOGIN = {
+        'ALLEGRO BRAND|PL':                  'https://allegro.pl/logowanie?origin_url=%2F',
+        'ALLEGRO|CZ':                        'https://allegro.cz/prihlaseni?origin_url=%2F',
+        'ALLEGRO|HU':                        'https://allegro.com/log-in?origin_url=https%3A%2F%2Fsalescenter.allegro.com',
+        'ALLEGRO|PL':                        'https://allegro.pl/logowanie?origin_url=%2F',
+        'ALLEGRO|SK':                        'https://allegro.com/log-in?origin_url=https%3A%2F%2Fsalescenter.allegro.com',
+        'ALTEX|RO':                          'https://marketplace.altex.ro/admin/dashboard',
+        'AMAZON|DE':                         'https://sellercentral.amazon.de',
+        'AMAZON|ES':                         'https://sellercentral.amazon.es',
+        'AMAZON|FR':                         'https://sellercentral.amazon.fr',
+        'AMAZON|IT':                         'https://sellercentral.amazon.it',
+        'AMAZON|NL':                         'https://sellercentral.amazon.nl/',
+        'AMAZON|PL':                         'https://sellercentral.amazon.pl',
+        'AMAZON|SE':                         'https://sellercentral.amazon.se/',
+        'AMAZON|UK':                         'https://sellercentral.amazon.co.uk',
+        'B&Q|UK':                            'https://marketplace.kingfisher.com/',
+        'BAUHAUS|DE':                        'https://bauhausde-prod.mirakl.net/mmp/shop/onboarding',
+        'BLACK RED WHITE|PL':                'https://blackredwhitepl-prod.mirakl.net/login',
+        'BLOKKER|NL':                        'https://login.blokkerconnect.nl/login',
+        'BLOOP|PT':                          'https://bloop.marketplacer.com/newportal/seller',
+        'BOL|NL':                            'https://login.bol.com/login?client_id=seller-portal',
+        'BRICO DEPOT|ES':                    'https://marketplace.bricodepot.es/',
+        'BRICO DEPOT|PT':                    'https://marketplace.bricodepot.es/',
+        'BRICOBRAVO|IT':                     'https://sellerhub.bricobravo.com/dashboard',
+        'BRICOMARCHÉ|FR':                    'https://bricomarchefr-prod.mirakl.net/mmp/shop/onboarding',
+        'BRICO|BE':                          'https://maxedanl-prod.mirakl.net/',
+        'BUT|FR':                            'https://but-prod.mirakl.net/login',
+        'CARREFOUR|ES':                      'https://carrefoures-prod.mirakl.net/login',
+        'CARREFOUR|FR':                      'https://carrefourfr-prod.mirakl.net/login',
+        'CASTORAMA|FR':                      'https://marketplace.castorama.fr/marketplace-dashboard/',
+        'CASTORAMA|PL':                      'https://marketplace.castorama.pl/',
+        'CDISCOUNT|FR':                      'https://seller.octopia.com/',
+        'CDON|DK':                           'https://admin.marketplace.cdon.com/',
+        'CDON|FI':                           'https://admin.marketplace.cdon.com/',
+        'CDON|NO':                           'https://admin.marketplace.cdon.com/',
+        'CDON|SE':                           'https://admin.marketplace.cdon.com/',
+        'CHECK24|DE':                        'https://mc.moebel.check24.de',
+        'CLUBEFASHION|PT':                   'https://clubefashion.mirakl.net/marketplace-dashboard/',
+        'CONFORAMA|ES':                      'https://conforamaiberia-prod.mirakl.net/login',
+        'CONFORAMA|FR':                      'https://conforama-prod.mirakl.net/login',
+        'CONFORAMA|PT':                      'https://conforamaiberia-prod.mirakl.net/login',
+        'COOP/JUMBO|CH':                     'https://app.ecosio.com/account/login',
+        'CULTURA|FR':                        'https://culturafr-prod.mirakl.net/mmp/shop/onboarding',
+        'DARTY|FR':                          'https://drt-prod.mirakl.net/login',
+        'DEINDEAL MARKETPLACE|CH':           'https://dsp.deindeal.cloud',
+        'DEINDEAL|CH':                       'https://dsp.deindeal.cloud',
+        'E-PRICE|IT':                        'https://marketplace.eprice.it/marketplace-dashboard/',
+        'EBAY|DE':                           'https://www.ebay.de/sh/ovw',
+        'EBAY|FR':                           'https://www.ebay.fr/sh/ovw',
+        'EBAY|IT':                           'https://www.ebay.it/sh/ovw',
+        'EBAY|UK':                           'https://www.ebay.co.uk/sh/ovw',
+        'ELECLERC|FR':                       'https://leclerc-prod.mirakl.net/',
+        'EMAG|HU':                           'https://marketplace.emag.hu/dashboard',
+        'EMAG|RO':                           'https://marketplace.emag.ro/dashboard',
+        'EMPIK|PL':                          'https://marketplace.empik.com/',
+        'FONQ|NL':                           'https://fonq.mirakl.net/',
+        'FURNISH|UK':                        'https://furnish.co.uk/',
+        'FYNDIQ|SE':                         'https://merchantcenter.fyndiq.se/',
+        'GALAXUS|CH':                        'https://partner.galaxus.ch/',
+        'GALAXUS|DE':                        'https://partner.galaxus.eu/',
+        'GAMM VERT FR (TERRACT)|FR':         'https://teractfr-prod.mirakl.net/mmp/shop/order/all',
+        'GROUPON|DE':                        'https://scm.commerceinterface.com/accounts/login/?next=/dashboard/',
+        'HOBBYBOX|FI':                       'https://ipagencyfi-prod.mirakl.net/marketplace-dashboard/',
+        'HOME&YOU|PL':                       'https://marketplace.home-you.com/marketplace-dashboard/',
+        'HOME24|AT':                         'https://home24.mirakl.net/',
+        'HOME24|CH':                         'https://home24.mirakl.net/',
+        'HOME24|DE':                         'https://home24.mirakl.net/',
+        'HOME24|FR':                         'https://home24.mirakl.net/',
+        'HOME24|NL':                         'https://home24.mirakl.net/',
+        'HOMEDECO|NL':                       'https://homedeco.nl/accounts/login/',
+        'HORNBACH|DE':                       'https://hornbach-mp.mirakl.net/marketplace-dashboard/',
+        'JUMPL|FR':                          'https://www.jumpl.io/account/login/?next=/dashboard/',
+        'KARKKAINEN|FI':                     'https://karkkainen.mirakl.net/login',
+        'KAUFLAND|AT':                       'https://sellerportal.kaufland.de/dashboard?storefront=at',
+        'KAUFLAND|CZ':                       'https://sellerportal.kaufland.de/onboarding?storefront=cz',
+        'KAUFLAND|DE':                       'https://sellerportal.kaufland.de/dashboard?storefront=de',
+        'KAUFLAND|PL':                       'https://sellerportal.kaufland.de/onboarding?storefront=pl',
+        'KAUFLAND|SK':                       'https://sellerportal.kaufland.de/onboarding?storefront=sk',
+        'KUANTO KUSTA|PT':                   'https://seller.kuantokusta.pt/',
+        'LEEN BAKKER|NL':                    'https://partnerplatform.leenbakker.nl/',
+        'LEROY MERLIN|ES':                   'https://leroymerlin-marketplace.mirakl.net/',
+        'LEROY MERLIN|FR':                   'https://leroymerlin-marketplace.mirakl.net/',
+        'LEROY MERLIN|IT':                   'https://leroymerlin-marketplace.mirakl.net/login',
+        'LEROY MERLIN|PT':                   'https://leroymerlin-marketplace.mirakl.net/',
+        'LEROY MERLIN|RO':                   'https://leroymerlin-marketplace.mirakl.net/',
+        'LIMANGO|DE':                        'https://partner.limango.de',
+        'MAISONS DU MONDE|DE':               'https://maisonsdumonde-prod.mirakl.net/',
+        'MAISONS DU MONDE|ES':               'https://maisonsdumonde-prod.mirakl.net/',
+        'MAISONS DU MONDE|FR':               'https://maisonsdumonde-prod.mirakl.net/',
+        'MAISONS DU MONDE|IT':               'https://maisonsdumonde-prod.mirakl.net/',
+        'MALL|CZ':                           'https://new-partners.mallgroup.com/login/',
+        'MALL|HU':                           'https://new-partners.mallgroup.com/login/',
+        'MALL|SK':                           'https://new-partners.mallgroup.com/login/',
+        'MANOMANO|DE':                       'https://toolbox.manomano.com/login',
+        'MANOMANO|ES':                       'https://toolbox.manomano.com/login',
+        'MANOMANO|FR':                       'https://toolbox.manomano.com/login',
+        'MANOMANO|IT':                       'https://toolbox.manomano.com/login',
+        'MANOMANO|UK':                       'https://toolbox.manomano.com/login',
+        'MANOR|CH':                          'https://manor-prod.mirakl.net/',
+        'MEDIAMARKT SATURN|CH':              'https://mediamarktsaturn.mirakl.net/',
+        'MICROSPOT|CH':                      'https://beliani.brickfox.net/',
+        'MIGROS|CH':                         'https://mlsplus.migros.net/mlsplus/#!login',
+        'MOEBEL24|DE':                       'https://marketplace.moebel24.de/vendor.php?dispatch=auth.login_form&return_url=vendor.php',
+        'MÖMAX|DE':                          'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'MORELE|PL':                         'https://marketplace.morele.net/login',
+        'OBI|CH':                            'https://streckenportal.obi.net/sites/ObiProdAx/ThirdPartyVendorPortal',
+        'OBI|DE':                            'https://belianide860.myvtex.com/admin',
+        'OTTO|DE':                           'https://portal.otto.market/',
+        'PAYBACK|DE':                        'https://paybackde-prod.mirakl.net/marketplace-dashboard/',
+        'PRAXIS|NL':                         'https://maxedanl-prod.mirakl.net/mmp/shop/onboarding',
+        'PRODUCTPINE|NL':                    'https://app.productpine.com/',
+        'RAKUTEN|FR':                        'https://outils.fr.shopping.rakuten.com/documents/merchant-dashboard/index.php?action=message1',
+        'ROBERT DYAS|UK':                    'https://app.virtualstock.com/accounts/login/?next=/',
+        'RUE DE COMMERCE|FR':                'https://mirakl-web.groupe-rueducommerce.fr/',
+        'SHEIN|DE':                          'https://sso.geiwohuo.com/#/home',
+        'SHÖPPING|AT':                       'https://portal.shoepping.at/marketplaceportal/',
+        'SONAE|PT':                          'https://sonaelink-portal.azurewebsites.net',
+        'TEMU|CH':                           'https://ch.seller.temu.com/',
+        'THE RANGE|UK':                      'https://therangeuk-prod.mirakl.net/mmp/shop/onboarding',
+        'VENTE UNIQUE|AT':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|BE':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|CH':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|DE':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|ES':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|FR':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|IT':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|LU':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|NL':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|PL':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|PT':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|SE':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|UK':                   'https://venteunique-prod.mirakl.net/',
+        'VIVRE|HU':                          'https://partners.vivre.eu/client-orders?supplier_id=11868',
+        'VIVRE|RO':                          'https://partners.vivre.eu/client-orders?supplier_id=11868',
+        'WAYFAIR|DE':                        'https://partners.wayfair.com/',
+        'WORTEN|ES':                         'https://marketplace.worten.pt/',
+        'WORTEN|PT':                         'https://marketplace.worten.pt/',
+        'WOWCHER|UK':                        'https://merchant-area.wowcher.co.uk/login',
+        'XXXLUTZ|AT':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|CH':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|DE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/'
+    };
+    // Adres panelu dla zlecenia. Kraj bierzemy z nazwy sklepu — tak samo jak przy
+    // zgadywaniu konta w mkAcctGuess. Marka („Vente Unique") bywa inna niz sklep
+    // („Beliani DE"), wiec probujemy obu, a na koncu zostaje sam host Mirakla:
+    // tam strona glowna JEST logowaniem, wiec to poprawne dojscie nawet bez wpisu.
+    function mkLoginUrl(j){
+        if (!j) return '';
+        const shop = String((j.data && j.data.shop) || j.shop || '');
+        const m = shop.match(/\b([A-Z]{2})\s*$/), cc = m ? m[1] : '';
+        const names = [j.brand, j.short, j.mp, shop.replace(/\s+[A-Z]{2}\s*$/, '')];
+        for (let i = 0; i < names.length; i++){
+            const n = String(names[i] || '').trim().toUpperCase();
+            if (!n) continue;
+            if (cc && MK_LOGIN[n + '|' + cc]) return MK_LOGIN[n + '|' + cc];
+        }
+        // kraju nie znamy albo tego kraju nie ma na liscie — bierzemy pierwszy wpis marki
+        for (let i = 0; i < names.length; i++){
+            const n = String(names[i] || '').trim().toUpperCase();
+            if (!n) continue;
+            const k = Object.keys(MK_LOGIN).filter(function (x){ return x.indexOf(n + '|') === 0; })[0];
+            if (k) return MK_LOGIN[k];
+        }
+        return j.host ? ('https://' + j.host + '/') : '';
+    }
+    // Doklejamy adres TYLKO do komunikatow, ktore faktycznie mowia o sesji — inaczej
+    // przy kazdym bledzie rachunkowym wisialby odsylacz do logowania i przestalby cokolwiek
+    // znaczyc. Wzorzec pokrywa tresci rzucane przez gmGet/gmPost, wayfGql i mkToken.
+    const MK_SESS_RE = /zaloguj|sesj|HTTP\s*40[13]|nie widzę tokena|nie widzę, na którego|odrzucił zapytanie|nie-JSON/i;
+    function withLogin(j, msg){
+        const t = String(msg == null ? '' : (msg.message || msg));
+        if (!MK_SESS_RE.test(t)) return t;
+        const u = mkLoginUrl(j);
+        return (u && t.indexOf(u) < 0) ? (t + ' → ' + u) : t;
     }
 
     // ===== rozpoznawanie wplat w wyciagu =====
@@ -19824,7 +20020,10 @@
       + '</div>';
 
     function $(s){ return panel.querySelector(s); }
-    function say(t, c){ const e = $('#mk-status'); if (e){ e.textContent = t || ''; e.style.color = c || '#666'; } }
+    // innerHTML zamiast textContent, zeby adres panelu w komunikacie byl klikalny.
+    // linkify() escapuje tresc przed podmiana, wiec pod wzgledem bezpieczenstwa
+    // wychodzi na to samo, co bylo.
+    function say(t, c){ const e = $('#mk-status'); if (e){ e.innerHTML = linkify(t || ''); e.style.color = c || '#666'; } }
     // Na Miraklu przy otwarciu panelu jeszcze raz zdejmujemy liste sklepow — do tego
     // czasu naglowek na pewno jest juz wczytany — i pokazujemy, ile ich znamy.
     function shopsInfo(){
@@ -19930,7 +20129,7 @@
                    + stepDone(!!j.booked, 'zaksięgowane')
                    + '</div>')
                 : '';
-            let det = esc(j.msg || '');
+            let det = linkify(j.msg || '');
             if (j.data){
                 const n = Object.keys(j.data.ord || {}).length, nr = Object.keys(j.data.ref || {}).length;
                 det = 'zamówień: <b>' + n + '</b> na ' + f2(j.data.gross) + (nr ? (' · zwrotów: <b>' + nr + '</b> na ' + f2(j.data.refund)) : '') +
@@ -19951,7 +20150,7 @@
                 if (sh && sh.found) det += '<div style="color:#c00;font-weight:700">JEST JUŻ W ARKUSZU — wiersz ' + esc(sh.row.row) + ' (' + esc(sh.row.marketplace) + ', ' + esc(sh.row.comments || '') + ')</div>';
                 else if (sh && sh.similar && sh.similar.length) det += '<div style="color:#c47f00">w arkuszu jest podobny wpis: ' + esc(sh.similar.map(function (x){ return x.data + ' ' + x.marketplace + ' ' + f2(x.kwota); }).join('; ')) + '</div>';
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
-                if (j.msg) det += '<div style="color:#c47f00">' + esc(j.msg) + '</div>';
+                if (j.msg) det += '<div style="color:#c47f00">' + linkify(j.msg) + '</div>';
             }
             h += '<tr style="border-top:1px solid #eee">'
               +  '<td style="padding:3px 5px">' + (onProlo && st === 'ready'
@@ -20712,15 +20911,29 @@
         const after = await crRead(st.num);
         st.open = after.ok ? after.open : st.open;
         st.nPay = after.ok ? after.nPay : st.nPay;
-        const jobs = jobsLoad();
-        if (jobs[j.ref]){
-            jobs[j.ref].booked = true;
-            jobs[j.ref].msg = 'zaksięgowane na auftragu ' + st.num
-                            + (after.ok && after.open != null ? (', open amount po księgowaniu ' + f2(after.open)) : '');
+        const jobs = jobsLoad(), cur = jobs[j.ref];
+        if (cur){
+            cur.booked = true;
+            cur.msg = 'zaksięgowane na auftragu ' + st.num
+                    + (after.ok && after.open != null ? (', open amount po księgowaniu ' + f2(after.open)) : '');
+            jobsSave(jobs);
+        }
+        // Dopisek do arkusza jest KROKIEM OSOBNYM — dokladnie jak przy imporcie: jego
+        // niepowodzenie NIE cofa ksiegowania, trafia tylko do opisu przy zleceniu, zebys
+        // wiedzial, co ewentualnie dopisac recznie. Duplikat wychwytuje sam arkusz
+        // (klucz data + konto + kwota) i wtedy oddaje „w arkuszu już było".
+        const cfg = shCfg();
+        if (cur && cfg.on && cfg.url && cfg.secret){
+            try {
+                const res = await shPost([shRow(j, c)]);
+                const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
+                cur.msg += res.added ? (' · wpisane do arkusza' + tb) : ' · w arkuszu już było';
+            } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); }
             jobsSave(jobs);
         }
         render();
-        say('Zaksięgowane na auftragu ' + st.num + (after.ok ? (', open amount po księgowaniu ' + f2(after.open)) : ''), '#0a7a2f');
+        say('Zaksięgowane na auftragu ' + st.num + (after.ok ? (', open amount po księgowaniu ' + f2(after.open)) : '')
+            + (cur && /arkusz/i.test(cur.msg) ? (' · ' + cur.msg.split('·').pop().trim()) : ''), '#0a7a2f');
     }
     function renderJoy(){
         const box = $('#mk-joy'); if (!box) return;
@@ -21343,7 +21556,7 @@
                     j.status = bad.length ? 'partial' : 'ready';
                     j.msg = bad.join('; ');
                     ok++;
-                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
             }
             return ok;
@@ -21372,7 +21585,7 @@
                 // Zapas: zestawienia odlozone przy ostatniej wizycie na stronie OBI.
                 reps = vtexCacheGet(host);
                 fromCache = true;
-                if (!reps.length){ say('OBI: ' + ((e && e.message) || e), '#c00'); return 0; }
+                if (!reps.length){ say('OBI: ' + withLogin({ brand: 'OBI', shop: 'OBI DE' }, e), '#c00'); return 0; }
                 say('OBI: nie mogę zapytać wprost, używam zestawień odłożonych przy ostatniej wizycie (' + reps.length + ').', '#c47f00');
             }
             // Bez tego przy braku dopasowania zostawala cisza: nie bylo wiadomo, czy
@@ -21414,7 +21627,7 @@
                     j.status = bad.length ? 'partial' : 'ready';
                     j.msg = bad.join('; ');
                     ok++;
-                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
             }
             if (!ok) say('OBI: raportów w tym okresie ' + reps.length + ', ale żaden nie ma nazwy z przelewu. Widziane nazwy: '
@@ -21432,7 +21645,7 @@
             say('Galaxus — pobieram listę wypłat…');
             let list;
             try { list = galxParseList(await galxHtml()); }
-            catch (e){ say('Galaxus: ' + ((e && e.message) || e), '#c47f00'); return 0; }
+            catch (e){ say('Galaxus: ' + withLogin({ brand: 'Galaxus', shop: 'Galaxus CH' }, e), '#c47f00'); return 0; }
             if (!list.length){ say('Galaxus: nie widzę żadnego linku do raportu na „Payout overview".', '#c47f00'); return 0; }
             let ok = 0;
             for (let i = 0; i < left.length; i++){
@@ -21461,7 +21674,7 @@
                     j.status = eq(p.net, j.amount) ? 'ready' : 'partial';
                     j.msg = eq(p.net, j.amount) ? '' : ('suma z raportu ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
                     ok++;
-                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
             }
             return ok;
@@ -21491,7 +21704,7 @@
             say('Wayfair — pobieram listę wypłat…');
             let list;
             try { list = await wayfList(mkShift(lo, -14), mkShift(up, 3)); }
-            catch (e){ say('Wayfair: ' + ((e && e.message) || e), '#c47f00'); return 0; }
+            catch (e){ say('Wayfair: ' + withLogin({ brand: 'Wayfair', shop: 'Wayfair DE' }, e), '#c47f00'); return 0; }
             if (!list.length){ say('Wayfair: w tym okresie portal nie pokazuje żadnej wypłaty.', '#c47f00'); return 0; }
             let ok = 0;
             for (let i = 0; i < left.length; i++){
@@ -21517,7 +21730,7 @@
                     if (p.err) throw new Error(p.err);
                     wayfApply(j, p, 'remittance ' + (w.displayRemittanceNumber || w.paymentId));
                     ok++;
-                } catch (e){ j.status = 'err'; j.msg = (e && e.message) || String(e); }
+                } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
             }
             return ok;
