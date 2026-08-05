@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      2.89
+// @version      2.90
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17706,7 +17706,10 @@
     const MK_SET_SEED = {
         'Mirakl (Vente) · Beliani DE': { bank: '157', booking: '9', acct: '1114' },
         'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' },
-        'Wayfair · Wayfair DE':        { bank: '10',  booking: '9', acct: '1223' }
+        'Wayfair · Wayfair DE':        { bank: '10',  booking: '9', acct: '1223' },
+        // Joybuy nie ma importu, wiec bank_setting jest mu niepotrzebny — liczy sie
+        // samo konto, na ktore idzie platnosc ksiegowana wprost na auftragu.
+        'Joybuy · Joybuy DE':          { bank: '',    booking: '9', acct: '1169' }
     };
     function setLoad(){
         let d = null;
@@ -18010,6 +18013,15 @@
         { mp: 'Wayfair',        ok: true,  payer: /WAYFAIR/i,
           ref: /reason\s*for\s*payment:\s*((?:[A-Z]{2})?\d{6,})/i,
           brand: 'Wayfair', short: 'Wayfair', host: 'partners.wayfair.com', kind: 'wayf', shop: 'Wayfair DE' },
+        // Joybuy wchodzi do banku jako „JINGDONG RETAIL GERMANY GMBH". To sprzedaz
+        // hurtowa: jeden przelew = jedna faktura = jeden auftrag, wiec NIE MA zadnego
+        // rozliczenia do pobrania ani paczki importu. Numer z tytulu przelewu to numer
+        // FAKTURY — po nim znajdujemy auftrag i ksiegujemy wprost na nim.
+        // Klarna i Amex maja tytul tego samego ksztaltu („Reason for payment: 157036402"),
+        // wiec rozstrzyga wylacznie platnik.
+        { mp: 'Joybuy',         ok: true,  payer: /JINGDONG/i,
+          ref: /reason\s*for\s*payment:\s*(\d{5,})/i,
+          brand: 'Joybuy', short: 'Joybuy', kind: 'joy', shop: 'Joybuy DE' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -19899,7 +19911,11 @@
         jobs.forEach(function (j){
             const st = j.status || 'new';
             const col = st === 'done' ? '#0a7a2f' : (st === 'ready' ? '#5b21b6' : (st === 'err' ? '#c00' : (st === 'partial' ? '#c47f00' : '#666')));
-            const lbl = { 'new': 'czeka na dane', 'ready': 'gotowe do importu', 'partial': 'wymaga sprawdzenia', 'done': 'zaimportowane', 'err': 'błąd', 'skip': 'poza zakresem' }[st] || st;
+            // Joybuy nie przechodzi przez import — nie ma dla niego „czeka na dane"
+            // ani „gotowe do importu". Jego jedyny krok to ksiegowanie na auftragu.
+            const lbl = (j.kind === 'joy')
+                ? (j.booked ? 'zaksięgowane na auftragu' : 'do zaksięgowania na auftragu')
+                : ({ 'new': 'czeka na dane', 'ready': 'gotowe do importu', 'partial': 'wymaga sprawdzenia', 'done': 'zaimportowane', 'err': 'błąd', 'skip': 'poza zakresem' }[st] || st);
             // Sciezka ma trzy kroki i latwo zgubic sie, ktory juz wykonano — zwlaszcza
             // ze import NIE ksieguje. Dlatego kazdy wiersz pokazuje je wprost.
             const stepDone = function (on, txt){
@@ -19907,7 +19923,7 @@
                      + (on ? 'background:#dcfce7;color:#166534;font-weight:700' : 'background:#f1f5f9;color:#94a3b8') + '">'
                      + (on ? '✓ ' : '○ ') + txt + '</span>';
             };
-            const steps = (st === 'done' || st === 'ready' || st === 'partial')
+            const steps = (j.kind !== 'joy' && (st === 'done' || st === 'ready' || st === 'partial'))
                 ? ('<div style="display:flex;gap:4px;margin-top:3px;flex-wrap:wrap">'
                    + stepDone(st === 'done', 'zaimportowane')
                    + stepDone(!!j.checked, 'sprawdzone')
@@ -19980,7 +19996,7 @@
                   +  '</td></tr>';
             }
         });
-        out.innerHTML = h + '</table><div id="mk-ref"></div><div id="mk-cr"></div>';
+        out.innerHTML = h + '</table><div id="mk-ref"></div><div id="mk-cr"></div><div id="mk-joy"></div>';
         out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-chk').forEach(function (b){ b.onclick = function(){ impCheck(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-impset').forEach(function (b){ b.onclick = function(){
@@ -20030,6 +20046,7 @@
         if (sn) sn.onclick = function(){ selAll(false); };
         renderRef();
         renderCr();
+        renderJoy();
     }
 
     // ---------- Salda: miesieczne zestawienie ----------
@@ -20590,6 +20607,165 @@
         if (cb) cb.onclick = function(){ crCheck(cb); };
         box.querySelectorAll('.mk-cr-b').forEach(function (b){
             b.onclick = function(){ crDoBook(list[+b.getAttribute('data-i')], b); };
+        });
+    }
+
+    // ---------- Joybuy: ksiegowanie wprost na auftragu ----------
+    // Joybuy kupuje hurtowo: jeden przelew = jedna faktura = jeden auftrag. Nie ma tu
+    // ani rozliczenia do pobrania, ani paczki importu — jedyne, co trzeba zrobic, to
+    // znalezc auftrag po numerze faktury z tytulu przelewu, porownac kwote z jego
+    // „open amount" i zaksiegowac. Ta sama mechanika co przy oddanych potraceniach
+    // Wayfaira, tylko szukanie idzie po INNYM kryterium.
+    const MK_JOY_SHOP = 'Joybuy DE';
+    const mkJoyState = {};                   // numer faktury -> { num, open, nPay, deleted, err, how }
+    function joyJobs(){ return jobList().filter(function (j){ return j.kind === 'joy'; }); }
+    function joyComment(j){
+        return 'Joybuy DE faktura ' + j.ref + ' · wpłata ' + j.date + ' ' + f2(j.amount) + ' ' + (j.cur || '');
+    }
+    // Numer z przelewu to numer FAKTURY, a nie fulfilmentu — search.php ma na to osobne
+    // kryterium. Najpierw probujemy adresem (jeden fetch, tanio), a gdyby ten wariant
+    // nie byl obslugiwany, wracamy do formularza w ramce — tej samej drogi, ktora dziala
+    // przy wplatach Galaxusa z numerem faktury.
+    async function joyUrlSearch(inv){
+        const tries = ['/search.php?what=invoice_number&invoice_number=' + encodeURIComponent(inv),
+                       '/search.php?express&what=invoice_number&invoice_number=' + encodeURIComponent(inv)];
+        for (let i = 0; i < tries.length; i++){
+            let res, html = '';
+            try { res = await fetch(tries[i], { credentials: 'same-origin' }); html = await res.text(); }
+            catch (e){ continue; }
+            const nums = [], m = String((res && res.url) || '').match(/auction\.php\?number=(\d+)/i);
+            if (m) nums.push(m[1]);
+            if (!nums.length){
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                doc.querySelectorAll('a[href*="auction.php?number="]').forEach(function (a){
+                    const h = a.getAttribute('href') || '';
+                    if (h.indexOf('shipping_auction.php') >= 0) return;
+                    const mm = h.match(/number=(\d+)/);
+                    if (mm && nums.indexOf(mm[1]) < 0) nums.push(mm[1]);
+                });
+            }
+            if (nums.length) return nums;
+        }
+        return [];
+    }
+    function joyFind(inv){
+        return new Promise(function (resolve){
+            joyUrlSearch(inv).then(function (nums){
+                if (nums.length){ resolve({ nums: nums, how: 'adres' }); return; }
+                galxFindAuftrag(inv, function (r){
+                    if (r && r.err){ resolve({ nums: [], err: r.err }); return; }
+                    const ns = [];
+                    ((r && r.urls) || []).forEach(function (u){
+                        const mm = String(u).match(/number=(\d+)/);
+                        if (mm && ns.indexOf(mm[1]) < 0) ns.push(mm[1]);
+                    });
+                    resolve({ nums: ns, how: 'formularz',
+                              err: ns.length ? '' : 'nie znajduję auftragu dla faktury ' + inv });
+                });
+            });
+        });
+    }
+    async function joyCheck(b){
+        const list = joyJobs().filter(function (j){ return !j.booked; });
+        if (!list.length) return;
+        b.disabled = true;
+        say('Szukam auftragów dla ' + list.length + ' faktur Joybuy…');
+        for (let i = 0; i < list.length; i++){
+            const j = list[i], st = mkJoyState[j.ref] || (mkJoyState[j.ref] = {});
+            say('Faktura ' + j.ref + ' (' + (i + 1) + '/' + list.length + ')…');
+            const f = await joyFind(j.ref);
+            if (!f.nums.length){ st.err = f.err || 'nie znajduję auftragu'; st.num = ''; renderJoy(); continue; }
+            if (f.nums.length > 1){ st.err = 'kilka auftragów (' + f.nums.join(', ') + ') — zaksięguj ręcznie'; st.num = ''; renderJoy(); continue; }
+            const r = await crRead(f.nums[0]);
+            if (!r.ok){ st.err = r.err; st.num = f.nums[0]; renderJoy(); continue; }
+            st.num = f.nums[0]; st.open = r.open; st.nPay = r.nPay; st.deleted = r.deleted;
+            st.err = ''; st.how = f.how;
+            renderJoy();
+        }
+        b.disabled = false;
+        say('Sprawdzone.', '#0a7a2f');
+    }
+    async function joyDoBook(j, b){
+        const st = mkJoyState[j.ref] || {};
+        const c = setLoad()[setKey(j.mp, j.shop || MK_JOY_SHOP)] || {};
+        if (!st.num){ say('Najpierw „Sprawdź auftragi".', '#c47f00'); return; }
+        if (!c.acct){ say('Nie ma konta dla ' + (j.shop || MK_JOY_SHOP) + ' — uzupełnij w ⚙ Konta.', '#c47f00'); return; }
+        const rozn = (st.open == null) ? null : r2(st.open - j.amount);
+        if (!confirm('Zaksięgować wpłatę Joybuy na auftragu?\n\n'
+            + '  faktura    : ' + j.ref + '\n'
+            + '  auftrag    : ' + st.num + '\n'
+            + '  kwota      : ' + f2(j.amount) + ' ' + (j.cur || '') + '\n'
+            + '  open amount: ' + (st.open == null ? 'nie odczytałem' : f2(st.open))
+            + (rozn ? ('   ⚠ różnica ' + f2(rozn)) : (st.open != null ? '   (zgadza się)' : '')) + '\n'
+            + '  konto      : ' + c.acct + '\n'
+            + '  data       : ' + j.date + '\n'
+            + '  komentarz  : ' + joyComment(j) + '\n'
+            + (st.deleted ? '\n⚠ AUFTRAG MA STATUS DELETED.\n' : '')
+            + (st.nPay ? ('\nNa tym auftragu są już ' + st.nPay + ' płatności.\n') : '')
+            + '\nTego się nie cofa jednym kliknięciem.')) return;
+        b.disabled = true;
+        const r = await crBook(st.num, j.date, c.acct, j.amount, joyComment(j));
+        b.disabled = false;
+        if (!r.ok){ say('Nie zaksięgowano: ' + r.err, '#c00'); return; }
+        // Potwierdzamy odczytem, a nie samym HTTP 200 — strona oddaje 200 takze wtedy,
+        // gdy formularz odrzucil dane.
+        const after = await crRead(st.num);
+        st.open = after.ok ? after.open : st.open;
+        st.nPay = after.ok ? after.nPay : st.nPay;
+        const jobs = jobsLoad();
+        if (jobs[j.ref]){
+            jobs[j.ref].booked = true;
+            jobs[j.ref].msg = 'zaksięgowane na auftragu ' + st.num
+                            + (after.ok && after.open != null ? (', open amount po księgowaniu ' + f2(after.open)) : '');
+            jobsSave(jobs);
+        }
+        render();
+        say('Zaksięgowane na auftragu ' + st.num + (after.ok ? (', open amount po księgowaniu ' + f2(after.open)) : ''), '#0a7a2f');
+    }
+    function renderJoy(){
+        const box = $('#mk-joy'); if (!box) return;
+        const list = joyJobs();
+        if (!list.length){ box.innerHTML = ''; return; }
+        const left = list.filter(function (j){ return !j.booked; }).length;
+        let h = '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ede9fe">'
+              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">'
+              + '<b style="font-size:11px;color:#5b21b6">Joybuy — księgowanie na auftragu</b>'
+              + '<button id="mk-joy-chk"' + (left ? '' : ' disabled')
+              + ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (left ? '#5b21b6' : '#c7c7c7')
+              + ';color:#fff;font-weight:700;cursor:' + (left ? 'pointer' : 'default') + ';font-size:11px">🔍 Sprawdź auftragi (' + left + ')</button></div>'
+              + '<div style="font-size:10px;color:#888;margin-bottom:6px">Sprzedaż hurtowa: jeden przelew = jedna faktura = jeden auftrag. '
+              + 'Numer z tytułu przelewu to numer faktury — po nim szukam auftragu i porównuję wpłatę z jego „open amount". '
+              + 'Bez importu i bez paczki.</div>';
+        list.forEach(function (j, i){
+            const st = mkJoyState[j.ref] || {};
+            const c = setLoad()[setKey(j.mp, j.shop || MK_JOY_SHOP)] || {};
+            const ok = st.num && !st.err;
+            const rozn = (ok && st.open != null) ? r2(st.open - j.amount) : null;
+            const can = ok && !j.booked && c.acct;
+            h += '<div style="margin:6px 0;padding:6px 8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:6px">'
+              +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              +  '<b style="font-size:11px;font-family:monospace">' + esc(j.ref) + '</b>'
+              +  '<span style="font-size:11px;color:#374151">' + f2(j.amount) + ' ' + esc(j.cur) + ' · ' + esc(j.date) + '</span>'
+              +  (st.num ? ('<a href="/auction.php?number=' + esc(st.num) + '&txnid=3" target="_blank" style="font-size:11px;color:#2563eb">auftrag ' + esc(st.num) + '</a>') : '')
+              +  (ok && st.open != null
+                    ? ('<span style="font-size:11px;color:' + (rozn ? '#c47f00' : '#0a7a2f') + ';font-weight:700">open amount ' + f2(st.open)
+                       + (rozn ? (' — różnica ' + f2(rozn)) : ' — zgadza się') + '</span>')
+                    : '')
+              +  (st.deleted ? '<span style="font-size:11px;color:#c00;font-weight:700">DELETED</span>' : '')
+              +  (st.err ? ('<span style="font-size:11px;color:#c47f00">' + esc(st.err) + '</span>') : '')
+              +  (j.booked ? '<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ zaksięgowane</span>' : '')
+              +  '<button class="mk-joy-b" data-i="' + i + '"' + (can ? '' : ' disabled')
+              +  ' style="padding:3px 10px;border:none;border-radius:6px;background:' + (can ? '#5b21b6' : '#c7c7c7')
+              +  ';color:#fff;font-weight:700;cursor:' + (can ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj na auftragu</button>'
+              +  (c.acct ? ('<span style="font-size:10px;color:#888">konto ' + esc(c.acct) + '</span>')
+                         : '<span style="font-size:11px;color:#c47f00">brak konta dla ' + esc(j.shop || MK_JOY_SHOP) + '</span>')
+              +  '</div></div>';
+        });
+        box.innerHTML = h + '</div>';
+        const cb = box.querySelector('#mk-joy-chk');
+        if (cb) cb.onclick = function(){ joyCheck(cb); };
+        box.querySelectorAll('.mk-joy-b').forEach(function (b){
+            b.onclick = function(){ joyDoBook(list[+b.getAttribute('data-i')], b); };
         });
     }
 
@@ -21350,6 +21526,7 @@
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
                 if (j.status !== 'new' || !j.ref) return false;
+                if (j.kind === 'joy') return false;      // nie ma rozliczenia do pobrania
                 if ((j.kind || 'mirakl') !== 'mirakl') return host ? false : true;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
             }).length;
