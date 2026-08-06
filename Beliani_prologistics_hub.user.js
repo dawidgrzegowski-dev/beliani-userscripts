@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.13
+// @version      3.14
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24906,6 +24906,15 @@
     //
     // NIC NIE OZNACZA. To dokladnie przelot „szukaj + pobierz plik", urwany zaraz
     // po odebraniu pliku; guziki oznaczajace nie sa tu w ogole dotykane.
+    // To samo pytanie, tylko bez wyliczania sprzedawcow i zrodel. Puste pole
+    // znaczy „nie zawezaj", a lista znaczy „tylko te" — i wlasnie ta roznica gubila
+    // platnosci ze sklepow nieobecnych juz w formularzu.
+    function expBezSprzedawcow(body){
+        const q = new URLSearchParams(body);
+        q.delete('username[]');
+        q.delete('source_seller_id[]');
+        return q.toString();
+    }
     window.__TM_EXPORT_FETCH = async function (konta, od, doo, system, postep){
         if (!Array.isArray(konta) || !konta.length) throw new Error('nie podano kont');
         if (!/^\d{4}-\d{2}-\d{2}$/.test(String(od)) || !/^\d{4}-\d{2}-\d{2}$/.test(String(doo)))
@@ -24924,10 +24933,23 @@
             const etykieta = expAccLabel(a);
             if (postep) postep(i, konta.length, etykieta);
             try {
-                const html = await expPost(expSearchBody(p, a), false);
-                expAssertForm(html);
-                const rows = expRows(html);
-                if (!rows.length){ out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: '' }); continue; }
+                // Pytamy DWA RAZY i bierzemy szersze. Wyszukiwanie jest tylko odczytem,
+                // wiec to nic nie kosztuje poza sekunda, a zamyka pytanie „czy na pewno
+                // dostalismy wszystko" danymi zamiast zalozeniem.
+                const bodyZ = expSearchBody(p, a);
+                const bodyB = expBezSprzedawcow(bodyZ);
+                const rowsZ = expRows(expAssertForm(await expPost(bodyZ, false)));
+                const rowsB = expRows(expAssertForm(await expPost(bodyB, false)));
+                const szersze = rowsB.length >= rowsZ.length;
+                const rows = szersze ? rowsB : rowsZ;
+                const jak = szersze ? 'bez filtra sprzedawców' : 'z filtrem sprzedawców';
+                if (!rows.length){
+                    out.push({ acc: a, nazwa: etykieta, wierszy: 0, zeSprzedawcami: rowsZ.length,
+                               bezSprzedawcow: rowsB.length, jak: jak, buf: null, blad: '' });
+                    continue;
+                }
+                // Eksport idzie po WYBRANYCH WIERSZACH, nie po filtrach — wiec ciala
+                // wyszukiwania tu nie powtarzamy, liczy sie sama lista selected[].
                 const f = await expPost(expFileBody(p, a, rows), true);
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
@@ -24940,6 +24962,7 @@
                     throw new Error('plik jest krótszy niż lista: ' + fr.n + ' z ' + rows.length
                                   + ' wierszy — serwer uciął zapytanie, zawęź zakres dat');
                 out.push({ acc: a, nazwa: etykieta, wierszy: rows.length,
+                           zeSprzedawcami: rowsZ.length, bezSprzedawcow: rowsB.length, jak: jak,
                            wPliku: fr.n, buf: f.buf, blad: '' });
             } catch (e){
                 out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: (e && e.message) || String(e) });
@@ -25662,14 +25685,22 @@
             salPlikInfo();
             // Kontrola wlasna: ile wierszy zapowiedzial serwer, a ile odczytalismy.
             // Roznica znaczy, ze plik przyszedl niepelny i uzgodnienie bylo by falszywe.
-            let zapow = 0;
-            wynik.forEach(function (x){ if (!x.blad) zapow += (x.wierszy || 0); });
+            let zapow = 0, gorsze = 0;
+            wynik.forEach(function (x){
+                if (x.blad) return;
+                zapow += (x.wierszy || 0);
+                // Ile wierszy zgubiloby pytanie z wyliczonymi sprzedawcami — chcemy to
+                // widziec, bo dokladnie ta roznica psula wczesniejsze uzgodnienia.
+                if (x.bezSprzedawcow != null && x.zeSprzedawcami != null)
+                    gorsze += Math.max(0, x.bezSprzedawcow - x.zeSprzedawcami);
+            });
             const odczyt = we.length + wy.length;
             if (zapow && odczyt < zapow)
                 problemy.push('odczytałem ' + odczyt + ' wierszy z zapowiedzianych ' + zapow
                             + ' — zestawienie jest niepełne, NIE uzgadniaj na nim');
             salSay('Pobrane: ' + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont'
-                + (zapow ? (' (serwer zapowiedział ' + zapow + ' wierszy)') : '') + '.'
+                + (zapow ? (' (serwer zapowiedział ' + zapow + ' wierszy' 
+                    + (gorsze ? ('; pytanie z listą sprzedawców zgubiłoby ' + gorsze) : '') + ')') : '') + '.'
                 + (problemy.length ? (' Problemy: ' + problemy.join('; ')) : ''),
                 problemy.length ? '#c00' : '#0a7a2f');
         } catch (e){
