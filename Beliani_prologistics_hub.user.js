@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.09
+// @version      3.11
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17843,10 +17843,32 @@
     // ma zostac tylko u Ciebie.
     const MK_SH_KEY = 'mkt_sheet';
     const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycby17PasQqFV7vkVT3_j8oZ0L2QmejC3SSs69YxWVxG57nniiclm19AG1q7FZ6r7R80NZQ/exec';
+
+    // ==========================================================================
+    //  KLUCZ DO ARKUSZA — JEDYNE MIEJSCE DO EDYCJI
+    //  Wpisz tu SECRET ustawiony w Apps Scripcie. Wtedy kazdy, kto zainstaluje
+    //  ten plik, ma dzialajace polaczenie od razu — bez wpisywania czegokolwiek
+    //  i bez klikania. Pole w panelu ⚙ Konta dalej dziala i nadpisuje ten klucz,
+    //  gdyby ktos potrzebowal wlasnego.
+    //
+    //  UWAGA, o czym trzeba pamietac: kazda kopia tego pliku niesie dzialajacy
+    //  klucz do wspolnego arkusza. Adres wdrozenia (wyzej) juz tu byl, wiec
+    //  plik i tak nalezalo trzymac wewnatrz firmy — teraz tym bardziej.
+    //  Wymiana klucza = zmiana w Apps Scripcie i w TEJ JEDNEJ LINII, po czym
+    //  rozeslanie nowej wersji.
+    // ==========================================================================
+    const MK_SH_SECRET = '123456';
+
     function shCfg(){
         let o = null;
         try { o = JSON.parse(GM_getValue(MK_SH_KEY, 'null')); } catch (e){}
         if (!o || typeof o !== 'object') o = { url: MK_SH_DEF, secret: '', on: true };
+        // Uzupelniamy z wbudowanych wartosci takze wtedy, gdy cos JUZ jest zapisane
+        // z pustym polem — inaczej osoba, ktora raz dotknela ustawien przed
+        // wbudowaniem klucza, zostalaby z nieczynnym arkuszem po aktualizacji.
+        if (!o.url) o.url = MK_SH_DEF;
+        if (!o.secret) o.secret = MK_SH_SECRET;
+        if (o.secret === 'WPISZ_TU_SECRET') o.secret = '';
         return o;
     }
     function shSave(o){ try { GM_setValue(MK_SH_KEY, JSON.stringify(o)); } catch (e){} }
@@ -17926,7 +17948,7 @@
     const mkSheet = {};                    // ref -> { found, row, similar }
     async function shCheck(list){
         const cfg = shCfg();
-        if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (⚙ Konta)');
+        if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (' + shWhy(cfg) + ')');
         const r = await shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, action: 'check', rows: list }));
         // Pusta tablica znaczylaby „sprawdzone, nic nie ma" — a to nieprawda, gdy
         // arkusz w ogole nie odeslal wyniku. Lepiej glosny blad niz falszywe „czysto".
@@ -17949,7 +17971,7 @@
     function shWhy(cfg){
         if (!cfg.on)     return 'wyłączony ptaszek „Dopisuj do arkusza" w ⚙ Konta';
         if (!cfg.url)    return 'brak adresu wdrożenia w ⚙ Konta';
-        if (!cfg.secret) return 'brak SECRET-u w ⚙ Konta';
+        if (!cfg.secret) return 'brak SECRET-u — wpisz go w ⚙ Konta albo wbuduj w skrypcie (MK_SH_SECRET)';
         return 'arkusz nie odpowiedział';
     }
     async function shPost(rows){
@@ -21682,7 +21704,11 @@
           +  '<input id="mk-sh-sec" type="password" value="' + esc(sc.secret || '') + '" placeholder="SECRET" style="width:110px;font-size:10px;padding:3px 5px">'
           +  '<button id="mk-sh-test" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">Sprawdź</button>'
           +  '<span id="mk-sh-msg" style="font-size:10px;color:#666"></span></div>'
-          +  '<div style="font-size:10px;color:#888;margin-top:3px">Adres jest jak hasło — kto go ma, może dopisywać wiersze. SECRET musi być ten sam, co w Apps Scripcie.</div>'
+          +  '<div style="font-size:10px;color:#888;margin-top:3px">Adres jest jak hasło — kto go ma, może dopisywać wiersze. SECRET musi być ten sam, co w Apps Scripcie.'
+          +  (MK_SH_SECRET !== 'WPISZ_TU_SECRET'
+              ? ' <b>Klucz jest wbudowany w skrypt</b> — nic nie musisz wpisywać, chyba że chcesz użyć własnego.'
+              : ' <b>Klucz nie jest jeszcze wbudowany</b> — wpisz go tu albo w skrypcie, w linii MK_SH_SECRET.')
+          +  '</div>'
           +  '</div>';
         if (!keys.length){ box.innerHTML = h + '<div style="color:#888;font-size:11px">Brak sklepów — najpierw pobierz rozliczenie na Miraklu.</div>'; }
         else {
@@ -22357,7 +22383,14 @@
             }
             // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
             // lepiej dowiedziec sie teraz niz przy potwierdzeniu ksiegowania.
-            const fresh = jobList().filter(function (x){ return x.status === 'ready'; });
+            // Pytamy takze o „wymaga sprawdzenia" (partial). Te zlecenia nie ida do
+            // importu, tylko sa zalatwiane recznie — wiec wiersz lezacy juz w arkuszu
+            // ma przy nich wieksza wartosc niz przy czymkolwiek innym. Warunek x.data
+            // odsiewa zlecenia bez rozliczenia: bez sklepu nie znamy konta, wiec klucz
+            // data+konto+kwota i tak nie mialby w co trafic.
+            const fresh = jobList().filter(function (x){
+                return (x.status === 'ready' || x.status === 'partial') && x.data;
+            });
             if (fresh.length){
                 say('Sprawdzam w arkuszu, czy to już nie zostało zrobione…');
                 try { await shCheckJobs(fresh); }
