@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.03
+// @version      3.04
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23534,10 +23534,20 @@
     // To NIE jest JSON — pojedyncze apostrofy. Zadnego JSON.parse, zadnego eval.
     // Do porownan bierzemy payment_id: „exported" jest cecha platnosci, a nie
     // sposobu wyrysowania wiersza, wiec reszta pol moze sie zmienic bez znaczenia.
+    // Wiekszosc wierszy niesie payment_id i to jest klucz najlepszy: „exported" jest
+    // cecha platnosci, wiec reszta pol moze sie zmienic bez znaczenia. Ale NIE KAZDY
+    // wiersz go ma — na zywym eksporcie konta 1145 Home24 FR bylo ich 4 z 37. Dla
+    // takich bierzemy cala wartosc checkboxa: mniej odporne na zmiane kolejnosci pol
+    // po stronie serwera, za to nadal jednoznaczne. A gdyby serwer ja przebudowal,
+    // weryfikacja powie „nie potwierdzam" — czyli pomyli sie w bezpieczna strone.
     function expKey(v){
-        const m = String(v).match(/'payment_id'\s*:\s*'([^']+)'/);
-        return m ? m[1] : null;
+        const s = String(v == null ? '' : v);
+        const m = s.match(/'payment_id'\s*:\s*'([^']+)'/);
+        if (m) return 'p:' + m[1];
+        const t = s.replace(/\s+/g, '');
+        return t ? ('v:' + t) : null;
     }
+    function expWeak(v){ return !/'payment_id'\s*:/.test(String(v == null ? '' : v)); }
     function expAuc(v){
         const m = String(v).match(/'auction_number'\s*:\s*'([^']+)'/);
         return m ? m[1] : '';
@@ -23621,6 +23631,28 @@
             if (!bof || bof !== eof || maxRow < 0) return null;
             return maxRow;                 // wiersz 0 = naglowek, wiec to liczba danych
         } catch (e){ return null; }
+    }
+
+    // Profil moze wypluwac CSV, JPK albo Sesam zamiast XLS-a. Pytanie zostaje to samo:
+    // czy plik nie wyszedl krotszy niz lista, ktora do niego poszla. Naglowek sprawia,
+    // ze wierszy bywa o jeden wiecej, a niektore formaty rozbijaja platnosc na dwie
+    // linie — dlatego alarmujemy WYLACZNIE gdy wierszy jest MNIEJ niz wyslanych.
+    function expTxtRows(bytes){
+        try {
+            if (!bytes || !bytes.length) return null;
+            const s = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+            const li = s.split(/\r?\n/).filter(function (x){ return x.trim() !== ''; });
+            return li.length || null;
+        } catch (e){ return null; }
+    }
+    function expFileRows(f){
+        const b = f && f.buf;
+        if (b && b.length > 8 && b[0] === 0xD0 && b[1] === 0xCF && b[2] === 0x11 && b[3] === 0xE0)
+            return { n: expXlsRows(b), typ: 'xls' };
+        const ext = expExt(f.cd, '');
+        if (/(csv|plain|text|xml)/.test(String(f.ct || '')) || /\.(csv|txt|jpk|xml|dat)$/i.test(ext))
+            return { n: expTxtRows(b), typ: 'tekst' };
+        return { n: null, typ: '?' };
     }
 
     function snapTotal(s){
@@ -24035,13 +24067,18 @@
 
         // Wiersz, ktorego nie umiemy zidentyfikowac, jest wierszem, ktorego nie
         // umiemy potwierdzic. Lepiej nie wyslac nic, niz oddac zielony ekran.
+        // Po zmianie expKey trafia tu juz tylko wartosc pusta.
         const nokey = plan.reduce(function (n, x){
             return n + x.vals.filter(function (v){ return !expKey(v); }).length; }, 0);
         if (nokey){
-            say('Nie rozpoznaję formatu ' + nokey + ' ' + plural(nokey, 'wiersza', 'wierszy', 'wierszy')
-                + ' — nie wyślę czegoś, czego potem nie potwierdzę.', '#c00');
+            say('W ' + nokey + ' ' + plural(nokey, 'wierszu', 'wierszach', 'wierszach')
+                + ' nie ma żadnego identyfikatora — nie wyślę czegoś, czego potem nie potwierdzę.', '#c00');
             return;
         }
+        // Wiersze bez payment_id dopasowujemy po calej tresci. Dziala, ale warto
+        // o tym wiedziec, wiec mowimy wprost i pokazujemy przyklad.
+        const weak = [];
+        plan.forEach(function (x){ x.vals.forEach(function (v){ if (expWeak(v)) weak.push(v); }); });
 
         const total = plan.reduce(function (n, x){ return n + x.vals.length; }, 0);
         const czas = expWhen(S.ts);
@@ -24050,7 +24087,10 @@
                    + 'Z pliku: ' + S.fileName + '\n'
                    + 'Pobranego: ' + czas + '\n'
                    + 'Kont: ' + plan.length + '\n'
-                   + 'Profil: ' + S.profName + '\n\n'
+                   + 'Profil: ' + S.profName + '\n'
+                   + (weak.length ? ('\n' + weak.length + ' ' + plural(weak.length, 'wiersz nie ma', 'wiersze nie mają', 'wierszy nie ma')
+                                     + ' numeru płatności — te dopasuję po całej treści wiersza.\n') : '')
+                   + '\n'
                    + (undo ? 'Cofnę wyłącznie te wiersze, które ten panel wcześniej oznaczył.'
                            : 'To zmienia stan w prologistics. Rób to dopiero wtedy,\n'
                            + 'gdy plik jest już w programie księgowym.'))) return;
@@ -24070,6 +24110,11 @@
             if (rep) rep.innerHTML = EXP_MARKREP;
         };
         let okAll = 0, alreadyAll = 0, badAll = [];
+        if (weak.length)
+            lines.push('<div style="color:#8a6d00;padding:3px 0">' + weak.length + ' '
+                     + plural(weak.length, 'wiersz bez numeru płatności', 'wiersze bez numeru płatności', 'wierszy bez numeru płatności')
+                     + ' — dopasowuję po całej treści. Przykład: <code style="font-size:10px">'
+                     + esc(weak[0].slice(0, 120)) + '</code></div>');
 
         try {
             for (let i = 0; i < plan.length; i++){
@@ -24276,9 +24321,10 @@
                 // pozniejsze oznaczenie zaklepaloby platnosci, ktorych ksiegowosc
                 // nigdy nie zobaczy, i to z zielonym potwierdzeniem. Takie konto
                 // wchodzi do migawki z zakazem oznaczania.
-                const nx = expXlsRows(f.buf);
+                const fr = expFileRows(f);
+                const nx = fr.n;
                 snaps[i] = { acc: a, label: expAccLabel(a), body: body, vals: rows,
-                             file: files[i].name, xls: nx, flipped: [] };
+                             file: files[i].name, xls: nx, ftyp: fr.typ, flipped: [] };
                 if (nx !== null && nx < rows.length){
                     snaps[i].bad = 'w pliku ' + nx + ' ' + plural(nx, 'wiersz', 'wiersze', 'wierszy')
                                  + ', a wysłałem ' + rows.length;
