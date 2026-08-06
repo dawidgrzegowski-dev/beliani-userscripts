@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.04
+// @version      3.06
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19,6 +19,10 @@
 // @connect      wyszukiwarkaregon.stat.gov.pl
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
+// @connect      www.prologistics.info
+// @connect      www.backend-rates.bazg.admin.ch
+// @connect      backend-rates.bazg.admin.ch
+// @connect      prologistics.info
 // @connect      mirakl.net
 // @connect      myvtex.com
 // @connect      galaxus.ch
@@ -17754,12 +17758,36 @@
     // Czytamy go ze strony /accounts.php zamiast wpisywac numery na sztywno: nazwy
     // sie zmieniaja, konta bywaja zamykane, a lista ma kilkaset pozycji. Zapamietujemy
     // wynik, bo plan kont zmienia sie rzadko.
+    // Modul chodzi na prologistics, Miraklu i VTEX-ie. Plan kont i bank settings
+    // leza WYLACZNIE na prologistics, wiec adres wzgledny dziala tylko w jednym z
+    // trzech przypadkow — na Miraklu „/accounts.php" celowalo w mirakl.net i wracalo
+    // 404. Stad to wejscie: na prologistics zwykly fetch, poza nim GM_xmlhttpRequest
+    // (ten sam mechanizm, ktorym siegamy z prologistics na Mirakla, tylko odwrotnie).
+    const PRO_BASE = 'https://www.prologistics.info';
+    async function proGet(path, hdrs){
+        if (onProlo()){
+            const r = await fetch(path, { credentials: 'same-origin', headers: hdrs || {} });
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + path);
+            return await r.text();
+        }
+        if (typeof GM_xmlhttpRequest === 'undefined')
+            throw new Error('bez GM_xmlhttpRequest nie sięgnę na prologistics — otwórz moduł tam');
+        const r = await new Promise(function (resolve, reject){
+            GM_xmlhttpRequest({
+                method: 'GET', url: PRO_BASE + path, headers: hdrs || {}, timeout: 60000,
+                onload: resolve,
+                onerror: function (){ reject(new Error('nie mogę połączyć się z prologistics')); },
+                ontimeout: function (){ reject(new Error('prologistics nie odpowiedział na czas')); }
+            });
+        });
+        if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' na ' + path);
+        return r.responseText;
+    }
+
     const MK_ACC_KEY = 'mkt_accounts';
     function mkAcctLoad(){ try { return JSON.parse(GM_getValue(MK_ACC_KEY, '[]')) || []; } catch (e){ return []; } }
-    async function mkAcctFetch(){
-        const r = await fetch('/accounts.php', { credentials: 'same-origin' });
-        if (!r.ok) throw new Error('HTTP ' + r.status + ' na /accounts.php');
-        const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+    function mkAccFromAccountsPage(html){
+        const doc = new DOMParser().parseFromString(html, 'text/html');
         const out = [], seen = {};
         doc.querySelectorAll('a[href*="original_number="]').forEach(function (a){
             const m = String(a.getAttribute('href') || '').match(/original_number=(\d+)/);
@@ -17773,7 +17801,36 @@
             // uwaga: „Active" jest podciagiem „Inactive", wiec pytamy o zaprzeczenie
             out.push({ n: m[1], nm: nm, on: !/inactive/i.test(td[3].textContent || '') });
         });
-        if (out.length) { try { GM_setValue(MK_ACC_KEY, JSON.stringify(out)); } catch (e){} }
+        return out;
+    }
+    // Zapas: ta sama lista kont wisi w rozwijanym polu na export.php, w postaci
+    // „1232, EUPAGO PT Beliani DE" — numer i nazwa razem. Modul Export payments
+    // czyta ja od dawna i jest sprawdzona na prawdziwych danych, wiec gdy uklad
+    // accounts.php sie zmieni, mamy z czego wziac plan kont bez zgadywania.
+    function mkAccFromExportPage(html){
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const out = [], seen = {};
+        doc.querySelectorAll('select[name="account"] option').forEach(function (o){
+            const v = String(o.value || '').trim();
+            if (!/^\d+$/.test(v) || v === '0' || seen[v]) return;
+            seen[v] = 1;
+            const t = String(o.textContent || '').replace(/\s+/g, ' ').trim();
+            out.push({ n: v, nm: t.replace(/^\d+\s*,\s*/, '') || t, on: true });
+        });
+        return out;
+    }
+    async function mkAcctFetch(){
+        let out = [], src = '';
+        try {
+            out = mkAccFromAccountsPage(await proGet('/accounts.php'));
+            if (out.length) src = 'accounts.php';
+        } catch (e){ /* zostaje zapas */ }
+        if (!out.length){
+            out = mkAccFromExportPage(await proGet('/export.php'));
+            if (out.length) src = 'export.php';
+        }
+        if (out.length){ try { GM_setValue(MK_ACC_KEY, JSON.stringify(out)); } catch (e){} }
+        out.src = src;
         return out;
     }
     // --- rejestr w Arkuszach Google ---
@@ -17896,106 +17953,72 @@
     const MK_BS_KEY = 'mkt_bank_settings';
     // Pierwszy adres jest ten wlasciwy — podejrzany z ruchu strony Bank settings.
     // Reszta zostaje na wypadek, gdyby kiedys sie przesunal.
-    const MK_BS_TRY = ['/api/bankSettings/index/', '/api/bankSettings/', '/api/bankSettings/search/',
-                       '/api/bank_settings/', '/api/bankSetting/', '/api/bankSettings/list/'];
+    // Sprawdzone na zywej odpowiedzi: GET /api/bankSettings/index/ z naglowkiem
+    // x-requested-with oddaje
+    //   { banks_list: { "157": {name:"Vente Unique DE", inactive:"0", …}, … }, success:true }
+    // Numer bank_setting jest KLUCZEM, nie polem w srodku — poprzedni parser szukal
+    // obiektow z polem „id" i dlatego nie znajdowal niczego nawet na prologistics.
+    // Numeru konta w tej odpowiedzi NIE MA; jest tylko nazwa, i to po niej dopasowujemy.
+    const MK_BS_URL = '/api/bankSettings/index/';
     function bsLoad(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function bsSave(o){ try { GM_setValue(MK_BS_KEY, JSON.stringify(o)); } catch (e){} }
-    // Nie znamy ksztaltu odpowiedzi, wiec chodzimy po calym drzewie i zbieramy kazdy
-    // obiekt z liczbowym „id" oraz czyms, co wyglada na opis konta.
+    // „inactive" nie jest ozdoba: Home 24 Beliani DE wystepuje jako 175 (zywe) i 176
+    // (martwe), tak samo Robert Dyas i Joybuy DE. Bez tego podpowiedz co drugi raz
+    // trafialaby w nieuzywany wpis.
     function bsFromJson(j){
+        const src = j && j.banks_list;
+        if (!src || typeof src !== 'object') return null;
         const out = {};
-        (function walk(v, d){
-            if (!v || typeof v !== 'object' || d > 8) return;
-            if (Array.isArray(v)){ v.forEach(function (x){ walk(x, d + 1); }); return; }
-            // Nie znamy nazw pol, wiec i identyfikatora szukamy w kilku miejscach,
-            // a opis skladamy ze WSZYSTKICH prostych wartosci obiektu poza samym id.
-            // Wystarczy, ze gdziekolwiek w srodku siedzi numer konta albo jego nazwa.
-            let id = '';
-            ['id', 'bank_setting_id', 'bankSettingId', 'value'].forEach(function (k){
-                if (id) return;
-                const x = v[k];
-                if (x != null && typeof x !== 'object' && /^\d{1,6}$/.test(String(x))) id = String(x);
-            });
-            if (id){
-                const txt = Object.keys(v)
-                    .filter(function (k){ return k !== 'id'; })
-                    .map(function (k){ return v[k]; })
-                    .filter(function (x){ return x != null && typeof x !== 'object' && typeof x !== 'function' && String(x) !== ''; })
-                    .join(' ');
-                if (txt.trim()) out[id] = String(txt).replace(/\s+/g, ' ').trim();
-            }
-            Object.keys(v).forEach(function (k){ walk(v[k], d + 1); });
-        })(j, 0);
-        return out;
-    }
-    function bsFromDom(){
-        const out = {};
-        document.querySelectorAll('tr').forEach(function (tr){
-            const td = tr.querySelectorAll('td');
-            if (td.length < 2) return;
-            const id = String(td[0].textContent || '').trim();
-            if (!/^\d{1,6}$/.test(id)) return;
-            const txt = Array.prototype.slice.call(td, 1).map(function (x){ return String(x.textContent || '').trim(); })
-                        .filter(Boolean).join(' · ').replace(/\s+/g, ' ');
-            if (txt) out[id] = txt;
+        Object.keys(src).forEach(function (id){
+            if (!/^\d{1,6}$/.test(String(id))) return;
+            const v = src[id] || {};
+            const nm = String(v.name == null ? '' : v.name).replace(/\s+/g, ' ').trim();
+            if (!nm) return;
+            out[id] = { nm: nm, off: String(v.inactive) === '1' };
         });
-        return out;
+        return Object.keys(out).length ? out : null;
     }
-    // Kotwica: znamy jedna pare na pewno — 157 to konto 1114 (Vente Unique DE).
+    // Kotwica: znamy jedna pare na pewno — 157 to Vente Unique DE (konto 1114).
     function bsOk(map){
         const v = map && map['157'];
-        return !!(v && /\b1114\b|Vente\s*Unique\s*DE/i.test(v));
+        return !!(v && /\b1114\b|Vente\s*Unique\s*DE/i.test(v.nm || ''));
     }
     async function bsFetch(){
-        for (let i = 0; i < MK_BS_TRY.length; i++){
-            try {
-                const r = await fetch(MK_BS_TRY[i], { credentials: 'same-origin', headers: {
-                    'accept': '*/*', 'x-requested-with': 'XMLHttpRequest'   // bez tego API oddaje strone, nie dane
-                } });
-                if (!r.ok) continue;
-                const m = bsFromJson(await r.json());
-                if (bsOk(m)){ bsSave(m); return { map: m, src: MK_BS_TRY[i] }; }
-            } catch (e){ /* nastepny kandydat */ }
-        }
-        if (/settings_page\/bank_settings/i.test(location.pathname)){
-            const m = bsFromDom();
-            if (bsOk(m)){ bsSave(m); return { map: m, src: 'ta strona' }; }
-            if (Object.keys(m).length) return { map: null, src: '', partial: m };
-        }
-        return { map: null, src: '' };
+        const txt = await proGet(MK_BS_URL, { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' });
+        let j = null;
+        try { j = JSON.parse(txt); }
+        catch (e){ throw new Error('z ' + MK_BS_URL + ' przyszedł nie-JSON — najpewniej strona logowania'); }
+        const m = bsFromJson(j);
+        if (!m) throw new Error('w odpowiedzi nie ma listy „banks_list" — podeślij mi jej treść');
+        if (!bsOk(m)) return { map: null, partial: m };
+        bsSave(m);
+        return { map: m, src: MK_BS_URL };
     }
-    // Podpowiadamy bank_setting tylko wtedy, gdy DOKLADNIE JEDEN wpis wskazuje na to konto.
-    // Wykaz Bank settings pokazuje NAZWY kont, a nie ich numery — samo szukanie „1114"
-    // nie znajdowalo nic poza kotwica. Dlatego probujemy po kolei trzech tropow, od
-    // najpewniejszego, i za kazdym razem wymagamy jednego trafienia.
-    function bsNorm(s){ return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim(); }
-    // Dopasowujemy po CALYCH slowach, nie po zwyklym podciagu: „vente unique be" siedzi
-    // w „Vente Unique Beliani Swizterland GmbH" i bez tego Belgia przykleilaby sie
-    // do konta szwajcarskiego.
-    function bsPick(keys, map, needle){
-        if (!needle || needle.length < 6) return '';
-        const n = ' ' + needle + ' ';
-        const hit = keys.filter(function (k){ return (' ' + bsNorm(map[k]) + ' ').indexOf(n) >= 0; });
-        return hit.length === 1 ? hit[0] : '';
+    // Podpowiedz po nazwie sklepu. Wchodzi do pola TYLKO gdy pasuje dokladnie jeden
+    // aktywny wpis — przy kilku kandydatach modul pokazuje ich liste i czeka na wybor.
+    // Zly bank_setting to przelew zaksiegowany na cudzym koncie, wiec „prawie pasuje"
+    // jest tu gorsze niz puste pole.
+    function bsNorm(t){
+        return String(t == null ? '' : t).toLowerCase()
+               .replace(/beliani|gmbh|s\.?a\.?|sp\.?\s*z\s*o\.?o\.?|ltd|b\.?v\.?|ou/g, ' ')
+               .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
     }
-    function bsGuess(acct, map, accList){
-        if (!acct) return '';
-        const keys = Object.keys(map || {});
-        if (!keys.length) return '';
-        // 1) numer konta, jesli wykaz w ogole go podaje
-        const re = new RegExp('\\b' + acct + '\\b');
-        const byNo = keys.filter(function (k){ return re.test(map[k]); });
-        if (byNo.length === 1) return byNo[0];
-        const a = (accList || []).filter(function (x){ return x.n === String(acct); })[0];
-        if (!a) return '';
-        // 2) pelna nazwa konta z planu kont
-        const nm = bsNorm(a.nm);
-        const byName = bsPick(keys, map, nm);
-        if (byName) return byName;
-        // 3) sam poczatek nazwy do kodu kraju: „vente unique de"
-        const m = nm.match(/^(.*?\b[a-z]{2}\b)/);
-        return m ? bsPick(keys, map, m[1]) : '';
+    function bsGuess(map, shop){
+        const q = bsNorm(shop);
+        if (!q) return [];
+        const hit = [];
+        Object.keys(map || {}).forEach(function (id){
+            const e = map[id];
+            if (!e || e.off) return;
+            const n = bsNorm(e.nm);
+            if (!n) return;
+            if (n === q) hit.push({ id: id, nm: e.nm, score: 3 });
+            else if (n.indexOf(q) >= 0 || q.indexOf(n) >= 0) hit.push({ id: id, nm: e.nm, score: 2 });
+        });
+        const best = hit.filter(function (x){ return x.score === 3; });
+        return best.length ? best : hit;
     }
+
 
     // Sklep na Miraklu nazywa sie „Beliani DE", a konto w prologistics „Vente Unique DE
     // Beliani DE". Kluczem jest kod kraju, ale MUSI stac zaraz za nazwa marketplace'u:
@@ -21582,7 +21605,11 @@
         function numOf(v){ const m = String(v == null ? '' : v).match(/^\s*(\d+)/); return m ? m[1] : String(v || '').trim(); }
         function dlBank(){
             let o = '';
-            bsKeys.forEach(function (k){ o += '<option value="' + esc(k + ' — ' + String(bs[k]).slice(0, 70)) + '"></option>'; });
+            bsKeys.forEach(function (k){
+                const e = bs[k] || {};
+                if (e.off) return;                     // martwych wpisow nie podpowiadamy
+                o += '<option value="' + esc(k + ' — ' + String(e.nm || '').slice(0, 70)) + '"></option>';
+            });
             return '<datalist id="mk-dl-bank">' + o + '</datalist>';
         }
         function dlAcct(){
@@ -21594,7 +21621,8 @@
             return '<datalist id="mk-dl-acct">' + o + '</datalist>';
         }
         function fieldBank(val, hl){
-            const lbl = (val && bs[val]) ? (val + ' — ' + String(bs[val]).slice(0, 70)) : (val || '');
+            const e = val && bs[val];
+            const lbl = e ? (val + ' — ' + String(e.nm || '').slice(0, 70) + (e.off ? ' (nieaktywny)' : '')) : (val || '');
             return '<input class="mk-s-bank" list="mk-dl-bank" value="' + esc(lbl) + '" placeholder="numer lub nazwa…"'
                  + ' style="width:210px;font-size:11px' + (hl ? ';background:#fef9c3' : '') + '">';
         }
@@ -21606,8 +21634,10 @@
         let h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
               + '<b style="font-size:11px;color:#5b21b6">Konta i ustawienia importu</b>'
               + '<span style="display:flex;gap:6px">'
-              + '<button id="mk-bs-get" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">⇩ Pobierz bank_setting' + (bsN ? (' (' + bsN + ')') : '') + '</button>'
-              + '<button id="mk-acc-rel" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">↻ Odśwież plan kont (' + acc.length + ')</button></span></div>';
+              + '<button id="mk-pull" style="padding:3px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:10px">'
+              +   ((bsN && acc.length) ? ('↻ Odśwież z prologistics (' + acc.length + ' kont, ' + bsN + ' bank settings)')
+                                       : '⇩ Uzupełnij z prologistics')
+              + '</button></span></div>';
         const sc = shCfg();
         h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff;border:1px solid #ede9fe;border-radius:6px">'
           +  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
@@ -21631,7 +21661,12 @@
             keys.forEach(function (k, i){
                 const c = rows[k];
                 // podpowiedz tylko gdy jednoznaczna; do zapisu i tak potrzebne klikniecie
-                const sug = c.bank ? '' : bsGuess(c.acct, bs, acc);
+                // Dopasowanie po nazwie sklepu — „Manor · Manor CH" trafia w 149 „Manor CH".
+                // Do pola wchodzi TYLKO jednoznaczne trafienie; przy kilku kandydatach
+                // pokazujemy ich liste i czekamy na wybor, bo zly bank_setting to
+                // przelew zaksiegowany na cudzym koncie.
+                const cand = c.bank ? [] : bsGuess(bs, String(k).split('·').pop());
+                const sug = cand.length === 1 ? cand[0].id : '';
                 if (sug) sugN++;
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
@@ -21639,7 +21674,10 @@
                   +  '<td style="padding:3px 4px"><input class="mk-s-book" value="' + esc(c.booking || '9') + '" style="width:40px;font-size:11px"></td>'
                   +  '<td style="padding:3px 4px">' + fieldAcct(c.acct) + '</td>'
                   +  '<td style="padding:3px 4px;white-space:nowrap;color:' + (c.bank ? '#0a7a2f' : (sug ? '#a16207' : '#c47f00')) + '">'
-                  +  (c.bank ? '✓' : (sug ? 'podpowiedź — sprawdź i zapisz' : 'brak bank_setting')) + '</td></tr>';
+                  +  (c.bank ? '✓'
+                      : (sug ? 'podpowiedź — sprawdź i zapisz'
+                      : (cand.length ? (cand.length + ' pasujące: ' + esc(cand.slice(0, 3).map(function (x){ return x.id + ' ' + x.nm; }).join(', ')) + ' — wybierz')
+                                     : 'brak bank_setting'))) + '</td></tr>';
                 void i;
             });
             h += '</table></div>' + dlBank() + dlAcct()
@@ -21716,32 +21754,53 @@
                 t.disabled = false;
             };
         })();
-        const bsb = box.querySelector('#mk-bs-get');
-        if (bsb) bsb.onclick = async function(){
-            bsb.disabled = true; bsb.textContent = '⇩ …';
+        const pull = box.querySelector('#mk-pull');
+        if (pull) pull.onclick = function(){ mkPull(true); };
+        // Pierwsze otwarcie panelu na czystym profilu: nie kazemy szukac guzika,
+        // tylko od razu probujemy pobrac. Przy niepowodzeniu milczymy — guzik zostaje.
+        // MK_AUTOPULL jest tu konieczne: mkPull konczy sie renderSet(), a ten trafia
+        // znowu w to miejsce. Gdyby pobralo sie tylko jedno z dwoch zrodel, warunek
+        // nadal bylby prawdziwy i para renderSet↔mkPull krecilaby sie bez konca.
+        if (!MK_AUTOPULL && (!bsN || !acc.length)){
+            MK_AUTOPULL = true;
+            setTimeout(function (){ mkPull(false); }, 60);
+        }
+    }
+
+    // Jedno pobranie obu list naraz. „ręcznie" rozroznia klikniecie od zaciagniecia
+    // przy pierwszym otwarciu panelu: przy samoczynnym nie zawracamy glowy komunikatem,
+    // gdy prologistics akurat nie odpowiada.
+    let MK_PULLING = false, MK_AUTOPULL = false;
+    async function mkPull(recznie){
+        if (MK_PULLING) return;
+        MK_PULLING = true;
+        const b = document.querySelector('#mk-pull');
+        const t0 = b ? b.textContent : '';
+        if (b){ b.disabled = true; b.textContent = '… pobieram'; }
+        const dobre = [], zle = [];
+        try {
+            let acc = null, bs = null;
+            try { acc = await mkAcctFetch(); dobre.push(acc.length + ' kont' + (acc.src ? (' z ' + acc.src) : '')); }
+            catch (e){ zle.push('plan kont: ' + ((e && e.message) || e)); }
             try {
                 const r = await bsFetch();
-                if (r.map){
-                    renderSet();
-                    say('Wczytałem ' + Object.keys(r.map).length + ' pozycji z „' + r.src + '". Podpowiedzi na żółto — sprawdź i zapisz.', '#0a7a2f');
-                } else if (r.partial){
-                    say('Widzę tabelę, ale nie rozpoznaję w niej pary 157 = konto 1114 — nie przyjmuję jej, żeby nie przypisać złego konta. Podeślij mi źródło tej strony.', '#c47f00');
-                    bsb.disabled = false; bsb.textContent = '⇩ Pobierz bank_setting';
-                } else {
-                    say('Nie znalazłem listy przez API. Otwórz /react/settings_page/bank_settings/ i kliknij tam ten sam przycisk.', '#c47f00');
-                    bsb.disabled = false; bsb.textContent = '⇩ Pobierz bank_setting';
-                }
-            } catch (e){
-                say('Nie udało się: ' + ((e && e.message) || e), '#c00');
-                bsb.disabled = false; bsb.textContent = '⇩ Pobierz bank_setting';
+                if (r.map) { bs = r.map; dobre.push(Object.keys(r.map).length + ' bank settings'); }
+                else zle.push('bank settings: dostałem ' + Object.keys(r.partial || {}).length
+                            + ' pozycji, ale 157 nie wyszło jako „Vente Unique DE" — nie przyjmuję listy, '
+                            + 'żeby nie podpowiedzieć złego konta');
+            } catch (e){ zle.push('bank settings: ' + ((e && e.message) || e)); }
+
+            if (dobre.length) renderSet();
+            if (recznie || zle.length){
+                if (dobre.length && !zle.length) say('Wczytałem ' + dobre.join(' i ') + '. Podpowiedzi na żółto — sprawdź i zapisz.', '#0a7a2f');
+                else if (dobre.length) say('Wczytałem ' + dobre.join(' i ') + ', ale ' + zle.join('; '), '#c47f00');
+                else say('Nie udało się: ' + zle.join('; '), '#c00');
             }
-        };
-        const rel = box.querySelector('#mk-acc-rel');
-        if (rel) rel.onclick = async function(){
-            rel.disabled = true; rel.textContent = '↻ …';
-            try { await mkAcctFetch(); renderSet(); say('Plan kont odświeżony.', '#0a7a2f'); }
-            catch (e){ say('Nie mogę wczytać planu kont: ' + ((e && e.message) || e), '#c00'); rel.disabled = false; }
-        };
+        } finally {
+            MK_PULLING = false;
+            const bb = document.querySelector('#mk-pull');
+            if (bb){ bb.disabled = false; if (t0) bb.textContent = t0; }
+        }
     }
 
     // ---------- Mirakl: pobranie rozliczen ----------
@@ -23326,7 +23385,7 @@
                        '3266', '3267', '3268', '3269', '3270', '3271', '3273'],
             dateField: 'payment', range: 'prev', from: '', to: '',
             country: '', clearing: '0', inv: '2', paid: '',
-            fname: '', minamount: '', maxamount: '', system: 'excel', par: '5', allUsers: false
+            fname: '', minamount: '', maxamount: '', system: 'excel', par: '5', allUsers: false, fx: false
         }]
     };
     function profLoad(){
@@ -23519,6 +23578,7 @@
     const EXP_VARS_MAX = 1200;
 
     let EXP_SNAP = null;
+    let EXP_FX = null;      // kursy potwierdzone na ten przelot
     let EXP_MARKREP = '';
 
     function snapLoad(){
@@ -23661,6 +23721,170 @@
     function expWhen(ts){
         const d = new Date(ts);
         return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '. ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }
+
+
+    // ---------- przewalutowanie na CHF ----------
+    //
+    // Kurs bierzemy z Monatsmittelkurs BAZG — tego samego, ktory ESTV pokazuje na
+    // stronie „Aktueller Monatsmittelkurs". Publiczne API, bez logowania:
+    //     https://www.backend-rates.bazg.admin.ch/api/xmlavgmonth?j=2026&m=07
+    //         <monat>2026-07</monat>
+    //         <devise code="EUR"><waehrung>1 EUR</waehrung><kurs>0.9280</kurs></devise>
+    // Wersja HTML tej tabeli oddaje 403 poza ramka estv.admin.ch, XML nie ma tego
+    // problemu. JEDNOSTKA jest tu tak samo wazna jak kurs: czesc walut notowana jest
+    // za 100 (100 SEK, 100 CZK, 100 HUF) i kto ja pominie, pomyli sie stukrotnie.
+    const FX_URL = 'https://www.backend-rates.bazg.admin.ch/api/xmlavgmonth';
+
+    // Waluty kont — przejrzana lista 648 pozycji z planu kont prologistics.
+    // Zapis skrocony: „WALUTA:konto konto …" rozdzielone kreska pionowa.
+    const FX_MAP_RAW = 'EUR:1001 1008 1017 1021 1022 1035 1048 1050 1051 1052 1055 1059 1060 1061 1062 1100 1102 1103 1104 1107 1108 1110 1113 1114 1115 1117 1118 1119 1121 1123 1124 1125 1126 1127 1130 1131 1134 1135 1138 1139 1141 1142 1143 1144 1145 1147 1149 1150 1151 1152 1153 1154 1155 1156 1157 1162 1163 1168 1169 1208 1209 1210 1211 1218 1220 1223 1224 1231 1232 1239 1242 1243 1244 1245 1247 1249 1250 1251 1252 1253 1254 1255 1256 1258 1259 1260 1261 1262 1263 1264 1265 1266 1267 1268 1269 1271 1272 1275 1279 1280 1281 1285 1296 1297 1301 1303 1305 1306 1307 1310 1311 1312 1314 1316 1317 1318 1319 1320 1321 1323 1325 1327 1328 1329 1330 1331 1332 1334 1335 1337 1338 1341 1343 1344 1345 1346 1347 1348 1349 1351 1353 1354 1355 1356 1358 1360 1362 1363 1364 1366 1371 1376 1377 1404 1405 1406 1407 1408 1417 1418 1419 1420 1421 1422 1423 1424 1427 1428 1430 1432 1434 1435 1436 1437 1440 1441 1449 1451 1452 1455 1459 1503 1504 1510 1512 1513 1514 1515 1517 1519 1520 1521 1522 1525 1526 1527 1528 1529 1530 1531 1532 1533 1534 1770 1774 1775 1776 1801 1802 1803 1804 1805 1806 1807 1808 1809 1999 2023 2024 2026 2028 2029 2030 2032 2033 2034 2036 2037 2038 2040 2043 2106 2107 2108 2109 2110 2210 2220 2222 2223 2224 2225 2226 2230 2236 2237 2244 2245 2246 2247 2248 2249 2250 2251 2252 2253 2254 2255 2256 2257 2258 2259 2260 2261 2262 2263 2264 2265 2266 2267 2268 2279 2280 2281 2284 2285 2286 2287 2288 2289 3206 3207 3208 3210 3223 3228 3229 3230 3235 3236 3237 3241 3242 3243 3244 3245 3246 3247 3248 3249 3250 3251 3252 3253 3254 3255 3256 3257 3258 3259 3260 3261 3262 3263 3264 3265 3266 3267 3268 3269 3270 3271 3272 3273 3283 3290 3291 3293 3298 3300 3301 3302 3304 3305 3306 3307 3308 3309 4400 5201 8110|CHF:1002 1009 1010 1011 1016 1034 1036 1037 1038 1041 1043 1044 1046 1047 1053 1063 1064 1065 1066 1068 1074 1092 1122 1219 1273 1295 1300 1302 1304 1326 1369 1379 1380 1400 1402 1403 1756 2039 2051 2200 2204 2269 3200 3201 3202 3274 3275 4402 5200 8180|PLN:1000 1007 1012 1023 1024 1025 1026 1027 1028 1029 1030 1031 1032 1033 1042 1045 1067 1069 1071 1073 1081 1082 1099 1101 1116 1120 1165 1203 1359 1367 1401 1410 1500 1511 1518 1523 1535 2203 2208 2209 2283 3204 3209 3292 3294 3297 4401 5202 8170|GBP:1015 1019 1146 1164 1207 1230 1238 1241 1274 1276 1277 1282 1283 1289 1298 1299 1336 1374 1414 1433 1454 1524 2022 2201 2205 2206 2271 3203 3205 3276 3289 8160|CZK:1058 1072 1080 1084 1111 1128 1133 1136 1137 1148 1215 1342 1361 1415 1446 1450 1502 2025 2218 2219 2235 2243 3221 3222 3227 3234 3238 3287 8150|HUF:1056 1085 1086 1087 1214 1216 1257 1340 1368 1370 1372 1411 1445 1458 1509 1516 2031 2213 2214 2233 2239 3213 3215 3225 3232 3239 3286 8140|SEK:1039 1054 1083 1167 1212 1248 1333 1412 1413 1416 1443 1456 2035 2211 2212 2232 2238 3211 3214 3216 3224 3231 3284 8120|DKK:1040 1057 1166 1213 1246 1339 1425 1426 1429 1431 1444 1457 2027 2215 2216 2234 2242 3217 3218 3219 3226 3233 3285 8130|NOK:1014 1091 1129 1132 1158 1221 1352 1375 1438 1439 1447 1453 1501 2041 2217 2221 2270 3212 3220 3240 3310 8190|USD:1018 1049 1070 1201 1202 1206 1278 1284 1286 1287 1288 1294 1309 1313 1315 4001 4203 4717 6561|RON:1013 1095 1096 1097 1098 1159 1160 1161 1373 1378 1381 1448 2272 2282 3277 3278 3279 8105|CAD:1290 1291 1292 1293 1308 1322 1324 2207 2231 4002 4716|CNY:1003';
+    let FX_MAP = null;
+    function fxMap(){
+        if (FX_MAP) return FX_MAP;
+        FX_MAP = {};
+        FX_MAP_RAW.split('|').forEach(function (part){
+            const i = part.indexOf(':');
+            if (i < 0) return;
+            const w = part.slice(0, i);
+            part.slice(i + 1).split(' ').forEach(function (k){ if (k) FX_MAP[k] = w; });
+        });
+        return FX_MAP;
+    }
+    // Zapamietane recznie poprawki uzytkownika — warstwa NAD lista powyzej, zeby
+    // konto dopisane w prologistics po wydaniu tej wersji dalo sie ustawic raz
+    // i zeby to przetrwalo aktualizacje HUB-a.
+    const FX_FIX_KEY = 'expp_waluty';
+    function fxFix(){ try { return JSON.parse(GM_getValue(FX_FIX_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    function fxFixSet(acc, cur){
+        const o = fxFix(); if (cur) o[acc] = cur; else delete o[acc];
+        try { GM_setValue(FX_FIX_KEY, JSON.stringify(o)); } catch (e){}
+    }
+
+    // Dla konta spoza listy (nowego) probujemy tak samo, jak przy skladaniu listy:
+    // najpierw kod waluty wprost w nazwie, potem kraj. Gdy nazwa nie niesie ani
+    // jednego, ani drugiego — mowimy „nie wiem" i pytamy. Nigdy nie zgadujemy.
+    const FX_CODES = ['EUR','CHF','PLN','CZK','HUF','DKK','SEK','NOK','GBP','USD','CAD','RON','CNY'];
+    const FX_LAND = { SWITZERLAND:'CHF', SWIZTERLAND:'CHF', SCHWEIZ:'CHF', CH:'CHF',
+        POLSKA:'PLN', POLAND:'PLN', PL:'PLN', NORWAY:'NOK', NORGE:'NOK', NO:'NOK',
+        CZ:'CZK', HU:'HUF', DK:'DKK', SE:'SEK', UK:'GBP', GB:'GBP', USA:'USD',
+        CAN:'CAD', RO:'RON', DE:'EUR', AT:'EUR', FR:'EUR', IT:'EUR', ES:'EUR',
+        PT:'EUR', NL:'EUR', BE:'EUR', LU:'EUR', FI:'EUR', SK:'EUR', EU:'EUR' };
+    function fxGuess(acc, label){
+        const fix = fxFix();
+        if (fix[acc]) return { cur: fix[acc], src: 'Twoje ustawienie' };
+        const m = fxMap();
+        if (m[acc]) return { cur: m[acc], src: 'lista kont' };
+        const t = String(label || '').toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+        const kod = t.filter(function (x){ return FX_CODES.indexOf(x) >= 0; });
+        if (kod.length) return { cur: kod[0], src: 'kod „' + kod[0] + '" w nazwie' };
+        const kraje = t.filter(function (x){ return FX_LAND[x]; });
+        const wal = kraje.map(function (x){ return FX_LAND[x]; })
+                         .filter(function (v, i, a){ return a.indexOf(v) === i; });
+        if (wal.length === 1) return { cur: wal[0], src: 'kraj ' + kraje.join('/') };
+        if (wal.length > 1) return { cur: '', src: 'sprzeczne kraje: ' + kraje.join(', ') };
+        return { cur: '', src: 'nie rozpoznaję z nazwy' };
+    }
+
+    async function fxRates(rok, mies){
+        const url = FX_URL + '?j=' + rok + '&m=' + (mies < 10 ? '0' : '') + mies;
+        const txt = await new Promise(function (resolve, reject){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({ method: 'GET', url: url, timeout: 30000,
+                onload: function (r){ resolve(r.responseText); },
+                onerror: function (){ reject(new Error('nie mogę połączyć się z BAZG')); },
+                ontimeout: function (){ reject(new Error('BAZG nie odpowiedział na czas')); } });
+        });
+        const doc = new DOMParser().parseFromString(txt, 'text/xml');
+        const mon = (doc.getElementsByTagName('monat')[0] || {}).textContent || '';
+        const chce = rok + '-' + (mies < 10 ? '0' : '') + mies;
+        if (mon.trim() !== chce)
+            throw new Error('BAZG oddał kursy za ' + (mon.trim() || '?') + ', a proszono o ' + chce);
+        const out = {};
+        const lst = doc.getElementsByTagName('devise');
+        for (let i = 0; i < lst.length; i++){
+            const w = (lst[i].getElementsByTagName('waehrung')[0] || {}).textContent || '';
+            const k = (lst[i].getElementsByTagName('kurs')[0] || {}).textContent || '';
+            const m = w.match(/^\s*(\d+)\s+([A-Z]{3})\s*$/);
+            if (!m || !k) continue;
+            out[m[2]] = { jedn: Number(m[1]), kurs: Number(k) };
+        }
+        out.CHF = { jedn: 1, kurs: 1 };
+        if (!out.EUR) throw new Error('w odpowiedzi BAZG nie ma kursu EUR — nie ufam tej tabeli');
+        return { mies: chce, kursy: out };
+    }
+
+    // Zaokraglenie „od zera", tak jak ZAOKR w Excelu: -0,005 → -0,01.
+    function fxR(x){ return x >= 0 ? Math.round(x) : -Math.round(-x); }
+
+    // Przewalutowanie pliku tekstowego Sesam. Zasada 1:1 z arkuszem, ktorego
+    // uzywacie dzis:
+    //   Steuer = ZAOKR(Steuer × kurs; 2)  — zawsze zwykłe przeliczenie
+    //   Netto  = ZAOKR(Netto  × kurs; 2), ale wiersz o NAJWIEKSZEJ przeliczonej
+    //            kwocie w dokumencie (i tylko gdy jest jeden taki) dostaje SUME
+    //            POZOSTALYCH. Bez tego przy zaokraglaniu kazdego pola osobno
+    //            czesc dokumentow rozjezdza sie o rappen — na lipcowym pliku
+    //            1145 bylo to 3 dokumenty z 37.
+    //   FW-Betrag zostaje nietkniety: to kwota w walucie obcej.
+    // Poza tymi dwoma polami plik nie jest ruszany — przepisujemy oryginalne
+    // bajty, podmieniajac wylacznie dwie liczby.
+    function fxPola(linia){
+        // zwraca [[start, koniec], …] dla kazdego pola, z poszanowaniem cudzyslowow
+        const out = []; let i = 0, st = 0, q = false;
+        for (; i < linia.length; i++){
+            const c = linia[i];
+            if (q){ if (c === '"'){ if (linia[i+1] === '"') i++; else q = false; } }
+            else if (c === '"') q = true;
+            else if (c === ','){ out.push([st, i]); st = i + 1; }
+        }
+        out.push([st, linia.length]);
+        return out;
+    }
+    function fxCsv(tekst, kurs, jedn){
+        const eol = tekst.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+        const lin = tekst.split(/\r?\n/);
+        const head = fxPola(lin[0]).map(function (p){ return lin[0].slice(p[0], p[1]).trim(); });
+        const iB = head.indexOf('Blg'), iM = head.indexOf('Netto'), iN = head.indexOf('Steuer');
+        if (iB < 0 || iM < 0 || iN < 0)
+            throw new Error('to nie wygląda na plik Sesam — nie ma kolumn Blg/Netto/Steuer');
+
+        const wier = [];
+        for (let r = 1; r < lin.length; r++){
+            if (!lin[r].trim()) continue;
+            const p = fxPola(lin[r]);
+            if (p.length !== head.length) throw new Error('wiersz ' + (r+1) + ' ma inną liczbę kolumn niż nagłówek');
+            const gr = function (k){ return lin[r].slice(p[k][0], p[k][1]).trim(); };
+            const m = Math.round(Number(gr(iM)) * 100), n = Math.round(Number(gr(iN)) * 100);
+            if (!isFinite(m) || !isFinite(n)) throw new Error('wiersz ' + (r+1) + ': nie umiem odczytać kwoty');
+            wier.push({ r: r, p: p, blg: gr(iB), m: m, n: n });
+        }
+        // przeliczenie i wyrownanie w obrebie dokumentu
+        wier.forEach(function (w){
+            w.M = fxR(w.m * kurs / jedn);
+            w.N = fxR(w.n * kurs / jedn);
+        });
+        const dok = {};
+        wier.forEach(function (w){ (dok[w.blg] = dok[w.blg] || []).push(w); });
+        let wyr = 0;
+        Object.keys(dok).forEach(function (b){
+            const g = dok[b];
+            let mx = -Infinity; g.forEach(function (w){ if (w.M > mx) mx = w.M; });
+            const naj = g.filter(function (w){ return w.M === mx; });
+            if (naj.length !== 1) return;                 // remis — nic nie ruszamy
+            let suma = 0; g.forEach(function (w){ suma += w.M; });
+            const nowy = suma - naj[0].M;
+            if (nowy !== naj[0].M) wyr++;
+            naj[0].M = nowy;
+        });
+        // skladamy plik z powrotem, podmieniajac WYLACZNIE dwie liczby
+        const f2 = function (c){ return (c / 100).toFixed(2); };
+        wier.forEach(function (w){
+            const l = lin[w.r], a = w.p[iM], b = w.p[iN];
+            const pierw = iM < iN ? [a, f2(w.M), b, f2(w.N)] : [b, f2(w.N), a, f2(w.M)];
+            lin[w.r] = l.slice(0, pierw[0][0]) + pierw[1] + l.slice(pierw[0][1], pierw[2][0])
+                     + pierw[3] + l.slice(pierw[2][1]);
+        });
+        return { tekst: lin.join(eol), wierszy: wier.length, dokumentow: Object.keys(dok).length, wyrownanych: wyr };
     }
 
     // ---------- UI ----------
@@ -23888,8 +24112,8 @@
            +     '<option value="cur"' + (p.range === 'cur' ? ' selected' : '') + '>bieżący miesiąc</option>'
            +     '<option value="fix"' + (p.range === 'fix' ? ' selected' : '') + '>zakres ręczny</option>'
            +   '</select></label>'
-           +   '<label>od <input id="exp-from" value="' + esc(r[0]) + '" size="10" style="font-size:12px"' + (p.range === 'fix' ? '' : ' disabled') + '></label>'
-           +   '<label>do <input id="exp-to" value="' + esc(r[1]) + '" size="10" style="font-size:12px"' + (p.range === 'fix' ? '' : ' disabled') + '></label>'
+           +   '<label>od <input type="date" id="exp-from" value="' + esc(r[0]) + '" style="font-size:12px;width:130px"' + (p.range === 'fix' ? '' : ' disabled') + '></label>'
+           +   '<label>do <input type="date" id="exp-to" value="' + esc(r[1]) + '" style="font-size:12px;width:130px"' + (p.range === 'fix' ? '' : ' disabled') + '></label>'
            +   '<label>data <select id="exp-df" style="font-size:12px">'
            +     '<option value="payment"' + (p.dateField === 'payment' ? ' selected' : '') + '>Payment date</option>'
            +     '<option value="invoice"' + (p.dateField === 'invoice' ? ' selected' : '') + '>Invoice date</option>'
@@ -23905,7 +24129,14 @@
            +     ['1', '3', '5', '8'].map(function (n){ return '<option value="' + n + '"' + (String(p.par || '5') === n ? ' selected' : '') + '>' + n + '</option>'; }).join('')
            +   '</select></label>'
            + '</div>'
+           + '<div style="margin-top:6px">'
+           +   '<label style="font-size:12px;display:inline-flex;gap:5px;align-items:center" title="Przelicza kolumny Netto i Steuer na franki kursem BAZG. Działa tylko dla formatów tekstowych, nie dla XLS.">'
+           +     '<input type="checkbox" id="exp-fx"' + (p.fx ? ' checked' : '') + '>'
+           +     'przewalutowanie na CHF'
+           +   '</label>'
+           + '</div>'
            + '<div style="margin-top:8px"><button id="exp-save" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer">Zapisz profil</button></div>'
+           + '<div id="exp-fxbox" style="margin-top:10px"></div>'
            + '<div id="exp-prog" style="margin-top:10px"></div>';
 
         panel.innerHTML = h;
@@ -23966,6 +24197,20 @@
         bind('#exp-range', 'range'); bind('#exp-df', 'dateField'); bind('#exp-state', 'state');
         bind('#exp-st', 'sellerType'); bind('#exp-inv', 'inv'); bind('#exp-paid', 'paid');
         bind('#exp-sys', 'system'); bind('#exp-from', 'from'); bind('#exp-to', 'to');
+        // Zakres trzymamy w ryzach: „do" nie moze byc wczesniej niz „od".
+        (function (){
+            const od = $('#exp-from'), doo = $('#exp-to');
+            if (!od || !doo) return;
+            const sync = function (){
+                if (od.value) doo.min = od.value; else doo.removeAttribute('min');
+                if (doo.value) od.max = doo.value; else od.removeAttribute('max');
+                if (od.value && doo.value && od.value > doo.value)
+                    say('Data „od" jest późniejsza niż „do" — popraw zakres.', '#c47f00');
+            };
+            od.addEventListener('change', sync);
+            doo.addEventListener('change', sync);
+            sync();
+        })();
         bind('#exp-par', 'par');
 
         $('#exp-save').onclick = function (){ say('Zapisane.', '#0a7a2f'); };
@@ -24007,6 +24252,13 @@
 
         $('#exp-run').onclick = function (){ runAll(this); };
         $('#exp-close').onclick = function (){ panel.style.display = 'none'; };
+        const fxb = $('#exp-fx');
+        if (fxb) fxb.onchange = function (){
+            const on = this.checked;
+            patch(function (q){ q.fx = on; });
+            EXP_FX = null;                      // zmiana ustawienia uniewaznia kursy
+            const bx = $('#exp-fxbox'); if (bx) bx.innerHTML = '';
+        };
         $('#exp-all').onchange = function (){
             const v = this.checked;
             patch(function (p){ p.allUsers = v; });
@@ -24221,6 +24473,92 @@
         }
     }
 
+    // Kursy pokazujemy DO ZATWIERDZENIA, zanim cokolwiek poleci. Kazdy wiersz da sie
+    // poprawic recznie, a konto o nierozpoznanej walucie blokuje start — kurs dla
+    // czegos, czego nie umiem nazwac, bylby zgadywaniem.
+    // Odcisk zestawu: kursy potwierdzone dla konkretnych kont i konkretnego
+    // miesiaca. Zmieni sie jedno albo drugie — potwierdzenie traci waznosc, bo
+    // inaczej dalo by sie zatwierdzic kursy na lipiec i pobrac sierpien.
+    function fxSig(accs, r){ return r[0] + '|' + r[1] + '|' + accs.slice().sort().join(','); }
+    async function fxPrepare(accs, r){
+        if (r[1].slice(0, 7) !== r[0].slice(0, 7))
+            throw new Error('zakres obejmuje dwa miesiące (' + r[0].slice(0, 7) + ' i ' + r[1].slice(0, 7)
+                          + '), a Monatsmittelkurs jest miesięczny — zawęź go do jednego miesiąca');
+        const t = await fxRates(Number(r[0].slice(0, 4)), Number(r[0].slice(5, 7)));
+        const poz = accs.map(function (a){
+            const g = fxGuess(a, expAccLabel(a));
+            const k = g.cur ? t.kursy[g.cur] : null;
+            return { acc: a, label: expAccLabel(a), cur: g.cur, src: g.src,
+                     kurs: k ? k.kurs : 0, jedn: k ? k.jedn : 1,
+                     brak: !g.cur ? 'nie znam waluty tego konta'
+                                  : (!k ? 'BAZG nie podał kursu dla ' + g.cur : '') };
+        });
+        return { mies: t.mies, kursy: t.kursy, poz: poz, ok: false, sig: fxSig(accs, r) };
+    }
+    function fxRender(){
+        const box = $('#exp-fxbox'); if (!box) return;
+        if (!EXP_FX){ box.innerHTML = ''; return; }
+        const f = EXP_FX;
+        let h = '<div style="border:1px solid #99f6e4;border-radius:8px;background:#f0fdfa;padding:8px">'
+              + '<div style="font-weight:700;margin-bottom:4px">Kursy na ' + esc(f.mies)
+              + ' <span style="font-weight:400;color:#555">— Monatsmittelkurs BAZG. Sprawdź, zanim ruszy.</span></div>'
+              + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+              + '<tr style="color:#888"><td style="padding:2px 4px">konto</td><td style="padding:2px 4px">waluta</td>'
+              + '<td style="padding:2px 4px">skąd</td><td style="padding:2px 4px">kurs</td></tr>';
+        f.poz.forEach(function (x, i){
+            const chf = x.cur === 'CHF';
+            h += '<tr style="border-top:1px solid #ccfbf1">'
+              +  '<td style="padding:2px 4px">' + esc(x.label) + '</td>'
+              +  '<td style="padding:2px 4px"><input data-fxi="' + i + '" class="fx-cur" value="' + esc(x.cur)
+              +    '" style="width:56px;font-size:11px;text-transform:uppercase"></td>'
+              +  '<td style="padding:2px 4px;color:' + (x.brak ? '#c00' : '#888') + '">' + esc(x.brak || x.src) + '</td>'
+              +  '<td style="padding:2px 4px;white-space:nowrap">'
+              +    (chf ? '<span style="color:#888">bez przeliczania</span>'
+                        : (x.jedn !== 1 ? ('<span style="color:#888">' + x.jedn + ' = </span>') : '')
+                          + '<input data-fxi="' + i + '" class="fx-kurs" value="' + esc(x.kurs ? String(x.kurs) : '')
+                          + '" style="width:78px;font-size:11px">')
+              +  '</td></tr>';
+        });
+        const zle = f.poz.filter(function (x){ return x.cur !== 'CHF' && (!x.cur || !(x.kurs > 0)); });
+        h += '</table><div style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +  '<button id="exp-fxgo" style="padding:5px 14px;border:none;border-radius:6px;background:#0f766e;'
+          +    'color:#fff;font-weight:700;cursor:pointer;font-size:12px"' + (zle.length ? ' disabled' : '')
+          +    '>Kursy się zgadzają — uruchom</button>'
+          +  '<button id="exp-fxno" style="padding:4px 10px;border:1px solid #ddd;border-radius:6px;'
+          +    'background:#fff;cursor:pointer;font-size:11px">Anuluj</button>'
+          +  (zle.length ? ('<span style="font-size:11px;color:#c00">Uzupełnij ' + zle.length + ' '
+                            + plural(zle.length, 'kurs', 'kursy', 'kursów') + ', żeby ruszyć.</span>') : '')
+          +  '</div></div>';
+        box.innerHTML = h;
+        box.querySelectorAll('.fx-cur').forEach(function (el){
+            el.onchange = function (){
+                const x = EXP_FX.poz[Number(this.getAttribute('data-fxi'))];
+                x.cur  = String(this.value).trim().toUpperCase();
+                const k = EXP_FX.kursy[x.cur];
+                x.kurs = k ? k.kurs : 0;
+                x.jedn = k ? k.jedn : 1;
+                x.src  = 'wpisana ręcznie';
+                x.brak = x.cur ? (k ? '' : 'BAZG nie podał kursu dla ' + x.cur) : 'nie znam waluty tego konta';
+                if (x.cur) fxFixSet(x.acc, x.cur);   // zapamietujemy na kolejne przeloty
+                fxRender();
+            };
+        });
+        box.querySelectorAll('.fx-kurs').forEach(function (el){
+            el.onchange = function (){
+                const x = EXP_FX.poz[Number(this.getAttribute('data-fxi'))];
+                const v = Number(String(this.value).replace(',', '.'));
+                x.kurs = (isFinite(v) && v > 0) ? v : 0;
+                x.src  = 'kurs wpisany ręcznie';
+                x.brak = x.kurs ? '' : 'kurs musi być liczbą większą od zera';
+                fxRender();
+            };
+        });
+        const go = $('#exp-fxgo');
+        if (go) go.onclick = function (){ EXP_FX.ok = true; runAll($('#exp-run')); };
+        const no = $('#exp-fxno');
+        if (no) no.onclick = function (){ EXP_FX = null; fxRender(); say('Anulowane.', '#666'); };
+    }
+
     async function runAll(b){
         if (running) return;
         const p = profCur(profLoad());
@@ -24234,15 +24572,39 @@
         }
         const r = expRange(p);
         if (!r[0] || !r[1]){ say('Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(r[0]) || !/^\d{4}-\d{2}-\d{2}$/.test(r[1])){
+            say('Daty muszą być w formacie RRRR-MM-DD — wybierz je z kalendarza.', '#c00'); return;
+        }
+        if (r[0] > r[1]){ say('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        // Przewalutowanie: najpierw kursy do zatwierdzenia, dopiero potem przelot.
+        if (p.fx && !(EXP_FX && EXP_FX.ok && EXP_FX.sig === fxSig(accs, r))){
+            b.disabled = true;
+            say('Pobieram kursy z BAZG…', '#666');
+            try {
+                EXP_FX = await fxPrepare(accs, r);
+                fxRender();
+                say('Sprawdź kursy i potwierdź.', '#0f766e');
+            } catch (e){
+                EXP_FX = null; fxRender();
+                say('Nie mogę przygotować kursów: ' + ((e && e.message) || e), '#c00');
+            }
+            b.disabled = false;
+            return;
+        }
+        const fxBy = {};
+        if (p.fx && EXP_FX) EXP_FX.poz.forEach(function (x){ fxBy[x.acc] = x; });
+
         const par = Math.max(1, Math.min(8, Number(p.par) || 5));
         if (!confirm('Pobrać ' + accs.length + ' ' + plural(accs.length, 'zestawienie', 'zestawienia', 'zestawień') + '?\n\n'
                    + 'Okres: ' + r[0] + ' … ' + r[1] + ' (' + (p.dateField === 'invoice' ? 'Invoice date' : 'Payment date') + ')\n'
                    + 'Sprzedawców: ' + users.length + (p.allUsers ? ' (wszyscy)' : '') + '\n'
                    + 'Format: ' + p.system + '\n'
+                   + (p.fx ? ('Przewalutowanie: TAK, kursy ' + EXP_FX.mies + '\n') : '')
                    + 'Równolegle: ' + par + '\n\n'
                    + 'Nic nie zostanie oznaczone jako wyeksportowane.\n'
                    + 'Oznaczysz je osobnym guzikiem, gdy plik wejdzie do księgowości.')) return;
 
+        if (EXP_FX) EXP_FX.ok = false;   // potwierdzenie jest jednorazowe
         running = true; expAbort = false;
         b.disabled = true;
         const stop = $('#exp-stop');
@@ -24315,7 +24677,18 @@
                 // „zestawienia", ktore w srodku jest komunikatem o bledzie.
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
-                files[i] = { name: safeName(expAccLabel(a)) + expExt(f.cd, '.xls'), data: f.buf };
+                let buf = f.buf, nazwa = safeName(expAccLabel(a)) + expExt(f.cd, '.xls');
+                if (p.fx && fxBy[a] && fxBy[a].cur !== 'CHF'){
+                    if (expFileRows(f).typ !== 'tekst')
+                        throw new Error('przewalutowanie działa tylko na formatach tekstowych, '
+                                      + 'a przyszedł plik binarny — zmień format w profilu');
+                    const w = fxCsv(new TextDecoder('utf-8', { fatal: false }).decode(f.buf),
+                                    fxBy[a].kurs, fxBy[a].jedn);
+                    buf = new TextEncoder().encode(w.tekst);
+                    nazwa = nazwa.replace(/(\.[^.]+)$/, ' CHF$1');
+                    st[i].fx = w;
+                }
+                files[i] = { name: nazwa, data: buf };
                 // Ile wierszy naprawde przyszlo w pliku. Gdyby serwer po cichu ucial
                 // zadanie, plik bylby krotszy od listy, ktora wyslalismy — a wtedy
                 // pozniejsze oznaczenie zaklepaloby platnosci, ktorych ksiegowosc
@@ -24331,7 +24704,9 @@
                     st[i].note = 'plik krótszy!';
                     problems.push(expAccLabel(a) + ': ' + snaps[i].bad);
                 } else {
-                    st[i].note = 'pobrane';
+                    st[i].note = st[i].fx
+                        ? ('przeliczone, ' + st[i].fx.wyrownanych + ' wyrównanych')
+                        : 'pobrane';
                 }
             } catch (e){
                 st[i].note = 'błąd';
