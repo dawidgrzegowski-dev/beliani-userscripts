@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.02
+// @version      3.03
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -43,6 +43,13 @@
 
 (function () {
     'use strict';
+
+    // Panele zamyka sie krzyzykiem, Escape'em albo wlasnym guzikiem modulu.
+    // Dawniej kazdy modul gasil swoj panel przy dowolnym kliknieciu poza nim.
+    // Skutek byl taki, ze nie dalo sie miec dwoch paneli naraz — otwarcie drugiego
+    // zamykalo pierwszy — a klikniecie w tresc prologistics gasilo wszystkie.
+    // Zmiana na true przywraca stare zachowanie.
+    const BL_AUTOCLOSE = false;
 
     // ===== Host helpers =====
     const H = location.hostname;
@@ -5452,8 +5459,9 @@
         }
     };
 
+    // Samo-zamykanie przy kliknieciu w strone — patrz BL_AUTOCLOSE u gory pliku.
     document.addEventListener('click', e => {
-        if (!btn.contains(e.target) && !panel.contains(e.target) && !editPopup.contains(e.target)) {
+        if (BL_AUTOCLOSE && !btn.contains(e.target) && !panel.contains(e.target) && !editPopup.contains(e.target)) {
             panel.style.display = 'none';
         }
     });
@@ -6257,8 +6265,9 @@
         }
     };
 
+    // Samo-zamykanie przy kliknieciu w strone — patrz BL_AUTOCLOSE u gory pliku.
     document.addEventListener('click', (e) => {
-        if (!refundBtn.contains(e.target) && !refundPanel.contains(e.target)) {
+        if (BL_AUTOCLOSE && !refundBtn.contains(e.target) && !refundPanel.contains(e.target)) {
             refundPanel.style.display = 'none';
         }
     });
@@ -9904,8 +9913,9 @@
         }
     };
 
+    // Samo-zamykanie przy kliknieciu w strone — patrz BL_AUTOCLOSE u gory pliku.
     document.addEventListener('click', function (e) {
-        if (!btn.contains(e.target) && !panel.contains(e.target)) {
+        if (BL_AUTOCLOSE && !btn.contains(e.target) && !panel.contains(e.target)) {
             panel.style.display = 'none';
         }
     });
@@ -10408,8 +10418,9 @@
             '</div>';
 
         btn.onclick = function () { panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; };
+        // Samo-zamykanie przy kliknieciu w strone — patrz BL_AUTOCLOSE u gory pliku.
         document.addEventListener('click', function (e) {
-            if (!btn.contains(e.target) && !panel.contains(e.target)) panel.style.display = 'none';
+            if (BL_AUTOCLOSE && !btn.contains(e.target) && !panel.contains(e.target)) panel.style.display = 'none';
         });
 
         document.body.appendChild(btn);
@@ -13076,8 +13087,9 @@
         }
     };
 
+    // Samo-zamykanie przy kliknieciu w strone — patrz BL_AUTOCLOSE u gory pliku.
     document.addEventListener('click', (e) => {
-        if (!btn.contains(e.target) && !panel.contains(e.target) && !commentPopup.contains(e.target)) {
+        if (BL_AUTOCLOSE && !btn.contains(e.target) && !panel.contains(e.target) && !commentPopup.contains(e.target)) {
             panel.style.display = 'none';
         }
     });
@@ -24403,7 +24415,171 @@
             .bl-x-wrap{position:sticky;top:0;height:0;z-index:9;overflow:visible;pointer-events:none;}
             .bl-x{pointer-events:auto;position:absolute;right:-6px;top:-8px;width:26px;height:26px;line-height:22px;padding:0;border:1px solid #e5d5d3;border-radius:13px;background:#fff;color:#750000;font-size:14px;font-weight:bold;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.15);font-family:Arial,Helvetica,sans-serif;}
             .bl-x:hover{background:#F6E7E6;}
+            /* ===== wspolna skorka paneli — kolory z Brand Booka Beliani =====
+               Core:  Cozy brown #750000 · Happy red #FF2F00 · Warm Yellow #FD9000
+                      Soft Peach #FFCCB7 · Calm Grey #DBD9D7
+               Bazowe: Dawn Grey #332524 · Urban grey #E8E8E8 · Subtle peach #F6E7E6
+               Pastele identyfikujace modul pochodza ze strony 69 brand booka, gdzie
+               sa wprost zatwierdzone do „internal tool settings in Prolo". Malujemy
+               WYLACZNIE obudowe panelu: ramke, pasek modulu, cien i krój pisma —
+               niczego w srodku, zeby nie zmienic znaczenia kolorow w modulach
+               (czerwony blad, zielony sukces zostaja takie, jakie byly). */
+            .bl-panel{
+                font-family:'Poppins','Segoe UI',Arial,Helvetica,sans-serif !important;
+                border:1px solid #DBD9D7 !important;
+                border-top:4px solid var(--bl-tint,#750000) !important;
+                border-radius:12px !important;
+                box-shadow:0 10px 30px rgba(51,37,36,.20) !important;
+            }
+            .bl-panel[data-bl-mod="export"]  {--bl-tint:#A2C4C9;}
+            .bl-panel[data-bl-mod="deposit"] {--bl-tint:#F9CB9C;}
+            .bl-panel[data-bl-mod="ksieg"]   {--bl-tint:#B6D7A8;}
+            .bl-panel[data-bl-mod="klient"]  {--bl-tint:#B4A7D6;}
+            .bl-panel[data-bl-mod="refund"]  {--bl-tint:#FFE599;}
+            .bl-panel[data-bl-mod="issuelog"]{--bl-tint:#A4C2F4;}
+            .bl-panel[data-bl-mod="marta"]   {--bl-tint:#DD7E6B;}
+            .bl-panel[data-bl-mod="auftrag"] {--bl-tint:#9FC5E8;}
         `);
+
+        // ===== dok paneli: obok siebie, nie jeden na drugim =====================
+        // Szerokosci sa literalami z definicji paneli w modulach. Swiadomie nie
+        // mierzymy ich w kazdym przelocie: pomiar wymaga wczesniejszego przywrocenia
+        // pierwotnej geometrii, a to znaczy skok przewijania w panelu, w ktorym ktos
+        // wlasnie pracuje.
+        const BL_DOCK = [
+            { sel: '#exp-panel',        mod: 'export',   w: 760  },
+            { sel: '#deposit-panel',    mod: 'deposit',  w: 760  },
+            { sel: '#ksieg-panel',      mod: 'ksieg',    w: 1100 },
+            { sel: '#klient-panel',     mod: 'klient',   w: 1100 },
+            { sel: '#refund-panel',     mod: 'refund',   w: 480  },
+            { sel: '#ilp-search-panel', mod: 'issuelog', w: 430  },
+            { sel: '#mkt-panel',        mod: 'marta',    w: 1100 },
+            { sel: '#auftrag-panel',    mod: 'auftrag',  w: 1180 },
+        ];
+        // Tylko te wlasnosci nadpisujemy i tylko te oddajemy przy zamknieciu.
+        const BL_OWNED = ['position','left','right','top','transform','width',
+                          'max-width','max-height','overflow-y','box-sizing'];
+        let blOrder = [], blKey = '';
+
+        function blSnap(el){
+            if (el.__blSnap) return;
+            const o = {};
+            BL_OWNED.forEach(function (k){
+                o[k] = [el.style.getPropertyValue(k), el.style.getPropertyPriority(k)];
+            });
+            el.__blSnap = o;
+        }
+        function blRestore(el){
+            const o = el.__blSnap;
+            if (!o) return;
+            BL_OWNED.forEach(function (k){
+                if (o[k][0]) el.style.setProperty(k, o[k][0], o[k][1]);
+                else el.style.removeProperty(k);
+            });
+            el.__blSnap = null;
+            el.classList.remove('bl-panel');
+            el.removeAttribute('data-bl-mod');
+        }
+        // Moduly ustawiaja swoje style przez cssText, czyli inline. Zwykla regula CSS
+        // z tym nie wygra niezaleznie od specyficznosci — stad setProperty z priorytetem.
+        function blPut(el, k, v){ el.style.setProperty(k, v, 'important'); }
+
+        function blTop(){
+            const L = document.getElementById('beliani-launcher');
+            let t = 122;
+            if (L){
+                try {
+                    const r = L.getBoundingClientRect();
+                    // Launcher da sie przeciagnac. Schodzimy pod niego tylko wtedy,
+                    // gdy naprawde stoi w prawym pasie, ktory zajmuja panele.
+                    if (r.right > window.innerWidth - 340 && r.top < 300) t = Math.round(r.top) + 52;
+                } catch (e){}
+            }
+            return Math.max(56, t);
+        }
+
+        function blApply(){
+            BL_DOCK.forEach(function (d){
+                const el = document.querySelector(d.sel);
+                if (el && blOrder.indexOf(d.sel) < 0) blRestore(el);
+            });
+            const n = blOrder.length;
+            if (!n) return;
+            const EDGE = 12, GAP = 10, MIN = 380;
+            const top = blTop();
+            const defs = blOrder.map(function (sel){
+                return BL_DOCK.filter(function (d){ return d.sel === sel; })[0];
+            });
+            const avail = window.innerWidth - 2 * EDGE - GAP * (n - 1);
+            let sum = 0;
+            defs.forEach(function (d){ sum += d.w; });
+            // Podloga schodzi razem z liczba paneli i NIE MA twardego dolu. Kazda
+            // stala wartosc (probowalem 240) sprawia, ze przy szesciu panelach na
+            // ekranie 1280 ostatni wyjezdza poza lewa krawedz i po prostu znika.
+            // avail/n gwarantuje, ze komplet zawsze sie zmiesci — ciasno, ale widac
+            // wszystko i wszystko da sie zamknac.
+            const floor = Math.min(MIN, Math.floor(avail / n));
+            const ws = defs.map(function (d){
+                return sum <= avail ? d.w : Math.max(floor, Math.floor(d.w * avail / sum));
+            });
+            // Po dociagnieciu do podlogi suma potrafi dalej nie wchodzic. Nadmiar
+            // odbieramy zawsze najszerszemu — najwezsze i tak nic juz nie oddadza.
+            let total = 0;
+            ws.forEach(function (w){ total += w; });
+            let guard = 0;
+            while (total > avail && guard++ < 200){
+                let k = -1, best = floor;
+                for (let i = 0; i < n; i++) if (ws[i] > best){ best = ws[i]; k = i; }
+                if (k < 0) break;
+                const cut = Math.min(ws[k] - floor, total - avail);
+                ws[k] -= cut; total -= cut;
+            }
+            // Ukladamy od prawej krawedzi w lewo, w kolejnosci OTWIERANIA. Dzieki temu
+            // nowy panel dostawia sie z lewej i nie rusza tego, w ktorym ktos pisze.
+            let right = EDGE;
+            for (let i = 0; i < n; i++){
+                const el = document.querySelector(defs[i].sel);
+                if (!el) continue;
+                blSnap(el);
+                // Bez tego szerokosc liczy sie do KRAWEDZI TRESCI: panel z padding:12px
+                // i ramka zajmuje 786 px zamiast 760 i sasiad wchodzi na niego.
+                blPut(el, 'box-sizing', 'border-box');
+                blPut(el, 'position', 'fixed');
+                blPut(el, 'left', 'auto');
+                blPut(el, 'transform', 'none');
+                blPut(el, 'right', right + 'px');
+                blPut(el, 'top', top + 'px');
+                blPut(el, 'width', ws[i] + 'px');
+                blPut(el, 'max-width', 'none');
+                blPut(el, 'max-height', Math.max(200, window.innerHeight - top - 12) + 'px');
+                blPut(el, 'overflow-y', 'auto');
+                el.classList.add('bl-panel');
+                el.setAttribute('data-bl-mod', defs[i].mod);
+                right += ws[i] + GAP;
+            }
+        }
+
+        // Zamiast MutationObserver — odpytywanie. Obserwator musialby pilnowac, zeby
+        // nie zareagowac na wlasne zapisy stylu, a to przy osmiu panelach i szesciu
+        // sposobach chowania robi sie kruche. Tu przerysowujemy tylko wtedy, gdy
+        // zmieni sie ZBIOR otwartych paneli albo rozmiar okna.
+        function blTick(){
+            try { ensureClosers(); } catch (e){}
+            const openNow = [];
+            BL_DOCK.forEach(function (d){
+                const el = document.querySelector(d.sel);
+                if (el && panelOpen(el)) openNow.push(d.sel);
+            });
+            blOrder = blOrder.filter(function (sel){ return openNow.indexOf(sel) >= 0; });
+            openNow.forEach(function (sel){ if (blOrder.indexOf(sel) < 0) blOrder.push(sel); });
+            const key = blOrder.join('|') + '@' + window.innerWidth + 'x' + window.innerHeight
+                      + '@' + blTop();
+            if (key === blKey) return;
+            blKey = key;
+            blApply();
+        }
+        setInterval(blTick, 250);
+        window.addEventListener('resize', blTick);
 
         function svgIco(p){ return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#FF2F00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + p + '</svg>'; }
         const LAUNCH_TOOLS = [
@@ -24446,11 +24622,24 @@
             { sel: '#ilp-ov',           needX: false },
             { sel: '#chinskie-wprow',   needX: false },
             { sel: '#chinskie-sprawdz', needX: false },
+            { sel: '#exp-panel',        needX: false },
         ];
         function panelOpen(el) {
             if (!el) return false;
             if (el.style && el.style.display === 'none') return false;
             try { return getComputedStyle(el).display !== 'none'; } catch (e) { return true; }
+        }
+        // Nie kazdy panel chowa sie tak samo. Przelicznik kursow i VIES steruja
+        // widocznoscia klasa „open" — ustawienie im display:none gasi je NA STALE,
+        // bo ich wlasny guzik przelacza tylko klase i nie ma jak tego cofnac.
+        function blClose(el) {
+            if (!el) return;
+            if (el.classList && el.classList.contains('open')) {
+                el.classList.remove('open');
+                el.style.removeProperty('display');
+                return;
+            }
+            el.style.display = 'none';
         }
         function ensureClosers() {
             HUB_PANELS.forEach(function (p) {
@@ -24464,7 +24653,7 @@
                 x.textContent = '✕';
                 x.addEventListener('click', function (ev) {
                     ev.preventDefault(); ev.stopPropagation();
-                    el.style.display = 'none';
+                    blClose(el);
                 });
                 w.appendChild(x);
                 el.insertBefore(w, el.firstChild);
@@ -24724,7 +24913,7 @@
                 if (inEditor(e.target)) return;
                 if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
                 const top = topmostOpenPanel();
-                if (top) { top.style.display = 'none'; if (e.preventDefault) e.preventDefault(); }
+                if (top) { blClose(top); if (e.preventDefault) e.preventDefault(); }
             }, true);
             document.addEventListener('click', function (e) {
                 const t = e.target;
