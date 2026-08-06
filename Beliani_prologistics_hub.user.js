@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.08
+// @version      3.09
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17928,7 +17928,11 @@
         const cfg = shCfg();
         if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (⚙ Konta)');
         const r = await shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, action: 'check', rows: list }));
-        return Array.isArray(r.result) ? r.result : [];
+        // Pusta tablica znaczylaby „sprawdzone, nic nie ma" — a to nieprawda, gdy
+        // arkusz w ogole nie odeslal wyniku. Lepiej glosny blad niz falszywe „czysto".
+        if (!Array.isArray(r.result) || r.result.length !== list.length)
+            throw new Error('arkusz nie odesłał wyniku sprawdzenia — najpewniej wdrożone jest starsze Apps Script');
+        return r.result;
     }
     async function shCheckJobs(jobs){
         const list = jobs.map(function (j){
@@ -20843,7 +20847,8 @@
         const ok = [];
         x.rows.forEach(function (r){
             const hit = txt.some(function (t){
-                return t.indexOf(r.id) >= 0 && /zaksięgowan|zaksiegowan|już był|juz byl/i.test(t);
+                return t.indexOf(r.id) >= 0
+                    && /zaksięgowan|zaksiegowan|zaksięg\. na pierwszej|zaksieg\. na pierwszej|już był|juz byl/i.test(t);
             });
             if (hit && ok.indexOf(r.id) < 0) ok.push(r.id);
         });
@@ -21360,10 +21365,22 @@
     // Samego ticketu nie szukamy: robi to modul „Ksiegowanie w tickecie" przez most
     // __TM_TICKET_COMMENT, ta sama droga, ktora dopisuje „Please add solution".
     async function refComment(x, done){
-        const want = x.rows.filter(function (r){
-            return r.note && (!done.length || done.indexOf(r.id) >= 0);
-        });
-        if (!want.length) return;
+        const zOpisem = x.rows.filter(function (r){ return r.note; });
+        // Gdy log ticketa nic nie potwierdzil (done puste), komentujemy wszystko —
+        // przebieg sie zakonczyl, wiec brak potwierdzenia znaczy „nie odczytalem",
+        // a nie „nie poszlo". Gdy potwierdzil CZESC, reszta wypada — i wlasnie to
+        // wypadniecie bylo dotad zupelnie nieme.
+        const want = zOpisem.filter(function (r){ return !done.length || done.indexOf(r.id) >= 0; });
+        if (!zOpisem.length){
+            say('Zwroty zaksięgowane. Opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
+                + '(dziś dostarcza je tylko rozliczenie Wayfaira).', '#666');
+            return;
+        }
+        if (!want.length){
+            say('Zwroty zaksięgowane, ale opisów NIE dopisałem: log modułu „Księgowanie w tickecie" '
+                + 'nie potwierdził żadnej z ' + zOpisem.length + ' pozycji z opisem. Sprawdź te tickety ręcznie.', '#c47f00');
+            return;
+        }
         if (typeof window.__TM_TICKET_COMMENT !== 'function'){
             say('Zwroty zaksięgowane, ale opisów nie dopiszę — moduł „Księgowanie w tickecie" jest wyłączony w launcherze.', '#c47f00');
             return;
@@ -21377,8 +21394,11 @@
                 else bad.push(want[i].id + ': ' + ((r && r.error) || 'nie powiodło się'));
             } catch (e){ bad.push(want[i].id + ': ' + ((e && e.message) || e)); }
         }
+        const pominiete = zOpisem.length - want.length;
         say('Opisy potrąceń: dopisane do ' + ok + ' z ' + want.length + ' ticketów'
-            + (bad.length ? ('. Bez komentarza: ' + bad.join('; ')) : '.'), bad.length ? '#c47f00' : '#0a7a2f');
+            + (bad.length ? ('. Bez komentarza: ' + bad.join('; ')) : '.')
+            + (pominiete ? (' Pominiętych ' + pominiete + ' — log ticketa ich nie potwierdził, dopisz ręcznie.') : ''),
+            (bad.length || pominiete) ? '#c47f00' : '#0a7a2f');
     }
     async function bookRefunds(x){
         const err = ksFill(x);
@@ -21388,7 +21408,12 @@
         ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
         const r = await ksWait(ksBtn());
         ksMirror(null);
-        if (r !== 'ok') return r;
+        if (r !== 'ok'){
+            // Wyjscie w tym miejscu bylo ciche, a wywolujacy pokazuje komunikat tylko
+            // przy pustym wyniku — wiec „przerwane" wygladalo jak „zrobione".
+            say('Przerwane na module „Księgowanie w tickecie" (' + r + '). Nic nie zaksięgowano i opisów nie dopisałem.', '#c47f00');
+            return r;
+        }
         // Zapisujemy, co POTWIERDZIL log ticketa. Gdy nic nie da sie z niego odczytac,
         // a przebieg sie zakonczyl, oznaczamy calosc, ale z adnotacja — lepiej pokazac
         // niepewnosc niz udawac, ze wiemy.
@@ -22335,7 +22360,8 @@
             const fresh = jobList().filter(function (x){ return x.status === 'ready'; });
             if (fresh.length){
                 say('Sprawdzam w arkuszu, czy to już nie zostało zrobione…');
-                try { await shCheckJobs(fresh); } catch (e){ /* arkusz nieustawiony albo niedostepny */ }
+                try { await shCheckJobs(fresh); }
+                catch (e){ problem.push('arkusz: ' + ((e && e.message) || e) + ' — duplikatów NIE sprawdziłem'); }
             }
             b.disabled = false; if (b2) b2.disabled = false;
             render();
