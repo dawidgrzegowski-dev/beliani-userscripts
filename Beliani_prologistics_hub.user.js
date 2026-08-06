@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.11
+// @version      3.12
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24899,6 +24899,886 @@
             + (zapomniane ? (' UWAGA: poprzedni plik (' + zapomniane + ' wierszy) nie został oznaczony i właśnie go zastąpiłem.') : ''),
             (problems.length || expAbort || zapomniane) ? '#c47f00' : '#0a7a2f');
     }
+    // ---------- most dla modulu Salda ----------
+    // Salda potrzebuje TEGO SAMEGO pliku, ktory daje „Uruchom", tylko bez panelu.
+    // Zamiast powtarzac tam kontrakt formularza (19 pol, kolejnosc, zrodla sprzedawcow)
+    // udostepniamy sciezke stad — jedno zrodlo prawdy, jedno miejsce do poprawiania.
+    //
+    // NIC NIE OZNACZA. To dokladnie przelot „szukaj + pobierz plik", urwany zaraz
+    // po odebraniu pliku; guziki oznaczajace nie sa tu w ogole dotykane.
+    window.__TM_EXPORT_FETCH = async function (konta, od, doo, system, postep){
+        if (!Array.isArray(konta) || !konta.length) throw new Error('nie podano kont');
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(od)) || !/^\d{4}-\d{2}-\d{2}$/.test(String(doo)))
+            throw new Error('daty muszą być w formacie RRRR-MM-DD');
+        await expLoadDoc();
+        // „state: 2" to Any — do uzgodnienia z bankiem bierzemy wszystko, niezaleznie
+        // od tego, czy ktos juz to wyeksportowal. „seller-type: all" tak samo.
+        const p = { state: '2', sellerType: 'all', group: '0', users: [], allUsers: true,
+                    dateField: 'payment', range: 'fix', from: String(od), to: String(doo),
+                    country: '', clearing: '0', inv: '', paid: '',
+                    fname: '', minamount: '', maxamount: '',
+                    system: system || 'excel', par: '1' };
+        const out = [];
+        for (let i = 0; i < konta.length; i++){
+            const a = String(konta[i]);
+            const etykieta = expAccLabel(a);
+            if (postep) postep(i, konta.length, etykieta);
+            try {
+                const html = await expPost(expSearchBody(p, a), false);
+                expAssertForm(html);
+                const rows = expRows(html);
+                if (!rows.length){ out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: '' }); continue; }
+                const f = await expPost(expFileBody(p, a, rows), true);
+                if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
+                    throw new Error('zamiast pliku przyszła strona HTML');
+                out.push({ acc: a, nazwa: etykieta, wierszy: rows.length, buf: f.buf, blad: '' });
+            } catch (e){
+                out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: (e && e.message) || String(e) });
+            }
+        }
+        return out;
+    };
+
+
+})();
+    }
+
+    // ===================== Salda =====================
+    // Uzgadnianie tego, co pokazuje operator platnosci, z tym, co siedzi w ksiedze.
+    // Lista „Sprawdzanie" jest otwarta — PayPal jest pierwszy, kolejne dokladamy
+    // do SAL_LISTA bez ruszania reszty modulu.
+    //
+    // Wszystko liczy sie w przegladarce: XLSX z PayPala (ZIP + XML) i XLS z
+    // prologistics (BIFF w uszkodzonym kontenerze OLE2 — kontener omijamy, szukajac
+    // rekordu BOF wprost w bajtach). Zadnej biblioteki z zewnatrz.
+    //
+    // Regula parowania, sprawdzona na lipcu (4792 wiersze) i sierpniu (948):
+    //   WPLATY  po numerze transakcji z kolumny Comment; awaryjnie kwota + data.
+    //           Numer zapisany jako LICZBA odrzucamy: 17 cyfr nie miesci sie w
+    //           precyzji zmiennoprzecinkowej i cyfry sa juz w pliku przeklamane.
+    //   ZWROTY  NIE po numerze — prologistics zapisuje tam numer PIERWOTNEJ wplaty.
+    //           Grupujemy wyplywy po numerze faktury (jeden zwrot potrafi zejsc na
+    //           osiem linii) i parujemy kwota + nazwisko, potem sama kwota.
+    //   Nic nie laczy sie „na sile": tylko przy obustronnej jednoznacznosci.
+    //   Blokady sporne (Hold / Cancellation) wypadaja z obu stron — to nie ruch
+    //   pieniedzy do zaksiegowania, tylko zamrozenie i jego zdjecie.
+    function init_salda() {
+(function () {
+    'use strict';
+    if (!/(^|\.)prologistics\.info$/i.test(location.hostname)) return;
+
+    const SAL_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+        ? ('v' + GM_info.script.version) : '';
+    // Czytniki obu formatow, ktore wchodza do modulu Salda.
+    // Wszystko dzieje sie w przegladarce, bez zadnej biblioteki z zewnatrz.
+
+    // ---------- XLSX (raporty PayPala) ----------
+    // XLSX to ZIP. Katalog centralny czytamy od konca, ale dlugosci pol bierzemy
+    // z naglowka LOKALNEGO — w plikach PayPala potrafia sie roznic.
+    function slUnzip(b) {
+        const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+        let eocd = -1;
+        for (let i = b.length - 22; i >= 0 && i > b.length - 65558; i--)
+            if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+        if (eocd < 0) throw new Error('to nie jest plik XLSX — brak katalogu ZIP');
+        const cnt = dv.getUint16(eocd + 10, true);
+        let off = dv.getUint32(eocd + 16, true);
+        const out = {};
+        for (let i = 0; i < cnt; i++) {
+            if (off + 46 > b.length || dv.getUint32(off, true) !== 0x02014b50) break;
+            const method = dv.getUint16(off + 10, true);
+            const csize = dv.getUint32(off + 20, true);
+            const nlen = dv.getUint16(off + 28, true);
+            const elen = dv.getUint16(off + 30, true);
+            const clen = dv.getUint16(off + 32, true);
+            const lho = dv.getUint32(off + 42, true);
+            const name = new TextDecoder('utf-8').decode(b.subarray(off + 46, off + 46 + nlen));
+            const ln = dv.getUint16(lho + 26, true), le = dv.getUint16(lho + 28, true);
+            out[name] = { method: method, raw: b.subarray(lho + 30 + ln + le, lho + 30 + ln + le + csize) };
+            off += 46 + nlen + elen + clen;
+        }
+        return out;
+    }
+    async function slInflate(raw) {
+        const st = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        return new Uint8Array(await new Response(st).arrayBuffer());
+    }
+    async function slPart(zip, name) {
+        const e = zip[name];
+        if (!e) return '';
+        return new TextDecoder('utf-8').decode(e.method === 0 ? e.raw : await slInflate(e.raw));
+    }
+    function slKol(ref) {                       // "BC12" -> 54
+        let n = 0;
+        for (let i = 0; i < ref.length; i++) {
+            const c = ref.charCodeAt(i);
+            if (c < 65 || c > 90) break;
+            n = n * 26 + (c - 64);
+        }
+        return n - 1;
+    }
+    async function slXlsx(bytes) {
+        const zip = slUnzip(bytes);
+        // teksty wspoldzielone
+        const sst = [];
+        const ss = await slPart(zip, 'xl/sharedStrings.xml');
+        if (ss) {
+            // <si> moze miec kilka <t> (formatowane fragmenty) — sklejamy je
+            const si = ss.split('<si>').slice(1);
+            si.forEach(function (blok) {
+                const czesci = blok.split('</si>')[0].match(/<t[^>]*>([\s\S]*?)<\/t>/g) || [];
+                sst.push(czesci.map(function (t) {
+                    return t.replace(/<[^>]+>/g, '');
+                }).join(''));
+            });
+        }
+        const rozkoduj = function (s) {
+            return String(s).replace(/&#(\d+);/g, function (_, d) { return String.fromCharCode(+d); })
+                .replace(/&#x([0-9a-f]+);/gi, function (_, d) { return String.fromCharCode(parseInt(d, 16)); })
+                .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+                .replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+        };
+        // pierwszy arkusz
+        let nazwa = 'xl/worksheets/sheet1.xml';
+        if (!zip[nazwa]) nazwa = Object.keys(zip).filter(function (k) {
+            return /^xl\/worksheets\/.*\.xml$/.test(k);
+        }).sort()[0];
+        const xml = await slPart(zip, nazwa);
+        const wiersze = [];
+        (xml.match(/<row[\s\S]*?(?:\/>|<\/row>)/g) || []).forEach(function (w) {
+            const nr = Number((w.match(/\sr="(\d+)"/) || [])[1] || 0);
+            const kom = [];
+            (w.match(/<c[\s\S]*?(?:\/>|<\/c>)/g) || []).forEach(function (c) {
+                const ref = (c.match(/\sr="([A-Z]+\d+)"/) || [])[1] || '';
+                const typ = (c.match(/\st="([^"]+)"/) || [])[1] || 'n';
+                const i = ref ? slKol(ref) : kom.length;
+                let v;
+                if (typ === 'inlineStr') {
+                    const t = c.match(/<t[^>]*>([\s\S]*?)<\/t>/g) || [];
+                    v = t.map(function (x) { return x.replace(/<[^>]+>/g, ''); }).join('');
+                } else {
+                    const m = c.match(/<v[^>]*>([\s\S]*?)<\/v>/);
+                    v = m ? m[1] : null;
+                    if (v != null && typ === 's') v = sst[Number(v)];
+                    else if (v != null && typ !== 'str' && typ !== 'e') v = Number(v);
+                }
+                kom[i] = (typeof v === 'string') ? rozkoduj(v) : (v === undefined ? null : v);
+            });
+            wiersze[nr - 1] = kom;
+        });
+        for (let i = 0; i < wiersze.length; i++) if (!wiersze[i]) wiersze[i] = [];
+        return wiersze;
+    }
+
+    // ---------- XLS / BIFF8 (eksport z prologistics) ----------
+    // Kontener OLE2 w tych plikach bywa uszkodzony (xlrd wpuszcza je dopiero
+    // z ignore_workbook_corruption), wiec go nie ruszamy: szukamy rekordu BOF
+    // wprost w bajtach i idziemy strumieniem rekordow. Tak samo robi expXlsRows.
+    function slXls(bytes) {
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        let start = -1;
+        for (let i = 0; i + 4 <= bytes.length; i++) {
+            if (bytes[i] === 0x09 && bytes[i + 1] === 0x08) {
+                const ln = dv.getUint16(i + 2, true);
+                if (ln === 16 || ln === 8 || ln === 6) { start = i; break; }
+            }
+        }
+        if (start < 0) throw new Error('to nie wygląda na plik XLS — nie znalazłem rekordu BOF');
+
+        // 1. przelot: zbieramy rekordy z doklejonymi CONTINUE
+        const rek = [];
+        let p = start;
+        while (p + 4 <= bytes.length) {
+            const id = dv.getUint16(p, true), ln = dv.getUint16(p + 2, true);
+            if (p + 4 + ln > bytes.length) break;
+            if (id === 0x003C && rek.length) rek[rek.length - 1].cont.push([p + 4, ln]);
+            else rek.push({ id: id, off: p + 4, len: ln, cont: [] });
+            p += 4 + ln;
+        }
+
+        // 2. tablica tekstow SST. Trudność siedzi w tym, że napis potrafi przejść
+        //    przez granicę CONTINUE, a za granicą stoi NOWY bajt „szeroki/wąski".
+        //    Sklejenie surowych bajtów bez tego bajtu daje krzaki, dlatego czytamy
+        //    znak po znaku, pilnując, w którym kawałku jesteśmy.
+        const sst = [];
+        const r0 = rek.filter(function (r) { return r.id === 0x00FC; })[0];
+        if (r0) {
+            const kawalki = [[r0.off, r0.len]].concat(r0.cont);
+            let ki = 0, ko = kawalki[0][0], koniec = kawalki[0][0] + kawalki[0][1];
+            const dalej = function () {                 // przejscie do kolejnego kawalka
+                if (ko < koniec) return true;
+                if (ki + 1 >= kawalki.length) return false;
+                ki++; ko = kawalki[ki][0]; koniec = kawalki[ki][0] + kawalki[ki][1];
+                return ko < koniec;
+            };
+            const u8 = function () { const v = bytes[ko]; ko += 1; return v; };
+            const u16 = function () { const v = dv.getUint16(ko, true); ko += 2; return v; };
+            const u32 = function () { const v = dv.getUint32(ko, true); ko += 4; return v; };
+            u32();                                       // laczna liczba napisow
+            const ile = u32();                           // unikalnych
+            for (let i = 0; i < ile && dalej(); i++) {
+                const dl = u16();
+                let flagi = u8(), szeroki = flagi & 1, rich = flagi & 8, far = flagi & 4;
+                let rl = 0, fl = 0;
+                if (rich) rl = u16();
+                if (far) fl = u32();
+                let s = '';
+                for (let j = 0; j < dl; j++) {
+                    if (!dalej()) break;
+                    if (ko >= koniec) break;
+                    if (szeroki) {
+                        if (ko + 2 > koniec) {           // znak rozjechany na granicy
+                            if (!dalej()) break;
+                            szeroki = u8() & 1; j--; continue;
+                        }
+                        s += String.fromCharCode(u16());
+                    } else {
+                        s += String.fromCharCode(u8());
+                    }
+                    if (ko >= koniec && j + 1 < dl) {    // koniec kawalka w srodku napisu
+                        if (!dalej()) break;
+                        szeroki = u8() & 1;
+                    }
+                }
+                if (rich) ko += rl * 4;
+                if (far) ko += fl;
+                sst.push(s);
+            }
+        }
+
+        // 3. komorki
+        const w = [];
+        const daj = function (r, c, v) {
+            if (!w[r]) w[r] = [];
+            w[r][c] = v;
+        };
+        const rk = function (v) {                        // rozpakowanie liczby RK
+            const cale = (v & 2) !== 0, sto = (v & 1) !== 0;
+            let x;
+            if (cale) { x = v >> 2; }
+            else {
+                const b = new ArrayBuffer(8), d = new DataView(b);
+                d.setUint32(4, v & 0xFFFFFFFC, true);
+                x = d.getFloat64(0, true);
+            }
+            return sto ? x / 100 : x;
+        };
+        rek.forEach(function (r) {
+            const o = r.off;
+            if (r.id === 0x00FD && r.len >= 10) {                 // LABELSST
+                daj(dv.getUint16(o, true), dv.getUint16(o + 2, true), sst[dv.getUint32(o + 6, true)]);
+            } else if (r.id === 0x027E && r.len >= 10) {          // RK
+                daj(dv.getUint16(o, true), dv.getUint16(o + 2, true), rk(dv.getUint32(o + 6, true)));
+            } else if (r.id === 0x0203 && r.len >= 14) {          // NUMBER
+                daj(dv.getUint16(o, true), dv.getUint16(o + 2, true), dv.getFloat64(o + 6, true));
+            } else if (r.id === 0x00BD && r.len >= 6) {           // MULRK
+                const wr = dv.getUint16(o, true);
+                let c = dv.getUint16(o + 2, true), q = o + 4;
+                while (q + 6 <= o + r.len - 2) { daj(wr, c++, rk(dv.getUint32(q + 2, true))); q += 6; }
+            } else if (r.id === 0x0204 && r.len >= 8) {           // LABEL
+                const dl = dv.getUint16(o + 6, true), fl = bytes[o + 8];
+                let s = '';
+                for (let i = 0; i < dl; i++)
+                    s += String.fromCharCode((fl & 1) ? dv.getUint16(o + 9 + i * 2, true) : bytes[o + 9 + i]);
+                daj(dv.getUint16(o, true), dv.getUint16(o + 2, true), s);
+            }
+        });
+        for (let i = 0; i < w.length; i++) if (!w[i]) w[i] = [];
+        return w;
+    }
+
+    // Silnik uzgodnienia PayPal <-> prologistics. Czysta logika, bez UI i bez sieci —
+    // wchodzi do modulu Salda w takiej postaci.
+
+    // ---------- normalizacja ----------
+    // Kwoty przychodza w trzech postaciach: liczba (XLS i lipcowy PayPal),
+    // „222,18" (sierpniowy PayPal) i „4.413,42" (kropka = tysiace). Rozpoznajemy
+    // po tym, czy PRZECINEK stoi na koncu jako separator dziesietny.
+    function slKwota(v) {
+        if (v == null || v === '') return null;
+        if (typeof v === 'number') return Math.round(v * 100) / 100;
+        let s = String(v).trim().replace(/ /g, '').replace(/\s/g, '');
+        if (!s) return null;
+        s = /,\d{1,2}$/.test(s) ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+        const x = Number(s);
+        return isFinite(x) ? Math.round(x * 100) / 100 : null;
+    }
+    function slData(v) {
+        if (v == null) return '';
+        const s = String(v);
+        let m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})/);        // PayPal: dd/MM/yyyy
+        if (m) return m[3] + '-' + m[2] + '-' + m[1];
+        m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);              // prologistics: yyyy-MM-dd
+        return m ? m[0] : '';
+    }
+    function slDni(a, b) {
+        if (!a || !b) return 9999;
+        return Math.abs((Date.parse(a + 'T00:00:00Z') - Date.parse(b + 'T00:00:00Z')) / 86400000);
+    }
+    // Tokeny nazwiska. Odrzucamy czlony pospolite — para oparta wylacznie na „GMBH"
+    // nic nie potwierdza. Diakrytyki zdejmujemy, bo prologistics i PayPal zapisuja
+    // je roznie.
+    const SL_STOP = { GMBH: 1, LTD: 1, SARL: 1, BV: 1, NV: 1, LLC: 1, SPZOO: 1, THE: 1,
+                      AND: 1, VAN: 1, VON: 1, DER: 1, DEN: 1, DELLA: 1, DEL: 1 };
+    function slTok(v) {
+        let s = String(v == null ? '' : v).replace(/_x000D_/g, ' ').replace(/ß/g, 'ss');
+        s = s.normalize('NFKD').replace(/[̀-ͯ]/g, '');
+        const out = {};
+        s.replace(/[^A-Za-z]+/g, ' ').toUpperCase().split(' ').forEach(function (t) {
+            if (t.length >= 3 && !SL_STOP[t]) out[t] = 1;
+        });
+        return Object.keys(out);
+    }
+    function slWspolne(a, b) {
+        for (let i = 0; i < a.length; i++) if (b.indexOf(a[i]) >= 0) return true;
+        return false;
+    }
+    // Numer transakcji z komentarza. LICZBY ODRZUCAMY: 17-cyfrowa wartosc nie miesci
+    // sie w precyzji zmiennoprzecinkowej, wiec jej cyfry sa juz w pliku przeklamane
+    // (lipiec, wiersze 63 i 521). Lepiej „nie wiem" niz zmyslony numer.
+    const SL_BEZPIECZNA = 9007199254740992;      // 2^53
+    function slTxId(kom) {
+        if (typeof kom === 'number')
+            return { id: '', liczba: Math.abs(kom) >= SL_BEZPIECZNA };
+        const m = String(kom == null ? '' : kom).match(/\b([A-Z0-9]{17})\b/);
+        return { id: m ? m[1] : '', liczba: false };
+    }
+
+    // ---------- wczytanie stron ----------
+    const SL_ZWROTY = { 'Payment Refund': 1, 'Payment Reversal': 1, 'Chargeback': 1 };
+    function slCzytajPP(wiersze) {
+        const hi = wiersze.findIndex(function (r) { return r && String(r[1] || '').trim() === 'Type'; });
+        if (hi < 0) throw new Error('to nie wygląda na raport PayPala — nie znalazłem nagłówka „Type”');
+        const okres = String((wiersze[5] || [])[0] || '');
+        const out = [];
+        for (let i = hi + 1; i < wiersze.length; i++) {
+            const r = wiersze[i] || [];
+            const typ = String(r[1] == null ? '' : r[1]).trim();
+            const id = String(r[2] == null ? '' : r[2]).trim();
+            if (!typ || !/^[A-Z0-9]{17}$/.test(id)) continue;     // stopka PayPal Inc. odpada tu
+            out.push({ data: slData(r[0]), typ: typ, id: id, tok: slTok(r[3]),
+                       kw: slKwota(r[5]), fee: slKwota(r[7]) });
+        }
+        return { okres: okres, poz: out };
+    }
+    function slCzytajPL(wiersze) {
+        const h = (wiersze[0] || []).map(function (x) { return String(x == null ? '' : x).trim(); });
+        const K = {};
+        ['Payment Date', 'Amount', 'Comment', 'Debit', 'Credit', 'Name', 'Invoice Number']
+            .forEach(function (k) { K[k] = h.indexOf(k); });
+        if (K['Amount'] < 0 || K['Debit'] < 0 || K['Comment'] < 0)
+            throw new Error('to nie wygląda na eksport płatności — brak kolumn Amount/Debit/Comment');
+        const we = [], wy = [];
+        for (let i = 1; i < wiersze.length; i++) {
+            const r = wiersze[i] || [];
+            if (!r.length) continue;
+            const kw = slKwota(r[K['Amount']]);
+            if (kw == null) continue;
+            const t = slTxId(r[K['Comment']]);
+            const rec = { w: i + 1, data: slData(r[K['Payment Date']]), kw: kw, id: t.id,
+                          podejrzanyId: t.liczba, tok: slTok(r[K['Name']]),
+                          fv: String(r[K['Invoice Number']] == null ? '' : r[K['Invoice Number']]).replace(/\.0$/, ''),
+                          deb: String(r[K['Debit']] == null ? '' : r[K['Debit']]).replace(/\.0$/, '') };
+            (/^13/.test(rec.deb) ? we : wy).push(rec);
+        }
+        return { we: we, wy: wy };
+    }
+
+    // ---------- parowanie z obustronna jednoznacznoscia ----------
+    // Zachlanne „bierz pierwszego kandydata" potrafi sparowac zla pozycje i nikt
+    // tego nie zauwazy. Laczymy WYLACZNIE wtedy, gdy A ma dokladnie jednego
+    // kandydata i ten kandydat ma dokladnie jednego pretendenta. Powtarzamy do
+    // punktu stalego, bo kazde polaczenie zwalnia pole innym.
+    function slParuj(A, B, warunek) {
+        const pary = [];
+        const wolA = A.map(function (_, i) { return i; });
+        const wolB = B.map(function (_, i) { return i; });
+        for (;;) {
+            let ruch = false;
+            for (let ai = 0; ai < wolA.length; ai++) {
+                const a = wolA[ai];
+                if (a < 0) continue;
+                const kand = wolB.filter(function (b) { return b >= 0 && warunek(A[a], B[b]); });
+                if (kand.length !== 1) continue;
+                const b = kand[0];
+                const pret = wolA.filter(function (x) { return x >= 0 && warunek(A[x], B[b]); });
+                if (pret.length !== 1) continue;
+                pary.push([a, b]);
+                wolA[ai] = -1;
+                wolB[wolB.indexOf(b)] = -1;
+                ruch = true;
+            }
+            if (!ruch) break;
+        }
+        return { pary: pary,
+                 wolA: wolA.filter(function (x) { return x >= 0; }),
+                 wolB: wolB.filter(function (x) { return x >= 0; }) };
+    }
+
+    // ---------- uzgodnienie ----------
+    function slUzgodnij(pp, disputy, pl) {
+        const wszystkie = pp.poz.concat(disputy ? disputy.poz : []);
+        // Blokady („Hold on Balance…" i „Cancellation of Hold…") NIE sa ruchem pieniedzy
+        // do zaksiegowania — to zamrozenie i jego zdjecie. Musza wypasc z obu stron
+        // uzgodnienia, zanim cokolwiek policzymy. Bez tego zdjecia blokad wchodza
+        // do wplat i psuja calosc: w lipcu bylo to 48 pozycji na 14 458.46.
+        const blok = wszystkie.filter(function (x) { return /hold/i.test(x.typ); });
+        const ruch = wszystkie.filter(function (x) { return !/hold/i.test(x.typ); });
+        // Dalej o kierunku decyduje ZNAK, nie nazwa: gdy PayPal doda nowy typ wplaty,
+        // ma wpasc do wlasciwej strony, a nie wypasc z zestawienia po cichu.
+        const wpl = ruch.filter(function (x) { return x.kw > 0 && !SL_ZWROTY[x.typ]; });
+        const zwr = ruch.filter(function (x) { return x.kw < 0 && SL_ZWROTY[x.typ]; });
+        const jedn = ruch.filter(function (x) { return x.kw > 0 && SL_ZWROTY[x.typ]; });
+        // Cokolwiek nie wpadlo do zadnego kubelka, ma byc WIDOCZNE, a nie pominiete.
+        const nieznane = ruch.filter(function (x) {
+            return wpl.indexOf(x) < 0 && zwr.indexOf(x) < 0 && jedn.indexOf(x) < 0;
+        });
+
+        // --- WPŁATY: numer transakcji, potem awaryjnie kwota + data ---
+        const mapaPL = {};
+        pl.we.forEach(function (r) { if (r.id) (mapaPL[r.id] = mapaPL[r.id] || []).push(r); });
+        const wplPary = [], wplRozjazd = [], wplDubel = [];
+        const wplWolne = [], plWolne = pl.we.filter(function (r) { return !r.id; });
+        wpl.forEach(function (p) {
+            const g = mapaPL[p.id];
+            if (!g) { wplWolne.push(p); return; }
+            const suma = Math.round(g.reduce(function (s, r) { return s + r.kw; }, 0) * 100) / 100;
+            if (g.length > 1) wplDubel.push({ id: p.id, wiersze: g.map(function (r) { return r.w; }), pp: p.kw, pl: suma });
+            if (Math.abs(p.kw - suma) > 0.005) wplRozjazd.push({ id: p.id, pp: p.kw, pl: suma });
+            wplPary.push({ pp: p, pl: g, jak: 'numer transakcji' });
+        });
+        const plBezPary = [];
+        Object.keys(mapaPL).forEach(function (id) {
+            if (!wpl.some(function (p) { return p.id === id; })) mapaPL[id].forEach(function (r) { plBezPary.push(r); });
+        });
+        const w2 = slParuj(wplWolne, plWolne, function (a, b) {
+            return Math.abs(a.kw - b.kw) < 0.005 && a.data === b.data;
+        });
+        w2.pary.forEach(function (p) { wplPary.push({ pp: wplWolne[p[0]], pl: [plWolne[p[1]]], jak: 'kwota i data (brak numeru w źródle)' }); });
+
+        // --- ZWROTY: grupujemy wypływy po numerze faktury ---
+        // Jeden zwrot PayPala prologistics rozbija na kilka linii ksiegowych —
+        // sprawdzone: w lipcu az na osiem. Parowanie linia do linii z zalozenia
+        // nie moze sie udac.
+        const grupy = {};
+        pl.wy.forEach(function (r) {
+            const k = r.fv || ('w' + r.w);
+            (grupy[k] = grupy[k] || { fv: k, kw: 0, tok: [], linie: [], data: r.data, deb: r.deb }).linie.push(r);
+        });
+        const G = Object.keys(grupy).map(function (k) {
+            const g = grupy[k];
+            g.kw = Math.round(g.linie.reduce(function (s, r) { return s + r.kw; }, 0) * 100) / 100;
+            const t = {};
+            g.linie.forEach(function (r) { r.tok.forEach(function (x) { t[x] = 1; }); });
+            g.tok = Object.keys(t);
+            g.niespojna = g.linie.some(function (r) { return r.data !== g.linie[0].data || r.deb !== g.linie[0].deb; });
+            return g;
+        });
+        const Z = zwr.map(function (x) { return { src: x, kw: Math.abs(x.kw), tok: x.tok, data: x.data }; });
+        const p1 = slParuj(Z, G, function (a, b) {
+            return Math.abs(a.kw - b.kw) < 0.005 && !b.niespojna && slWspolne(a.tok, b.tok);
+        });
+        const Z2 = p1.wolA.map(function (i) { return Z[i]; });
+        const G2 = p1.wolB.map(function (i) { return G[i]; });
+        const p2 = slParuj(Z2, G2, function (a, b) {
+            return Math.abs(a.kw - b.kw) < 0.005 && !b.niespojna;
+        });
+        const zwrPary = p1.pary.map(function (p) { return { pp: Z[p[0]], pl: G[p[1]], jak: 'kwota i nazwisko' }; })
+            .concat(p2.pary.map(function (p) { return { pp: Z2[p[0]], pl: G2[p[1]], jak: 'sama kwota — bez potwierdzenia nazwiskiem' }; }));
+
+        const suma = function (a, f) { return Math.round(a.reduce(function (s, x) { return s + f(x); }, 0) * 100) / 100; };
+        return {
+            okres: pp.okres,
+            wplaty: {
+                pp: wpl.length, pl: pl.we.length, pary: wplPary.length,
+                rozjazd: wplRozjazd, dubel: wplDubel,
+                bezParyPP: wplWolne.filter(function (_, i) { return w2.wolA.indexOf(i) >= 0; }),
+                bezParyPL: plBezPary.concat(w2.wolB.map(function (i) { return plWolne[i]; })),
+                sumaPP: suma(wpl, function (x) { return x.kw; }),
+                sumaPL: suma(pl.we, function (x) { return x.kw; })
+            },
+            zwroty: {
+                pp: Z.length, plLinie: pl.wy.length, plGrupy: G.length, pary: zwrPary.length,
+                poNazwisku: p1.pary.length, poKwocie: p2.pary.length,
+                niespojne: G.filter(function (g) { return g.niespojna; }).length,
+                bezParyPP: p2.wolA.map(function (i) { return Z2[i]; }),
+                bezParyPL: p2.wolB.map(function (i) { return G2[i]; }),
+                sumaPP: suma(Z, function (x) { return x.kw; }),
+                sumaPL: suma(G, function (x) { return x.kw; })
+            },
+            jednorazowe: { n: jedn.length, suma: suma(jedn, function (x) { return x.kw; }), poz: jedn },
+            blokady: { n: blok.length, suma: suma(blok, function (x) { return x.kw; }) },
+            nieznane: { n: nieznane.length, suma: suma(nieznane, function (x) { return x.kw; }),
+                        typy: nieznane.map(function (x) { return x.typ; })
+                            .filter(function (v, i, a) { return a.indexOf(v) === i; }) },
+            prowizja: suma(pp.poz, function (x) { return x.fee || 0; }),
+            podejrzaneId: pl.we.concat(pl.wy).filter(function (r) { return r.podejrzanyId; })
+        };
+    }
+
+    // ---------- lista Sprawdzania ----------
+    // Kazda pozycja to osobne uzgodnienie. PayPal jest pierwszy; kolejne dokladamy
+    // tutaj, bez ruszania reszty modulu.
+    const SAL_LISTA = [
+        { id: 'paypal', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
+        { id: 'saferpay', nazwa: 'Saferpay ↔ Export payments', opis: 'jeszcze nie zrobione', gotowe: false },
+        { id: 'bank', nazwa: 'Wyciąg bankowy ↔ konto', opis: 'jeszcze nie zrobione', gotowe: false }
+    ];
+    // Konta PayPal, ktore uzgadniamy. Numery sa stale, ale ETYKIETY czytamy z zywego
+    // export.php — dzieki temu zmiana nazwy konta w prologistics widac tu od razu,
+    // a nie dopiero po poprawieniu skryptu.
+    const SAL_PP = ['1029', '1155', '1158', '1273', '1274', '1301', '1333', '1339', '1340', '1342', '1532'];
+    const SAL_KEY = 'salda_ust';
+    function salUst(){
+        let o = null;
+        try { o = JSON.parse(GM_getValue(SAL_KEY, 'null')); } catch (e){}
+        if (!o || typeof o !== 'object') o = {};
+        if (!Array.isArray(o.konta) || !o.konta.length) o.konta = SAL_PP.slice();
+        if (!o.od || !o.do){
+            const n = new Date();
+            const a = new Date(n.getFullYear(), n.getMonth() - 1, 1);
+            const b = new Date(n.getFullYear(), n.getMonth(), 0);
+            o.od = salIso(a); o.do = salIso(b);
+        }
+        return o;
+    }
+    function salZapisz(o){ try { GM_setValue(SAL_KEY, JSON.stringify(o)); } catch (e){} }
+    function salIso(d){
+        return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+    }
+    function salEsc(s){
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function salPln(n){
+        const a = Math.abs(Number(n) || 0).toFixed(2).split('.');
+        return (Number(n) < 0 ? '−' : '') + a[0].replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + ',' + a[1];
+    }
+
+    // Etykiety kont z export.php. Gdy strona jest nieosiagalna, zostaja same numery —
+    // moduł ma dzialac takze wtedy, tylko mniej czytelnie.
+    let SAL_ETYK = null;
+    async function salEtykiety(){
+        if (SAL_ETYK) return SAL_ETYK;
+        SAL_ETYK = {};
+        try {
+            const r = await fetch('/export.php', { credentials: 'same-origin' });
+            if (r.ok){
+                const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+                doc.querySelectorAll('select[name="account"] option').forEach(function (o){
+                    if (o.value) SAL_ETYK[o.value] = (o.textContent || '').replace(/\s+/g, ' ').trim();
+                });
+            }
+        } catch (e){}
+        return SAL_ETYK;
+    }
+    // Stan aktywnosci konta zna accounts.php (kolumna Active/Inactive) i modul
+    // marketplace juz go tam czyta i zapisuje. Korzystamy z jego zapasu, zeby nie
+    // ciagnac tej strony drugi raz. Brak wpisu = nie wiemy, i tak to mowimy.
+    function salAktywne(){
+        try {
+            const l = JSON.parse(GM_getValue('mkt_accounts', '[]')) || [];
+            const m = {};
+            l.forEach(function (x){ m[String(x.n)] = !!x.on; });
+            return m;
+        } catch (e){ return {}; }
+    }
+
+    let SAL_PLIKI = { pp: [], di: [] };     // wczytane raporty PayPala
+    let SAL_EXP = null;                     // pobrane zestawienia z prologistics
+    let SAL_WYNIK = null;
+
+    function salPanel(){
+        let el = document.getElementById('sal-panel');
+        if (el) return el;
+        el = document.createElement('div');
+        el.id = 'sal-panel';
+        el.className = 'bl-panel';
+        el.style.cssText = 'position:fixed;right:16px;top:64px;width:780px;max-height:86vh;overflow-y:auto;'
+            + 'background:#fff;border:1px solid #DBD9D7;border-radius:12px;box-shadow:0 10px 30px rgba(51,37,36,.20);'
+            + 'z-index:2147483000;padding:12px;font-size:12px;display:none;box-sizing:border-box';
+        document.body.appendChild(el);
+        return el;
+    }
+    function salSay(t, c){
+        const s = document.getElementById('sal-status');
+        if (s){ s.textContent = t || ''; s.style.color = c || '#666'; }
+    }
+
+    function salRysujListe(){
+        const p = salPanel();
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda <span style="font-weight:400;font-size:11px;opacity:.6">'
+            + salEsc(SAL_VER) + ' · sprawdzanie</span></div>'
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888;line-height:1">×</button></div>'
+            + '<div style="color:#555;margin-bottom:8px">Wybierz, co sprawdzamy.</div>'
+            + SAL_LISTA.map(function (x){
+                return '<div class="sal-poz" data-id="' + salEsc(x.id) + '" style="border:1px solid '
+                    + (x.gotowe ? '#DBD9D7' : '#eee') + ';border-radius:8px;padding:8px 10px;margin-bottom:6px;'
+                    + 'cursor:' + (x.gotowe ? 'pointer' : 'default') + ';background:' + (x.gotowe ? '#fff' : '#fafafa') + '">'
+                    + '<div style="font-weight:700;color:' + (x.gotowe ? '#333' : '#aaa') + '">' + salEsc(x.nazwa) + '</div>'
+                    + '<div style="font-size:11px;color:#888">' + salEsc(x.opis) + '</div></div>';
+            }).join('')
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-top:6px"></div>';
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelectorAll('.sal-poz').forEach(function (d){
+            const x = SAL_LISTA.filter(function (y){ return y.id === d.getAttribute('data-id'); })[0];
+            if (x && x.gotowe) d.onclick = function (){ salRysujPP(); };
+        });
+    }
+
+    async function salRysujPP(){
+        const p = salPanel(), u = salUst();
+        const et = await salEtykiety(), akt = salAktywne();
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · PayPal ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.do) + '" style="font-size:12px;width:130px"></label>'
+            + '<button id="sal-pobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
+            + '</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Konta PayPal <span style="font-weight:400;color:#888;font-size:11px">'
+            + '— nieaktywne zostawiam na liście: jeśli coś na nich wisi, lepiej to zobaczyć</span></div>'
+            + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px">'
+            + SAL_PP.map(function (n){
+                const on = u.konta.indexOf(n) >= 0;
+                const stan = (n in akt) ? (akt[n] ? '' : ' <span style="color:#c47f00">nieaktywne</span>') : ' <span style="color:#bbb">?</span>';
+                return '<label style="font-size:11px;display:flex;gap:5px;align-items:center">'
+                    + '<input type="checkbox" class="sal-k" value="' + n + '"' + (on ? ' checked' : '') + '>'
+                    + salEsc(et[n] || n) + stan + '</label>';
+            }).join('')
+            + '</div>'
+            + '<div style="margin-top:5px"><button id="sal-all" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">zaznacz wszystkie</button> '
+            + '<button id="sal-none" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">odznacz</button></div>'
+            + '</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Raporty z PayPala</div>'
+            + '<label style="font-size:11px;display:block;margin-bottom:3px">transakcje (można kilka) '
+            + '<input type="file" id="sal-fpp" accept=".xlsx,.XLSX" multiple style="font-size:11px"></label>'
+            + '<label style="font-size:11px;display:block">disputy — opcjonalnie '
+            + '<input type="file" id="sal-fdi" accept=".xlsx,.XLSX" multiple style="font-size:11px"></label>'
+            + '<div id="sal-plikinfo" style="font-size:11px;color:#888;margin-top:4px"></div>'
+            + '</div>'
+
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+            + '<button id="sal-run" style="padding:6px 16px;border:none;border-radius:6px;background:#0f766e;color:#fff;font-weight:700;cursor:pointer">Porównaj</button>'
+            + '<span id="sal-status" style="font-size:11px;color:#666"></span></div>'
+            + '<div id="sal-raport" style="margin-top:10px"></div>';
+
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        const zapiszUst = function (){
+            const o = salUst();
+            o.od = p.querySelector('#sal-od').value;
+            o.do = p.querySelector('#sal-do').value;
+            o.konta = Array.prototype.slice.call(p.querySelectorAll('.sal-k'))
+                .filter(function (c){ return c.checked; }).map(function (c){ return c.value; });
+            salZapisz(o);
+        };
+        p.querySelector('#sal-od').onchange = zapiszUst;
+        p.querySelector('#sal-do').onchange = zapiszUst;
+        p.querySelectorAll('.sal-k').forEach(function (c){ c.onchange = zapiszUst; });
+        p.querySelector('#sal-all').onclick = function (){
+            p.querySelectorAll('.sal-k').forEach(function (c){ c.checked = true; }); zapiszUst();
+        };
+        p.querySelector('#sal-none').onclick = function (){
+            p.querySelectorAll('.sal-k').forEach(function (c){ c.checked = false; }); zapiszUst();
+        };
+        p.querySelector('#sal-fpp').onchange = function (){ salWczytaj(this.files, 'pp'); };
+        p.querySelector('#sal-fdi').onchange = function (){ salWczytaj(this.files, 'di'); };
+        p.querySelector('#sal-pobierz').onclick = function (){ salPobierz(this); };
+        p.querySelector('#sal-run').onclick = function (){ salPorownaj(this); };
+        salPlikInfo();
+    }
+
+    function salPlikInfo(){
+        const d = document.getElementById('sal-plikinfo');
+        if (!d) return;
+        const opis = [];
+        if (SAL_PLIKI.pp.length) opis.push('transakcje: ' + SAL_PLIKI.pp.map(function (x){ return x.nazwa + ' (' + x.poz.length + ')'; }).join(', '));
+        if (SAL_PLIKI.di.length) opis.push('disputy: ' + SAL_PLIKI.di.map(function (x){ return x.nazwa + ' (' + x.poz.length + ')'; }).join(', '));
+        if (SAL_EXP) opis.push('z prologistics: ' + SAL_EXP.we.length + ' wpływów, ' + SAL_EXP.wy.length + ' wypływów');
+        d.innerHTML = opis.length ? salEsc(opis.join(' · ')) : 'nic jeszcze nie wczytane';
+    }
+
+    async function salWczytaj(files, gdzie){
+        SAL_PLIKI[gdzie] = [];
+        for (let i = 0; i < files.length; i++){
+            try {
+                const b = new Uint8Array(await files[i].arrayBuffer());
+                const r = slCzytajPP(await slXlsx(b));
+                SAL_PLIKI[gdzie].push({ nazwa: files[i].name, okres: r.okres, poz: r.poz });
+            } catch (e){
+                salSay('„' + files[i].name + '": ' + ((e && e.message) || e), '#c00');
+            }
+        }
+        salPlikInfo();
+    }
+
+    // Pobranie zestawien idzie mostem z modulu Export payments — ta sama droga,
+    // ktorej uzywa jego wlasny przycisk. Nic nie jest oznaczane jako wyeksportowane.
+    async function salPobierz(b){
+        const p = salPanel();
+        const konta = Array.prototype.slice.call(p.querySelectorAll('.sal-k'))
+            .filter(function (c){ return c.checked; }).map(function (c){ return c.value; });
+        if (!konta.length){ salSay('Nie wybrałeś żadnego konta.', '#c47f00'); return; }
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salSay('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        if (typeof window.__TM_EXPORT_FETCH !== 'function'){
+            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawień.', '#c00');
+            return;
+        }
+        b.disabled = true;
+        try {
+            const wynik = await window.__TM_EXPORT_FETCH(konta, od, doo, 'excel', function (i, n, nazwa){
+                salSay('Pobieram ' + (i + 1) + '/' + n + ' — ' + nazwa + '…', '#666');
+            });
+            const we = [], wy = [];
+            const problemy = [];
+            wynik.forEach(function (x){
+                if (x.blad){ problemy.push(x.nazwa + ': ' + x.blad); return; }
+                if (!x.buf) return;
+                const r = slCzytajPL(slXls(x.buf));
+                r.we.forEach(function (y){ y.konto = x.acc; we.push(y); });
+                r.wy.forEach(function (y){ y.konto = x.acc; wy.push(y); });
+            });
+            SAL_EXP = { we: we, wy: wy };
+            salPlikInfo();
+            salSay('Pobrane: ' + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont.'
+                + (problemy.length ? (' Problemy: ' + problemy.join('; ')) : ''),
+                problemy.length ? '#c47f00' : '#0a7a2f');
+        } catch (e){
+            salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        }
+        b.disabled = false;
+    }
+
+    function salPorownaj(b){
+        if (!SAL_PLIKI.pp.length){ salSay('Wskaż raport transakcji z PayPala.', '#c47f00'); return; }
+        if (!SAL_EXP){ salSay('Najpierw pobierz zestawienie z prologistics albo wskaż plik.', '#c47f00'); return; }
+        b.disabled = true;
+        try {
+            const pp = { okres: SAL_PLIKI.pp[0].okres,
+                         poz: SAL_PLIKI.pp.reduce(function (a, x){ return a.concat(x.poz); }, []) };
+            const di = SAL_PLIKI.di.length
+                ? { okres: SAL_PLIKI.di[0].okres, poz: SAL_PLIKI.di.reduce(function (a, x){ return a.concat(x.poz); }, []) }
+                : null;
+            SAL_WYNIK = slUzgodnij(pp, di, SAL_EXP);
+            salRaport(SAL_WYNIK);
+            salSay('Gotowe.', '#0a7a2f');
+        } catch (e){
+            salSay('Nie policzyłem: ' + ((e && e.message) || e), '#c00');
+        }
+        b.disabled = false;
+    }
+
+    function salRaport(r){
+        const d = document.getElementById('sal-raport');
+        if (!d) return;
+        const roz = function (a, b){ return Math.round((a - b) * 100) / 100; };
+        const kol = function (v){ return Math.abs(v) < 0.005 ? '#0a7a2f' : '#c00'; };
+        const wiersz = function (ety, pp, pl){
+            return '<tr style="border-top:1px solid #f0f0f0"><td style="padding:3px 6px">' + ety + '</td>'
+                + '<td style="padding:3px 6px;text-align:right">' + salPln(pp) + '</td>'
+                + '<td style="padding:3px 6px;text-align:right">' + salPln(pl) + '</td>'
+                + '<td style="padding:3px 6px;text-align:right;font-weight:700;color:' + kol(roz(pp, pl)) + '">'
+                + salPln(roz(pp, pl)) + '</td></tr>';
+        };
+        let h = '<div style="border:1px solid #DBD9D7;border-radius:8px;padding:10px">'
+            + '<div style="font-weight:700;margin-bottom:6px">' + salEsc(r.okres || 'uzgodnienie') + '</div>'
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + '<tr style="color:#888"><td style="padding:3px 6px"></td>'
+            + '<td style="padding:3px 6px;text-align:right">PayPal</td>'
+            + '<td style="padding:3px 6px;text-align:right">prologistics</td>'
+            + '<td style="padding:3px 6px;text-align:right">różnica</td></tr>'
+            + wiersz('wpłaty', r.wplaty.sumaPP, r.wplaty.sumaPL)
+            + wiersz('zwroty', r.zwroty.sumaPP, r.zwroty.sumaPL)
+            + '</table>';
+
+        h += '<div style="margin-top:8px;font-size:11px;color:#444">'
+            + '<b>Wpłaty:</b> ' + r.wplaty.pp + ' w PayPalu, ' + r.wplaty.pl + ' w prologistics, sparowanych '
+            + r.wplaty.pary + '. Bez pary: ' + r.wplaty.bezParyPP.length + ' po stronie PayPala, '
+            + r.wplaty.bezParyPL.length + ' po stronie prologistics.'
+            + '<br><b>Zwroty:</b> ' + r.zwroty.pp + ' w PayPalu; ' + r.zwroty.plLinie + ' linii w prologistics '
+            + 'złożonych w ' + r.zwroty.plGrupy + ' faktur. Sparowanych ' + r.zwroty.pary
+            + ' (nazwiskiem ' + r.zwroty.poNazwisku + ', samą kwotą ' + r.zwroty.poKwocie + ').'
+            + ' Bez pary: ' + r.zwroty.bezParyPP.length + ' / ' + r.zwroty.bezParyPL.length + '.'
+            + '</div>';
+
+        const uwagi = [];
+        if (r.wplaty.dubel.length) uwagi.push({ k: '#c00', t: 'Zaksięgowane dwa razy: '
+            + r.wplaty.dubel.map(function (x){ return x.id + ' (wiersze ' + x.wiersze.join(' i ') + ', ' + salPln(x.pl) + ' zamiast ' + salPln(x.pp) + ')'; }).join('; ') });
+        // Podwojne ksiegowanie JEST rozjazdem kwoty — zglaszamy je raz, jako duplikat.
+        // Dwie czerwone linie o tej samej sprawie kaza czytelnikowi szukac dwoch problemow.
+        const dublID = {};
+        r.wplaty.dubel.forEach(function (x){ dublID[x.id] = 1; });
+        const rozjazdInne = r.wplaty.rozjazd.filter(function (x){ return !dublID[x.id]; });
+        if (rozjazdInne.length) uwagi.push({ k: '#c00', t: 'Rozjazd kwoty przy tym samym numerze: '
+            + rozjazdInne.map(function (x){ return x.id + ' — PayPal ' + salPln(x.pp) + ', prologistics ' + salPln(x.pl); }).join('; ') });
+        if (r.jednorazowe.n) uwagi.push({ k: '#c47f00', t: 'Jednorazowe zwroty dodatnie (Payment Reversal): '
+            + r.jednorazowe.n + ' na ' + salPln(r.jednorazowe.suma) + ' — nie wchodzą do różnicy, sprawdź osobno.' });
+        if (r.blokady.n) uwagi.push({ k: '#666', t: 'Blokady sporne (Hold / Cancellation): ' + r.blokady.n
+            + ' pozycji, saldo ' + salPln(r.blokady.suma) + '. Nie są księgowane, ale przesuwają stan konta PayPal — '
+            + 'o tyle nie zgodzi się saldo z księgą.' });
+        if (r.nieznane.n) uwagi.push({ k: '#c00', t: 'Typy, których nie znam: ' + r.nieznane.typy.join(', ')
+            + ' (' + r.nieznane.n + ' poz., ' + salPln(r.nieznane.suma) + '). Nie policzyłem ich po żadnej stronie.' });
+        if (r.zwroty.niespojne) uwagi.push({ k: '#c47f00', t: 'Faktur o niespójnych liniach (różna data albo różne konto): '
+            + r.zwroty.niespojne + ' — wyłączone z parowania, sprawdź ręcznie.' });
+        if (r.podejrzaneId.length) uwagi.push({ k: '#c47f00', t: 'Wiersze z numerem transakcji zapisanym jako liczba: '
+            + r.podejrzaneId.map(function (x){ return x.w; }).join(', ')
+            + ' — cyfry są w pliku przekłamane, numeru nie użyłem.' });
+        if (r.prowizja) uwagi.push({ k: '#666', t: 'Prowizja PayPala w tym okresie: ' + salPln(r.prowizja)
+            + ' — w eksporcie jej nie ma, księgujecie osobno.' });
+
+        if (uwagi.length) h += '<div style="margin-top:8px">' + uwagi.map(function (x){
+            return '<div style="font-size:11px;color:' + x.k + ';margin-top:3px">• ' + salEsc(x.t) + '</div>';
+        }).join('') + '</div>';
+
+        h += '<div style="margin-top:8px"><button id="sal-csv" style="padding:4px 12px;border:1px solid #ccc;'
+            + 'border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz niesparowane (CSV)</button></div></div>';
+        d.innerHTML = h;
+        const c = d.querySelector('#sal-csv');
+        if (c) c.onclick = function (){ salCsv(r); };
+    }
+
+    function salCsv(r){
+        const lin = ['strona;rodzaj;data;numer/faktura;kwota;konto'];
+        r.wplaty.bezParyPP.forEach(function (x){ lin.push('PayPal;wpłata;' + x.data + ';' + x.id + ';' + x.kw + ';'); });
+        r.wplaty.bezParyPL.forEach(function (x){ lin.push('prologistics;wpłata;' + x.data + ';' + (x.id || ('wiersz ' + x.w)) + ';' + x.kw + ';' + (x.konto || '')); });
+        r.zwroty.bezParyPP.forEach(function (x){ lin.push('PayPal;zwrot;' + x.data + ';' + (x.src ? x.src.id : '') + ';' + (-x.kw) + ';'); });
+        r.zwroty.bezParyPL.forEach(function (x){ lin.push('prologistics;zwrot;' + x.data + ';' + x.fv + ';' + (-x.kw) + ';' + (x.linie[0] ? (x.linie[0].konto || '') : '')); });
+        const blob = new Blob(['﻿' + lin.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'salda-paypal-niesparowane.csv';
+        document.body.appendChild(a); a.click();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }
+
+    // ---------- guzik ----------
+    const btn = document.createElement('button');
+    btn.id = 'sal-btn';
+    btn.textContent = '📊 Salda';
+    btn.style.cssText = 'position:fixed;right:16px;top:16px;z-index:2147482999;padding:6px 12px;'
+        + 'border:1px solid #DBD9D7;border-radius:8px;background:#fff;cursor:pointer;font-size:12px;'
+        + 'font-weight:700;color:#750000;display:none';
+    document.body.appendChild(btn);
+    btn.onclick = function (){
+        const p = salPanel();
+        if (p.style.display === 'block'){ p.style.display = 'none'; return; }
+        if (!p.innerHTML) salRysujListe();
+        p.style.display = 'block';
+    };
+
+    // Guzik zostaje schowany — launcher pokazuje go sam, po selektorze #sal-btn,
+    // dokladnie tak jak guziki pozostalych modulow.
 })();
     }
 
@@ -24914,6 +25794,7 @@
         { id: 'allegro',  name: 'Allegro CZ/HU/SK',          test: onAllegro, init: init_allegro },
         { id: 'deposit',  name: 'Chinskie', test: onProlo, init: init_deposit },
         { id: 'export',   name: 'Export payments',           test: onProlo,   init: init_export },
+        { id: 'salda',    name: 'Salda',                     test: onProlo,   init: init_salda },
     ];
 
     MODULES.forEach(function (m) {
@@ -25133,6 +26014,7 @@
             { id:'klient',   icon:svgIco('<circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2"/>'), label:'Zmiana typu klienta', sel:'#klient-btn' },
             { id:'sepa',     icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M9 13h6"/><path d="M9 17h6"/>'), label:'Walidator SEPA', sel:'#sepa-btn' },
             { id:'export',   icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M12 11v6"/><path d="M9.5 14.5l2.5 2.5l2.5 -2.5"/>'), label:'Export payments', sel:'#exp-btn' },
+            { id:'salda',    icon:svgIco('<path d="M3 12m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v7a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z"/><path d="M9 8m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v11a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z"/><path d="M15 4m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v15a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z"/><path d="M4 20h14"/>'), label:'Salda', sel:'#sal-btn' },
             { id:'issuelog', icon:svgIco('<rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><path d="M9 12h.01"/><path d="M13 12h2"/><path d="M9 16h.01"/><path d="M13 16h2"/>'), label:'Issue / PAID', sel:'#ilp-btn' },
             { id:'issuelog', icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Issue — Szukaj', sel:'#ilp-search-btn' },
             { id:'deposit',  icon:svgIco('<path d="M12 3l8 4.5v9l-8 4.5l-8 -4.5v-9z"/><path d="M12 12l8 -4.5"/><path d="M12 12v9"/><path d="M12 12l-8 -4.5"/>'), label:'Chińskie', sel:'#chinskie-btn' },
@@ -25164,6 +26046,7 @@
             { sel: '#chinskie-wprow',   needX: false },
             { sel: '#chinskie-sprawdz', needX: false },
             { sel: '#exp-panel',        needX: false },
+            { sel: '#sal-panel',        needX: false },
         ];
         function panelOpen(el) {
             if (!el) return false;
