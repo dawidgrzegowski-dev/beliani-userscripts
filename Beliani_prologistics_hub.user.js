@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.12
+// @version      3.13
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24931,7 +24931,16 @@
                 const f = await expPost(expFileBody(p, a, rows), true);
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
-                out.push({ acc: a, nazwa: etykieta, wierszy: rows.length, buf: f.buf, blad: '' });
+                // Plik KROTSZY niz lista, ktora poszla w zapytaniu, znaczy, ze serwer
+                // po cichu ucial zadanie (limit pol w formularzu). Uzgodnienie na takim
+                // pliku pokazuje dziesiatki nieistniejacych brakow i wyglada wiarygodnie.
+                // Lepiej oddac blad na tym koncie niz wynik, ktoremu nie mozna ufac.
+                const fr = expFileRows(f);
+                if (fr.n != null && fr.n < rows.length)
+                    throw new Error('plik jest krótszy niż lista: ' + fr.n + ' z ' + rows.length
+                                  + ' wierszy — serwer uciął zapytanie, zawęź zakres dat');
+                out.push({ acc: a, nazwa: etykieta, wierszy: rows.length,
+                           wPliku: fr.n, buf: f.buf, blad: '' });
             } catch (e){
                 out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: (e && e.message) || String(e) });
             }
@@ -25651,9 +25660,18 @@
             });
             SAL_EXP = { we: we, wy: wy };
             salPlikInfo();
-            salSay('Pobrane: ' + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont.'
+            // Kontrola wlasna: ile wierszy zapowiedzial serwer, a ile odczytalismy.
+            // Roznica znaczy, ze plik przyszedl niepelny i uzgodnienie bylo by falszywe.
+            let zapow = 0;
+            wynik.forEach(function (x){ if (!x.blad) zapow += (x.wierszy || 0); });
+            const odczyt = we.length + wy.length;
+            if (zapow && odczyt < zapow)
+                problemy.push('odczytałem ' + odczyt + ' wierszy z zapowiedzianych ' + zapow
+                            + ' — zestawienie jest niepełne, NIE uzgadniaj na nim');
+            salSay('Pobrane: ' + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont'
+                + (zapow ? (' (serwer zapowiedział ' + zapow + ' wierszy)') : '') + '.'
                 + (problemy.length ? (' Problemy: ' + problemy.join('; ')) : ''),
-                problemy.length ? '#c47f00' : '#0a7a2f');
+                problemy.length ? '#c00' : '#0a7a2f');
         } catch (e){
             salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
         }
