@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.06
+// @version      3.08
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17765,7 +17765,9 @@
     // (ten sam mechanizm, ktorym siegamy z prologistics na Mirakla, tylko odwrotnie).
     const PRO_BASE = 'https://www.prologistics.info';
     async function proGet(path, hdrs){
-        if (onProlo()){
+        // onProlo jest tu ZMIENNA (17689), nie funkcja — lokalna nazwa przeslania
+        // globalna funkcje o tej samej nazwie. Nawiasy wywalaly cale pobranie.
+        if (onProlo){
             const r = await fetch(path, { credentials: 'same-origin', headers: hdrs || {} });
             if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + path);
             return await r.text();
@@ -17936,6 +17938,15 @@
         const res = await shCheck(list);
         jobs.forEach(function (j, i){ mkSheet[j.ref] = res[i] || null; });
         return res;
+    }
+    // Czego brakuje, zeby arkusz dzialal. Uzywane wszedzie tam, gdzie zapis albo
+    // sprawdzenie zostaje pominiete — zeby komunikat mowil, co zrobic, a nie tylko
+    // ze sie nie udalo.
+    function shWhy(cfg){
+        if (!cfg.on)     return 'wyłączony ptaszek „Dopisuj do arkusza" w ⚙ Konta';
+        if (!cfg.url)    return 'brak adresu wdrożenia w ⚙ Konta';
+        if (!cfg.secret) return 'brak SECRET-u w ⚙ Konta';
+        return 'arkusz nie odpowiedział';
     }
     async function shPost(rows){
         const cfg = shCfg();
@@ -22589,9 +22600,16 @@
             });
             h += '</table></div>';
         }
+        // Stan guzika bierzemy z ZAPISANEJ flagi, nie z samego licznika: prologistics
+        // po zaksiegowaniu nadal oddaje te wiersze jako OK, wiec licznik nie odroznia
+        // „jest co ksiegowac" od „juz zrobione". Flage czytamy swiezo z dysku, bo
+        // impRender bywa wolany z zamknieciem, ktore pamieta starszy stan zlecenia.
+        const jbNow = jobsLoad()[job.ref] || job;
+        const canBook = ok.length > 0 && !jbNow.booked;
         h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-          +  '<button id="mk-book"' + (ok.length ? '' : ' disabled')
-          +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (ok.length ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (ok.length ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj OK (' + ok.length + ')</button>'
+          +  '<button id="mk-book"' + (canBook ? '' : ' disabled')
+          +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (canBook ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (canBook ? 'pointer' : 'default') + ';font-size:11px">'
+          +  (jbNow.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : ('▶ Zaksięguj OK (' + ok.length + ')')) + '</button>'
           +  '<button id="mk-imp-re" style="padding:5px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">↻ Odśwież</button>'
           +  '<span id="mk-book-msg" style="font-size:11px;color:#666"></span></div>';
         box.style.display = 'block';
@@ -22639,6 +22657,7 @@
                 await impBook(job.impId, ok.map(function (x){ return x.id; }));
                 const jobs = jobsLoad();
                 if (jobs[job.ref]){ jobs[job.ref].booked = true; jobs[job.ref].checked = true; jobsSave(jobs); }
+                await shAfterBook(jobs, job.ref);
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję wynik…';
                 render();
                 await impCheck(job.ref);                 // stan po ksiegowaniu, prosto z systemu
@@ -22647,6 +22666,32 @@
                 bb.disabled = false;
             }
         };
+    }
+
+    // Wiersz do arkusza po ZAKSIEGOWANIU. Dotad lecial tylko przy imporcie, czyli
+    // w chwili, gdy paczka byla jeszcze niezaksiegowana — a ptaszek w ustawieniach
+    // obiecuje „Dopisuj do arkusza po zaksiegowaniu". Powtorzenie jest bezpieczne:
+    // Apps Script deduplikuje po kluczu data+konto+kwota, wiec drugi zapis wraca
+    // z added=false i konczy sie dopiskiem „w arkuszu juz bylo".
+    // Nieudany dopis NIE cofa ksiegowania — trafia do opisu zlecenia, zebys wiedzial,
+    // co dopisac recznie.
+    async function shAfterBook(jobs, ref){
+        const j = jobs[ref];
+        if (!j) return;
+        const cfg = shCfg();
+        if (!(cfg.on && cfg.url && cfg.secret)){
+            j.msg = String(j.msg || '') + ' · ARKUSZ POMINIĘTY: ' + shWhy(cfg) + ' — wiersz dopisz ręcznie';
+            jobsSave(jobs);
+            return;
+        }
+        const c = setLoad()[setKey(j.mp, j.data && j.data.shop)] || {};
+        try {
+            const res = await shPost([shRow(j, c)]);
+            j.msg = String(j.msg || '') + (res.added ? ' · wpisane do arkusza' : ' · w arkuszu już było');
+        } catch (e){
+            j.msg = String(j.msg || '') + ' · ARKUSZ: ' + ((e && e.message) || e) + ' — wiersz dopisz ręcznie';
+        }
+        jobsSave(jobs);
     }
 
     // Zbiorcze ksiegowanie paczek. Kazda paczka jest najpierw ODCZYTYWANA, wiec ksiegujemy
@@ -22692,6 +22737,7 @@
                     jobs[p.j.ref].checked = true;
                     jobs[p.j.ref].msg = String(jobs[p.j.ref].msg || '') + ' · zaksięgowane ' + p.ok.length + ' poz.';
                     jobsSave(jobs);
+                    await shAfterBook(jobs, p.j.ref);
                 }
                 done++;
             } catch (e){ bad.push(p.j.impId + ': ' + ((e && e.message) || e)); }
@@ -22736,8 +22782,12 @@
         }
         // Trzy zapory przed powtorzeniem cudzej pracy — sprawdzane PRZED wyslaniem.
         b.disabled = true; say('Sprawdzam, czy to już nie zostało zrobione…');
-        let dupSheet = [], dupFile = [];
-        try { await shCheckJobs(sel); } catch (e){ say('Arkusz: ' + ((e && e.message) || e) + ' — sprawdzam dalej bez niego.', '#c47f00'); }
+        let dupSheet = [], dupFile = [], shErr = '';
+        // Stare wyniki kasujemy, zeby po nieudanym sprawdzeniu nie zostal na ekranie
+        // wynik z poprzedniego przebiegu — czyli zeby „nie wiem" nie udawalo „czysto".
+        sel.forEach(function (j){ delete mkSheet[j.ref]; });
+        try { await shCheckJobs(sel); }
+        catch (e){ shErr = (e && e.message) || String(e); say('Arkusz: ' + shErr + ' — sprawdzam dalej bez niego.', '#c47f00'); }
         for (let i = 0; i < sel.length; i++){
             const s = mkSheet[sel[i].ref];
             if (s && s.found) dupSheet.push(sel[i]);
@@ -22755,19 +22805,24 @@
             const s = mkSheet[j.ref];
             const df = dupFile.filter(function (x){ return x.j.ref === j.ref; })[0];
             let flag = '';
-            if (s && s.found) flag += '   ⚠ JEST JUŻ W ARKUSZU (wiersz ' + s.row.row + ', ' + s.row.marketplace + ')';
+            if (shErr) flag += '   ⚠ arkusz NIESPRAWDZONY';
+            else if (s && s.found) flag += '   ⚠ JEST JUŻ W ARKUSZU (wiersz ' + s.row.row + ', ' + s.row.marketplace + ')';
             else if (s && s.similar && s.similar.length) flag += '   ⚠ w arkuszu jest podobny wpis: ' + s.similar[0].data + ' ' + s.similar[0].marketplace;
             if (df) flag += df.f.exact
                 ? ('   ⚠ TEN PLIK BYŁ JUŻ IMPORTOWANY (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ')')
                 : ('   ⚠ tego dnia szedł już import z tego sklepu, ale na inną kwotę (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ') — sprawdź');
             return '  • ' + j.data.shop + '  ' + j.date + '  ' + n + ' zam.  ' + f2(j.data.gross) + ' ' + j.cur + '  → konto ' + (c.acct || '?') + ' (bank_setting ' + c.bank + ')' + flag;
         });
-        const warn = (dupSheet.length || dupFile.length)
+        const brakArk = shErr
+            ? ('\n\n⛔ NIE SPRAWDZIŁEM ARKUSZA: ' + shErr
+               + '\nNie wiem więc, czy ktoś już tego nie zaksięgował. Brak ostrzeżeń NIE znaczy, że jest czysto.')
+            : '';
+        const warn = brakArk + ((dupSheet.length || dupFile.length)
             ? ('\n\n⚠ UWAGA: ' + (dupSheet.length ? (dupSheet.length + ' pozycji jest już w arkuszu') : '')
                + (dupSheet.length && dupFile.length ? ', ' : '')
                + (dupFile.length ? (dupFile.length + ' plików było już importowanych') : '')
                + '.\nPrawdopodobnie ktoś to już zaksięgował. Sprawdź, zanim potwierdzisz.')
-            : '';
+            : '');
         if (!confirm('Zaksięgować ' + sel.length + ' zestawień, razem ' + cnt + ' zamówień na ' + f2(tot) + '?\n\n'
             + lines.join('\n') + warn + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
         b.disabled = true;
@@ -22822,6 +22877,12 @@
                     const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
                     cur.msg += res.added ? (' · wpisane do arkusza' + tb) : ' · w arkuszu już było';
                 } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); }
+                jobsSave(jobs);
+            } else {
+                // Bez tej galezi brak SECRET-u wygladal dokladnie tak samo, jak udany
+                // zapis: zielone „Zaksiegowane" i ani slowa o arkuszu. cur.msg zostaje
+                // przy zleceniu na stale, wiec informacja nie znika z ekranem.
+                cur.msg += ' · ARKUSZ POMINIĘTY: ' + shWhy(cfg) + ' — wiersz dopisz ręcznie';
                 jobsSave(jobs);
             }
             return true;
@@ -24705,7 +24766,7 @@
                     problems.push(expAccLabel(a) + ': ' + snaps[i].bad);
                 } else {
                     st[i].note = st[i].fx
-                        ? ('przeliczone, ' + st[i].fx.wyrownanych + ' wyrównanych')
+                        ? ('przeliczone, wyrównanych ' + st[i].fx.wyrownanych + ' z ' + st[i].fx.dokumentow + ' dok.')
                         : 'pobrane';
                 }
             } catch (e){
