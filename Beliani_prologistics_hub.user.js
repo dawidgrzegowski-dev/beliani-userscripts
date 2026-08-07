@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.31
+// @version      3.33
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -14086,11 +14086,33 @@
                 return nos.length ? (ty + ' ' + pcRangeList(nos).join(',')) : ty;
             });
         }
+        // Kod kraju z SWIFT-u. BIC to 4 znaki banku, 2 KRAJU, 2 lokalizacji
+        // i opcjonalnie 3 oddzialu — kraj stoi wiec zawsze na pozycji 5-6.
+        // Bierzemy go stad, a nie z adresu, bo adres bywa wpisany dowolnie.
+        function pcSwiftKraj(sw){
+            var t = String(sw == null ? '' : sw).replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+            return /^[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$/.test(t) ? t.slice(4, 6) : '';
+        }
+        // Czy ta paczka idzie do Indii. Wymagamy ZGODNOSCI wszystkich odczytanych
+        // SWIFT-ow: gdy w grupie sa dwa rozne kraje, cos jest nie tak z danymi
+        // i zostajemy przy „Deposit" — slowo w tytule to nie miejsce na domysly.
+        var PC_ADV_KRAJE = { IN: 1 };
+        function pcAdvance(G){
+            var kraje = {};
+            ((G && G.dep) || []).forEach(function(r){
+                var b = r.pi && r.pi.bank;
+                var k = (b && b.ok) ? pcSwiftKraj(b.swift) : '';
+                if (k) kraje[k] = 1;
+            });
+            var lista = Object.keys(kraje);
+            return lista.length === 1 && !!PC_ADV_KRAJE[lista[0]];
+        }
         function pcBuildTitle(orders, pcts, conts, pens, cfg){
             var sep = cfg.ns ? ',' : ', ';
             var cl = (cfg.cont && conts.length) ? ((cfg.nCont == null) ? conts : conts.slice(0, cfg.nCont)) : [];
             var parts = ['Order ' + pcFormatOrders(orders, cfg.om)];
-            if (cfg.dep && pcts.length) parts.push('Deposit ' + pcts.map(function(x){ return x + '%'; }).join(sep));
+            if (cfg.dep && pcts.length) parts.push((cfg.adv ? 'Advance payment ' : 'Deposit ')
+                + pcts.map(function(x){ return x + '%'; }).join(sep));
             if (cl.length) parts.push(cl.join(sep));
             if (cfg.pen && pens.length) parts.push(pcFormatPens(pens).join(sep));
             return parts.join(sep);
@@ -14099,7 +14121,7 @@
         function pcFitConts(orders, pcts, conts, pens, cfg){
             var best = 0;
             for (var n = 1; n <= conts.length; n++){
-                var c = { om: cfg.om, ns: cfg.ns, dep: cfg.dep, cont: true, pen: cfg.pen, nCont: n };
+                var c = { om: cfg.om, ns: cfg.ns, dep: cfg.dep, cont: true, pen: cfg.pen, nCont: n, adv: cfg.adv };
                 if (pcBuildTitle(orders, pcts, conts, pens, c).length <= PC_TITLE_MAX) best = n; else break;
             }
             return best;
@@ -14111,19 +14133,23 @@
             (G.bal || []).forEach(function(r){ addOrder(r.order); String(r.container || '').split(/[\s,;]+/).forEach(function(tok){ var c = pcContForTitle(tok.replace(/[()]/g, '').trim()); if (c && /[A-Za-z0-9]/.test(c) && conts.indexOf(c) === -1) conts.push(c); }); pcParsePenalties(r.note).forEach(function(v){ if (pens.indexOf(v) === -1) pens.push(v); }); });
             if (!orders.length) return '';
             orders.sort(function(a, b){ var na = parseInt(a, 10), nb = parseInt(b, 10); if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb; return String(a).localeCompare(String(b)); });
+            // „Advance payment" jest o 9 znakow dluzsze niz „Deposit", wiec ustalamy
+            // je PRZED doborem wariantu tytulu — inaczej limit dlugosci liczylby sie
+            // od zlego napisu i tytul moglby wyjsc za dlugi.
+            var adv = pcAdvance(G);
             var cfgs = [
-                { om: 'full', ns: false, dep: true, cont: true, pen: true },
-                { om: 'range', ns: false, dep: true, cont: true, pen: true },
-                { om: 'rangenospace', ns: false, dep: true, cont: true, pen: true },
-                { om: 'rangenospace', ns: true, dep: true, cont: true, pen: true }
+                { om: 'full', ns: false, dep: true, cont: true, pen: true, adv: adv },
+                { om: 'range', ns: false, dep: true, cont: true, pen: true, adv: adv },
+                { om: 'rangenospace', ns: false, dep: true, cont: true, pen: true, adv: adv },
+                { om: 'rangenospace', ns: true, dep: true, cont: true, pen: true, adv: adv }
             ];
             var title = '';
             for (var ci = 0; ci < cfgs.length; ci++){ title = pcBuildTitle(orders, pcts, conts, pens, cfgs[ci]); if (title.length <= PC_TITLE_MAX) return title; }
             // Nie wchodza wszystkie kontenery -> wpisz tyle CALYCH ile sie zmiesci.
             // Wersja bez spacji tylko wtedy, gdy dzieki niej wejdzie WIECEJ kontenerow.
             if (conts.length){
-                var cSp = { om: 'rangenospace', ns: false, dep: true, cont: true, pen: true };
-                var cNs = { om: 'rangenospace', ns: true, dep: true, cont: true, pen: true };
+                var cSp = { om: 'rangenospace', ns: false, dep: true, cont: true, pen: true, adv: adv };
+                var cNs = { om: 'rangenospace', ns: true, dep: true, cont: true, pen: true, adv: adv };
                 var nSp = pcFitConts(orders, pcts, conts, pens, cSp), nNs = pcFitConts(orders, pcts, conts, pens, cNs);
                 if (nSp > 0 || nNs > 0){
                     var use = (nNs > nSp) ? cNs : cSp;
@@ -14132,9 +14158,9 @@
                 }
             }
             var tail = [
-                { om: 'rangenospace', ns: true, dep: true, cont: false, pen: true },
-                { om: 'rangenospace', ns: true, dep: true, cont: false, pen: false },
-                { om: 'rangenospace', ns: true, dep: false, cont: false, pen: false }
+                { om: 'rangenospace', ns: true, dep: true, cont: false, pen: true, adv: adv },
+                { om: 'rangenospace', ns: true, dep: true, cont: false, pen: false, adv: adv },
+                { om: 'rangenospace', ns: true, dep: false, cont: false, pen: false, adv: adv }
             ];
             for (var ti = 0; ti < tail.length; ti++){ title = pcBuildTitle(orders, pcts, conts, pens, tail[ti]); if (title.length <= PC_TITLE_MAX) return title; }
             return title;
@@ -26727,6 +26753,40 @@
             + '<td style="' + TDR + '">' + salPln(w.sumaPL) + '</td>'
             + '<td style="' + TDR + ';font-weight:700;color:' + (zero(d0) ? '#0a7a2f' : '#b45309') + '">'
             + salPln(d0) + '</td></tr></table>'
+
+            // Rozliczenie roznicy. Bez tego raport podaje dwie liczby i zostawia
+            // czytelnika z ich laczeniem — a to wlasnie ta czesc odpowiada na
+            // pytanie „z czego to wynika".
+            + (function (){
+                const s2 = function (a, f){ return Math.round(a.reduce(function (n, x){ return n + (f ? f(x) : x.kw); }, 0) * 100) / 100; };
+                const poz = [];
+                if (r.przeksiegowania.length) poz.push(['przeksięgowania — pieniądze wpłynęły przed zakresem',
+                    -s2(r.przeksiegowania, function (x){ return x.pl.kw; }), r.przeksiegowania.length]);
+                if (w.bezAuf.length) poz.push(['wyciąg: wpłaty bez pary', s2(w.bezAuf), w.bezAuf.length]);
+                if (w.bezPary.length) poz.push(['wyciąg: numer bez odpowiednika', s2(w.bezPary), w.bezPary.length]);
+                if (w.proloBezPary.length) poz.push(['prologistics: brak wpłaty w wyciągu',
+                    -s2(w.proloBezPary), w.proloBezPary.length]);
+                if (w.rozjazd.length) poz.push(['rozbieżności kwot przy zgodnym numerze',
+                    s2(w.rozjazd, function (x){ return x.roznica; }), w.rozjazd.length]);
+                const suma = Math.round(poz.reduce(function (n, x){ return n + x[1]; }, 0) * 100) / 100;
+                const reszta = roz(d0, suma);
+                if (!zero(reszta)) poz.push(['pozostałe, niewyjaśnione', reszta, '']);
+                if (!poz.length) return '';
+                return sek('Rozliczenie różnicy')
+                    + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+                    + '<tr><td style="' + TD + ';font-weight:700">Różnica ogółem</td>'
+                    + '<td style="' + TDR + ';font-weight:700;color:' + (zero(d0) ? '#0a7a2f' : '#b45309') + '">'
+                    + salPln(d0) + '</td><td style="' + TD + '"></td></tr>'
+                    + poz.map(function (x){
+                          return '<tr><td style="' + TD + ';padding-left:18px;color:#555">' + salEsc(x[0]) + '</td>'
+                               + '<td style="' + TDR + ';color:#555">' + salPln(x[1]) + '</td>'
+                               + '<td style="' + TD + ';color:#999">' + (x[2] === '' ? '' : (x[2] + ' poz.')) + '</td></tr>';
+                      }).join('')
+                    + '</table>'
+                    + (zero(reszta)
+                        ? '<div style="font-size:11px;color:#0a7a2f;margin-top:3px">Różnica rozliczona w całości.</div>'
+                        : '');
+              })()
 
             + sek('Pozycje uzgodnione')
             + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
