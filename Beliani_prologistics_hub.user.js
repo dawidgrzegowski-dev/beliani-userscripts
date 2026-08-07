@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.25
+// @version      3.26
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24906,6 +24906,22 @@
     //
     // NIC NIE OZNACZA. To dokladnie przelot „szukaj + pobierz plik", urwany zaraz
     // po odebraniu pliku; guziki oznaczajace nie sa tu w ogole dotykane.
+    // Ograniczenie czasu. fetch bez limitu czeka w nieskonczonosc, wiec milczacy
+    // serwer wygladalby jak wieczna praca. Limit jest hojny, bo zapytanie o komplet
+    // sprzedawcow i faktury usuniete idzie dobra chwile — chodzi tylko o to, zeby
+    // kiedykolwiek sie skonczylo i powiedzialo, na czym stanelo.
+    const EXP_LIMIT_MS = 300000;
+    function expZLimitem(obietnica, opis){
+        let t = null;
+        const zegar = new Promise(function (_, odrzuc){
+            t = setTimeout(function (){
+                odrzuc(new Error(opis + ': brak odpowiedzi przez '
+                               + Math.round(EXP_LIMIT_MS / 1000) + ' s — serwer nie odpowiada, '
+                               + 'spróbuj węższego zakresu dat'));
+            }, EXP_LIMIT_MS);
+        });
+        return Promise.race([obietnica, zegar]).finally(function (){ if (t) clearTimeout(t); });
+    }
     window.__TM_EXPORT_FETCH = async function (konta, od, doo, system, postep){
         if (!Array.isArray(konta) || !konta.length) throw new Error('nie podano kont');
         if (!/^\d{4}-\d{2}-\d{2}$/.test(String(od)) || !/^\d{4}-\d{2}-\d{2}$/.test(String(doo)))
@@ -24939,7 +24955,10 @@
                 // Sprzedawcow WYLICZAMY. Puste pole username[] nie znaczy tu „wszyscy",
                 // tylko „zaden" — zapytanie bez tej listy wraca z zerem wierszy
                 // (sprawdzone na produkcji: 0 wplywow, 0 wyplywow).
-                const rows = expRows(expAssertForm(await expPost(expSearchBody(p, a), false)));
+                const t0 = Date.now();
+                const rows = expRows(expAssertForm(
+                    await expZLimitem(expPost(expSearchBody(p, a), false), 'wyszukiwanie')));
+                const tSzuk = Math.round((Date.now() - t0) / 1000);
                 if (!rows.length){
                     // Zero wierszy bywa prawda (konto bez ruchu), ale bywa tez objawem
                     // zlego zapytania. Odnotowujemy to jawnie, zeby nie wygladalo
@@ -24947,10 +24966,12 @@
                     out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, pusto: true, blad: '' });
                     continue;
                 }
-                krok('znalazłem ' + rows.length + ' poz., pobieram plik');
+                krok('znalazłem ' + rows.length + ' poz. w ' + tSzuk + ' s, pobieram plik');
                 // Eksport idzie po WYBRANYCH WIERSZACH, nie po filtrach — wiec ciala
                 // wyszukiwania tu nie powtarzamy, liczy sie sama lista selected[].
-                const f = await expPost(expFileBody(p, a, rows), true);
+                const t1 = Date.now();
+                const f = await expZLimitem(expPost(expFileBody(p, a, rows), true), 'pobieranie pliku');
+                const tPlik = Math.round((Date.now() - t1) / 1000);
                 krok('plik ' + Math.round(f.buf.length / 1024) + ' kB, sprawdzam długość');
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
@@ -24962,7 +24983,7 @@
                 if (fr.n != null && fr.n < rows.length)
                     throw new Error('plik jest krótszy niż lista: ' + fr.n + ' z ' + rows.length
                                   + ' wierszy — serwer uciął zapytanie, zawęź zakres dat');
-                krok('gotowe, ' + rows.length + ' poz.');
+                krok('gotowe: szukanie ' + tSzuk + ' s, plik ' + tPlik + ' s');
                 out.push({ acc: a, nazwa: etykieta, wierszy: rows.length,
                            wPliku: fr.n, buf: f.buf, blad: '' });
             } catch (e){
