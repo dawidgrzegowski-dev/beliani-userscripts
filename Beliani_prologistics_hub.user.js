@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.21
+// @version      3.23
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25287,6 +25287,18 @@
         const hi = wiersze.findIndex(function (r) { return r && String(r[1] || '').trim() === 'Type'; });
         if (hi < 0) throw new Error('to nie wygląda na raport PayPala — nie znalazłem nagłówka „Type”');
         const okres = String((wiersze[5] || [])[0] || '');
+        // Naglowek niesie walute i skrzynke PayPala. Oba pola sa krytyczne: raport
+        // w funtach porownany z kontem w euro da liczby, ktore wygladaja sensownie
+        // i nie sa niczym. Wyciagamy je i oddajemy wyzej do sprawdzenia.
+        const szukaj = function (re) {
+            for (let i = 0; i < Math.min(10, wiersze.length); i++) {
+                const m = String((wiersze[i] || [])[0] || '').match(re);
+                if (m) return m[1];
+            }
+            return '';
+        };
+        const waluta = szukaj(/Amounts?\s+in\s+([A-Z]{3})/i).toUpperCase();
+        const skrzynka = szukaj(/PayPal\s+account\s*:\s*(\S+)/i);
         const out = [];
         for (let i = hi + 1; i < wiersze.length; i++) {
             const r = wiersze[i] || [];
@@ -25296,11 +25308,17 @@
             out.push({ data: slData(r[0]), typ: typ, id: id, tok: slTok(r[3]),
                        kw: slKwota(r[5]), fee: slKwota(r[7]) });
         }
-        return { okres: okres, poz: out };
+        return { okres: okres, waluta: waluta, skrzynka: skrzynka, poz: out };
     }
     // Kierunek rozpoznajemy po NUMERZE KONTA, ktore uzgadniamy. Regula „Debit zaczyna
     // sie od 13" trzymala sie tylko na 1301 — konto 1274 zaczyna sie od 12 i wszystkie
     // wplywy wpadaly do wyplywow. Konto obciazone = pieniadze weszly na nie.
+    const SL_WAL = ['EUR','GBP','CHF','PLN','NOK','SEK','DKK','HUF','CZK','USD','CAD','RON'];
+    function slWalutaKonta(etykieta) {
+        const t = String(etykieta || '').toUpperCase().split(/[^A-Z]+/);
+        for (let i = 0; i < t.length; i++) if (SL_WAL.indexOf(t[i]) >= 0) return t[i];
+        return '';
+    }
     function slCzytajPL(wiersze, konto) {
         const h = (wiersze[0] || []).map(function (x) { return String(x == null ? '' : x).trim(); });
         const K = {};
@@ -25323,7 +25341,9 @@
             const wplyw = konto ? (rec.deb === String(konto)) : /^1[23]/.test(rec.deb);
             (wplyw ? we : wy).push(rec);
         }
-        return { we: we, wy: wy };
+        // Zero wplywow przy niepustym pliku to prawie zawsze zle rozpoznane konto —
+        // dokladnie ten objaw dal 1274, zanim kierunek liczylismy po numerze konta.
+        return { we: we, wy: wy, wierszy: we.length + wy.length };
     }
 
     // ---------- parowanie z obustronna jednoznacznoscia ----------
@@ -25627,21 +25647,26 @@
             + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
             + '<div style="font-weight:700;margin-bottom:4px">Konta PayPal <span style="font-weight:400;color:#888;font-size:11px">'
             + '— zaznacz kilka z Ctrl albo Shift; nieaktywne zostają na liście</span></div>'
+            // Podswietlenie zaznaczenia w liscie gasnie, gdy lista traci ognisko —
+            // dlatego wybrane pozycje dostaja jeszcze ZNACZNIK w tresci. Sam kolor
+            // to za malo, zeby na pierwszy rzut oka wiedziec, co poleci.
+            + '<style>#sal-konta option{padding:2px 4px}'
+            + '#sal-konta option:checked{background:linear-gradient(#f3e8e8,#f3e8e8);'
+            + 'color:#750000;font-weight:700}</style>'
             + '<select id="sal-konta" multiple size="7" style="width:100%;font-size:11px;padding:3px;'
             + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
             + SAL_PP.map(function (n){
                 const on = u.konta.indexOf(n) >= 0;
-                // Stan aktywnosci dopisujemy do etykiety, bo w <option> nie da sie
-                // wstawic znacznika — a wiedziec, ze konto jest wygaszone, warto.
                 const stan = (n in akt) ? (akt[n] ? '' : '  · nieaktywne') : '  · stan nieznany';
-                return '<option value="' + n + '"' + (on ? ' selected' : '') + '>'
-                    + salEsc(et[n] || n) + salEsc(stan) + '</option>';
+                return '<option value="' + n + '" data-ety="' + salEsc((et[n] || n) + stan) + '"'
+                    + (on ? ' selected' : '') + '></option>';
             }).join('')
             + '</select>'
             + '<div style="margin-top:5px;display:flex;gap:6px;align-items:center">'
             + '<button id="sal-all" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">zaznacz wszystkie</button>'
             + '<button id="sal-none" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">odznacz</button>'
             + '<span id="sal-ile" style="font-size:10px;color:#888"></span></div>'
+            + '<div id="sal-ktore" style="font-size:10px;margin-top:4px;line-height:1.7"></div>'
             + '</div>'
 
             + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
@@ -25666,10 +25691,30 @@
             o.do = p.querySelector('#sal-do').value;
             o.konta = salWybrane(p);
             salZapisz(o);
+            salZnaczniki(p);
             const ile = p.querySelector('#sal-ile');
-            if (ile) ile.textContent = o.konta.length
-                ? ('wybrane: ' + o.konta.length + ' z ' + SAL_PP.length)
-                : 'nie wybrano żadnego konta';
+            if (ile){
+                ile.textContent = o.konta.length
+                    ? ('wybrane: ' + o.konta.length + ' z ' + SAL_PP.length)
+                    : 'nie wybrano żadnego konta';
+                ile.style.color = o.konta.length ? '#750000' : '#c00';
+                ile.style.fontWeight = '700';
+            }
+            // Pod lista wypisujemy WPROST, ktore konta polecą — licznik mowi „ile",
+            // a to mowi „ktore", i tego brakowalo najbardziej.
+            const kt = p.querySelector('#sal-ktore');
+            if (kt){
+                const sel = p.querySelector('#sal-konta');
+                const nazwy = Array.prototype.slice.call(sel.selectedOptions).map(function (x){
+                    return String(x.getAttribute('data-ety') || x.value).split('·')[0].trim();
+                });
+                kt.innerHTML = nazwy.length
+                    ? ('Do pobrania: ' + nazwy.map(function (x){
+                          return '<span style="display:inline-block;background:#f3e8e8;color:#750000;'
+                               + 'border-radius:4px;padding:1px 6px;margin:1px 3px 1px 0">' + salEsc(x) + '</span>';
+                      }).join(''))
+                    : '<span style="color:#c00">Nie wybrano konta — pobieranie nic nie zrobi.</span>';
+            }
         };
         p.querySelector('#sal-od').onchange = zapiszUst;
         p.querySelector('#sal-do').onchange = zapiszUst;
@@ -25688,28 +25733,75 @@
         salPlikInfo();
     }
 
+    // W <option> nie da sie wstawic elementu, wiec znacznik jest czescia tekstu.
+    // Odswiezamy go po kazdej zmianie zaznaczenia.
+    function salZnaczniki(p){
+        const sel = p.querySelector('#sal-konta');
+        if (!sel) return;
+        Array.prototype.slice.call(sel.options).forEach(function (o){
+            const ety = o.getAttribute('data-ety') || o.value;
+            o.textContent = (o.selected ? '●  ' : '○  ') + ety;
+        });
+    }
     function salWybrane(p){
         const sel = p.querySelector('#sal-konta');
         if (!sel) return [];
         return Array.prototype.slice.call(sel.selectedOptions).map(function (o){ return o.value; });
     }
+    // Wczytane zrodla pokazujemy jako liste z krzyzykiem przy kazdym. Bez tego
+    // raz wskazanego pliku nie dalo sie cofnac inaczej niz przeladowaniem strony.
     function salPlikInfo(){
         const d = document.getElementById('sal-plikinfo');
         if (!d) return;
-        const opis = [];
-        if (SAL_PLIKI.pp.length) opis.push('transakcje: ' + SAL_PLIKI.pp.map(function (x){ return x.nazwa + ' (' + x.poz.length + ')'; }).join(', '));
-        if (SAL_PLIKI.di.length) opis.push('disputy: ' + SAL_PLIKI.di.map(function (x){ return x.nazwa + ' (' + x.poz.length + ')'; }).join(', '));
-        if (SAL_EXP) opis.push('z prologistics: ' + SAL_EXP.we.length + ' wpływów, ' + SAL_EXP.wy.length + ' wypływów');
-        d.innerHTML = opis.length ? salEsc(opis.join(' · ')) : 'nic jeszcze nie wczytane';
+        const chip = function (klucz, ety, opis){
+            return '<div style="display:flex;gap:6px;align-items:center;margin-top:2px">'
+                 + '<button class="sal-x" data-k="' + klucz + '" title="usuń" '
+                 + 'style="border:1px solid #ddd;background:#fff;border-radius:4px;width:18px;height:18px;'
+                 + 'line-height:1;cursor:pointer;color:#c00;font-size:12px;padding:0">×</button>'
+                 + '<span><b>' + salEsc(ety) + '</b> ' + salEsc(opis) + '</span></div>';
+        };
+        let h = '';
+        SAL_PLIKI.pp.forEach(function (x, i){
+            h += chip('pp:' + i, x.nazwa, '· ' + x.poz.length + ' poz.'
+                 + (x.waluta ? (' · ' + x.waluta) : '') + (x.skrzynka ? (' · ' + x.skrzynka) : ''));
+        });
+        SAL_PLIKI.di.forEach(function (x, i){
+            h += chip('di:' + i, x.nazwa, '· disputy, ' + x.poz.length + ' poz.');
+        });
+        if (SAL_EXP){
+            const zr = (SAL_EXP.zrodla || []).filter(function (x){ return x.we + x.wy > 0; });
+            h += chip('exp:0', 'zestawienie z prologistics',
+                 '· ' + SAL_EXP.we.length + ' wpływów, ' + SAL_EXP.wy.length + ' wypływów'
+                 + (zr.length ? (' · konta ' + zr.map(function (x){ return x.acc; }).join(', ')) : ''));
+        }
+        d.innerHTML = h || '<span style="color:#888">nic jeszcze nie wczytane</span>';
+        d.querySelectorAll('.sal-x').forEach(function (btn){
+            btn.onclick = function (){
+                const k = this.getAttribute('data-k').split(':');
+                if (k[0] === 'exp') SAL_EXP = null;
+                else SAL_PLIKI[k[0]].splice(Number(k[1]), 1);
+                // Pole wyboru pliku trzeba wyczyscic, inaczej wskazanie TEGO SAMEGO
+                // pliku drugi raz nie wywola zadnego zdarzenia i nic sie nie stanie.
+                const pole = document.getElementById(k[0] === 'di' ? 'sal-fdi' : 'sal-fpp');
+                if (pole && k[0] !== 'exp' && !SAL_PLIKI[k[0]].length) pole.value = '';
+                SAL_WYNIK = null;
+                const rap = document.getElementById('sal-raport');
+                if (rap) rap.innerHTML = '';
+                salPlikInfo();
+                salSay('Usunięte.', '#666');
+            };
+        });
     }
 
     async function salWczytaj(files, gdzie){
-        SAL_PLIKI[gdzie] = [];
         for (let i = 0; i < files.length; i++){
+            // Ten sam plik dwa razy to prawie zawsze pomylka, nie zamiar.
+            if (SAL_PLIKI[gdzie].some(function (x){ return x.nazwa === files[i].name; })) continue;
             try {
                 const b = new Uint8Array(await files[i].arrayBuffer());
                 const r = slCzytajPP(await slXlsx(b));
-                SAL_PLIKI[gdzie].push({ nazwa: files[i].name, okres: r.okres, poz: r.poz });
+                SAL_PLIKI[gdzie].push({ nazwa: files[i].name, okres: r.okres, poz: r.poz,
+                                        waluta: r.waluta, skrzynka: r.skrzynka });
             } catch (e){
                 salSay('„' + files[i].name + '": ' + ((e && e.message) || e), '#c00');
             }
@@ -25743,16 +25835,24 @@
                 ostatni = 'Pobieram ' + (i + 1) + '/' + n + ' — ' + nazwa + (etap ? (' · ' + etap) : '');
                 salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
             });
-            const we = [], wy = [];
+            const we = [], wy = [], zrodla = [];
             const problemy = [];
             wynik.forEach(function (x){
                 if (x.blad){ problemy.push(x.nazwa + ': ' + x.blad); return; }
                 if (!x.buf) return;
                 const r = slCzytajPL(slXls(x.buf), x.acc);
+                zrodla.push({ acc: x.acc, nazwa: x.nazwa, waluta: slWalutaKonta(x.nazwa),
+                              we: r.we.length, wy: r.wy.length });
+                // Wiersze sa, ale zaden nie trafil na stronę wplywow — to znaczy,
+                // ze numer konta nie zgadza sie z kolumna Debit. Cicho przepuszczony
+                // daje zerowe wplaty i uzgodnienie bez sensu.
+                if (r.wierszy && !r.we.length)
+                    problemy.push(x.nazwa + ': żaden z ' + r.wierszy
+                                + ' wierszy nie jest wpływem na to konto — sprawdź numer konta');
                 r.we.forEach(function (y){ y.konto = x.acc; we.push(y); });
                 r.wy.forEach(function (y){ y.konto = x.acc; wy.push(y); });
             });
-            SAL_EXP = { we: we, wy: wy };
+            SAL_EXP = { we: we, wy: wy, zrodla: zrodla };
             salPlikInfo();
             // Kontrola wlasna: ile wierszy zapowiedzial serwer, a ile odczytalismy.
             // Roznica znaczy, ze plik przyszedl niepelny i uzgodnienie bylo by falszywe.
@@ -25794,6 +25894,33 @@
     function salPorownaj(b){
         if (!SAL_PLIKI.pp.length){ salSay('Wskaż raport transakcji z PayPala.', '#c47f00'); return; }
         if (!SAL_EXP){ salSay('Najpierw pobierz zestawienie z prologistics albo wskaż plik.', '#c47f00'); return; }
+        // Zapora walutowa. Raport PayPala dotyczy JEDNEJ skrzynki i JEDNEJ waluty,
+        // a lista kont pozwala zaznaczyc jedenascie. Porownanie funtow z frankami
+        // wypisze liczby, ktore wygladaja sensownie i nie znacza nic — wiec zamiast
+        // liczyc, mowimy, co sie nie zgadza.
+        const walPP = SAL_PLIKI.pp.map(function (x){ return x.waluta; })
+            .filter(function (v, i, a){ return v && a.indexOf(v) === i; });
+        const zr = (SAL_EXP && SAL_EXP.zrodla) ? SAL_EXP.zrodla.filter(function (x){ return x.we + x.wy > 0; }) : [];
+        const walPL = zr.map(function (x){ return x.waluta; })
+            .filter(function (v, i, a){ return v && a.indexOf(v) === i; });
+        if (walPP.length > 1){
+            salSay('Wgrane raporty są w różnych walutach (' + walPP.join(', ')
+                 + '). Uzgadniaj jedną walutę naraz.', '#c00');
+            return;
+        }
+        if (walPP.length && walPL.length && walPL.join() !== walPP.join()){
+            salSay('Raport PayPala jest w ' + walPP[0] + ', a pobrane konta w '
+                 + walPL.join(', ') + ' (' + zr.map(function (x){ return x.acc; }).join(', ')
+                 + '). Nie porównuję — wybierz konto zgodne z raportem.', '#c00');
+            return;
+        }
+        if (zr.length > 1){
+            salSay('Pobrano ' + zr.length + ' kont (' + zr.map(function (x){ return x.acc; }).join(', ')
+                 + '), a raport PayPala dotyczy jednej skrzynki'
+                 + (SAL_PLIKI.pp[0].skrzynka ? (' — ' + SAL_PLIKI.pp[0].skrzynka) : '')
+                 + '. Zostaw jedno konto.', '#c00');
+            return;
+        }
         b.disabled = true;
         try {
             const pp = { okres: SAL_PLIKI.pp[0].okres,
