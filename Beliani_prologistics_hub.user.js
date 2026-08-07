@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.33
+// @version      3.35
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -16620,9 +16620,19 @@
         }
         function getXLSX(){ try { if (typeof XLSX !== 'undefined') return XLSX; } catch(e){} try { if (window.XLSX) return window.XLSX; } catch(e){} try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX) return unsafeWindow.XLSX; } catch(e){} return null; }
         function isAccLbl(x){ return /(?:a\/?c|acc(?:ount)?)\s*(?:no\b|num)/i.test(String(x == null ? '' : x)); }
+        // Dopisek w nawiasie przy numerze konta: „(for USD CURRENCY)", „(USD account)",
+        // „（USD）". Odcinamy go PRZED liczeniem liter — inaczej komentarz dostawcy
+        // dyskwalifikuje poprawny numer, a z nim caly blok bankowy.
+        // Odcinamy WYLACZNIE nawiasy: tekst bez nawiasow zostaje i dalej podlega
+        // kontroli, zeby adres nadal nie mial szans trafic do pola konta.
+        function piAccBezUwagi(v){
+            return String(v == null ? '' : v)
+                .replace(/[（(][^)）]*[)）]/g, ' ')
+                .replace(/\s+/g, ' ').trim();
+        }
         function isCleanAcc(v){
             if (v == null) return false;
-            var s = String(v).trim(), dg = normAcc(s);
+            var s = piAccBezUwagi(v), dg = normAcc(s);
             if (dg.length < 8 || dg.length > 24) return false;
             var letters = (s.replace(/\(?\s*usd\s*\)?|\uff08\s*usd\s*\uff09/ig, '').match(/[A-Za-z]/g) || []).length;
             return letters <= 4;
@@ -16667,7 +16677,7 @@
         // wzgledem wartosci (BAZHOU: pod "ACCOUNT NO." stal adres banku, a numer konta
         // pod "BANK NAME") — wtedy adres nie moze trafic do konta ani numer do nazwy banku.
         function piAccShape(v){
-            var s = String(v == null ? '' : v).trim();
+            var s = piAccBezUwagi(v);
             if (!s || /[,;]/.test(s)) return false;
             var c = s.replace(/[\s.–—\-\/]+/g, '');
             if (/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/i.test(c)) return true;
@@ -16912,9 +16922,38 @@
             }
             return false;
         }
+        // Indeksy UKRYTYCH kolumn arkusza. SheetJS wypelnia ws['!cols'] dopiero
+        // przy cellStyles:true — bez tego widocznosci nie widac wcale.
+        function piHiddenCols(ws){
+            var out = {}, cols = (ws && ws['!cols']) || [];
+            for (var i = 0; i < cols.length; i++){
+                var c = cols[i];
+                if (c && (c.hidden === true || c.hidden === 1)) out[i] = 1;
+            }
+            return out;
+        }
+        // Arkusz jako tablica wierszy, z WYCIETYMI ukrytymi kolumnami. Zostawiamy
+        // puste miejsce zamiast usuwac kolumne, zeby nie przesuwac pozostalych —
+        // reguly czytajace „wartosc w prawo od etykiety" musza dzialac jak dotad.
+        function piAoa(X, ws){
+            var aoa;
+            try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); }
+            catch(e){ return null; }
+            var ukryte = piHiddenCols(ws);
+            var ile = 0; for (var k in ukryte) ile++;
+            if (!ile) return aoa;
+            for (var r = 0; r < aoa.length; r++){
+                var row = aoa[r]; if (!row) continue;
+                for (var c = 0; c < row.length; c++) if (ukryte[c]) row[c] = null;
+            }
+            return aoa;
+        }
         function parsePIxlsx(u8, order){
             var X = getXLSX(); if (!X) return { err: 'brak SheetJS' };
-            var wb; try { wb = X.read(u8, { type: 'array' }); } catch(e){ return { err: 'P/I nieczytelne' }; }
+            // cellStyles:true jest tu KONIECZNE — bez niego SheetJS nie odda
+            // informacji o ukrytych kolumnach i wrocilibysmy do czytania 20%
+            // z kolumny, ktorej nikt nie widzi.
+            var wb; try { wb = X.read(u8, { type: 'array', cellStyles: true }); } catch(e){ return { err: 'P/I nieczytelne' }; }
             var meta = (wb.Workbook && wb.Workbook.Sheets) || [];
             function pick(wantHidden){
                 var best = null, bestScore = -1;
@@ -16923,7 +16962,7 @@
                     if (hid !== (wantHidden ? 1 : 0)) continue;
                     var nm = wb.SheetNames[si];
                     var ws = wb.Sheets[nm]; if (!ws) continue;
-                    var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ continue; }
+                    var aoa = piAoa(X, ws); if (!aoa) continue;
                     var r = scanPIsheet(aoa);
                     if (r.pct == null && !r.acc) continue;
                     var sc = 0;
@@ -16944,7 +16983,9 @@
                 var found = [], seen = {};
                 for (var si = 0; si < wb.SheetNames.length; si++){
                     var nm = wb.SheetNames[si], ws = wb.Sheets[nm]; if (!ws) continue;
-                    var aoa; try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); } catch(e){ continue; }
+                    // Tu tak samo: ukryta kolumna moze niesc STARY numer konta,
+                    // a wtedy szukanie zapasowe podstawiloby go zamiast biezacego.
+                    var aoa = piAoa(X, ws); if (!aoa) continue;
                     var b = scanPIbank(aoa);
                     if (!b.ok) continue;
                     var k = normAcc(b.acc) + '|' + b.swift;
