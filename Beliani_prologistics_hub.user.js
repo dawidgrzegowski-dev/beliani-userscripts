@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.18
+// @version      3.20
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25617,18 +25617,22 @@
 
             + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
             + '<div style="font-weight:700;margin-bottom:4px">Konta PayPal <span style="font-weight:400;color:#888;font-size:11px">'
-            + '— nieaktywne zostawiam na liście: jeśli coś na nich wisi, lepiej to zobaczyć</span></div>'
-            + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px">'
+            + '— zaznacz kilka z Ctrl albo Shift; nieaktywne zostają na liście</span></div>'
+            + '<select id="sal-konta" multiple size="7" style="width:100%;font-size:11px;padding:3px;'
+            + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
             + SAL_PP.map(function (n){
                 const on = u.konta.indexOf(n) >= 0;
-                const stan = (n in akt) ? (akt[n] ? '' : ' <span style="color:#c47f00">nieaktywne</span>') : ' <span style="color:#bbb">?</span>';
-                return '<label style="font-size:11px;display:flex;gap:5px;align-items:center">'
-                    + '<input type="checkbox" class="sal-k" value="' + n + '"' + (on ? ' checked' : '') + '>'
-                    + salEsc(et[n] || n) + stan + '</label>';
+                // Stan aktywnosci dopisujemy do etykiety, bo w <option> nie da sie
+                // wstawic znacznika — a wiedziec, ze konto jest wygaszone, warto.
+                const stan = (n in akt) ? (akt[n] ? '' : '  · nieaktywne') : '  · stan nieznany';
+                return '<option value="' + n + '"' + (on ? ' selected' : '') + '>'
+                    + salEsc(et[n] || n) + salEsc(stan) + '</option>';
             }).join('')
-            + '</div>'
-            + '<div style="margin-top:5px"><button id="sal-all" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">zaznacz wszystkie</button> '
-            + '<button id="sal-none" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">odznacz</button></div>'
+            + '</select>'
+            + '<div style="margin-top:5px;display:flex;gap:6px;align-items:center">'
+            + '<button id="sal-all" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">zaznacz wszystkie</button>'
+            + '<button id="sal-none" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">odznacz</button>'
+            + '<span id="sal-ile" style="font-size:10px;color:#888"></span></div>'
             + '</div>'
 
             + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
@@ -25651,26 +25655,35 @@
             const o = salUst();
             o.od = p.querySelector('#sal-od').value;
             o.do = p.querySelector('#sal-do').value;
-            o.konta = Array.prototype.slice.call(p.querySelectorAll('.sal-k'))
-                .filter(function (c){ return c.checked; }).map(function (c){ return c.value; });
+            o.konta = salWybrane(p);
             salZapisz(o);
+            const ile = p.querySelector('#sal-ile');
+            if (ile) ile.textContent = o.konta.length
+                ? ('wybrane: ' + o.konta.length + ' z ' + SAL_PP.length)
+                : 'nie wybrano żadnego konta';
         };
         p.querySelector('#sal-od').onchange = zapiszUst;
         p.querySelector('#sal-do').onchange = zapiszUst;
-        p.querySelectorAll('.sal-k').forEach(function (c){ c.onchange = zapiszUst; });
-        p.querySelector('#sal-all').onclick = function (){
-            p.querySelectorAll('.sal-k').forEach(function (c){ c.checked = true; }); zapiszUst();
+        p.querySelector('#sal-konta').onchange = zapiszUst;
+        const zazn = function (v){
+            p.querySelectorAll('#sal-konta option').forEach(function (o){ o.selected = v; });
+            zapiszUst();
         };
-        p.querySelector('#sal-none').onclick = function (){
-            p.querySelectorAll('.sal-k').forEach(function (c){ c.checked = false; }); zapiszUst();
-        };
+        p.querySelector('#sal-all').onclick = function (){ zazn(true); };
+        p.querySelector('#sal-none').onclick = function (){ zazn(false); };
         p.querySelector('#sal-fpp').onchange = function (){ salWczytaj(this.files, 'pp'); };
         p.querySelector('#sal-fdi').onchange = function (){ salWczytaj(this.files, 'di'); };
         p.querySelector('#sal-pobierz').onclick = function (){ salPobierz(this); };
         p.querySelector('#sal-run').onclick = function (){ salPorownaj(this); };
+        zapiszUst();
         salPlikInfo();
     }
 
+    function salWybrane(p){
+        const sel = p.querySelector('#sal-konta');
+        if (!sel) return [];
+        return Array.prototype.slice.call(sel.selectedOptions).map(function (o){ return o.value; });
+    }
     function salPlikInfo(){
         const d = document.getElementById('sal-plikinfo');
         if (!d) return;
@@ -25699,8 +25712,7 @@
     // ktorej uzywa jego wlasny przycisk. Nic nie jest oznaczane jako wyeksportowane.
     async function salPobierz(b){
         const p = salPanel();
-        const konta = Array.prototype.slice.call(p.querySelectorAll('.sal-k'))
-            .filter(function (c){ return c.checked; }).map(function (c){ return c.value; });
+        const konta = salWybrane(p);
         if (!konta.length){ salSay('Nie wybrałeś żadnego konta.', '#c47f00'); return; }
         const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
         if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
@@ -25789,115 +25801,171 @@
         b.disabled = false;
     }
 
-    function salRaport(r){
+    // Raport ma forme protokolu uzgodnienia: zestawienie zbiorcze, rozliczenie
+    // roznicy, klasyfikacja pozycji nieuzgodnionych ze statusem, pozycje
+    // informacyjne i zastrzezenia. Zadnych polecen w rodzaju „patrz tu" —
+    // status mowi, co pozycja znaczy, a decyzje podejmuje czytajacy.
+    function salRaport(r) {
         const d = document.getElementById('sal-raport');
         if (!d) return;
-        const roz = function (a, b){ return Math.round((a - b) * 100) / 100; };
-        const kol = function (v){ return Math.abs(v) < 0.005 ? '#0a7a2f' : '#c00'; };
-        const wiersz = function (ety, pp, pl){
-            return '<tr style="border-top:1px solid #f0f0f0"><td style="padding:3px 6px">' + ety + '</td>'
-                + '<td style="padding:3px 6px;text-align:right">' + salPln(pp) + '</td>'
-                + '<td style="padding:3px 6px;text-align:right">' + salPln(pl) + '</td>'
-                + '<td style="padding:3px 6px;text-align:right;font-weight:700;color:' + kol(roz(pp, pl)) + '">'
-                + salPln(roz(pp, pl)) + '</td></tr>';
+        const roz = function (a, b) { return Math.round((a - b) * 100) / 100; };
+        const zero = function (v) { return Math.abs(v) < 0.005; };
+        const kolR = function (v) { return zero(v) ? '#0a7a2f' : '#b45309'; };
+        const TH = 'padding:4px 6px;font-weight:400;color:#888;border-bottom:1px solid #e5e5e5';
+        const TD = 'padding:3px 6px';
+        const TDR = 'padding:3px 6px;text-align:right;font-variant-numeric:tabular-nums';
+        const sek = function (tyt) {
+            return '<div style="margin:12px 0 4px;font-size:11px;letter-spacing:.06em;'
+                 + 'text-transform:uppercase;color:#750000;font-weight:700">' + tyt + '</div>';
         };
-        let h = '<div style="border:1px solid #DBD9D7;border-radius:8px;padding:10px">'
-            + '<div style="font-weight:700;margin-bottom:6px">' + salEsc(r.okres || 'uzgodnienie') + '</div>'
+
+        const wpl = r.wplaty, zwr = r.zwroty;
+        const nettoPP = roz(wpl.sumaPP, zwr.sumaPP);
+        const nettoPL = roz(wpl.sumaPL, zwr.sumaPL);
+
+        let h = '<div style="border:1px solid #DBD9D7;border-radius:10px;padding:12px">'
+            + '<div style="font-weight:700;font-size:13px">Protokół uzgodnienia — PayPal / Export payments</div>'
+            + '<div style="font-size:11px;color:#666;margin-top:2px">'
+            + salEsc(String(r.okres || '').replace(/^Transaction details:\s*/i, 'Okres: ')) + '</div>';
+
+        // --- zestawienie zbiorcze ---
+        h += sek('Zestawienie zbiorcze')
+          + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+          + '<tr><td style="' + TH + '"></td><td style="' + TH + ';text-align:right">PayPal</td>'
+          + '<td style="' + TH + ';text-align:right">prologistics</td>'
+          + '<td style="' + TH + ';text-align:right">Różnica</td></tr>'
+          + ['Wpłaty', 'Zwroty'].map(function (ety, i) {
+                const b = i ? zwr : wpl, v = roz(b.sumaPP, b.sumaPL);
+                return '<tr><td style="' + TD + '">' + ety + '</td>'
+                     + '<td style="' + TDR + '">' + salPln(b.sumaPP) + '</td>'
+                     + '<td style="' + TDR + '">' + salPln(b.sumaPL) + '</td>'
+                     + '<td style="' + TDR + ';font-weight:700;color:' + kolR(v) + '">' + salPln(v) + '</td></tr>';
+            }).join('')
+          + '<tr style="border-top:1px solid #ccc"><td style="' + TD + ';font-weight:700">Saldo ruchu</td>'
+          + '<td style="' + TDR + ';font-weight:700">' + salPln(nettoPP) + '</td>'
+          + '<td style="' + TDR + ';font-weight:700">' + salPln(nettoPL) + '</td>'
+          + '<td style="' + TDR + ';font-weight:700;color:' + kolR(roz(nettoPP, nettoPL)) + '">'
+          + salPln(roz(nettoPP, nettoPL)) + '</td></tr></table>';
+
+        // --- rozliczenie roznicy: z czego sklada sie kazda roznica ---
+        const skladniki = function (b) {
+            const poz = [];
+            const nieuzg = roz(
+                b.bezParyPP.reduce(function (n, x) { return n + x.kw; }, 0),
+                b.bezParyPL.reduce(function (n, x) { return n + x.kw; }, 0));
+            if (b === wpl) (b.dubel || []).forEach(function (x) {
+                poz.push(['dokument ' + x.id + ' ujęty dwukrotnie', roz(x.pp, x.pl)]);
+            });
+            poz.push(['pozycje nieuzgodnione (per saldo)', nieuzg]);
+            const suma = poz.reduce(function (n, x) { return n + x[1]; }, 0);
+            const cel = roz(b.sumaPP, b.sumaPL);
+            const resztka = roz(cel, Math.round(suma * 100) / 100);
+            if (!zero(resztka)) poz.push(['pozostałe, niewyjaśnione', resztka]);
+            return poz;
+        };
+        h += sek('Rozliczenie różnicy')
+          + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+          + [['Wpłaty', wpl], ['Zwroty', zwr]].map(function (p) {
+                const cel = roz(p[1].sumaPP, p[1].sumaPL);
+                if (zero(cel) && !(p[1].dubel || []).length)
+                    return '<tr><td style="' + TD + '">' + p[0] + '</td>'
+                         + '<td style="' + TDR + ';color:#0a7a2f">' + salPln(0) + ' — uzgodnione</td></tr>';
+                return '<tr><td style="' + TD + ';font-weight:700">' + p[0] + '</td>'
+                     + '<td style="' + TDR + ';font-weight:700;color:' + kolR(cel) + '">' + salPln(cel) + '</td></tr>'
+                     + skladniki(p[1]).map(function (x) {
+                           return '<tr><td style="' + TD + ';padding-left:18px;color:#555">' + salEsc(x[0]) + '</td>'
+                                + '<td style="' + TDR + ';color:#555">' + salPln(x[1]) + '</td></tr>';
+                       }).join('');
+            }).join('') + '</table>';
+
+        // --- pozycje uzgodnione ---
+        h += sek('Pozycje uzgodnione')
+          + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+          + '<tr><td style="' + TH + '"></td><td style="' + TH + ';text-align:right">Uzgodniono</td>'
+          + '<td style="' + TH + '">Kryterium</td></tr>'
+          + '<tr><td style="' + TD + '">Wpłaty</td><td style="' + TDR + '">' + wpl.pary + ' z ' + wpl.pp + '</td>'
+          + '<td style="' + TD + ';color:#555">numer transakcji</td></tr>'
+          + '<tr><td style="' + TD + '">Zwroty</td><td style="' + TDR + '">' + zwr.pary + ' z ' + zwr.pp + '</td>'
+          + '<td style="' + TD + ';color:#555">kwota i kontrahent (' + zwr.poNazwisku + '), sama kwota ('
+          + zwr.poKwocie + ')</td></tr></table>'
+          + '<div style="font-size:11px;color:#777;margin-top:3px">'
+          + zwr.plLinie + ' pozycji księgowych po stronie prologistics ujęto w ' + zwr.plGrupy
+          + ' dokumentów według numeru faktury.</div>';
+
+        // --- pozycje nieuzgodnione ---
+        const KLAS = [
+            ['powtarza',  'Kwota niejednoznaczna — wielokrotne wystąpienie po obu stronach', 'Bez wpływu na saldo', '#0a7a2f'],
+            ['nazwisko',  'Zgodna kwota, rozbieżny kontrahent',                              'Do potwierdzenia',    '#b45309'],
+            ['brak',      'Brak pozycji przeciwstawnej o tej kwocie',                        'Wymaga wyjaśnienia',  '#c00']
+        ];
+        const tabNieuzg = function (ety, b) {
+            if (!b.bezParyPP.length && !b.bezParyPL.length) return '';
+            const A = b.powody.A, B = b.powody.B;
+            const n = roz(b.bezParyPP.reduce(function (s, x) { return s + x.kw; }, 0),
+                          b.bezParyPL.reduce(function (s, x) { return s + x.kw; }, 0));
+            return '<div style="font-weight:700;font-size:12px;margin-top:6px">' + ety + '</div>'
+                + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+                + '<tr><td style="' + TH + '">Klasyfikacja</td>'
+                + '<td style="' + TH + ';text-align:right">PayPal</td>'
+                + '<td style="' + TH + ';text-align:right">prologistics</td>'
+                + '<td style="' + TH + '">Status</td></tr>'
+                + KLAS.map(function (k) {
+                      const kwoty = k[0] === 'brak'
+                          ? ' <span style="color:#888">(' + salPln(A.brakKw) + ' / ' + salPln(B.brakKw) + ')</span>' : '';
+                      return '<tr><td style="' + TD + '">' + k[1] + kwoty + '</td>'
+                           + '<td style="' + TDR + '">' + A[k[0]] + '</td>'
+                           + '<td style="' + TDR + '">' + B[k[0]] + '</td>'
+                           + '<td style="' + TD + ';color:' + k[3] + '">' + k[2] + '</td></tr>';
+                  }).join('')
+                + '<tr style="border-top:1px solid #ccc"><td style="' + TD + ';font-weight:700">Per saldo</td>'
+                + '<td colspan="2" style="' + TDR + ';font-weight:700;color:' + kolR(n) + '">' + salPln(n) + '</td>'
+                + '<td style="' + TD + ';color:#777">' + (zero(n) ? 'bez wpływu na różnicę' : 'ujęte w rozliczeniu wyżej')
+                + '</td></tr></table>';
+        };
+        const nieuzgH = tabNieuzg('Wpłaty', wpl) + tabNieuzg('Zwroty', zwr);
+        if (nieuzgH) h += sek('Pozycje nieuzgodnione') + nieuzgH;
+
+        // --- pozycje informacyjne ---
+        const info = [];
+        if (r.jednorazowe.n) info.push(['Payment Reversal — wpływy jednorazowe',
+            r.jednorazowe.n + ' poz.', salPln(r.jednorazowe.suma), 'poza uzgodnieniem, do odrębnej analizy']);
+        if (r.blokady.n) info.push(['Blokady sporne (Hold / Cancellation)',
+            r.blokady.n + ' poz.', salPln(r.blokady.suma), 'nieksięgowane; o tę kwotę saldo PayPal odbiega od księgi']);
+        if (r.prowizja) info.push(['Prowizja PayPal', '', salPln(r.prowizja), 'brak w eksporcie; księgowana odrębnie']);
+        if (info.length) h += sek('Pozycje informacyjne')
             + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
-            + '<tr style="color:#888"><td style="padding:3px 6px"></td>'
-            + '<td style="padding:3px 6px;text-align:right">PayPal</td>'
-            + '<td style="padding:3px 6px;text-align:right">prologistics</td>'
-            + '<td style="padding:3px 6px;text-align:right">różnica</td></tr>'
-            + wiersz('wpłaty', r.wplaty.sumaPP, r.wplaty.sumaPL)
-            + wiersz('zwroty', r.zwroty.sumaPP, r.zwroty.sumaPL)
-            + '</table>';
+            + info.map(function (x) {
+                  return '<tr><td style="' + TD + '">' + salEsc(x[0]) + '</td>'
+                       + '<td style="' + TDR + ';color:#777">' + x[1] + '</td>'
+                       + '<td style="' + TDR + '">' + x[2] + '</td>'
+                       + '<td style="' + TD + ';color:#777">' + salEsc(x[3]) + '</td></tr>';
+              }).join('') + '</table>';
 
-        h += '<div style="margin-top:8px;font-size:11px;color:#444">'
-            + '<b>Wpłaty:</b> ' + r.wplaty.pp + ' w PayPalu, ' + r.wplaty.pl + ' w prologistics, sparowanych '
-            + r.wplaty.pary + '. Bez pary: ' + r.wplaty.bezParyPP.length + ' po stronie PayPala, '
-            + r.wplaty.bezParyPL.length + ' po stronie prologistics.'
-            + '<br><b>Zwroty:</b> ' + r.zwroty.pp + ' w PayPalu; ' + r.zwroty.plLinie + ' linii w prologistics '
-            + 'złożonych w ' + r.zwroty.plGrupy + ' faktur. Sparowanych ' + r.zwroty.pary
-            + ' (nazwiskiem ' + r.zwroty.poNazwisku + ', samą kwotą ' + r.zwroty.poKwocie + ').'
-            + ' Bez pary: ' + r.zwroty.bezParyPP.length + ' / ' + r.zwroty.bezParyPL.length + '.'
-            + '</div>';
+        // --- zastrzezenia ---
+        const zas = [];
+        (r.wplaty.rozjazd || []).filter(function (x) {
+            return !(r.wplaty.dubel || []).some(function (y) { return y.id === x.id; });
+        }).forEach(function (x) {
+            zas.push('Numer ' + x.id + ': kwota PayPal ' + salPln(x.pp) + ', prologistics ' + salPln(x.pl) + '.');
+        });
+        if (r.nieznane.n) zas.push('Typy transakcji nieujęte w klasyfikacji: ' + r.nieznane.typy.join(', ')
+            + ' (' + r.nieznane.n + ' poz., ' + salPln(r.nieznane.suma) + '). Nie uwzględniono po żadnej stronie.');
+        if (zwr.niespojne) zas.push('Faktury o niejednorodnych pozycjach (różna data lub konto): ' + zwr.niespojne
+            + '. Wyłączone z parowania; kwoty pozostają w zestawieniu zbiorczym.');
+        if (r.podejrzaneId.length) zas.push('Numer transakcji zapisany wartością liczbową w wierszach '
+            + r.podejrzaneId.map(function (x) { return x.w; }).join(', ')
+            + '. Zapis przekracza precyzję formatu, cyfry są nierzetelne — numeru nie użyto.');
+        if (zas.length) h += sek('Zastrzeżenia')
+            + '<ol style="margin:0;padding-left:18px;font-size:11px;color:#444">'
+            + zas.map(function (x) { return '<li style="margin-bottom:2px">' + salEsc(x) + '</li>'; }).join('')
+            + '</ol>';
 
-        // Sama lista niesparowanych wyglada jak lista zgubionych pieniedzy.
-        // Najwazniejsze zdanie raportu brzmi: ile z tej listy naprawde znika,
-        // a ile tylko nie da sie przypisac, bo kwoty sie powtarzaja.
-        const rozNies = function (bl){
-            const sA = bl.bezParyPP.reduce(function (n, x){ return n + x.kw; }, 0);
-            const sB = bl.bezParyPL.reduce(function (n, x){ return n + x.kw; }, 0);
-            return Math.round((sA - sB) * 100) / 100;
-        };
-        const nies = function (ety, bl){
-            if (!bl.bezParyPP.length && !bl.bezParyPL.length) return '';
-            const a = bl.powody.A, b = bl.powody.B;
-            const r = rozNies(bl);
-            return '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-top:8px">'
-                + '<div style="font-weight:700;margin-bottom:3px">' + ety + ' bez pary — jak to czytać</div>'
-                + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
-                + '<tr style="color:#888"><td style="padding:2px 4px">powód</td>'
-                + '<td style="padding:2px 4px;text-align:right">PayPal</td>'
-                + '<td style="padding:2px 4px;text-align:right">prologistics</td>'
-                + '<td style="padding:2px 4px">co z tym</td></tr>'
-                + '<tr style="border-top:1px solid #f3f3f3"><td style="padding:2px 4px">kwota powtarza się po obu stronach</td>'
-                + '<td style="padding:2px 4px;text-align:right">' + a.powtarza + '</td>'
-                + '<td style="padding:2px 4px;text-align:right">' + b.powtarza + '</td>'
-                + '<td style="padding:2px 4px;color:#0a7a2f">nic — w sumach się znoszą</td></tr>'
-                + '<tr style="border-top:1px solid #f3f3f3"><td style="padding:2px 4px">kwota pasuje, nazwisko nie</td>'
-                + '<td style="padding:2px 4px;text-align:right">' + a.nazwisko + '</td>'
-                + '<td style="padding:2px 4px;text-align:right">' + b.nazwisko + '</td>'
-                + '<td style="padding:2px 4px;color:#c47f00">zerknij, prawdopodobnie para</td></tr>'
-                + '<tr style="border-top:1px solid #f3f3f3"><td style="padding:2px 4px"><b>brak odpowiednika na tę kwotę</b></td>'
-                + '<td style="padding:2px 4px;text-align:right"><b>' + a.brak + '</b> (' + salPln(a.brakKw) + ')</td>'
-                + '<td style="padding:2px 4px;text-align:right"><b>' + b.brak + '</b> (' + salPln(b.brakKw) + ')</td>'
-                + '<td style="padding:2px 4px;color:#c00">TO oglądaj</td></tr>'
-                + '</table>'
-                + '<div style="font-size:11px;margin-top:5px;color:'
-                + (Math.abs(r) < 0.005 ? '#0a7a2f' : '#444') + '">'
-                + 'Sumy tej listy różnią się o <b>' + salPln(r) + '</b>'
-                + (Math.abs(r) < 0.005
-                    ? ' — czyli o nic. Wszystkie te pozycje znoszą się nawzajem.'
-                    : ' — i tyle właśnie wnoszą do różnicy w tabeli wyżej.')
-                + '</div></div>';
-        };
-        h += nies('Wpłaty', r.wplaty) + nies('Zwroty', r.zwroty);
-
-        const uwagi = [];
-        if (r.wplaty.dubel.length) uwagi.push({ k: '#c00', t: 'Zaksięgowane dwa razy: '
-            + r.wplaty.dubel.map(function (x){ return x.id + ' (wiersze ' + x.wiersze.join(' i ') + ', ' + salPln(x.pl) + ' zamiast ' + salPln(x.pp) + ')'; }).join('; ') });
-        // Podwojne ksiegowanie JEST rozjazdem kwoty — zglaszamy je raz, jako duplikat.
-        // Dwie czerwone linie o tej samej sprawie kaza czytelnikowi szukac dwoch problemow.
-        const dublID = {};
-        r.wplaty.dubel.forEach(function (x){ dublID[x.id] = 1; });
-        const rozjazdInne = r.wplaty.rozjazd.filter(function (x){ return !dublID[x.id]; });
-        if (rozjazdInne.length) uwagi.push({ k: '#c00', t: 'Rozjazd kwoty przy tym samym numerze: '
-            + rozjazdInne.map(function (x){ return x.id + ' — PayPal ' + salPln(x.pp) + ', prologistics ' + salPln(x.pl); }).join('; ') });
-        if (r.jednorazowe.n) uwagi.push({ k: '#c47f00', t: 'Jednorazowe zwroty dodatnie (Payment Reversal): '
-            + r.jednorazowe.n + ' na ' + salPln(r.jednorazowe.suma) + ' — nie wchodzą do różnicy, sprawdź osobno.' });
-        if (r.blokady.n) uwagi.push({ k: '#666', t: 'Blokady sporne (Hold / Cancellation): ' + r.blokady.n
-            + ' pozycji, saldo ' + salPln(r.blokady.suma) + '. Nie są księgowane, ale przesuwają stan konta PayPal — '
-            + 'o tyle nie zgodzi się saldo z księgą.' });
-        if (r.nieznane.n) uwagi.push({ k: '#c00', t: 'Typy, których nie znam: ' + r.nieznane.typy.join(', ')
-            + ' (' + r.nieznane.n + ' poz., ' + salPln(r.nieznane.suma) + '). Nie policzyłem ich po żadnej stronie.' });
-        if (r.zwroty.niespojne) uwagi.push({ k: '#c47f00', t: 'Faktur o niespójnych liniach (różna data albo różne konto): '
-            + r.zwroty.niespojne + ' — wyłączone z parowania, sprawdź ręcznie.' });
-        if (r.podejrzaneId.length) uwagi.push({ k: '#c47f00', t: 'Wiersze z numerem transakcji zapisanym jako liczba: '
-            + r.podejrzaneId.map(function (x){ return x.w; }).join(', ')
-            + ' — cyfry są w pliku przekłamane, numeru nie użyłem.' });
-        if (r.prowizja) uwagi.push({ k: '#666', t: 'Prowizja PayPala w tym okresie: ' + salPln(r.prowizja)
-            + ' — w eksporcie jej nie ma, księgujecie osobno.' });
-
-        if (uwagi.length) h += '<div style="margin-top:8px">' + uwagi.map(function (x){
-            return '<div style="font-size:11px;color:' + x.k + ';margin-top:3px">• ' + salEsc(x.t) + '</div>';
-        }).join('') + '</div>';
-
-        h += '<div style="margin-top:8px"><button id="sal-csv" style="padding:4px 12px;border:1px solid #ccc;'
-            + 'border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz niesparowane (CSV)</button></div></div>';
+        h += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #eee">'
+          + '<button id="sal-csv" style="padding:4px 12px;border:1px solid #ccc;border-radius:6px;'
+          + 'background:#fff;cursor:pointer;font-size:11px">Wykaz pozycji nieuzgodnionych (CSV)</button></div></div>';
         d.innerHTML = h;
         const c = d.querySelector('#sal-csv');
-        if (c) c.onclick = function (){ salCsv(r); };
+        if (c) c.onclick = function () { salCsv(r); };
     }
 
     function salCsv(r){
