@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.30
+// @version      3.31
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25792,13 +25792,44 @@
         return { konto: konto, waluta: waluta, poz: poz };
     }
 
+    // Podzbior o zadanej sumie. Przechodzimy kombinacje wprost — zbior wolnych
+    // pozycji po czterech poziomach parowania jest maly (na 1450 bylo ich piec),
+    // wiec nie ma po co byc sprytnym. Zwracamy PIERWSZY trafiony albo null,
+    // a przy dwoch roznych rozwiazaniach nie zwracamy nic: dwuznacznosc to nie para.
+    function slPodzbior(lista, n, cel) {
+        const trafione = [];
+        const idx = new Array(n);
+        (function szukaj(start, glebokosc, suma) {
+            if (trafione.length > 1) return;
+            if (glebokosc === n) {
+                if (Math.abs(suma - cel) < 0.005) trafione.push(idx.map(function (i) { return lista[i]; }));
+                return;
+            }
+            for (let i = start; i < lista.length; i++) {
+                if (suma - cel > 0.005) break;
+                idx[glebokosc] = i;
+                szukaj(i + 1, glebokosc + 1, Math.round((suma + lista[i].kw) * 100) / 100);
+                if (trafione.length > 1) return;
+            }
+        })(0, 0, 0);
+        return trafione.length === 1 ? trafione[0] : null;
+    }
+
     // Uzgodnienie wyciagu z eksportem. Inaczej niz przy PayPalu: tu kluczem jest
     // NUMER AUFTRAGA, obecny po obu stronach, wiec parowanie jest twarde.
     // Kwota bywa rozna od zaksiegowanej (bank potraca oplaty, klient doplaca
     // zaokraglenie), wiec rozjazd kwoty przy zgodnym numerze pokazujemy osobno —
     // to nie jest brak pary, tylko roznica do wyjasnienia.
+    // Wplyw z bramki platniczej to nie zaplata za zamowienie, tylko przelew srodkow
+    // z systemu, ktory zebral je wczesniej. Nie ma z czym go parowac — ma byc widoczny
+    // jako pozycja informacyjna, a nie jako brak.
+    const SL_BRAMKI = /vyplata prostredku ze systemu|\bpayu\b|przelewy\s*24|\bp24\b|\bpaypal\b|\bstripe\b|\badyen\b|\bsaferpay\b/i;
+    function slBramka(x) {
+        return SL_BRAMKI.test([x.nazwa, x.opis, x.typ].join(' '));
+    }
     function slUzgodnijBank(bank, pl) {
-        const wpl = bank.poz.filter(function (x) { return x.kw > 0; });
+        const wpl = bank.poz.filter(function (x) { return x.kw > 0 && !slBramka(x); });
+        const bramki = bank.poz.filter(function (x) { return x.kw > 0 && slBramka(x); });
         const wyp = bank.poz.filter(function (x) { return x.kw < 0; });
 
         const wgAuf = {};
@@ -25843,14 +25874,50 @@
         });
         p3.pary.forEach(function (x) { dodaj(wolne2[x[0]], [wolneP[x[1]]], 'kwota i data — bez numeru'); });
 
-        p3.wolA.forEach(function (i) { (wolne2[i].auf ? bezPary : bezAuf).push(wolne2[i]); });
-        const proloBezPary = p3.wolB.map(function (i) { return wolneP[i]; });
+        // poziom 4 — WPLATA ZBIORCZA: jeden przelew pokrywa kilka zamowien.
+        // Szukamy podzbioru 2..4 pozycji, ktore sumuja sie do kwoty przelewu. Wiecej
+        // nie probujemy: przy duzych zbiorach kazda kwota da sie zlozyc przypadkiem,
+        // a falszywe sparowanie jest gorsze niz brak.
+        let woln4 = p3.wolA.map(function (i) { return wolne2[i]; });
+        let prol4 = p3.wolB.map(function (i) { return wolneP[i]; });
+        const zbiorcze = [];
+        woln4 = woln4.filter(function (b) {
+            const kand = prol4.filter(function (r) { return !uzyte[r.w] && slDni(b.data, r.data) <= 5; });
+            for (let n = 2; n <= 4 && n <= kand.length; n++) {
+                const wynik = slPodzbior(kand, n, b.kw);
+                if (wynik) {
+                    dodaj(b, wynik, 'wpłata zbiorcza — ' + n + ' zamówienia');
+                    zbiorcze.push({ bank: b, pl: wynik });
+                    return false;
+                }
+            }
+            return true;
+        });
+        prol4 = prol4.filter(function (r) { return !uzyte[r.w]; });
+
+        // poziom 5 — PRZEKSIEGOWANIE: wplyw, ktory ma w tym samym pliku lustrzany
+        // wyplyw o tej samej kwocie i tym samym auftragu. To korekta (np. zmiana
+        // stawki VAT), a nie brakujaca wplata — pieniadze przyszly wczesniej i sa
+        // poza zakresem wyciagu. Sprawdzone: 3 z 3 takich przypadkow na 1450.
+        const wyAuf = {};
+        pl.wy.forEach(function (x) { if (x.auf) (wyAuf[x.auf.nr] = wyAuf[x.auf.nr] || []).push(x); });
+        const przeksieg = [];
+        const proloBezPary = prol4.filter(function (r) {
+            const g = r.auf ? (wyAuf[r.auf.nr] || []) : [];
+            const l = g.filter(function (y) { return Math.abs(y.kw - r.kw) < 0.005; })[0];
+            if (!l) return true;
+            przeksieg.push({ pl: r, lustro: l });
+            return false;
+        });
+        woln4.forEach(function (b) { (b.auf ? bezPary : bezAuf).push(b); });
         // wiersze eksportu bez numeru auftraga w ogole — osobno, bo to inna sprawa
         const proloBezAuf = pl.we.filter(function (r) { return !r.auf; });
 
         const suma = function (a, f) { return Math.round(a.reduce(function (n, x) { return n + f(x); }, 0) * 100) / 100; };
         return {
             konto: bank.konto, waluta: bank.waluta,
+            bramki: { n: bramki.length, suma: suma(bramki, function (x) { return x.kw; }), poz: bramki },
+            zbiorcze: zbiorcze, przeksiegowania: przeksieg,
             wplaty: {
                 bank: wpl.length, pl: pl.we.length, pary: pary.length,
                 wgPoziomu: pary.reduce(function (m, x) { m[x.jak] = (m[x.jak] || 0) + 1; return m; }, {}),
@@ -26679,6 +26746,31 @@
             ['prologistics: brak wpłaty w wyciągu', w.proloBezPary.length, 'zaksięgowane, pieniądze nie doszły albo są poza zakresem'],
             ['prologistics: wiersz bez numeru auftraga', w.proloBezAuf.length, 'nie ma po czym parować']
         ].filter(function (x){ return x[1]; });
+        if (r.przeksiegowania.length) h += sek('Przeksięgowania')
+            + '<div style="font-size:11px;color:#444;margin-bottom:4px">Wpłata i jej lustrzane odksięgowanie '
+            + 'w tym samym pliku — korekta (np. zmiana stawki VAT). Pieniądze wpłynęły wcześniej, '
+            + 'poza zakresem wyciągu, więc brak pary jest tu normalny.</div>'
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + '<tr><td style="' + TH + '">Auftrag</td><td style="' + TH + ';text-align:right">Kwota</td>'
+            + '<td style="' + TH + '">Data księgowania</td><td style="' + TH + ';text-align:right">Wiersze</td></tr>'
+            + r.przeksiegowania.map(function (x){
+                  return '<tr><td style="' + TD + '">' + salEsc(x.pl.auf ? x.pl.auf.nr : '—') + '</td>'
+                       + '<td style="' + TDR + '">' + salPln(x.pl.kw) + '</td>'
+                       + '<td style="' + TD + '">' + salEsc(x.pl.data) + '</td>'
+                       + '<td style="' + TDR + ';color:#777">' + x.pl.w + ' / ' + x.lustro.w + '</td></tr>';
+              }).join('') + '</table>';
+        if (r.zbiorcze.length) h += sek('Wpłaty zbiorcze')
+            + '<div style="font-size:11px;color:#444;margin-bottom:4px">Jeden przelew pokrywa kilka zamówień. '
+            + 'Sparowane, bo suma zgadza się co do grosza.</div>'
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + '<tr><td style="' + TH + '">Wyciąg</td><td style="' + TH + ';text-align:right">Kwota</td>'
+            + '<td style="' + TH + '">Auftragi</td></tr>'
+            + r.zbiorcze.map(function (x){
+                  return '<tr><td style="' + TD + '">' + salEsc(x.bank.data) + ' ' + salEsc((x.bank.nazwa || '').slice(0, 26)) + '</td>'
+                       + '<td style="' + TDR + '">' + salPln(x.bank.kw) + '</td>'
+                       + '<td style="' + TD + '">' + x.pl.map(function (y){
+                             return salEsc(y.auf ? y.auf.nr : '?') + ' (' + salPln(y.kw) + ')'; }).join(' + ') + '</td></tr>';
+              }).join('') + '</table>';
         if (K.length) h += sek('Pozycje nieuzgodnione')
             + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
             + K.map(function (x){
@@ -26702,6 +26794,8 @@
             + (w.rozjazd.length > 40 ? '<div style="font-size:11px;color:#888">…i ' + (w.rozjazd.length - 40) + ' dalszych</div>' : '');
 
         const info = [];
+        if (r.bramki.n) info.push(['Wpływy z bramek płatniczych', r.bramki.n + ' poz.', salPln(r.bramki.suma),
+            'zbiorcza wypłata z systemu płatności — poza uzgodnieniem, nie ma z czym parować']);
         if (r.wyplaty.n) info.push(['Wypływy z rachunku', r.wyplaty.n + ' poz.', salPln(r.wyplaty.suma),
             'poza uzgodnieniem wpłat']);
         if (r.oplaty) info.push(['Opłaty bankowe', '', salPln(r.oplaty), 'z kolumny Fee']);
