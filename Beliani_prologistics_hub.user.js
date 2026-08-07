@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.29
+// @version      3.30
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25767,7 +25767,8 @@
             const d = String(r[K['Transaction Date']] || '').match(/(\d{2})\.(\d{2})\.(\d{4})/);
             // Numeru auftraga szukamy w VS, a gdy go tam nie ma — w opisie i wiadomosci.
             // Bank potrafi wpisac go w pole tekstowe („Refund for deleted order 15230365").
-            const vs = String(r[K['VS']] || '').trim();
+            // VS bywa wpisany z zerami wiodacymi — obcinamy je, zanim porownamy.
+            const vs = String(r[K['VS']] || '').trim().replace(/^0+/, '');
             let auf = /^\d{6,}$/.test(vs) ? vs : '';
             if (!auf) {
                 const t = [r[K['Message']], r[K['Note']]].join(' ');
@@ -25805,22 +25806,45 @@
             if (r.auf) (wgAuf[r.auf.nr] = wgAuf[r.auf.nr] || []).push(r);
         });
 
+        // Klient nie zawsze wpisuje numer auftraga. Bywa numer FAKTURY, bywa numer
+        // przekrecony, bywa pusto. Dlatego kaskada trzech poziomow — kazdy nastepny
+        // slabszy, ale kazdy oznaczony, zeby bylo widac, na czym para stoi.
+        const wgFv = {};
+        pl.we.forEach(function (r) { if (r.fv) (wgFv[r.fv] = wgFv[r.fv] || []).push(r); });
+
         const pary = [], rozjazd = [], bezAuf = [], bezPary = [];
         const uzyte = {};
-        wpl.forEach(function (b) {
-            if (!b.auf) { bezAuf.push(b); return; }
-            const g = wgAuf[b.auf];
-            if (!g || !g.length) { bezPary.push(b); return; }
+        const wolne = [];
+        const dodaj = function (b, g, jak) {
             const suma = Math.round(g.reduce(function (n, x) { return n + x.kw; }, 0) * 100) / 100;
-            uzyte[b.auf] = 1;
-            pary.push({ bank: b, pl: g, suma: suma });
+            g.forEach(function (r) { uzyte[r.w] = 1; });
+            pary.push({ bank: b, pl: g, suma: suma, jak: jak });
             if (Math.abs(b.kw - suma) > 0.005)
-                rozjazd.push({ auf: b.auf, bank: b.kw, prolo: suma, roznica: Math.round((b.kw - suma) * 100) / 100 });
+                rozjazd.push({ auf: (g[0].auf ? g[0].auf.nr : b.auf), bank: b.kw, prolo: suma,
+                               roznica: Math.round((b.kw - suma) * 100) / 100, jak: jak });
+        };
+        // poziom 1 — VS to numer auftraga
+        wpl.forEach(function (b) {
+            const g = b.auf ? (wgAuf[b.auf] || []).filter(function (r) { return !uzyte[r.w]; }) : [];
+            if (g.length) dodaj(b, g, 'numer auftraga');
+            else wolne.push(b);
         });
-        const proloBezPary = [];
-        Object.keys(wgAuf).forEach(function (nr) {
-            if (!uzyte[nr]) wgAuf[nr].forEach(function (r) { proloBezPary.push(r); });
+        // poziom 2 — VS to numer FAKTURY
+        const wolne2 = [];
+        wolne.forEach(function (b) {
+            const g = b.auf ? (wgFv[b.auf] || []).filter(function (r) { return !uzyte[r.w]; }) : [];
+            if (g.length) dodaj(b, g, 'numer faktury wpisany jako VS');
+            else wolne2.push(b);
         });
+        // poziom 3 — kwota i data, z obustronna jednoznacznoscia
+        const wolneP = pl.we.filter(function (r) { return !uzyte[r.w]; });
+        const p3 = slParuj(wolne2, wolneP, function (a, r) {
+            return Math.abs(a.kw - r.kw) < 0.005 && slDni(a.data, r.data) <= 3;
+        });
+        p3.pary.forEach(function (x) { dodaj(wolne2[x[0]], [wolneP[x[1]]], 'kwota i data — bez numeru'); });
+
+        p3.wolA.forEach(function (i) { (wolne2[i].auf ? bezPary : bezAuf).push(wolne2[i]); });
+        const proloBezPary = p3.wolB.map(function (i) { return wolneP[i]; });
         // wiersze eksportu bez numeru auftraga w ogole — osobno, bo to inna sprawa
         const proloBezAuf = pl.we.filter(function (r) { return !r.auf; });
 
@@ -25829,6 +25853,7 @@
             konto: bank.konto, waluta: bank.waluta,
             wplaty: {
                 bank: wpl.length, pl: pl.we.length, pary: pary.length,
+                wgPoziomu: pary.reduce(function (m, x) { m[x.jak] = (m[x.jak] || 0) + 1; return m; }, {}),
                 rozjazd: rozjazd,
                 bezAuf: bezAuf, bezPary: bezPary,
                 proloBezPary: proloBezPary, proloBezAuf: proloBezAuf,
@@ -26638,8 +26663,12 @@
 
             + sek('Pozycje uzgodnione')
             + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
-            + '<tr><td style="' + TD + '">Sparowane po numerze auftraga</td>'
-            + '<td style="' + TDR + '">' + w.pary + ' z ' + w.bank + '</td></tr>'
+            + '<tr><td style="' + TD + ';font-weight:700">Sparowane</td>'
+            + '<td style="' + TDR + ';font-weight:700">' + w.pary + ' z ' + w.bank + '</td></tr>'
+            + Object.keys(w.wgPoziomu || {}).map(function (k){
+                  return '<tr><td style="' + TD + ';padding-left:18px;color:#555">' + salEsc(k) + '</td>'
+                       + '<td style="' + TDR + ';color:#555">' + w.wgPoziomu[k] + '</td></tr>';
+              }).join('')
             + '<tr><td style="' + TD + '">Zgodny numer, rozbieżna kwota</td>'
             + '<td style="' + TDR + ';color:' + (w.rozjazd.length ? '#c00' : '#0a7a2f') + '">' + w.rozjazd.length + '</td></tr>'
             + '</table>';
