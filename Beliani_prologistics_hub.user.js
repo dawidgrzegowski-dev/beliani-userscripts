@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.23
+// @version      3.24
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25220,6 +25220,154 @@
         return w;
     }
 
+    // ---------- zapis XLSX ----------
+    // Wlasny, bo HUB nie ma zadnej biblioteki, a wykaz ma sie otwierac w Excelu
+    // z klikalnymi numerami auftragow. Zip skladamy bez kompresji (metoda 0) —
+    // plik jest maly, a kod krotszy i nie da sie w nim pomylic o bajt.
+    function slCrc32(b) {
+        if (!slCrc32.t) {
+            const t = new Uint32Array(256);
+            for (let i = 0; i < 256; i++) {
+                let c = i;
+                for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+                t[i] = c >>> 0;
+            }
+            slCrc32.t = t;
+        }
+        const t = slCrc32.t;
+        let c = 0xFFFFFFFF;
+        for (let i = 0; i < b.length; i++) c = t[(c ^ b[i]) & 0xFF] ^ (c >>> 8);
+        return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+    function slZip(pliki) {
+        const enc = new TextEncoder();
+        const czesci = [], centr = [];
+        let off = 0;
+        pliki.forEach(function (f) {
+            const nm = enc.encode(f.name);
+            const dane = (typeof f.data === 'string') ? enc.encode(f.data) : f.data;
+            const crc = slCrc32(dane);
+            const lok = new Uint8Array(30 + nm.length);
+            const dv = new DataView(lok.buffer);
+            dv.setUint32(0, 0x04034b50, true);
+            dv.setUint16(4, 20, true);            // wersja
+            dv.setUint16(6, 0x0800, true);        // nazwy w UTF-8
+            dv.setUint16(8, 0, true);             // bez kompresji
+            dv.setUint32(14, crc, true);
+            dv.setUint32(18, dane.length, true);
+            dv.setUint32(22, dane.length, true);
+            dv.setUint16(26, nm.length, true);
+            lok.set(nm, 30);
+            czesci.push(lok, dane);
+
+            const c = new Uint8Array(46 + nm.length);
+            const cv = new DataView(c.buffer);
+            cv.setUint32(0, 0x02014b50, true);
+            cv.setUint16(4, 20, true);
+            cv.setUint16(6, 20, true);
+            cv.setUint16(8, 0x0800, true);
+            cv.setUint32(16, crc, true);
+            cv.setUint32(20, dane.length, true);
+            cv.setUint32(24, dane.length, true);
+            cv.setUint16(28, nm.length, true);
+            cv.setUint32(42, off, true);
+            c.set(nm, 46);
+            centr.push(c);
+            off += lok.length + dane.length;
+        });
+        const cLen = centr.reduce(function (n, x) { return n + x.length; }, 0);
+        const eocd = new Uint8Array(22);
+        const ev = new DataView(eocd.buffer);
+        ev.setUint32(0, 0x06054b50, true);
+        ev.setUint16(8, pliki.length, true);
+        ev.setUint16(10, pliki.length, true);
+        ev.setUint32(12, cLen, true);
+        ev.setUint32(16, off, true);
+        return new Blob(czesci.concat(centr, [eocd]), { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    }
+    function slX(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;')
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+    }
+    function slKolNazwa(i) {                       // 0 -> A, 26 -> AA
+        let s = '';
+        for (i += 1; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s;
+        return s;
+    }
+    // wiersze: tablica tablic. Komorka to napis/liczba albo { v, href } dla odnosnika.
+    function slXlsxBlob(arkusz, wiersze) {
+        const linki = [];
+        const xmlWiersze = wiersze.map(function (w, ri) {
+            const kom = w.map(function (c, ci) {
+                const ref = slKolNazwa(ci) + (ri + 1);
+                const link = c && typeof c === 'object' && c.href;
+                const v = link ? c.v : c;
+                if (link) linki.push({ ref: ref, href: c.href });
+                const st = ri === 0 ? ' s="1"' : (link ? ' s="2"' : '');
+                if (typeof v === 'number' && isFinite(v))
+                    return '<c r="' + ref + '"' + st + '><v>' + v + '</v></c>';
+                if (v == null || v === '') return '';
+                return '<c r="' + ref + '" t="inlineStr"' + st + '><is><t xml:space="preserve">'
+                     + slX(v) + '</t></is></c>';
+            }).join('');
+            return '<row r="' + (ri + 1) + '">' + kom + '</row>';
+        }).join('');
+
+        const hl = linki.length
+            ? '<hyperlinks>' + linki.map(function (x, i) {
+                  return '<hyperlink ref="' + x.ref + '" r:id="rId' + (i + 1) + '"/>';
+              }).join('') + '</hyperlinks>' : '';
+        const relLinki = linki.map(function (x, i) {
+            return '<Relationship Id="rId' + (i + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"'
+                 + ' Target="' + slX(x.href) + '" TargetMode="External"/>';
+        }).join('');
+
+        const P = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+        const pliki = [
+            { name: '[Content_Types].xml', data: P
+                + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                + '<Default Extension="xml" ContentType="application/xml"/>'
+                + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                + '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                + '</Types>' },
+            { name: '_rels/.rels', data: P
+                + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                + '</Relationships>' },
+            { name: 'xl/workbook.xml', data: P
+                + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                + 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                + '<sheets><sheet name="' + slX(arkusz).slice(0, 31) + '" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+            { name: 'xl/_rels/workbook.xml.rels', data: P
+                + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                + '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                + '</Relationships>' },
+            // styl 1 = naglowek pogrubiony, styl 2 = odnosnik (niebieski, podkreslony)
+            { name: 'xl/styles.xml', data: P
+                + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                + '<fonts count="3"><font><sz val="11"/><name val="Calibri"/></font>'
+                + '<font><b/><sz val="11"/><name val="Calibri"/></font>'
+                + '<font><u/><color rgb="FF0563C1"/><sz val="11"/><name val="Calibri"/></font></fonts>'
+                + '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+                + '<borders count="1"><border/></borders>'
+                + '<cellStyleXfs count="1"><xf/></cellStyleXfs>'
+                + '<cellXfs count="3"><xf xfId="0"/><xf fontId="1" applyFont="1" xfId="0"/>'
+                + '<xf fontId="2" applyFont="1" xfId="0"/></cellXfs></styleSheet>' },
+            { name: 'xl/worksheets/sheet1.xml', data: P
+                + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                + 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                + '<sheetData>' + xmlWiersze + '</sheetData>' + hl + '</worksheet>' }
+        ];
+        if (linki.length) pliki.push({ name: 'xl/worksheets/_rels/sheet1.xml.rels', data: P
+            + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + relLinki + '</Relationships>' });
+        return slZip(pliki);
+    }
+
     // Silnik uzgodnienia PayPal <-> prologistics. Czysta logika, bez UI i bez sieci —
     // wchodzi do modulu Salda w takiej postaci.
 
@@ -25313,6 +25461,17 @@
     // Kierunek rozpoznajemy po NUMERZE KONTA, ktore uzgadniamy. Regula „Debit zaczyna
     // sie od 13" trzymala sie tylko na 1301 — konto 1274 zaczyna sie od 12 i wszystkie
     // wplywy wpadaly do wyplywow. Konto obciazone = pieniadze weszly na nie.
+    // „15262831 / 3" to numer auftraga i txnid — dokladnie tak, jak sklada je adres
+    // auction.php?number=…&txnid=…  Rozbijamy je, zeby dalo sie zrobic odnosnik.
+    // Bywa tez postac „CREDIT 10960760 TICKET 631168" (nota kredytowa) — tam auftraga
+    // nie ma i nie udajemy, ze jest.
+    function slAuftrag(v) {
+        const m = String(v == null ? '' : v).match(/^\s*(\d{5,})\s*(?:\/\s*(\d+))?\s*$/);
+        return m ? { nr: m[1], txn: m[2] || '3' } : null;
+    }
+    function slAufUrl(a) {
+        return a ? ('https://www.prologistics.info/auction.php?number=' + a.nr + '&txnid=' + a.txn) : '';
+    }
     const SL_WAL = ['EUR','GBP','CHF','PLN','NOK','SEK','DKK','HUF','CZK','USD','CAD','RON'];
     function slWalutaKonta(etykieta) {
         const t = String(etykieta || '').toUpperCase().split(/[^A-Z]+/);
@@ -25322,7 +25481,7 @@
     function slCzytajPL(wiersze, konto) {
         const h = (wiersze[0] || []).map(function (x) { return String(x == null ? '' : x).trim(); });
         const K = {};
-        ['Payment Date', 'Amount', 'Comment', 'Debit', 'Credit', 'Name', 'Invoice Number']
+        ['Payment Date', 'Amount', 'Comment', 'Debit', 'Credit', 'Name', 'Invoice Number', 'Auftrag number']
             .forEach(function (k) { K[k] = h.indexOf(k); });
         if (K['Amount'] < 0 || K['Debit'] < 0 || K['Comment'] < 0)
             throw new Error('to nie wygląda na eksport płatności — brak kolumn Amount/Debit/Comment');
@@ -25337,7 +25496,8 @@
                           podejrzanyId: t.liczba, tok: slTok(r[K['Name']]),
                           fv: String(r[K['Invoice Number']] == null ? '' : r[K['Invoice Number']]).replace(/\.0$/, ''),
                           deb: String(r[K['Debit']] == null ? '' : r[K['Debit']]).replace(/\.0$/, ''),
-                          cred: String(r[K['Credit']] == null ? '' : r[K['Credit']]).replace(/\.0$/, '') };
+                          cred: String(r[K['Credit']] == null ? '' : r[K['Credit']]).replace(/\.0$/, ''),
+                          auf: slAuftrag(r[K['Auftrag number']]) };
             const wplyw = konto ? (rec.deb === String(konto)) : /^1[23]/.test(rec.deb);
             (wplyw ? we : wy).push(rec);
         }
@@ -25469,6 +25629,7 @@
             g.linie.forEach(function (r) { r.tok.forEach(function (x) { t[x] = 1; }); });
             g.tok = Object.keys(t);
             g.niespojna = g.linie.some(function (r) { return r.data !== g.linie[0].data || r.deb !== g.linie[0].deb; });
+            g.auf = (g.linie.filter(function (r) { return r.auf; })[0] || {}).auf || null;
             return g;
         });
         const Z = zwr.map(function (x) { return { src: x, kw: Math.abs(x.kw), tok: x.tok, data: x.data }; });
@@ -26098,24 +26259,46 @@
 
         h += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #eee">'
           + '<button id="sal-csv" style="padding:4px 12px;border:1px solid #ccc;border-radius:6px;'
-          + 'background:#fff;cursor:pointer;font-size:11px">Wykaz pozycji nieuzgodnionych (CSV)</button></div></div>';
+          + 'background:#fff;cursor:pointer;font-size:11px">Wykaz pozycji nieuzgodnionych (XLSX)</button></div></div>';
         d.innerHTML = h;
         const c = d.querySelector('#sal-csv');
-        if (c) c.onclick = function () { salCsv(r); };
+        if (c) c.onclick = function () { salWykaz(r); };
     }
 
-    function salCsv(r){
-        const lin = ['strona;rodzaj;data;numer/faktura;kwota;konto;powód'];
-        r.wplaty.bezParyPP.forEach(function (x){ lin.push('PayPal;wpłata;' + x.data + ';' + x.id + ';' + x.kw + ';;' + (x.powodTxt || '')); });
-        r.wplaty.bezParyPL.forEach(function (x){ lin.push('prologistics;wpłata;' + x.data + ';' + (x.id || ('wiersz ' + x.w)) + ';' + x.kw + ';' + (x.konto || '') + ';' + (x.powodTxt || '')); });
-        r.zwroty.bezParyPP.forEach(function (x){ lin.push('PayPal;zwrot;' + x.data + ';' + (x.src ? x.src.id : '') + ';' + (-x.kw) + ';;' + (x.powodTxt || '')); });
-        r.zwroty.bezParyPL.forEach(function (x){ lin.push('prologistics;zwrot;' + x.data + ';' + x.fv + ';' + (-x.kw) + ';' + (x.linie[0] ? (x.linie[0].konto || '') : '') + ';' + (x.powodTxt || '')); });
-        const blob = new Blob(['﻿' + lin.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    // Wykaz zapisujemy jako XLSX z klikalnym numerem auftraga. Numer transakcji
+    // bywa pusty albo w formacie, ktorego nie rozpoznajemy (UK ma 28-znakowe
+    // odnosniki zamiast 17-znakowych numerow PayPala) — auftrag jest wtedy
+    // jedynym punktem zaczepienia i prowadzi wprost do dokumentu.
+    function salWykaz(r){
+        const naglowek = ['Strona', 'Rodzaj', 'Data', 'Auftrag', 'Numer transakcji',
+                          'Faktura', 'Kwota', 'Konto', 'Wiersz', 'Powód'];
+        const w = [naglowek];
+        const link = function (auf){
+            return auf ? { v: auf.nr, href: slAufUrl(auf) } : '';
+        };
+        r.wplaty.bezParyPP.forEach(function (x){
+            w.push(['PayPal', 'Wpłata', x.data, '', x.id, '', x.kw, '', '', x.powodTxt || '']);
+        });
+        r.wplaty.bezParyPL.forEach(function (x){
+            w.push(['prologistics', 'Wpłata', x.data, link(x.auf), x.id || '', x.fv || '',
+                    x.kw, x.konto || '', x.w, x.powodTxt || '']);
+        });
+        r.zwroty.bezParyPP.forEach(function (x){
+            w.push(['PayPal', 'Zwrot', x.data, '', x.src ? x.src.id : '', '', -x.kw, '', '', x.powodTxt || '']);
+        });
+        r.zwroty.bezParyPL.forEach(function (x){
+            const l0 = x.linie[0] || {};
+            w.push(['prologistics', 'Zwrot', x.data, link(x.auf), l0.id || '', x.fv || '',
+                    -x.kw, l0.konto || '', x.linie.map(function (y){ return y.w; }).join(', '),
+                    x.powodTxt || '']);
+        });
+        const blob = slXlsxBlob('Nieuzgodnione', w);
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = 'salda-paypal-niesparowane.csv';
+        a.download = 'salda-paypal-nieuzgodnione.xlsx';
         document.body.appendChild(a); a.click();
-        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+        salSay('Zapisane: ' + (w.length - 1) + ' pozycji.', '#0a7a2f');
     }
 
     // ---------- guzik ----------
