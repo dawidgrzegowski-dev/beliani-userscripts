@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.17
+// @version      3.18
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24906,15 +24906,6 @@
     //
     // NIC NIE OZNACZA. To dokladnie przelot „szukaj + pobierz plik", urwany zaraz
     // po odebraniu pliku; guziki oznaczajace nie sa tu w ogole dotykane.
-    // To samo pytanie, tylko bez wyliczania sprzedawcow i zrodel. Puste pole
-    // znaczy „nie zawezaj", a lista znaczy „tylko te" — i wlasnie ta roznica gubila
-    // platnosci ze sklepow nieobecnych juz w formularzu.
-    function expBezSprzedawcow(body){
-        const q = new URLSearchParams(body);
-        q.delete('username[]');
-        q.delete('source_seller_id[]');
-        return q.toString();
-    }
     window.__TM_EXPORT_FETCH = async function (konta, od, doo, system, postep){
         if (!Array.isArray(konta) || !konta.length) throw new Error('nie podano kont');
         if (!/^\d{4}-\d{2}-\d{2}$/.test(String(od)) || !/^\d{4}-\d{2}-\d{2}$/.test(String(doo)))
@@ -24945,12 +24936,15 @@
             const krok = function (etap){ if (postep) postep(i, konta.length, etykieta, etap); };
             krok('szukam pozycji');
             try {
-                // Sprzedawcow nie wyliczamy: puste pole znaczy „nie zawezaj", a lista
-                // znaczylaby „tylko te" — i wycinalaby platnosci ze sklepow, ktorych
-                // w formularzu juz nie ma.
-                const rows = expRows(expAssertForm(await expPost(expBezSprzedawcow(expSearchBody(p, a)), false)));
+                // Sprzedawcow WYLICZAMY. Puste pole username[] nie znaczy tu „wszyscy",
+                // tylko „zaden" — zapytanie bez tej listy wraca z zerem wierszy
+                // (sprawdzone na produkcji: 0 wplywow, 0 wyplywow).
+                const rows = expRows(expAssertForm(await expPost(expSearchBody(p, a), false)));
                 if (!rows.length){
-                    out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: '' });
+                    // Zero wierszy bywa prawda (konto bez ruchu), ale bywa tez objawem
+                    // zlego zapytania. Odnotowujemy to jawnie, zeby nie wygladalo
+                    // jak udane pobranie pustki.
+                    out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, pusto: true, blad: '' });
                     continue;
                 }
                 krok('znalazłem ' + rows.length + ' poz., pobieram plik');
@@ -25751,6 +25745,12 @@
                     gorsze += (x.wierszy - x.wPliku);
             });
             const odczyt = we.length + wy.length;
+            // Zero wierszy ze WSZYSTKICH kont to prawie zawsze zle zapytanie, a nie
+            // miesiac bez ruchu. Mowimy to wprost, zamiast meldowac zielone „pobrane 0".
+            const puste = wynik.filter(function (x){ return !x.blad && x.pusto; }).length;
+            if (!odczyt && puste === wynik.length && wynik.length)
+                problemy.push('żadne z ' + puste + ' kont nie zwróciło ani jednego wiersza '
+                            + '— sprawdź zakres dat, a jeśli jest dobry, to zapytanie jest złe');
             if (zapow && odczyt < zapow)
                 problemy.push('odczytałem ' + odczyt + ' wierszy z zapowiedzianych ' + zapow
                             + ' — zestawienie jest niepełne, NIE uzgadniaj na nim');
