@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.20
+// @version      3.21
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25278,7 +25278,11 @@
     }
 
     // ---------- wczytanie stron ----------
-    const SL_ZWROTY = { 'Payment Refund': 1, 'Payment Reversal': 1, 'Chargeback': 1 };
+    // PayPal pisze te same typy roznie na roznych kontach: „Payment Refund" na 1301,
+    // „Payment refund" na 1274. Porownujemy wiec malymi literami — inaczej zwroty
+    // jednego konta w ogole nie zostaja rozpoznane jako zwroty.
+    const SL_ZWROTY = { 'payment refund': 1, 'payment reversal': 1, 'chargeback': 1 };
+    function slZwrot(typ) { return !!SL_ZWROTY[String(typ || '').trim().toLowerCase()]; }
     function slCzytajPP(wiersze) {
         const hi = wiersze.findIndex(function (r) { return r && String(r[1] || '').trim() === 'Type'; });
         if (hi < 0) throw new Error('to nie wygląda na raport PayPala — nie znalazłem nagłówka „Type”');
@@ -25294,7 +25298,10 @@
         }
         return { okres: okres, poz: out };
     }
-    function slCzytajPL(wiersze) {
+    // Kierunek rozpoznajemy po NUMERZE KONTA, ktore uzgadniamy. Regula „Debit zaczyna
+    // sie od 13" trzymala sie tylko na 1301 — konto 1274 zaczyna sie od 12 i wszystkie
+    // wplywy wpadaly do wyplywow. Konto obciazone = pieniadze weszly na nie.
+    function slCzytajPL(wiersze, konto) {
         const h = (wiersze[0] || []).map(function (x) { return String(x == null ? '' : x).trim(); });
         const K = {};
         ['Payment Date', 'Amount', 'Comment', 'Debit', 'Credit', 'Name', 'Invoice Number']
@@ -25311,8 +25318,10 @@
             const rec = { w: i + 1, data: slData(r[K['Payment Date']]), kw: kw, id: t.id,
                           podejrzanyId: t.liczba, tok: slTok(r[K['Name']]),
                           fv: String(r[K['Invoice Number']] == null ? '' : r[K['Invoice Number']]).replace(/\.0$/, ''),
-                          deb: String(r[K['Debit']] == null ? '' : r[K['Debit']]).replace(/\.0$/, '') };
-            (/^13/.test(rec.deb) ? we : wy).push(rec);
+                          deb: String(r[K['Debit']] == null ? '' : r[K['Debit']]).replace(/\.0$/, ''),
+                          cred: String(r[K['Credit']] == null ? '' : r[K['Credit']]).replace(/\.0$/, '') };
+            const wplyw = konto ? (rec.deb === String(konto)) : /^1[23]/.test(rec.deb);
+            (wplyw ? we : wy).push(rec);
         }
         return { we: we, wy: wy };
     }
@@ -25394,9 +25403,9 @@
         const ruch = wszystkie.filter(function (x) { return !/hold/i.test(x.typ); });
         // Dalej o kierunku decyduje ZNAK, nie nazwa: gdy PayPal doda nowy typ wplaty,
         // ma wpasc do wlasciwej strony, a nie wypasc z zestawienia po cichu.
-        const wpl = ruch.filter(function (x) { return x.kw > 0 && !SL_ZWROTY[x.typ]; });
-        const zwr = ruch.filter(function (x) { return x.kw < 0 && SL_ZWROTY[x.typ]; });
-        const jedn = ruch.filter(function (x) { return x.kw > 0 && SL_ZWROTY[x.typ]; });
+        const wpl = ruch.filter(function (x) { return x.kw > 0 && !slZwrot(x.typ); });
+        const zwr = ruch.filter(function (x) { return x.kw < 0 && slZwrot(x.typ); });
+        const jedn = ruch.filter(function (x) { return x.kw > 0 && slZwrot(x.typ); });
         // Cokolwiek nie wpadlo do zadnego kubelka, ma byc WIDOCZNE, a nie pominiete.
         const nieznane = ruch.filter(function (x) {
             return wpl.indexOf(x) < 0 && zwr.indexOf(x) < 0 && jedn.indexOf(x) < 0;
@@ -25739,7 +25748,7 @@
             wynik.forEach(function (x){
                 if (x.blad){ problemy.push(x.nazwa + ': ' + x.blad); return; }
                 if (!x.buf) return;
-                const r = slCzytajPL(slXls(x.buf));
+                const r = slCzytajPL(slXls(x.buf), x.acc);
                 r.we.forEach(function (y){ y.konto = x.acc; we.push(y); });
                 r.wy.forEach(function (y){ y.konto = x.acc; wy.push(y); });
             });
