@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.27
+// @version      3.29
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23521,6 +23521,9 @@
     // ---------- zakres dat ----------
     function expRange(p){
         const now = new Date();
+        // Profil zapisany dawno temu potrafi niesc puste albo prastare daty. Puste
+        // uzupelniamy dzisiejsza — lepiej pobrac jeden dzien niz nic.
+        if (p.range === 'fix' && (!p.from || !p.to)) return [p.from || iso(now), p.to || iso(now)];
         if (p.range === 'cur'){
             const a = new Date(now.getFullYear(), now.getMonth(), 1);
             const b = new Date(now.getFullYear(), now.getMonth() + 1, 0);
@@ -24314,7 +24317,19 @@
             const e = $(id);
             if (e) e.onchange = function (){ const v = e.value; patch(function (p){ p[field] = v; }); render(); };
         };
-        bind('#exp-range', 'range'); bind('#exp-df', 'dateField'); bind('#exp-state', 'state');
+        // Przejscie na „zakres reczny" ustawia DZISIAJ do DZISIAJ. Bez tego wracaly
+        // daty sprzed lat, zapisane kiedys w profilu — a taki zakres wyglada na
+        // wybrany swiadomie i nikt go nie sprawdza.
+        const zakres = $('#exp-range');
+        if (zakres) zakres.onchange = function (){
+            const v = zakres.value;
+            patch(function (p){
+                if (v === 'fix' && p.range !== 'fix'){ p.from = iso(new Date()); p.to = iso(new Date()); }
+                p.range = v;
+            });
+            render();
+        };
+        bind('#exp-df', 'dateField'); bind('#exp-state', 'state');
         bind('#exp-st', 'sellerType'); bind('#exp-inv', 'inv'); bind('#exp-paid', 'paid');
         bind('#exp-sys', 'system'); bind('#exp-from', 'from'); bind('#exp-to', 'to');
         // Zakres trzymamy w ryzach: „do" nie moze byc wczesniej niz „od".
@@ -24955,31 +24970,16 @@
                 // Sprzedawcow WYLICZAMY. Puste pole username[] nie znaczy tu „wszyscy",
                 // tylko „zaden" — zapytanie bez tej listy wraca z zerem wierszy
                 // (sprawdzone na produkcji: 0 wplywow, 0 wyplywow).
-                // Pytamy DWOMA waskimi zapytaniami zamiast jednego szerokiego.
-                // Opcje formularza sa podzialem: „Not deleted only" (0) plus
-                // „Deleted only" (1) to dokladnie „All" (2). Jedno pytanie o „All"
-                // potrafi isc kilkadziesiat sekund, a te dwa zwykle sa duzo tansze,
-                // bo drugie zwraca garstke. Wynik laczymy i usuwamy powtorzenia —
-                // gdyby zbiory sie nakladaly, i tak nic nie zginie ani sie nie zdubluje.
+                // JEDNO zapytanie, inv_status=2 („All"). Probowalem rozbic je na dwa
+                // wezsze („Not deleted only" + „Deleted only"), zakladajac, ze koszt
+                // siedzi w szukaniu po fakturach usunietych. POMIAR NA PRODUKCJI TO
+                // OBALIL: dwa zapytania to 86 s wobec 44 s na jedno, a 224 i 21 wierszy
+                // kosztowaly tyle samo. Koszt nie zalezy ani od inv_status, ani od
+                // liczby wierszy — wiec dzielenie tylko podwajalo czekanie.
                 const t0 = Date.now();
-                const szukaj = async function (inv, opis){
-                    const q = new URLSearchParams(expSearchBody(p, a));
-                    q.set('inv_status', inv);
-                    return expRows(expAssertForm(
-                        await expZLimitem(expPost(q.toString(), false), opis)));
-                };
-                const zwykle = await szukaj('0', 'wyszukiwanie (faktury bieżące)');
-                krok('bieżące: ' + zwykle.length + ' poz., szukam usuniętych');
-                const usuniete = await szukaj('1', 'wyszukiwanie (faktury usunięte)');
-                const widziane = {};
-                const rows = zwykle.concat(usuniete).filter(function (v){
-                    const k = String(v);
-                    if (widziane[k]) return false;
-                    widziane[k] = 1;
-                    return true;
-                });
+                const rows = expRows(expAssertForm(
+                    await expZLimitem(expPost(expSearchBody(p, a), false), 'wyszukiwanie')));
                 const tSzuk = Math.round((Date.now() - t0) / 1000);
-                const rozbicie = zwykle.length + ' bieżących + ' + usuniete.length + ' usuniętych';
                 if (!rows.length){
                     // Zero wierszy bywa prawda (konto bez ruchu), ale bywa tez objawem
                     // zlego zapytania. Odnotowujemy to jawnie, zeby nie wygladalo
@@ -24987,7 +24987,7 @@
                     out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, pusto: true, blad: '' });
                     continue;
                 }
-                krok('znalazłem ' + rows.length + ' poz. (' + rozbicie + ') w ' + tSzuk + ' s, pobieram plik');
+                krok('znalazłem ' + rows.length + ' poz. w ' + tSzuk + ' s, pobieram plik');
                 // Eksport idzie po WYBRANYCH WIERSZACH, nie po filtrach — wiec ciala
                 // wyszukiwania tu nie powtarzamy, liczy sie sama lista selected[].
                 const t1 = Date.now();
@@ -25005,7 +25005,7 @@
                     throw new Error('plik jest krótszy niż lista: ' + fr.n + ' z ' + rows.length
                                   + ' wierszy — serwer uciął zapytanie, zawęź zakres dat');
                 krok('gotowe: szukanie ' + tSzuk + ' s, plik ' + tPlik + ' s');
-                out.push({ acc: a, nazwa: etykieta, wierszy: rows.length, rozbicie: rozbicie,
+                out.push({ acc: a, nazwa: etykieta, wierszy: rows.length,
                            sekSzukanie: tSzuk, sekPlik: tPlik,
                            wPliku: fr.n, buf: f.buf, blad: '' });
             } catch (e){
@@ -25723,13 +25723,131 @@
         };
     }
 
+    // ---------- wyciag bankowy (Raiffeisenbank CZ) ----------
+    // Plik: CSV ze srednikiem, w cudzyslowach, BOM na poczatku, daty dd.MM.yyyy.
+    // Klucz do uzgodnienia to kolumna VS (variabilni symbol) — siedzi w niej NUMER
+    // AUFTRAGA, ten sam, ktory export payments ma w kolumnie „Auftrag number".
+    // Sprawdzone na wyciagu 403699004/5500 za sierpien: 270 z 295 wierszy ma VS.
+    function slCsvPodziel(t) {
+        const w = [];
+        let pole = '', wiersz = [], q = false;
+        for (let i = 0; i < t.length; i++) {
+            const c = t[i];
+            if (q) {
+                if (c === '"') { if (t[i + 1] === '"') { pole += '"'; i++; } else q = false; }
+                else pole += c;
+            } else if (c === '"') q = true;
+            else if (c === ';') { wiersz.push(pole); pole = ''; }
+            else if (c === '\n') { wiersz.push(pole); w.push(wiersz); wiersz = []; pole = ''; }
+            else if (c !== '\r') pole += c;
+        }
+        if (pole || wiersz.length) { wiersz.push(pole); w.push(wiersz); }
+        return w.filter(function (r) { return r.some(function (x) { return String(x).trim(); }); });
+    }
+    function slCzytajBank(tekst) {
+        const w = slCsvPodziel(String(tekst).replace(/^﻿/, ''));
+        if (!w.length) throw new Error('pusty plik');
+        const h = w[0].map(function (x) { return String(x || '').trim(); });
+        const K = {};
+        h.forEach(function (k, i) { if (k && !(k in K)) K[k] = i; });
+        // „Accocunt Number" to literowka w samym pliku banku — zostawiamy jak jest.
+        const wymagane = ['Transaction Date', 'VS', 'Booked amount'];
+        const brak = wymagane.filter(function (k) { return !(k in K); });
+        if (brak.length)
+            throw new Error('to nie wygląda na wyciąg bankowy — brak kolumn: ' + brak.join(', '));
+
+        const poz = [];
+        let konto = '', waluta = '';
+        for (let i = 1; i < w.length; i++) {
+            const r = w[i];
+            const kw = slKwota(r[K['Booked amount']]);
+            if (kw == null) continue;
+            konto = konto || String(r[K['Account number']] || '').trim();
+            waluta = waluta || String(r[K['Account Currency']] || '').trim().toUpperCase();
+            const d = String(r[K['Transaction Date']] || '').match(/(\d{2})\.(\d{2})\.(\d{4})/);
+            // Numeru auftraga szukamy w VS, a gdy go tam nie ma — w opisie i wiadomosci.
+            // Bank potrafi wpisac go w pole tekstowe („Refund for deleted order 15230365").
+            const vs = String(r[K['VS']] || '').trim();
+            let auf = /^\d{6,}$/.test(vs) ? vs : '';
+            if (!auf) {
+                const t = [r[K['Message']], r[K['Note']]].join(' ');
+                const m = String(t).match(/\b(1[45]\d{6})\b/);
+                auf = m ? m[1] : '';
+            }
+            poz.push({
+                w: i + 1,
+                data: d ? (d[3] + '-' + d[2] + '-' + d[1]) : '',
+                kw: kw,
+                auf: auf,
+                zVS: /^\d{6,}$/.test(vs),
+                tok: slTok(r[K['Name of Account']]),
+                nazwa: String(r[K['Name of Account']] || '').trim(),
+                typ: String(r[K['Transaction type']] || '').trim(),
+                opis: String(r[K['Note']] || r[K['Message']] || '').trim(),
+                id: String(r[K['Transaction ID']] || '').trim(),
+                oplata: slKwota(r[K['Fee']]) || 0
+            });
+        }
+        return { konto: konto, waluta: waluta, poz: poz };
+    }
+
+    // Uzgodnienie wyciagu z eksportem. Inaczej niz przy PayPalu: tu kluczem jest
+    // NUMER AUFTRAGA, obecny po obu stronach, wiec parowanie jest twarde.
+    // Kwota bywa rozna od zaksiegowanej (bank potraca oplaty, klient doplaca
+    // zaokraglenie), wiec rozjazd kwoty przy zgodnym numerze pokazujemy osobno —
+    // to nie jest brak pary, tylko roznica do wyjasnienia.
+    function slUzgodnijBank(bank, pl) {
+        const wpl = bank.poz.filter(function (x) { return x.kw > 0; });
+        const wyp = bank.poz.filter(function (x) { return x.kw < 0; });
+
+        const wgAuf = {};
+        pl.we.forEach(function (r) {
+            if (r.auf) (wgAuf[r.auf.nr] = wgAuf[r.auf.nr] || []).push(r);
+        });
+
+        const pary = [], rozjazd = [], bezAuf = [], bezPary = [];
+        const uzyte = {};
+        wpl.forEach(function (b) {
+            if (!b.auf) { bezAuf.push(b); return; }
+            const g = wgAuf[b.auf];
+            if (!g || !g.length) { bezPary.push(b); return; }
+            const suma = Math.round(g.reduce(function (n, x) { return n + x.kw; }, 0) * 100) / 100;
+            uzyte[b.auf] = 1;
+            pary.push({ bank: b, pl: g, suma: suma });
+            if (Math.abs(b.kw - suma) > 0.005)
+                rozjazd.push({ auf: b.auf, bank: b.kw, prolo: suma, roznica: Math.round((b.kw - suma) * 100) / 100 });
+        });
+        const proloBezPary = [];
+        Object.keys(wgAuf).forEach(function (nr) {
+            if (!uzyte[nr]) wgAuf[nr].forEach(function (r) { proloBezPary.push(r); });
+        });
+        // wiersze eksportu bez numeru auftraga w ogole — osobno, bo to inna sprawa
+        const proloBezAuf = pl.we.filter(function (r) { return !r.auf; });
+
+        const suma = function (a, f) { return Math.round(a.reduce(function (n, x) { return n + f(x); }, 0) * 100) / 100; };
+        return {
+            konto: bank.konto, waluta: bank.waluta,
+            wplaty: {
+                bank: wpl.length, pl: pl.we.length, pary: pary.length,
+                rozjazd: rozjazd,
+                bezAuf: bezAuf, bezPary: bezPary,
+                proloBezPary: proloBezPary, proloBezAuf: proloBezAuf,
+                sumaBank: suma(wpl, function (x) { return x.kw; }),
+                sumaPL: suma(pl.we, function (x) { return x.kw; })
+            },
+            wyplaty: { n: wyp.length, suma: suma(wyp, function (x) { return x.kw; }), poz: wyp },
+            oplaty: suma(bank.poz, function (x) { return x.oplata; })
+        };
+    }
+
     // ---------- lista Sprawdzania ----------
     // Kazda pozycja to osobne uzgodnienie. PayPal jest pierwszy; kolejne dokladamy
     // tutaj, bez ruszania reszty modulu.
     const SAL_LISTA = [
         { id: 'paypal', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
-        { id: 'saferpay', nazwa: 'Saferpay ↔ Export payments', opis: 'jeszcze nie zrobione', gotowe: false },
-        { id: 'bank', nazwa: 'Wyciąg bankowy ↔ konto', opis: 'jeszcze nie zrobione', gotowe: false }
+        { id: 'bank', nazwa: 'Wyciąg bankowy ↔ Export payments',
+          opis: 'wyciąg z banku kontra zestawienie z prologistics · parowanie po numerze auftraga', gotowe: true },
+        { id: 'saferpay', nazwa: 'Saferpay ↔ Export payments', opis: 'jeszcze nie zrobione', gotowe: false }
     ];
     // Konta PayPal, ktore uzgadniamy. Numery sa stale, ale ETYKIETY czytamy z zywego
     // export.php — dzieki temu zmiana nazwy konta w prologistics widac tu od razu,
@@ -25832,7 +25950,7 @@
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
         p.querySelectorAll('.sal-poz').forEach(function (d){
             const x = SAL_LISTA.filter(function (y){ return y.id === d.getAttribute('data-id'); })[0];
-            if (x && x.gotowe) d.onclick = function (){ salRysujPP(); };
+            if (x && x.gotowe) d.onclick = function (){ (x.id === 'bank' ? salRysujBank : salRysujPP)(); };
         });
     }
 
@@ -26045,11 +26163,8 @@
             clearInterval(zegar);
             const czasy = wynik.filter(function (x){ return !x.blad && x.sekSzukanie != null; })
                 .map(function (x){ return 'szukanie ' + x.sekSzukanie + ' s, plik ' + x.sekPlik + ' s'; });
-            const rozb = wynik.filter(function (x){ return x.rozbicie; })
-                .map(function (x){ return x.rozbicie; });
             salSay('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: '
                 + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont'
-                + (rozb.length ? (' [' + rozb.join(' | ') + ']') : '')
                 + (czasy.length ? (' · ' + czasy.join(' | ')) : '')
                 + (zapow ? (' (serwer zapowiedział ' + zapow + ' wierszy' 
                     + (gorsze ? ('; w pliku brakuje ' + gorsze) : '') + ')') : '') + '.'
@@ -26327,6 +26442,287 @@
         if (!p.innerHTML) salRysujListe();
         p.style.display = 'block';
     };
+
+    // ---------- ekran: wyciag bankowy ----------
+    // Konta bankowe trzymamy tu, bo lista w export.php ma ich setki. Dokladanie
+    // kolejnego to jedna linia; etykiety i tak czytamy z zywej strony.
+    const SAL_BANKI = ['1450'];
+    let SAL_BANK = null;       // wczytany wyciag
+    let SAL_BEXP = null;       // zestawienie z prologistics
+
+    async function salRysujBank(){
+        const p = salPanel(), u = salUst();
+        const et = await salEtykiety(), akt = salAktywne();
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · Wyciąg bankowy ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.bod || u.od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.bdo || u.do) + '" style="font-size:12px;width:130px"></label>'
+            + '<button id="sal-pobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
+            + '</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Konto bankowe</div>'
+            + '<select id="sal-konta" style="width:100%;font-size:12px;padding:4px;'
+            + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
+            + SAL_BANKI.map(function (n){
+                const stan = (n in akt) ? (akt[n] ? '' : '  · nieaktywne') : '';
+                return '<option value="' + n + '"' + ((u.bkonto || SAL_BANKI[0]) === n ? ' selected' : '') + '>'
+                    + salEsc(et[n] || n) + salEsc(stan) + '</option>';
+            }).join('')
+            + '</select>'
+            + '<div id="sal-ktore" style="font-size:10px;margin-top:4px;line-height:1.7"></div></div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Wyciąg z banku '
+            + '<span style="font-weight:400;color:#888;font-size:11px">— CSV pobrany z bankowości, kolumna VS niesie numer auftraga</span></div>'
+            + '<input type="file" id="sal-fbank" accept=".csv,.CSV" style="font-size:11px">'
+            + '<div id="sal-plikinfo" style="font-size:11px;color:#888;margin-top:4px"></div></div>'
+
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+            + '<button id="sal-run" style="padding:6px 16px;border:none;border-radius:6px;background:#0f766e;color:#fff;font-weight:700;cursor:pointer">Porównaj</button>'
+            + '<span id="sal-status" style="font-size:11px;color:#666"></span></div>'
+            + '<div id="sal-raport" style="margin-top:10px"></div>';
+
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        const zapisz = function (){
+            const o = salUst();
+            o.bod = p.querySelector('#sal-od').value;
+            o.bdo = p.querySelector('#sal-do').value;
+            o.bkonto = p.querySelector('#sal-konta').value;
+            salZapisz(o);
+            const kt = p.querySelector('#sal-ktore'), sel = p.querySelector('#sal-konta');
+            if (kt && sel && sel.options[sel.selectedIndex])
+                kt.innerHTML = '<span style="display:inline-block;background:#750000;color:#fff;font-weight:700;'
+                             + 'border-radius:5px;padding:3px 10px">'
+                             + salEsc(sel.options[sel.selectedIndex].text.split('·')[0].trim()) + '</span>';
+        };
+        p.querySelector('#sal-od').onchange = zapisz;
+        p.querySelector('#sal-do').onchange = zapisz;
+        p.querySelector('#sal-konta').onchange = zapisz;
+        p.querySelector('#sal-fbank').onchange = function (){ salWczytajBank(this.files); };
+        p.querySelector('#sal-pobierz').onclick = function (){ salPobierzBank(this); };
+        p.querySelector('#sal-run').onclick = function (){ salPorownajBank(this); };
+        zapisz();
+        salBankInfo();
+    }
+
+    function salBankInfo(){
+        const d = document.getElementById('sal-plikinfo');
+        if (!d) return;
+        const chip = function (k, ety, opis){
+            return '<div style="display:flex;gap:6px;align-items:center;margin-top:2px">'
+                 + '<button class="sal-bx" data-k="' + k + '" title="usuń" style="border:1px solid #ddd;'
+                 + 'background:#fff;border-radius:4px;width:18px;height:18px;line-height:1;cursor:pointer;'
+                 + 'color:#c00;font-size:12px;padding:0">×</button>'
+                 + '<span><b>' + salEsc(ety) + '</b> ' + salEsc(opis) + '</span></div>';
+        };
+        let h = '';
+        if (SAL_BANK) h += chip('bank', SAL_BANK.nazwa, '· ' + SAL_BANK.poz.length + ' pozycji · '
+            + (SAL_BANK.konto || '?') + (SAL_BANK.waluta ? (' · ' + SAL_BANK.waluta) : ''));
+        if (SAL_BEXP) h += chip('exp', 'zestawienie z prologistics', '· ' + SAL_BEXP.we.length
+            + ' wpływów, ' + SAL_BEXP.wy.length + ' wypływów');
+        d.innerHTML = h || '<span style="color:#888">nic jeszcze nie wczytane</span>';
+        d.querySelectorAll('.sal-bx').forEach(function (b){
+            b.onclick = function (){
+                if (this.getAttribute('data-k') === 'bank'){ SAL_BANK = null;
+                    const pole = document.getElementById('sal-fbank'); if (pole) pole.value = ''; }
+                else SAL_BEXP = null;
+                const rap = document.getElementById('sal-raport'); if (rap) rap.innerHTML = '';
+                salBankInfo();
+                salSay('Usunięte.', '#666');
+            };
+        });
+    }
+
+    async function salWczytajBank(files){
+        if (!files || !files.length) return;
+        try {
+            const t = await files[0].text();
+            const r = slCzytajBank(t);
+            SAL_BANK = { nazwa: files[0].name, konto: r.konto, waluta: r.waluta, poz: r.poz };
+            salSay('Wczytane: ' + r.poz.length + ' pozycji z ' + (r.konto || 'konta') + '.', '#0a7a2f');
+        } catch (e){
+            SAL_BANK = null;
+            salSay('„' + files[0].name + '": ' + ((e && e.message) || e), '#c00');
+        }
+        salBankInfo();
+    }
+
+    async function salPobierzBank(b){
+        const p = salPanel();
+        const konto = p.querySelector('#sal-konta').value;
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salSay('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        if (typeof window.__TM_EXPORT_FETCH !== 'function'){
+            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawienia.', '#c00');
+            return;
+        }
+        b.disabled = true;
+        const t0 = Date.now();
+        let ostatni = 'Pobieram…';
+        const zegar = setInterval(function (){
+            salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+        }, 1000);
+        try {
+            const wynik = await window.__TM_EXPORT_FETCH([konto], od, doo, 'excel', function (i, n, nazwa, etap){
+                ostatni = 'Pobieram ' + nazwa + (etap ? (' · ' + etap) : '');
+                salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+            });
+            const x = wynik[0];
+            if (x.blad) throw new Error(x.blad);
+            if (!x.buf){ SAL_BEXP = { we: [], wy: [] }; salBankInfo();
+                salSay('To konto nie ma ruchu w tym zakresie.', '#c47f00');
+                clearInterval(zegar); b.disabled = false; return; }
+            SAL_BEXP = slCzytajPL(slXls(x.buf), konto);
+            clearInterval(zegar);
+            salBankInfo();
+            salSay('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: '
+                + SAL_BEXP.we.length + ' wpływów, ' + SAL_BEXP.wy.length + ' wypływów'
+                + (x.sekSzukanie != null ? (' · szukanie ' + x.sekSzukanie + ' s, plik ' + x.sekPlik + ' s') : '')
+                + '.', '#0a7a2f');
+        } catch (e){
+            salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        } finally { clearInterval(zegar); }
+        b.disabled = false;
+    }
+
+    function salPorownajBank(b){
+        if (!SAL_BANK){ salSay('Wskaż plik wyciągu.', '#c47f00'); return; }
+        if (!SAL_BEXP){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
+        b.disabled = true;
+        try {
+            const r = slUzgodnijBank(SAL_BANK, SAL_BEXP);
+            salRaportBank(r);
+            salSay('Gotowe.', '#0a7a2f');
+        } catch (e){
+            salSay('Nie policzyłem: ' + ((e && e.message) || e), '#c00');
+        }
+        b.disabled = false;
+    }
+
+    function salRaportBank(r){
+        const d = document.getElementById('sal-raport');
+        if (!d) return;
+        const roz = function (a, b){ return Math.round((a - b) * 100) / 100; };
+        const zero = function (v){ return Math.abs(v) < 0.005; };
+        const TH = 'padding:4px 6px;font-weight:400;color:#888;border-bottom:1px solid #e5e5e5';
+        const TD = 'padding:3px 6px';
+        const TDR = 'padding:3px 6px;text-align:right;font-variant-numeric:tabular-nums';
+        const sek = function (t){
+            return '<div style="margin:12px 0 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;'
+                 + 'color:#750000;font-weight:700">' + t + '</div>';
+        };
+        const w = r.wplaty;
+        const d0 = roz(w.sumaBank, w.sumaPL);
+        let h = '<div style="border:1px solid #DBD9D7;border-radius:10px;padding:12px">'
+            + '<div style="font-weight:700;font-size:13px">Protokół uzgodnienia — wyciąg bankowy / Export payments</div>'
+            + '<div style="font-size:11px;color:#666;margin-top:2px">Rachunek ' + salEsc(r.konto || '—')
+            + (r.waluta ? (' · ' + salEsc(r.waluta)) : '') + '</div>'
+
+            + sek('Zestawienie zbiorcze')
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + '<tr><td style="' + TH + '"></td><td style="' + TH + ';text-align:right">Wyciąg</td>'
+            + '<td style="' + TH + ';text-align:right">prologistics</td>'
+            + '<td style="' + TH + ';text-align:right">Różnica</td></tr>'
+            + '<tr><td style="' + TD + '">Wpływy</td>'
+            + '<td style="' + TDR + '">' + salPln(w.sumaBank) + '</td>'
+            + '<td style="' + TDR + '">' + salPln(w.sumaPL) + '</td>'
+            + '<td style="' + TDR + ';font-weight:700;color:' + (zero(d0) ? '#0a7a2f' : '#b45309') + '">'
+            + salPln(d0) + '</td></tr></table>'
+
+            + sek('Pozycje uzgodnione')
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + '<tr><td style="' + TD + '">Sparowane po numerze auftraga</td>'
+            + '<td style="' + TDR + '">' + w.pary + ' z ' + w.bank + '</td></tr>'
+            + '<tr><td style="' + TD + '">Zgodny numer, rozbieżna kwota</td>'
+            + '<td style="' + TDR + ';color:' + (w.rozjazd.length ? '#c00' : '#0a7a2f') + '">' + w.rozjazd.length + '</td></tr>'
+            + '</table>';
+
+        const K = [
+            ['Wyciąg: brak numeru auftraga', w.bezAuf.length, 'wpłata bez VS — nie ma po czym parować'],
+            ['Wyciąg: numer jest, brak w prologistics', w.bezPary.length, 'wpłata w banku, brak księgowania'],
+            ['prologistics: brak wpłaty w wyciągu', w.proloBezPary.length, 'zaksięgowane, pieniądze nie doszły albo są poza zakresem'],
+            ['prologistics: wiersz bez numeru auftraga', w.proloBezAuf.length, 'nie ma po czym parować']
+        ].filter(function (x){ return x[1]; });
+        if (K.length) h += sek('Pozycje nieuzgodnione')
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + K.map(function (x){
+                  return '<tr><td style="' + TD + '">' + salEsc(x[0]) + '</td>'
+                       + '<td style="' + TDR + ';font-weight:700">' + x[1] + '</td>'
+                       + '<td style="' + TD + ';color:#777">' + salEsc(x[2]) + '</td></tr>';
+              }).join('') + '</table>';
+
+        if (w.rozjazd.length) h += sek('Rozbieżności kwot przy zgodnym numerze')
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + '<tr><td style="' + TH + '">Auftrag</td><td style="' + TH + ';text-align:right">Wyciąg</td>'
+            + '<td style="' + TH + ';text-align:right">prologistics</td>'
+            + '<td style="' + TH + ';text-align:right">Różnica</td></tr>'
+            + w.rozjazd.slice(0, 40).map(function (x){
+                  return '<tr><td style="' + TD + '">' + salEsc(x.auf) + '</td>'
+                       + '<td style="' + TDR + '">' + salPln(x.bank) + '</td>'
+                       + '<td style="' + TDR + '">' + salPln(x.prolo) + '</td>'
+                       + '<td style="' + TDR + ';color:#c00">' + salPln(x.roznica) + '</td></tr>';
+              }).join('')
+            + '</table>'
+            + (w.rozjazd.length > 40 ? '<div style="font-size:11px;color:#888">…i ' + (w.rozjazd.length - 40) + ' dalszych</div>' : '');
+
+        const info = [];
+        if (r.wyplaty.n) info.push(['Wypływy z rachunku', r.wyplaty.n + ' poz.', salPln(r.wyplaty.suma),
+            'poza uzgodnieniem wpłat']);
+        if (r.oplaty) info.push(['Opłaty bankowe', '', salPln(r.oplaty), 'z kolumny Fee']);
+        if (info.length) h += sek('Pozycje informacyjne')
+            + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            + info.map(function (x){
+                  return '<tr><td style="' + TD + '">' + salEsc(x[0]) + '</td>'
+                       + '<td style="' + TDR + ';color:#777">' + x[1] + '</td>'
+                       + '<td style="' + TDR + '">' + x[2] + '</td>'
+                       + '<td style="' + TD + ';color:#777">' + salEsc(x[3]) + '</td></tr>';
+              }).join('') + '</table>';
+
+        h += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #eee">'
+          + '<button id="sal-bcsv" style="padding:4px 12px;border:1px solid #ccc;border-radius:6px;'
+          + 'background:#fff;cursor:pointer;font-size:11px">Wykaz pozycji nieuzgodnionych (XLSX)</button></div></div>';
+        d.innerHTML = h;
+        const c = d.querySelector('#sal-bcsv');
+        if (c) c.onclick = function (){ salWykazBank(r); };
+    }
+
+    function salWykazBank(r){
+        const w = r.wplaty;
+        const wier = [['Strona', 'Data', 'Auftrag', 'Kwota', 'Kontrahent', 'Opis', 'Wiersz', 'Powód']];
+        const link = function (nr){
+            return nr ? { v: nr, href: slAufUrl({ nr: nr, txn: '3' }) } : '';
+        };
+        w.rozjazd.forEach(function (x){
+            wier.push(['różnica kwoty', '', link(x.auf), x.roznica, '', 'wyciąg ' + x.bank + ', prologistics ' + x.prolo, '',
+                       'zgodny numer, rozbieżna kwota']);
+        });
+        w.bezAuf.forEach(function (x){
+            wier.push(['wyciąg', x.data, '', x.kw, x.nazwa, x.opis, x.w, 'brak numeru auftraga w wyciągu']);
+        });
+        w.bezPary.forEach(function (x){
+            wier.push(['wyciąg', x.data, link(x.auf), x.kw, x.nazwa, x.opis, x.w, 'brak księgowania w prologistics']);
+        });
+        w.proloBezPary.forEach(function (x){
+            wier.push(['prologistics', x.data, link(x.auf ? x.auf.nr : ''), x.kw, '', '', x.w, 'brak wpłaty w wyciągu']);
+        });
+        w.proloBezAuf.forEach(function (x){
+            wier.push(['prologistics', x.data, '', x.kw, '', '', x.w, 'wiersz bez numeru auftraga']);
+        });
+        const blob = slXlsxBlob('Nieuzgodnione', wier);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'salda-bank-nieuzgodnione.xlsx';
+        document.body.appendChild(a); a.click();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+        salSay('Zapisane: ' + (wier.length - 1) + ' pozycji.', '#0a7a2f');
+    }
 
     // Guzik zostaje schowany — launcher pokazuje go sam, po selektorze #sal-btn,
     // dokladnie tak jak guziki pozostalych modulow.
