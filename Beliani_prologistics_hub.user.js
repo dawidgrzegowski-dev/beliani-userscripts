@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.15
+// @version      3.17
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24942,26 +24942,22 @@
         for (let i = 0; i < konta.length; i++){
             const a = String(konta[i]);
             const etykieta = expAccLabel(a);
-            if (postep) postep(i, konta.length, etykieta);
+            const krok = function (etap){ if (postep) postep(i, konta.length, etykieta, etap); };
+            krok('szukam pozycji');
             try {
-                // Pytamy DWA RAZY i bierzemy szersze. Wyszukiwanie jest tylko odczytem,
-                // wiec to nic nie kosztuje poza sekunda, a zamyka pytanie „czy na pewno
-                // dostalismy wszystko" danymi zamiast zalozeniem.
-                const bodyZ = expSearchBody(p, a);
-                const bodyB = expBezSprzedawcow(bodyZ);
-                const rowsZ = expRows(expAssertForm(await expPost(bodyZ, false)));
-                const rowsB = expRows(expAssertForm(await expPost(bodyB, false)));
-                const szersze = rowsB.length >= rowsZ.length;
-                const rows = szersze ? rowsB : rowsZ;
-                const jak = szersze ? 'bez filtra sprzedawców' : 'z filtrem sprzedawców';
+                // Sprzedawcow nie wyliczamy: puste pole znaczy „nie zawezaj", a lista
+                // znaczylaby „tylko te" — i wycinalaby platnosci ze sklepow, ktorych
+                // w formularzu juz nie ma.
+                const rows = expRows(expAssertForm(await expPost(expBezSprzedawcow(expSearchBody(p, a)), false)));
                 if (!rows.length){
-                    out.push({ acc: a, nazwa: etykieta, wierszy: 0, zeSprzedawcami: rowsZ.length,
-                               bezSprzedawcow: rowsB.length, jak: jak, buf: null, blad: '' });
+                    out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: '' });
                     continue;
                 }
+                krok('znalazłem ' + rows.length + ' poz., pobieram plik');
                 // Eksport idzie po WYBRANYCH WIERSZACH, nie po filtrach — wiec ciala
                 // wyszukiwania tu nie powtarzamy, liczy sie sama lista selected[].
                 const f = await expPost(expFileBody(p, a, rows), true);
+                krok('plik ' + Math.round(f.buf.length / 1024) + ' kB, sprawdzam długość');
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
                 // Plik KROTSZY niz lista, ktora poszla w zapytaniu, znaczy, ze serwer
@@ -24972,8 +24968,8 @@
                 if (fr.n != null && fr.n < rows.length)
                     throw new Error('plik jest krótszy niż lista: ' + fr.n + ' z ' + rows.length
                                   + ' wierszy — serwer uciął zapytanie, zawęź zakres dat');
+                krok('gotowe, ' + rows.length + ' poz.');
                 out.push({ acc: a, nazwa: etykieta, wierszy: rows.length,
-                           zeSprzedawcami: rowsZ.length, bezSprzedawcow: rowsB.length, jak: jak,
                            wPliku: fr.n, buf: f.buf, blad: '' });
             } catch (e){
                 out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: (e && e.message) || String(e) });
@@ -25359,6 +25355,41 @@
     }
 
     // ---------- uzgodnienie ----------
+    // Dlaczego pozycja zostala bez pary — to najwazniejsza czesc raportu.
+    //   „powtarza sie" — kwota wystepuje po obu stronach wielokrotnie, wiec kazda
+    //                    pasuje do kazdej. NIE zgadujemy; w sumach i tak sie znosza.
+    //   „brak"         — po drugiej stronie nie ma NIC na te kwote. To jest to,
+    //                    co trzeba obejrzec.
+    //   „nazwisko"     — kwota pasuje pojedynczo, ale nazwiska sie nie zgadzaja.
+    function slPowody(bezA, bezB) {
+        const licz = function (t) {
+            const m = {};
+            t.forEach(function (x) { const k = x.kw.toFixed(2); m[k] = (m[k] || 0) + 1; });
+            return m;
+        };
+        const mA = licz(bezA), mB = licz(bezB);
+        const opisz = function (t, moja, druga) {
+            t.forEach(function (x) {
+                const k = x.kw.toFixed(2);
+                const a = moja[k] || 0, b = druga[k] || 0;
+                if (!b) { x.powod = 'brak'; x.powodTxt = 'po drugiej stronie nie ma nic na tę kwotę'; }
+                else if (a > 1 || b > 1) {
+                    x.powod = 'powtarza';
+                    x.powodTxt = 'kwota powtarza się (tu ' + a + ', tam ' + b + ') — nie da się przypisać jednoznacznie';
+                } else { x.powod = 'nazwisko'; x.powodTxt = 'kwota pasuje pojedynczo, ale nazwisko się nie zgadza'; }
+            });
+        };
+        opisz(bezA, mA, mB);
+        opisz(bezB, mB, mA);
+        const zlicz = function (t) {
+            const c = { brak: 0, powtarza: 0, nazwisko: 0, brakKw: 0 };
+            t.forEach(function (x) { c[x.powod]++; if (x.powod === 'brak') c.brakKw += x.kw; });
+            c.brakKw = Math.round(c.brakKw * 100) / 100;
+            return c;
+        };
+        return { A: zlicz(bezA), B: zlicz(bezB) };
+    }
+
     function slUzgodnij(pp, disputy, pl) {
         const wszystkie = pp.poz.concat(disputy ? disputy.poz : []);
         // Blokady („Hold on Balance…" i „Cancellation of Hold…") NIE sa ruchem pieniedzy
@@ -25430,13 +25461,20 @@
             .concat(p2.pary.map(function (p) { return { pp: Z2[p[0]], pl: G2[p[1]], jak: 'sama kwota — bez potwierdzenia nazwiskiem' }; }));
 
         const suma = function (a, f) { return Math.round(a.reduce(function (s, x) { return s + f(x); }, 0) * 100) / 100; };
+        // Powody rozdajemy dopiero TU, gdy oba komplety niesparowanych sa juz znane —
+        // powod jednej strony wynika z tego, co zostalo po drugiej.
+        const bezZwrPP = p2.wolA.map(function (i) { return Z2[i]; });
+        const bezZwrPL = p2.wolB.map(function (i) { return G2[i]; });
+        const powodyZwr = slPowody(bezZwrPP, bezZwrPL);
+        const bezWplPP = wplWolne.filter(function (_, i) { return w2.wolA.indexOf(i) >= 0; });
+        const bezWplPL = plBezPary.concat(w2.wolB.map(function (i) { return plWolne[i]; }));
+        const powodyWpl = slPowody(bezWplPP, bezWplPL);
         return {
             okres: pp.okres,
             wplaty: {
                 pp: wpl.length, pl: pl.we.length, pary: wplPary.length,
                 rozjazd: wplRozjazd, dubel: wplDubel,
-                bezParyPP: wplWolne.filter(function (_, i) { return w2.wolA.indexOf(i) >= 0; }),
-                bezParyPL: plBezPary.concat(w2.wolB.map(function (i) { return plWolne[i]; })),
+                bezParyPP: bezWplPP, bezParyPL: bezWplPL, powody: powodyWpl,
                 sumaPP: suma(wpl, function (x) { return x.kw; }),
                 sumaPL: suma(pl.we, function (x) { return x.kw; })
             },
@@ -25444,8 +25482,7 @@
                 pp: Z.length, plLinie: pl.wy.length, plGrupy: G.length, pary: zwrPary.length,
                 poNazwisku: p1.pary.length, poKwocie: p2.pary.length,
                 niespojne: G.filter(function (g) { return g.niespojna; }).length,
-                bezParyPP: p2.wolA.map(function (i) { return Z2[i]; }),
-                bezParyPL: p2.wolB.map(function (i) { return G2[i]; }),
+                bezParyPP: bezZwrPP, bezParyPL: bezZwrPL, powody: powodyZwr,
                 sumaPP: suma(Z, function (x) { return x.kw; }),
                 sumaPL: suma(G, function (x) { return x.kw; })
             },
@@ -25679,9 +25716,17 @@
             return;
         }
         b.disabled = true;
+        // Zegar tyka co sekunde nawet wtedy, gdy serwer milczy. Bez tego dlugie
+        // pobranie (4792 wiersze to kilka MB) wyglada dokladnie tak samo jak zwiecha.
+        const t0 = Date.now();
+        let ostatni = 'Pobieram…';
+        const zegar = setInterval(function (){
+            salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+        }, 1000);
         try {
-            const wynik = await window.__TM_EXPORT_FETCH(konta, od, doo, 'excel', function (i, n, nazwa){
-                salSay('Pobieram ' + (i + 1) + '/' + n + ' — ' + nazwa + '…', '#666');
+            const wynik = await window.__TM_EXPORT_FETCH(konta, od, doo, 'excel', function (i, n, nazwa, etap){
+                ostatni = 'Pobieram ' + (i + 1) + '/' + n + ' — ' + nazwa + (etap ? (' · ' + etap) : '');
+                salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
             });
             const we = [], wy = [];
             const problemy = [];
@@ -25702,20 +25747,25 @@
                 zapow += (x.wierszy || 0);
                 // Ile wierszy zgubiloby pytanie z wyliczonymi sprzedawcami — chcemy to
                 // widziec, bo dokladnie ta roznica psula wczesniejsze uzgodnienia.
-                if (x.bezSprzedawcow != null && x.zeSprzedawcami != null)
-                    gorsze += Math.max(0, x.bezSprzedawcow - x.zeSprzedawcami);
+                if (x.wPliku != null && x.wPliku < (x.wierszy || 0))
+                    gorsze += (x.wierszy - x.wPliku);
             });
             const odczyt = we.length + wy.length;
             if (zapow && odczyt < zapow)
                 problemy.push('odczytałem ' + odczyt + ' wierszy z zapowiedzianych ' + zapow
                             + ' — zestawienie jest niepełne, NIE uzgadniaj na nim');
-            salSay('Pobrane: ' + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont'
+            clearInterval(zegar);
+            salSay('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: '
+                + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont'
                 + (zapow ? (' (serwer zapowiedział ' + zapow + ' wierszy' 
-                    + (gorsze ? ('; pytanie z listą sprzedawców zgubiłoby ' + gorsze) : '') + ')') : '') + '.'
+                    + (gorsze ? ('; w pliku brakuje ' + gorsze) : '') + ')') : '') + '.'
                 + (problemy.length ? (' Problemy: ' + problemy.join('; ')) : ''),
                 problemy.length ? '#c00' : '#0a7a2f');
         } catch (e){
-            salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+            salSay('Nie pobrałem po ' + Math.round((Date.now() - t0) / 1000) + ' s: '
+                 + ((e && e.message) || e), '#c00');
+        } finally {
+            clearInterval(zegar);
         }
         b.disabled = false;
     }
@@ -25772,6 +25822,48 @@
             + ' Bez pary: ' + r.zwroty.bezParyPP.length + ' / ' + r.zwroty.bezParyPL.length + '.'
             + '</div>';
 
+        // Sama lista niesparowanych wyglada jak lista zgubionych pieniedzy.
+        // Najwazniejsze zdanie raportu brzmi: ile z tej listy naprawde znika,
+        // a ile tylko nie da sie przypisac, bo kwoty sie powtarzaja.
+        const rozNies = function (bl){
+            const sA = bl.bezParyPP.reduce(function (n, x){ return n + x.kw; }, 0);
+            const sB = bl.bezParyPL.reduce(function (n, x){ return n + x.kw; }, 0);
+            return Math.round((sA - sB) * 100) / 100;
+        };
+        const nies = function (ety, bl){
+            if (!bl.bezParyPP.length && !bl.bezParyPL.length) return '';
+            const a = bl.powody.A, b = bl.powody.B;
+            const r = rozNies(bl);
+            return '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-top:8px">'
+                + '<div style="font-weight:700;margin-bottom:3px">' + ety + ' bez pary — jak to czytać</div>'
+                + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+                + '<tr style="color:#888"><td style="padding:2px 4px">powód</td>'
+                + '<td style="padding:2px 4px;text-align:right">PayPal</td>'
+                + '<td style="padding:2px 4px;text-align:right">prologistics</td>'
+                + '<td style="padding:2px 4px">co z tym</td></tr>'
+                + '<tr style="border-top:1px solid #f3f3f3"><td style="padding:2px 4px">kwota powtarza się po obu stronach</td>'
+                + '<td style="padding:2px 4px;text-align:right">' + a.powtarza + '</td>'
+                + '<td style="padding:2px 4px;text-align:right">' + b.powtarza + '</td>'
+                + '<td style="padding:2px 4px;color:#0a7a2f">nic — w sumach się znoszą</td></tr>'
+                + '<tr style="border-top:1px solid #f3f3f3"><td style="padding:2px 4px">kwota pasuje, nazwisko nie</td>'
+                + '<td style="padding:2px 4px;text-align:right">' + a.nazwisko + '</td>'
+                + '<td style="padding:2px 4px;text-align:right">' + b.nazwisko + '</td>'
+                + '<td style="padding:2px 4px;color:#c47f00">zerknij, prawdopodobnie para</td></tr>'
+                + '<tr style="border-top:1px solid #f3f3f3"><td style="padding:2px 4px"><b>brak odpowiednika na tę kwotę</b></td>'
+                + '<td style="padding:2px 4px;text-align:right"><b>' + a.brak + '</b> (' + salPln(a.brakKw) + ')</td>'
+                + '<td style="padding:2px 4px;text-align:right"><b>' + b.brak + '</b> (' + salPln(b.brakKw) + ')</td>'
+                + '<td style="padding:2px 4px;color:#c00">TO oglądaj</td></tr>'
+                + '</table>'
+                + '<div style="font-size:11px;margin-top:5px;color:'
+                + (Math.abs(r) < 0.005 ? '#0a7a2f' : '#444') + '">'
+                + 'Sumy tej listy różnią się o <b>' + salPln(r) + '</b>'
+                + (Math.abs(r) < 0.005
+                    ? ' — czyli o nic. Wszystkie te pozycje znoszą się nawzajem.'
+                    : ' — i tyle właśnie wnoszą do różnicy w tabeli wyżej.')
+                + '</div></div>';
+        };
+        h += nies('Wpłaty', r.wplaty) + nies('Zwroty', r.zwroty);
+
         const uwagi = [];
         if (r.wplaty.dubel.length) uwagi.push({ k: '#c00', t: 'Zaksięgowane dwa razy: '
             + r.wplaty.dubel.map(function (x){ return x.id + ' (wiersze ' + x.wiersze.join(' i ') + ', ' + salPln(x.pl) + ' zamiast ' + salPln(x.pp) + ')'; }).join('; ') });
@@ -25809,11 +25901,11 @@
     }
 
     function salCsv(r){
-        const lin = ['strona;rodzaj;data;numer/faktura;kwota;konto'];
-        r.wplaty.bezParyPP.forEach(function (x){ lin.push('PayPal;wpłata;' + x.data + ';' + x.id + ';' + x.kw + ';'); });
-        r.wplaty.bezParyPL.forEach(function (x){ lin.push('prologistics;wpłata;' + x.data + ';' + (x.id || ('wiersz ' + x.w)) + ';' + x.kw + ';' + (x.konto || '')); });
-        r.zwroty.bezParyPP.forEach(function (x){ lin.push('PayPal;zwrot;' + x.data + ';' + (x.src ? x.src.id : '') + ';' + (-x.kw) + ';'); });
-        r.zwroty.bezParyPL.forEach(function (x){ lin.push('prologistics;zwrot;' + x.data + ';' + x.fv + ';' + (-x.kw) + ';' + (x.linie[0] ? (x.linie[0].konto || '') : '')); });
+        const lin = ['strona;rodzaj;data;numer/faktura;kwota;konto;powód'];
+        r.wplaty.bezParyPP.forEach(function (x){ lin.push('PayPal;wpłata;' + x.data + ';' + x.id + ';' + x.kw + ';;' + (x.powodTxt || '')); });
+        r.wplaty.bezParyPL.forEach(function (x){ lin.push('prologistics;wpłata;' + x.data + ';' + (x.id || ('wiersz ' + x.w)) + ';' + x.kw + ';' + (x.konto || '') + ';' + (x.powodTxt || '')); });
+        r.zwroty.bezParyPP.forEach(function (x){ lin.push('PayPal;zwrot;' + x.data + ';' + (x.src ? x.src.id : '') + ';' + (-x.kw) + ';;' + (x.powodTxt || '')); });
+        r.zwroty.bezParyPL.forEach(function (x){ lin.push('prologistics;zwrot;' + x.data + ';' + x.fv + ';' + (-x.kw) + ';' + (x.linie[0] ? (x.linie[0].konto || '') : '') + ';' + (x.powodTxt || '')); });
         const blob = new Blob(['﻿' + lin.join('\r\n')], { type: 'text/csv;charset=utf-8' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
