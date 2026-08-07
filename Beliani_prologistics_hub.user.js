@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.24
+// @version      3.25
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25697,7 +25697,9 @@
         let o = null;
         try { o = JSON.parse(GM_getValue(SAL_KEY, 'null')); } catch (e){}
         if (!o || typeof o !== 'object') o = {};
-        if (!Array.isArray(o.konta) || !o.konta.length) o.konta = SAL_PP.slice();
+        // Jeden raport PayPala to jedna skrzynka i jedna waluta, wiec i jedno konto.
+        if (!Array.isArray(o.konta) || !o.konta.length) o.konta = ['1301'];
+        if (o.konta.length > 1) o.konta = [o.konta[0]];
         if (!o.od || !o.do){
             const n = new Date();
             const a = new Date(n.getFullYear(), n.getMonth() - 1, 1);
@@ -25807,26 +25809,15 @@
 
             + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
             + '<div style="font-weight:700;margin-bottom:4px">Konta PayPal <span style="font-weight:400;color:#888;font-size:11px">'
-            + '— zaznacz kilka z Ctrl albo Shift; nieaktywne zostają na liście</span></div>'
-            // Podswietlenie zaznaczenia w liscie gasnie, gdy lista traci ognisko —
-            // dlatego wybrane pozycje dostaja jeszcze ZNACZNIK w tresci. Sam kolor
-            // to za malo, zeby na pierwszy rzut oka wiedziec, co poleci.
-            + '<style>#sal-konta option{padding:2px 4px}'
-            + '#sal-konta option:checked{background:linear-gradient(#f3e8e8,#f3e8e8);'
-            + 'color:#750000;font-weight:700}</style>'
-            + '<select id="sal-konta" multiple size="7" style="width:100%;font-size:11px;padding:3px;'
+            + '— jeden raport PayPala to jedna skrzynka i jedna waluta, więc jedno konto</span></div>'
+            + '<select id="sal-konta" style="width:100%;font-size:12px;padding:4px;'
             + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
             + SAL_PP.map(function (n){
-                const on = u.konta.indexOf(n) >= 0;
                 const stan = (n in akt) ? (akt[n] ? '' : '  · nieaktywne') : '  · stan nieznany';
-                return '<option value="' + n + '" data-ety="' + salEsc((et[n] || n) + stan) + '"'
-                    + (on ? ' selected' : '') + '></option>';
+                return '<option value="' + n + '"' + (u.konta[0] === n ? ' selected' : '') + '>'
+                    + salEsc(et[n] || n) + salEsc(stan) + '</option>';
             }).join('')
             + '</select>'
-            + '<div style="margin-top:5px;display:flex;gap:6px;align-items:center">'
-            + '<button id="sal-all" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">zaznacz wszystkie</button>'
-            + '<button id="sal-none" style="font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer">odznacz</button>'
-            + '<span id="sal-ile" style="font-size:10px;color:#888"></span></div>'
             + '<div id="sal-ktore" style="font-size:10px;margin-top:4px;line-height:1.7"></div>'
             + '</div>'
 
@@ -25852,40 +25843,23 @@
             o.do = p.querySelector('#sal-do').value;
             o.konta = salWybrane(p);
             salZapisz(o);
-            salZnaczniki(p);
-            const ile = p.querySelector('#sal-ile');
-            if (ile){
-                ile.textContent = o.konta.length
-                    ? ('wybrane: ' + o.konta.length + ' z ' + SAL_PP.length)
-                    : 'nie wybrano żadnego konta';
-                ile.style.color = o.konta.length ? '#750000' : '#c00';
-                ile.style.fontWeight = '700';
-            }
-            // Pod lista wypisujemy WPROST, ktore konta polecą — licznik mowi „ile",
-            // a to mowi „ktore", i tego brakowalo najbardziej.
+            // Pod lista powtarzamy wybor duzym, czytelnym napisem. Zwinieta lista
+            // pokazuje wybrana pozycje sama, ale przy dziesieciu podobnych numerach
+            // warto miec to jeszcze raz, wyroznione.
             const kt = p.querySelector('#sal-ktore');
-            if (kt){
-                const sel = p.querySelector('#sal-konta');
-                const nazwy = Array.prototype.slice.call(sel.selectedOptions).map(function (x){
-                    return String(x.getAttribute('data-ety') || x.value).split('·')[0].trim();
-                });
-                kt.innerHTML = nazwy.length
-                    ? ('Do pobrania: ' + nazwy.map(function (x){
-                          return '<span style="display:inline-block;background:#f3e8e8;color:#750000;'
-                               + 'border-radius:4px;padding:1px 6px;margin:1px 3px 1px 0">' + salEsc(x) + '</span>';
-                      }).join(''))
-                    : '<span style="color:#c00">Nie wybrano konta — pobieranie nic nie zrobi.</span>';
+            const sel = p.querySelector('#sal-konta');
+            if (kt && sel){
+                const opt = sel.options[sel.selectedIndex];
+                kt.innerHTML = opt
+                    ? ('<span style="display:inline-block;background:#750000;color:#fff;font-weight:700;'
+                       + 'border-radius:5px;padding:3px 10px">' + salEsc(opt.text.split('·')[0].trim()) + '</span>')
+                    : '';
             }
         };
         p.querySelector('#sal-od').onchange = zapiszUst;
         p.querySelector('#sal-do').onchange = zapiszUst;
         p.querySelector('#sal-konta').onchange = zapiszUst;
-        const zazn = function (v){
-            p.querySelectorAll('#sal-konta option').forEach(function (o){ o.selected = v; });
-            zapiszUst();
-        };
-        p.querySelector('#sal-all').onclick = function (){ zazn(true); };
-        p.querySelector('#sal-none').onclick = function (){ zazn(false); };
+
         p.querySelector('#sal-fpp').onchange = function (){ salWczytaj(this.files, 'pp'); };
         p.querySelector('#sal-fdi').onchange = function (){ salWczytaj(this.files, 'di'); };
         p.querySelector('#sal-pobierz').onclick = function (){ salPobierz(this); };
@@ -25894,20 +25868,9 @@
         salPlikInfo();
     }
 
-    // W <option> nie da sie wstawic elementu, wiec znacznik jest czescia tekstu.
-    // Odswiezamy go po kazdej zmianie zaznaczenia.
-    function salZnaczniki(p){
-        const sel = p.querySelector('#sal-konta');
-        if (!sel) return;
-        Array.prototype.slice.call(sel.options).forEach(function (o){
-            const ety = o.getAttribute('data-ety') || o.value;
-            o.textContent = (o.selected ? '●  ' : '○  ') + ety;
-        });
-    }
     function salWybrane(p){
         const sel = p.querySelector('#sal-konta');
-        if (!sel) return [];
-        return Array.prototype.slice.call(sel.selectedOptions).map(function (o){ return o.value; });
+        return (sel && sel.value) ? [sel.value] : [];
     }
     // Wczytane zrodla pokazujemy jako liste z krzyzykiem przy kazdym. Bez tego
     // raz wskazanego pliku nie dalo sie cofnac inaczej niz przeladowaniem strony.
