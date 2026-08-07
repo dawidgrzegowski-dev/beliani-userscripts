@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.14
+// @version      3.15
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24922,9 +24922,20 @@
         await expLoadDoc();
         // „state: 2" to Any — do uzgodnienia z bankiem bierzemy wszystko, niezaleznie
         // od tego, czy ktos juz to wyeksportowal. „seller-type: all" tak samo.
+        // KAZDE pole ustawiamy na jawna wartosc „wszystko" z formularza. Puste pole
+        // NIE znaczy tu „nie filtruj": serwer bierze wtedy opcje domyslna. Na
+        // inv_status domyslna jest „Not deleted only" (value=0), wiec puste pole
+        // wycinalo faktury usuniete — na lipcu 1301 bylo to 287 wierszy z 4792
+        // i wygladalo na 287 brakow w uzgodnieniu.
+        //   state=2            Any
+        //   seller-type=all    All
+        //   inv_status=2       All (deleted/not deleted)   <-- ta pulapka
+        //   paid_status=''     All  (tu pusty napis JEST opcja „All")
+        //   clearing_account=0 All
+        //   source_seller_group=0  All
         const p = { state: '2', sellerType: 'all', group: '0', users: [], allUsers: true,
                     dateField: 'payment', range: 'fix', from: String(od), to: String(doo),
-                    country: '', clearing: '0', inv: '', paid: '',
+                    country: '', clearing: '0', inv: '2', paid: '',
                     fname: '', minamount: '', maxamount: '',
                     system: system || 'excel', par: '1' };
         const out = [];
