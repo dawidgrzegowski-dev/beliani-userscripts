@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.26
+// @version      3.27
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24955,10 +24955,31 @@
                 // Sprzedawcow WYLICZAMY. Puste pole username[] nie znaczy tu „wszyscy",
                 // tylko „zaden" — zapytanie bez tej listy wraca z zerem wierszy
                 // (sprawdzone na produkcji: 0 wplywow, 0 wyplywow).
+                // Pytamy DWOMA waskimi zapytaniami zamiast jednego szerokiego.
+                // Opcje formularza sa podzialem: „Not deleted only" (0) plus
+                // „Deleted only" (1) to dokladnie „All" (2). Jedno pytanie o „All"
+                // potrafi isc kilkadziesiat sekund, a te dwa zwykle sa duzo tansze,
+                // bo drugie zwraca garstke. Wynik laczymy i usuwamy powtorzenia —
+                // gdyby zbiory sie nakladaly, i tak nic nie zginie ani sie nie zdubluje.
                 const t0 = Date.now();
-                const rows = expRows(expAssertForm(
-                    await expZLimitem(expPost(expSearchBody(p, a), false), 'wyszukiwanie')));
+                const szukaj = async function (inv, opis){
+                    const q = new URLSearchParams(expSearchBody(p, a));
+                    q.set('inv_status', inv);
+                    return expRows(expAssertForm(
+                        await expZLimitem(expPost(q.toString(), false), opis)));
+                };
+                const zwykle = await szukaj('0', 'wyszukiwanie (faktury bieżące)');
+                krok('bieżące: ' + zwykle.length + ' poz., szukam usuniętych');
+                const usuniete = await szukaj('1', 'wyszukiwanie (faktury usunięte)');
+                const widziane = {};
+                const rows = zwykle.concat(usuniete).filter(function (v){
+                    const k = String(v);
+                    if (widziane[k]) return false;
+                    widziane[k] = 1;
+                    return true;
+                });
                 const tSzuk = Math.round((Date.now() - t0) / 1000);
+                const rozbicie = zwykle.length + ' bieżących + ' + usuniete.length + ' usuniętych';
                 if (!rows.length){
                     // Zero wierszy bywa prawda (konto bez ruchu), ale bywa tez objawem
                     // zlego zapytania. Odnotowujemy to jawnie, zeby nie wygladalo
@@ -24966,7 +24987,7 @@
                     out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, pusto: true, blad: '' });
                     continue;
                 }
-                krok('znalazłem ' + rows.length + ' poz. w ' + tSzuk + ' s, pobieram plik');
+                krok('znalazłem ' + rows.length + ' poz. (' + rozbicie + ') w ' + tSzuk + ' s, pobieram plik');
                 // Eksport idzie po WYBRANYCH WIERSZACH, nie po filtrach — wiec ciala
                 // wyszukiwania tu nie powtarzamy, liczy sie sama lista selected[].
                 const t1 = Date.now();
@@ -24984,7 +25005,8 @@
                     throw new Error('plik jest krótszy niż lista: ' + fr.n + ' z ' + rows.length
                                   + ' wierszy — serwer uciął zapytanie, zawęź zakres dat');
                 krok('gotowe: szukanie ' + tSzuk + ' s, plik ' + tPlik + ' s');
-                out.push({ acc: a, nazwa: etykieta, wierszy: rows.length,
+                out.push({ acc: a, nazwa: etykieta, wierszy: rows.length, rozbicie: rozbicie,
+                           sekSzukanie: tSzuk, sekPlik: tPlik,
                            wPliku: fr.n, buf: f.buf, blad: '' });
             } catch (e){
                 out.push({ acc: a, nazwa: etykieta, wierszy: 0, buf: null, blad: (e && e.message) || String(e) });
@@ -26021,8 +26043,14 @@
                 problemy.push('odczytałem ' + odczyt + ' wierszy z zapowiedzianych ' + zapow
                             + ' — zestawienie jest niepełne, NIE uzgadniaj na nim');
             clearInterval(zegar);
+            const czasy = wynik.filter(function (x){ return !x.blad && x.sekSzukanie != null; })
+                .map(function (x){ return 'szukanie ' + x.sekSzukanie + ' s, plik ' + x.sekPlik + ' s'; });
+            const rozb = wynik.filter(function (x){ return x.rozbicie; })
+                .map(function (x){ return x.rozbicie; });
             salSay('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: '
                 + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont'
+                + (rozb.length ? (' [' + rozb.join(' | ') + ']') : '')
+                + (czasy.length ? (' · ' + czasy.join(' | ')) : '')
                 + (zapow ? (' (serwer zapowiedział ' + zapow + ' wierszy' 
                     + (gorsze ? ('; w pliku brakuje ' + gorsze) : '') + ')') : '') + '.'
                 + (problemy.length ? (' Problemy: ' + problemy.join('; ')) : ''),
