@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.35
+// @version      3.37
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -16641,6 +16641,26 @@
         // Etykiety w plikach dostawcow sa niekonsekwentne: literowka "BANEFICIARY",
         // raz "SWIFT NO. :" a raz "BENEFICIARY'S SWIFT NO.:", kolumna etykiety to A albo B.
         // Dlatego normalizujemy tekst i szukamy wartosci "pierwsza niepusta komorka w prawo".
+        // --- normalizacja tekstu z proformy ---
+        // Dostawcy pisza znakami PELNEJ SZEROKOSCI: dwukropek U+FF1A, cyfry, litery,
+        // nawiasy, procent, spacja ideograficzna. Kazdy z nich potrafi wywrocic odczyt
+        // pojedynczego pola i przewrocic caly blok bankowy — zdarzylo sie to juz trzy razy.
+        // NFKC sprowadza cala te rodzine do zwyklych znakow jednym ruchem; reszte
+        // (znaki, ktorych NFKC nie rusza) dokladamy tu jawnie.
+        // Normalizujemy NA WEJSCIU, wiec dziala dla wszystkich pol, nie tylko dla konta.
+        function piTekst(v){
+            if (v == null) return v;
+            if (typeof v !== 'string') return v;
+            var s = v;
+            try { s = s.normalize('NFKC'); } catch (e){}
+            return s
+                .replace(/[​‌‍﻿]/g, '')                 // zerowej szerokosci i BOM
+                .replace(/[  -   　]/g, ' ')                // twarde i egzotyczne spacje
+                .replace(/[∶ː˸᠄꞉]/g, ':')                 // dwukropki spoza NFKC
+                .replace(/[‐-―−⁃]/g, '-')               // myslniki i minusy
+                .replace(/[‘’‛ʼ´′]/g, "'")                // apostrofy typograficzne
+                .replace(/[ 	]+/g, ' ');
+        }
         function piBankNorm(x){
             var t = String(x == null ? '' : x).toUpperCase().replace(/[^A-Z0-9]+/g, ' ');
             return t.replace(/\bS\b/g, ' ').replace(/\s+/g, ' ').trim();
@@ -16665,12 +16685,19 @@
         }
         // Etykieta bywa sklejona z wartoscia w jednej komorce ("SWIFT NO. : ABOCCNBJ020").
         function piBankCell(x){
-            var s = String(x == null ? '' : x);
+            var s = piTekst(String(x == null ? '' : x));
             if (!s.trim()) return null;
             var k = piBankKey(s);
             if (k) return { key: k, val: '' };
-            var ci = s.indexOf(':');
-            if (ci > 0){ k = piBankKey(s.slice(0, ci)); if (k) return { key: k, val: s.slice(ci + 1).trim() }; }
+            // Rozdzielnikiem bywa dwukropek PELNEJ SZEROKOSCI (U+FF1A) — chinskie
+            // klawiatury wstawiaja go zamiast ASCII. indexOf(':') go nie widzial,
+            // wiec linia z numerem konta przepadala, a z nia caly blok bankowy.
+            // Z wartosci zdejmujemy tez powtorzone dwukropki („NAME::WARTOSC").
+            var ci = s.search(/[:：︓﹕]/);
+            if (ci > 0){
+                k = piBankKey(s.slice(0, ci));
+                if (k) return { key: k, val: s.slice(ci + 1).replace(/^[\s:：︓﹕]+/, '').trim() };
+            }
             return null;
         }
         // Wartosc musi pasowac do slotu. W P/I dostawcow etykiety bywaja przesuniete
@@ -16941,10 +16968,16 @@
             catch(e){ return null; }
             var ukryte = piHiddenCols(ws);
             var ile = 0; for (var k in ukryte) ile++;
-            if (!ile) return aoa;
+            if (!ile){
+                for (var r0 = 0; r0 < aoa.length; r0++){
+                    var w0 = aoa[r0]; if (!w0) continue;
+                    for (var c0 = 0; c0 < w0.length; c0++) w0[c0] = piTekst(w0[c0]);
+                }
+                return aoa;
+            }
             for (var r = 0; r < aoa.length; r++){
                 var row = aoa[r]; if (!row) continue;
-                for (var c = 0; c < row.length; c++) if (ukryte[c]) row[c] = null;
+                for (var c = 0; c < row.length; c++) row[c] = ukryte[c] ? null : piTekst(row[c]);
             }
             return aoa;
         }
