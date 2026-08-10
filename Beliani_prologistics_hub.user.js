@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.44
+// @version      3.45
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20908,26 +20908,23 @@
       + '</div>'
       + '<div style="padding:12px 16px">'
       +   (onProlo
-            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wgraj wyciąg bankowy (UBS albo Postbank, CSV) — rozpoznam wpłaty od marketplace\'ów. <b>Możesz wskazać kilka plików naraz albo dokładać je pojedynczo</b>: wpłaty z różnych banków dopisują się do wspólnej listy (Vente BE i NL wpływają na inne konto niż reszta). Zestawienia dociągam prosto z paneli marketplace\'ów, stąd; musisz być tam zalogowany w przeglądarce.</div>'
+            ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Wrzuć pliki jednym guzikiem — <b>wyciąg bankowy</b> (UBS, Postbank, PostFinance) albo <b>raport rozliczenia</b> (eBay, Galaxus, Wayfair). Rodzaj rozpoznaję po zawartości, nie po nazwie, więc kolejność i wymieszanie nie mają znaczenia. <b>Możesz wskazać kilka naraz albo dokładać pojedynczo</b>: wpłaty z różnych banków dopisują się do wspólnej listy (Vente BE i NL wpływają na inne konto niż reszta). Zestawienia dociągam prosto z paneli marketplace\'ów, stąd; musisz być tam zalogowany w przeglądarce.</div>'
               // Pasek narzedzi jedzie z przewijaniem — przy kilkudziesieciu zleceniach
               // guziki byly poza ekranem i trzeba bylo wracac na gore.
               + '<div style="position:sticky;top:0;z-index:6;background:#fff;padding:4px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-              + '<input type="file" id="mk-file" accept=".csv,text/csv" multiple style="font-size:11px">'
-              + '<button id="mk-all" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
-              // Galaxus nie ma API — rozliczenie sciaga sie recznie z „Payout overview"
-              // i wrzuca tutaj; zlecenie znajdujemy po sumie wyplaty.
-              + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport Galaxus'
-              + '<input type="file" id="mk-galx" accept=".csv,text/csv" style="display:none"></label>'
-              // Wayfair ma API i normalnie schodzi sam — reczne wgranie zostaje na wypadek
-              // wygaslej sesji w portalu albo rozliczenia spoza widocznego okresu.
-              + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport Wayfair'
-              + '<input type="file" id="mk-wayf" accept=".csv,text/csv" style="display:none"></label>'
-              // eBay placi raz na miesiac, a raport transakcji sam podaje sprzedawce, kwote
-              // wyplaty, jej date i numer — nie trzeba do niego ani wyciagu z banku, ani
-              // wpisywania czegokolwiek z reki. Gdy zlecenie z wyciagu juz czeka, wchodzi
-              // w nie; gdy nie ma zadnego, zaklada je z danych z pliku.
-              + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport eBay'
-              + '<input type="file" id="mk-ebay" accept=".csv,text/csv" style="display:none"></label>'
+              // Jedno wejscie na wszystko. Rodzaj pliku poznajemy po TRESCI, nie po nazwie
+              // ani nie po tym, w ktory guzik ktos trafil — kazdy parser ma wlasny warunek
+              // wejscia (naglowek, komplet kolumn), wiec pytamy ich po kolei.
+              + '<label style="font-size:12px;font-weight:700;color:#fff;background:#7c3aed;border:none;border-radius:6px;padding:5px 12px;cursor:pointer">📎 Dodaj pliki'
+              + '<input type="file" id="mk-any" accept=".csv,text/csv" multiple style="display:none"></label>'
+              + '<button id="mk-all" style="padding:5px 12px;border:1px solid #7c3aed;border-radius:6px;background:#fff;color:#7c3aed;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
+              // Dawne osobne wejscia zostaja w DOM, tylko ukryte. Ich obsluga jest
+              // sprawdzona i dziala — nowe wejscie tylko podrzuca im wlasciwy plik,
+              // zamiast przepisywac cztery dzialajace sciezki od nowa.
+              + '<input type="file" id="mk-file" accept=".csv,text/csv" multiple style="display:none">'
+              + '<input type="file" id="mk-galx" accept=".csv,text/csv" style="display:none">'
+              + '<input type="file" id="mk-wayf" accept=".csv,text/csv" style="display:none">'
+              + '<input type="file" id="mk-ebay" accept=".csv,text/csv" style="display:none">'
               // Druga droga zaciagniecia zlecenia: bez wyciagu z banku, z samej kwoty i daty.
               + '<span style="display:inline-flex;gap:4px;align-items:center;border:1px dashed #c4b5fd;border-radius:6px;padding:3px 6px;background:#faf5ff">'
               + '<span style="font-size:11px;color:#5b21b6;font-weight:700">bez wyciągu:</span>'
@@ -22247,6 +22244,71 @@
                 + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
                 errs.length ? '#c47f00' : '#0a7a2f');
         };
+        // Rodzaj pliku poznajemy pytajac PARSERY, a nie przepisujac ich warunki wejscia
+        // do osobnej tabelki sygnatur — taka tabelka rozjechalaby sie przy pierwszej
+        // zmianie ktoregos parsera. Kazdy z nich ma wlasny, ostry warunek: wyciag musi
+        // miec naglowek UBS/Postbank/PostFinance, Galaxus komplet czterech kolumn,
+        // Wayfair naglowek „Invoice #", eBay kolumny z VAT-em pobranym przez eBaya.
+        // Kolejnosc od najostrzejszego. Parsery sa czyste — nic nie zapisuja.
+        function mkTypPliku(txt){
+            try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
+            try { if (!mkParseEbay(txt).err) return 'ebay'; } catch (e){}
+            try { if (!mkParseGalx(txt, 'Galaxus CH').err) return 'galx'; } catch (e){}
+            try { if (!mkParseWayf(txt).err) return 'wayf'; } catch (e){}
+            return '';
+        }
+        // Podanie pliku dawnemu, ukrytemu wejsciu. DataTransfer to jedyna droga, zeby
+        // ustawic input.files z kodu; dzieki temu sprawdzona obsluga kazdego rodzaju
+        // zostaje nietknieta.
+        function mkPodrzuc(sel, pliki){
+            const el = $(sel);
+            if (!el || !pliki.length) return false;
+            try {
+                const dt = new DataTransfer();
+                pliki.forEach(function (f){ dt.items.add(f); });
+                el.files = dt.files;
+                el.dispatchEvent(new Event('change'));
+                return true;
+            } catch (e){ return false; }
+        }
+        const anyIn = $('#mk-any');
+        if (anyIn) anyIn.onchange = async function(){
+            const fs = Array.prototype.slice.call(this.files || []);
+            try { this.value = ''; } catch (e){}
+            if (!fs.length) return;
+            if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
+            const kubelki = { bank: [], ebay: [], galx: [], wayf: [] }, nieznane = [];
+            for (let i = 0; i < fs.length; i++){
+                const f = fs[i];
+                let typ = '';
+                try { typ = mkTypPliku(mkDecode(await readBuf(f))); }
+                catch (e){ typ = ''; }
+                if (typ) kubelki[typ].push(f); else nieznane.push(f);
+            }
+            // Wyciagi ida razem — ich obsluga sama zlicza i podsumowuje kilka plikow naraz.
+            if (kubelki.bank.length) mkPodrzuc('#mk-file', kubelki.bank);
+            // Raporty pojedynczo: kazdy dotyczy jednej wyplaty i kazdy ma wlasny komunikat.
+            ['ebay', 'galx', 'wayf'].forEach(function (t){
+                kubelki[t].forEach(function (f){ mkPodrzuc('#mk-' + t, [f]); });
+            });
+            const rozpoznane = ['bank', 'ebay', 'galx', 'wayf']
+                .filter(function (t){ return kubelki[t].length; })
+                .map(function (t){ return kubelki[t].length + '× ' + ({ bank: 'wyciąg', ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair' })[t]; });
+            // Plik, ktorego nie przypisalismy, NIE moze skonczyc w prozni. Oddajemy go
+            // obsludze wyciagu: to najczestszy przypadek, a jej komunikat bledu jest
+            // najbardziej konkretny („nie rozpoznaje naglowka — obsluguje UBS…").
+            // Dzieki temu nietrafione rozpoznanie degraduje sie do zachowania sprzed
+            // scalenia guzikow, a nie do ciszy.
+            if (nieznane.length){
+                mkPodrzuc('#mk-file', nieznane);
+                say('Nie rozpoznałem po zawartości: ' + nieznane.map(function (f){ return f.name; }).join(', ')
+                    + ' — próbuję jako wyciąg bankowy.'
+                    + (rozpoznane.length ? (' Pozostałe: ' + rozpoznane.join(', ') + '.') : ''), '#c47f00');
+            } else if (rozpoznane.length > 1){
+                say('Wczytuję: ' + rozpoznane.join(', ') + '.', '#666');
+            }
+        };
+
         // Reczne dodanie wplaty. Data NIE ma wartosci domyslnej: podpowiedziana „dzisiaj"
         // bywa zatwierdzana odruchowo, a ta data idzie potem do ksiegowania jako
         // date_overwrite_to — czyli wplata z konca lipca wpadlaby w sierpien.
@@ -23143,7 +23205,7 @@
                              bankRef: p.bankRef, method: p.method, stan: p.stan, url: p.url };
                 j.msg = 'rozpoznana wypłata ' + p.id + ' z ' + p.date + ' na ' + f2(p.amount) + ' ' + p.cur
                       + (p.bankRef ? (' · ref. bankowa ' + p.bankRef) : '')
-                      + ' — pobierz z eBaya raport transakcji tej wypłaty i wrzuć go guzikiem „📄 Raport eBay"';
+                      + ' — pobierz z eBaya raport transakcji tej wypłaty i wrzuć go guzikiem „📎 Dodaj pliki"';
                 n++;
             });
             jobsSave(jobs); render();
