@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.40
+// @version      3.41
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19380,6 +19380,177 @@
         });
     }
 
+    // ================= EBAY =================
+    // Plik: "Transaktionsbericht" z Seller Huba, CSV ze SREDNIKIEM w cudzyslowach, BOM,
+    // liczby po niemiecku (kropka = tysiace, przecinek = dziesietne), "--" zamiast pustego.
+    // Nad naglowkiem stoi blok opisowy, a w nim dwie linie, ktore czynia ten plik
+    // samowystarczalnym — nie trzeba wyciagu z banku, zeby wiedziec, co wplynelo:
+    //     "Verkäufer";"beliani_uk"
+    //     "Betrag";"4.072,29 CHF"
+    // Sprawdzone na wyplacie 7662816842: suma kolumny "Betrag abzügl. Kosten" = 4072,29 CHF,
+    // czyli DOKLADNIE kwota z naglowka. Ta kolumna jest w walucie WYPLATY i sluzy do
+    // uzgodnienia z bankiem; kwoty ksiegowane na zamowieniach sa w walucie TRANSAKCJI.
+    const MK_EBAY_SHOP = { beliani_uk: 'Ebay UK', beliani_de: 'Ebay DE', beliani_it: 'Ebay IT',
+                           beliani_es: 'Ebay ES', beliani_fr: 'Ebay FR' };
+    // Nazwy kolumn po niemiecku i po angielsku — raport wychodzi w jezyku konta, a konto
+    // brytyjskie potrafi oddawac plik po niemiecku. Mapujemy PO NAZWIE, nie po numerze:
+    // eBay dokladal juz kolumny w srodku ukladu, a wtedy staly indeks siega nie tam.
+    const MK_EBAY_COLS = {
+        typ:   ['typ', 'type'],
+        order: ['bestellnummer', 'order number'],
+        net:   ['betrag abzügl. kosten', 'betrag abzugl. kosten', 'net amount'],
+        curNet:['auszahlungswährung', 'auszahlungswahrung', 'payout currency'],
+        pDate: ['auszahlungsdatum', 'payout date'],
+        pNo:   ['auszahlung nr.', 'auszahlung nr', 'payout id', 'payout number'],
+        vat:   ['von ebay eingezogene steuer', 'ebay collected tax'],
+        gross: ['transaktionsbetrag (inkl. kosten)', 'transaction amount (incl. costs)', 'gross transaction amount'],
+        curTx: ['transaktionswährung', 'transaktionswahrung', 'transaction currency'],
+        ref:   ['referenznummer', 'reference number'],
+        title: ['angebotstitel', 'listing title'],
+        sku:   ['bestandseinheit', 'custom label'],
+        item:  ['artikelnr.', 'artikelnr', 'item number']
+    };
+    // Typy wierszy, ktore cokolwiek znacza. Reszta ("Andere Gebühr", "Versandetikett",
+    // "Auszahlung") to prowizje i etykiety zwrotne — sa juz potracone w kolumnie netto,
+    // wiec do ksiegowania na zamowieniach NIE ida. Tak samo robi makro dzialu.
+    const MK_EBAY_ORDER  = /^(bestellung|order)$/i;
+    const MK_EBAY_REFUND = /^(rückerstattung|ruckerstattung|refund|fall|case|zahlungsstreitfall|payment dispute)$/i;
+
+    function ebayNum(v){
+        const s = String(v == null ? '' : v).trim();
+        if (!s || s === '--') return null;
+        // Format niemiecki: kropka to separator tysiecy, przecinek dziesietny.
+        const t = s.replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+        const n = Number(t);
+        return isFinite(n) ? n : null;
+    }
+    // "4. Aug 2026" / "31. Jul 2026" -> ISO. Miesiace niemieckie i angielskie.
+    const MK_EBAY_MON = { jan:1, feb:2, mär:3, mar:3, apr:4, mai:5, may:5, jun:6, jul:7,
+                          aug:8, sep:9, okt:10, oct:10, nov:11, dez:12, dec:12 };
+    function ebayDate(v){
+        const s = String(v == null ? '' : v).trim();
+        const m = s.match(/(\d{1,2})\.?\s*([A-Za-zÄÖÜäöü]{3,})\.?\s*(\d{4})/);
+        if (m){
+            const mm = MK_EBAY_MON[m[2].slice(0, 3).toLowerCase()];
+            if (mm) return m[3] + '-' + String(mm).padStart(2, '0') + '-' + String(m[1]).padStart(2, '0');
+        }
+        const iso = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+        return iso ? iso[0] : '';
+    }
+    // Podzial wiersza CSV ze srednikiem, z cudzyslowami i podwojonym cudzyslowem w srodku.
+    function ebaySplit(line){
+        const out = [];
+        let pole = '', q = false;
+        for (let i = 0; i < line.length; i++){
+            const c = line[i];
+            if (q){
+                if (c === '"'){ if (line[i + 1] === '"'){ pole += '"'; i++; } else q = false; }
+                else pole += c;
+            } else if (c === '"') q = true;
+            else if (c === ';'){ out.push(pole); pole = ''; }
+            else pole += c;
+        }
+        out.push(pole);
+        return out;
+    }
+    function ebayCols(hdr){
+        const low = hdr.map(function (h){ return String(h || '').trim().toLowerCase(); });
+        const c = {};
+        Object.keys(MK_EBAY_COLS).forEach(function (k){
+            c[k] = -1;
+            MK_EBAY_COLS[k].forEach(function (nazwa){
+                if (c[k] < 0){ const i = low.indexOf(nazwa); if (i >= 0) c[k] = i; }
+            });
+        });
+        return c;
+    }
+    function mkParseEbay(text){
+        const linie = String(text == null ? '' : text).replace(/^﻿/, '').split(/\r?\n/);
+        // Naglowek to pierwszy wiersz o sensownej liczbie kolumn — nazwa pierwszej kolumny
+        // zalezy od jezyka, wiec nie da sie na niej zakotwiczyc.
+        let hi = -1, hdr = null;
+        for (let i = 0; i < linie.length && i < 60; i++){
+            const p = ebaySplit(linie[i]);
+            if (p.length >= 20){ hi = i; hdr = p; break; }
+        }
+        if (hi < 0) return { err: 'to nie wygląda na raport transakcji eBaya — nie znalazłem wiersza nagłówka' };
+        const c = ebayCols(hdr);
+        const brak = ['typ', 'order', 'net', 'gross', 'vat'].filter(function (k){ return c[k] < 0; });
+        if (brak.length) return { err: 'w nagłówku eBaya brakuje kolumn: ' + brak.join(', ') };
+
+        // Preambula: sprzedawca i zapowiedziana kwota wyplaty.
+        let seller = '', zapow = null, zapowCur = '';
+        for (let i = 0; i < hi; i++){
+            const p = ebaySplit(linie[i]);
+            const k = String(p[0] || '').trim().toLowerCase();
+            const v = String(p[1] || '').trim();
+            if (/^(verkäufer|verkaufer|seller)$/.test(k)) seller = v;
+            if (/^(betrag|amount)$/.test(k)){
+                const m = v.match(/([-\d.,]+)\s*([A-Z]{3})/);
+                if (m){ zapow = ebayNum(m[1]); zapowCur = m[2]; }
+            }
+        }
+
+        const ord = {}, ref = {}, refNote = {}, ids = {};
+        let netto = 0, gross = 0, refund = 0, nPos = 0, nZwr = 0, pominiete = 0;
+        let payNo = '', payDate = '', curNet = zapowCur, curTx = '';
+        for (let i = hi + 1; i < linie.length; i++){
+            const r = ebaySplit(linie[i]);
+            if (r.length < 5 || !String(r[0] || '').trim()) continue;
+            const typ = String(r[c.typ] || '').trim();
+            const netRow = ebayNum(r[c.net]);
+            if (netRow != null) netto = r2(netto + netRow);
+            if (c.pNo   >= 0 && !payNo)   payNo   = String(r[c.pNo] || '').trim();
+            if (c.pDate >= 0 && !payDate) payDate = ebayDate(r[c.pDate]);
+            if (c.curNet >= 0 && !curNet) curNet = String(r[c.curNet] || '').trim().toUpperCase();
+            if (c.curTx  >= 0 && !curTx)  curTx  = String(r[c.curTx] || '').trim().toUpperCase();
+
+            const jestOrder = MK_EBAY_ORDER.test(typ), jestZwrot = MK_EBAY_REFUND.test(typ);
+            if (!jestOrder && !jestZwrot) continue;                 // prowizje i etykiety pomijamy
+
+            // Kwota ksiegowana = brutto transakcji + VAT pobrany przez eBaya, czyli tyle,
+            // ile klient faktycznie zaplacil. Sprawdzone: 49,99 (towar) + 10,00 (VAT) = 59,99.
+            const b = ebayNum(r[c.gross]), v = ebayNum(r[c.vat]);
+            if (b == null && v == null){ pominiete++; continue; }   // wiersz bez kwot
+            const kw = r2((b || 0) + (v || 0));
+            const id = String(r[c.order] || '').trim();
+            if (!id || id === '--'){ pominiete++; continue; }
+            ids[id] = 1;
+            if (jestOrder){
+                if (!kw) continue;
+                ord[id] = r2((ord[id] || 0) + kw);
+                gross = r2(gross + kw);
+                nPos++;
+            } else {
+                if (!kw) continue;
+                const abs = Math.abs(kw);
+                ref[id] = r2((ref[id] || 0) + abs);
+                refund = r2(refund + abs);
+                nZwr++;
+                // Opis zwrotu — tak jak przy Wayfairze trafi do komentarza w tickecie.
+                const opis = [typ,
+                    c.ref   >= 0 ? String(r[c.ref] || '').trim()   : '',
+                    c.title >= 0 ? String(r[c.title] || '').trim() : '',
+                    c.sku   >= 0 ? ('SKU ' + String(r[c.sku] || '').trim()) : '',
+                    (kw < 0 ? '' : '+') + kw.toFixed(2) + ' ' + (curTx || '')
+                ].filter(function (x){ return x && x !== '--' && x !== 'SKU --'; }).join(' · ');
+                refNote[id] = refNote[id] ? (refNote[id] + '\n\n' + opis) : opis;
+            }
+        }
+        if (!nPos && !nZwr) return { err: 'raport eBaya nie ma ani jednego wiersza „Bestellung” / „Rückerstattung”' };
+        return {
+            seller: seller, shop: MK_EBAY_SHOP[seller.toLowerCase()] || '',
+            payNo: payNo, payDate: payDate,
+            cur: curNet || zapowCur || '', curTx: curTx,
+            // net = to, co wplynelo na konto (waluta wyplaty). Tym uzgadniamy zlecenie.
+            net: netto, zapowiedziano: zapow,
+            netOk: (zapow == null) || eq(netto, zapow),
+            ord: ord, ref: ref, refNote: refNote, ids: ids,
+            gross: gross, refund: refund, nPos: nPos, nZwr: nZwr, pominiete: pominiete,
+            n: Object.keys(ord).length + Object.keys(ref).length
+        };
+    }
+
     // ================= WAYFAIR =================
     // Rozliczenie („remittance") to CSV z portalu partnerskiego. Uklad NIE jest staly:
     // kolumny „Allowance" pojawiaja sie tylko wtedy, gdy w danym rozliczeniu wystapilo
@@ -20589,6 +20760,12 @@
               // wygaslej sesji w portalu albo rozliczenia spoza widocznego okresu.
               + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport Wayfair'
               + '<input type="file" id="mk-wayf" accept=".csv,text/csv" style="display:none"></label>'
+              // eBay placi raz na miesiac, a raport transakcji sam podaje sprzedawce, kwote
+              // wyplaty, jej date i numer — nie trzeba do niego ani wyciagu z banku, ani
+              // wpisywania czegokolwiek z reki. Gdy zlecenie z wyciagu juz czeka, wchodzi
+              // w nie; gdy nie ma zadnego, zaklada je z danych z pliku.
+              + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport eBay'
+              + '<input type="file" id="mk-ebay" accept=".csv,text/csv" style="display:none"></label>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
               + '<button id="mk-sal" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">📊 Salda</button>'
               + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
@@ -21867,6 +22044,88 @@
                 + (otherT ? (', pozostałych marketplace’ów ' + otherT + ' — na razie poza zakresem') : '') + '.'
                 + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
                 errs.length ? '#c47f00' : '#0a7a2f');
+        };
+        // Raport transakcji eBaya. Inaczej niz przy Galaxusie i Wayfairze plik jest
+        // SAMOWYSTARCZALNY: w bloku nad naglowkiem stoi sprzedawca i kwota wyplaty, a te
+        // same liczby da sie odtworzyc z wierszy (suma kolumny netto). Dlatego gdy nie ma
+        // zlecenia z wyciagu, zakladamy je z pliku — o to chodzilo w prosbie „nie kazdy
+        // wchodzi na bank, a chcialbym zeby wszyscy mogli ksiegowac".
+        const ebayIn = $('#mk-ebay');
+        if (ebayIn) ebayIn.onchange = function(){
+            const f = this.files && this.files[0];
+            try { this.value = ''; } catch (e){}
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                const p = mkParseEbay(mkDecode(rd.result));
+                if (p.err){ say(p.err, '#c00'); return; }
+                if (!p.shop){
+                    say('Nie znam sprzedawcy „' + (p.seller || '—') + '" — dopisz go do listy kont eBaya.', '#c47f00');
+                    return;
+                }
+                // Plik sam sie kontroluje: suma wierszy kontra kwota z naglowka. Gdy sie
+                // rozjezdza, nie wiadomo, ktora liczba jest prawdziwa — nie ksiegujemy.
+                if (!p.netOk){
+                    say('Raport eBaya jest niespójny: suma wierszy ' + f2(p.net) + ' ' + p.cur
+                        + ', a nagłówek mówi ' + f2(p.zapowiedziano) + ' ' + p.cur
+                        + '. Nie wczytuję — sprawdź plik.', '#c00');
+                    return;
+                }
+                const jobs = jobsLoad();
+                // Zlecenie z wyciagu rozpoznajemy po NUMERZE WYPLATY, a gdy go w tytule
+                // przelewu nie bylo — po kwocie wyplaty wsrod zlecen eBaya bez danych.
+                let k = Object.keys(jobs).filter(function (x){
+                    return jobs[x].kind === 'ebay' && String(jobs[x].ref || '') === String(p.payNo);
+                })[0];
+                if (!k){
+                    const kand = Object.keys(jobs).filter(function (x){
+                        return jobs[x].kind === 'ebay' && !jobs[x].data && eq(jobs[x].amount, p.net);
+                    });
+                    if (kand.length > 1){
+                        say('Kwota ' + f2(p.net) + ' ' + p.cur + ' pasuje do ' + kand.length
+                            + ' zleceń eBaya — nie zgaduję, które uzupełnić.', '#c47f00');
+                        return;
+                    }
+                    k = kand[0];
+                }
+                let zalozone = false;
+                if (!k){
+                    // Brak zlecenia z wyciagu — zakladamy je z samego pliku. Klucz to numer
+                    // wyplaty, ten sam, ktory znajdzie sie potem w tytule przelewu, wiec
+                    // pozniejsze wgranie wyciagu NIE utworzy drugiego zlecenia na te sama wplate.
+                    k = String(p.payNo || (p.payDate + '_' + p.net));
+                    jobs[k] = { ref: String(p.payNo || ''), date: p.payDate, amount: p.net, cur: p.cur,
+                                mp: 'Ebay', brand: 'eBay', short: 'eBay', host: '', kind: 'ebay',
+                                shop: p.shop, docs: null, payer: '', txId: '', status: 'new', msg: '' };
+                    zalozone = true;
+                }
+                const j = jobs[k];
+                if (j.status === 'done'){ say('Ta wypłata jest już zaksięgowana.', '#c47f00'); return; }
+                if (!j.shop) j.shop = p.shop;
+                if (!j.date) j.date = p.payDate;
+                const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
+                j.data = { ebay: p, shop: p.shop, gross: p.gross, refund: p.refund,
+                           net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
+                           refNote: p.refNote, unknown: {}, skipped: {}, full: true, both: both,
+                           pays: 1, split: false, rows: p.nPos + p.nZwr, total: p.nPos + p.nZwr,
+                           pages: 1, how: 'plik ' + f.name };
+                j.status = j.data.netOk ? 'ready' : 'partial';
+                j.msg = j.data.netOk ? '' : ('wypłata z pliku ' + f2(p.net) + ' ' + p.cur
+                        + ' nie zgadza się z kwotą zlecenia ' + f2(j.amount) + ' ' + (j.cur || ''));
+                // Kwoty zamowien sa w walucie TRANSAKCJI, a wyplata w walucie konta —
+                // bez tej adnotacji rozjazd miedzy suma pozycji a wplata wyglada na blad.
+                j.note = 'kwoty zamówień w ' + (p.curTx || '—') + ', wypłata w ' + (p.cur || '—')
+                       + ' · prowizje i etykiety zwrotne są już potrącone w wypłacie i nie wchodzą na zamówienia';
+                jobsSave(jobs); render();
+                say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
+                    + ': ' + p.shop + ' · wypłata nr ' + (p.payNo || '—') + ' z ' + (p.payDate || '—')
+                    + ' na ' + f2(p.net) + ' ' + p.cur
+                    + ' · zamówień ' + Object.keys(p.ord).length + ' na ' + f2(p.gross) + ' ' + p.curTx
+                    + (p.nZwr ? (' · zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund) + ' ' + p.curTx
+                                 + ' — idą na listę zwrotów') : ''),
+                    '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
         };
         // Rozliczenie Galaxusa wrzucane recznie. Dopasowanie idzie po SUMIE „Amount paid out",
         // bo to ona trafia na konto — referencja z przelewu (UUID) nie wystepuje w pliku.
