@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.48
+// @version      3.50
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19414,14 +19414,34 @@
     // Sprawdzone na wyplacie 7662816842: suma kolumny "Betrag abzügl. Kosten" = 4072,29 CHF,
     // czyli DOKLADNIE kwota z naglowka. Ta kolumna jest w walucie WYPLATY i sluzy do
     // uzgodnienia z bankiem; kwoty ksiegowane na zamowieniach sa w walucie TRANSAKCJI.
-    // Nazwy kont NIE sa u eBaya jednolite: konto brytyjskie to „beliani_uk"
-    // (podkreslenie), niemieckie „beliani-de" (myslnik). Sprawdzone na dwoch prawdziwych
-    // raportach. Dlatego kluczujemy po ksztalcie ODARTYM ze znakow rozdzielajacych —
-    // wtedy myslnik, podkreslenie, kropka, spacja i wielkosc liter przestaja miec
-    // znaczenie i kolejne kraje wejda bez poprawki w kodzie.
-    const MK_EBAY_SHOP = { belianiuk: 'Ebay UK', belianide: 'Ebay DE', belianiit: 'Ebay IT',
-                           belianies: 'Ebay ES', belianifr: 'Ebay FR' };
+    // Nazwy kont u eBaya NIE maja jednej konwencji. Na trzech prawdziwych raportach
+    // wystapily trzy rozne: „beliani_uk" (podkreslenie), „beliani-de" (myslnik)
+    // i „beliani_italia" (pelna nazwa kraju). Mapa po dokladnej nazwie musialaby byc
+    // poprawiana przy kazdym nowym kraju, wiec rozpoznajemy SAM KRAJ: zdejmujemy nazwe
+    // firmy i znaki rozdzielajace, a z ogona odczytujemy oznaczenie panstwa. Dzieki temu
+    // „beliani-espana" czy „beliani_france" wejda bez zmiany w kodzie.
+    const MK_EBAY_KRAJ = {
+        uk: 'Ebay UK', gb: 'Ebay UK', unitedkingdom: 'Ebay UK', britain: 'Ebay UK',
+        de: 'Ebay DE', deutschland: 'Ebay DE', germany: 'Ebay DE', niemcy: 'Ebay DE',
+        it: 'Ebay IT', italia: 'Ebay IT', italy: 'Ebay IT',
+        es: 'Ebay ES', espana: 'Ebay ES', espanya: 'Ebay ES', spain: 'Ebay ES',
+        fr: 'Ebay FR', france: 'Ebay FR', francia: 'Ebay FR'
+    };
     function ebaySeller(v){ return String(v == null ? '' : v).toLowerCase().replace(/[^a-z0-9]/g, ''); }
+    function ebayShop(v){
+        const s = ebaySeller(v);
+        if (!s) return '';
+        const ogon = s.replace(/^beliani/, '');
+        if (MK_EBAY_KRAJ[ogon]) return MK_EBAY_KRAJ[ogon];
+        if (MK_EBAY_KRAJ[s]) return MK_EBAY_KRAJ[s];
+        // Konto z doklejonym przyrostkiem („beliani_it_outlet"). Od najdluzszego hasla,
+        // zeby „italia" wygralo z „it" i zeby dwuliterowy kod nie lapal przypadkiem.
+        const hasla = Object.keys(MK_EBAY_KRAJ).sort(function (a, b){ return b.length - a.length; });
+        for (let i = 0; i < hasla.length; i++){
+            if (ogon.indexOf(hasla[i]) === 0) return MK_EBAY_KRAJ[hasla[i]];
+        }
+        return '';
+    }
     // Nazwy kolumn po niemiecku i po angielsku — raport wychodzi w jezyku konta, a konto
     // brytyjskie potrafi oddawac plik po niemiecku. Mapujemy PO NAZWIE, nie po numerze:
     // eBay dokladal juz kolumny w srodku ukladu, a wtedy staly indeks siega nie tam.
@@ -19598,7 +19618,7 @@
         }
         if (!nPos && !nZwr) return { err: 'raport eBaya nie ma ani jednego wiersza „Bestellung” / „Rückerstattung”' };
         return {
-            seller: seller, shop: MK_EBAY_SHOP[ebaySeller(seller)] || '',
+            seller: seller, shop: ebayShop(seller),
             payNo: payNo, payDate: payDate,
             cur: curNet || zapowCur || '', curTx: curTx,
             // net = to, co wplynelo na konto (waluta wyplaty). Tym uzgadniamy zlecenie.
@@ -19661,11 +19681,16 @@
     // przez czlowieka z ta sama liczba — czyli potwierdzalaby wlasna pomylke. Dojda razem
     // z wyborem kandydata z listy.
     const MK_MAN = [
+        // Waluta to ta, w ktorej wplywa WYPLATA, a nie ta, w ktorej sprzedano. eBay
+        // rozlicza wszystkie kraje na jedno konto UBS w CHF — sprawdzone na raportach
+        // UK, DE i IT: „Auszahlungswaehrung" = CHF przy transakcjach w GBP i EUR.
+        // Poprzednio bylo tu EUR dla DE/IT/ES/FR, czyli waluta transakcji — reczne
+        // zlecenie mialoby wtedy zla walute i nie zgadzaloby sie z wyciagiem.
         { label: 'eBay UK',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay UK', cur: 'CHF' },
-        { label: 'eBay DE',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay DE', cur: 'EUR' },
-        { label: 'eBay IT',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay IT', cur: 'EUR' },
-        { label: 'eBay ES',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay ES', cur: 'EUR' },
-        { label: 'eBay FR',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay FR', cur: 'EUR' },
+        { label: 'eBay DE',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay DE', cur: 'CHF' },
+        { label: 'eBay IT',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay IT', cur: 'CHF' },
+        { label: 'eBay ES',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay ES', cur: 'CHF' },
+        { label: 'eBay FR',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay FR', cur: 'CHF' },
         { label: 'Galaxus CH', mp: 'Galaxus', brand: 'Galaxus', short: 'Galaxus', kind: 'galx',
           host: 'partner.galaxus.ch', shop: 'Galaxus CH', cur: 'CHF' },
         { label: 'Wayfair DE', mp: 'Wayfair', brand: 'Wayfair', short: 'Wayfair', kind: 'wayf',
@@ -22444,10 +22469,12 @@
                 const p = mkParseEbay(mkDecode(rd.result));
                 if (p.err){ say(p.err, '#c00'); return; }
                 if (!p.shop){
-                    say('Nie znam sprzedawcy „' + (p.seller || '—') + '" — znam '
-                        + Object.keys(MK_EBAY_SHOP).map(function (k){ return MK_EBAY_SHOP[k]; }).join(', ')
-                        + '. Myślnik, podkreślenie i wielkość liter nie mają znaczenia, '
-                        + 'więc to nowe konto — trzeba je dopisać do listy w skrypcie.', '#c47f00');
+                    const znane = {};
+                    Object.keys(MK_EBAY_KRAJ).forEach(function (k){ znane[MK_EBAY_KRAJ[k]] = 1; });
+                    say('Nie znam sprzedawcy „' + (p.seller || '—') + '" — znam ' + Object.keys(znane).join(', ')
+                        + '. Rozpoznaję po oznaczeniu kraju w nazwie konta (myślnik, podkreślenie '
+                        + 'i wielkość liter nie mają znaczenia), więc to konto z innego kraju '
+                        + '— trzeba je dopisać do listy w skrypcie.', '#c47f00');
                     return;
                 }
                 // Plik sam sie kontroluje: suma wierszy kontra kwota z naglowka. Gdy sie
