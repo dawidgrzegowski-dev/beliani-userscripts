@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.39
+// @version      3.40
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -6425,10 +6425,17 @@
         const c = 98 - rem; return c < 10 ? '0' + c : '' + c;
     }
     // Probuje zbudowac poprawny IBAN z samych cyfr krajowego konta + kodu kraju.
+    // Zwraca { v, sprawdzony } albo null. Rozroznienie jest istotne:
+    //  - galaz 2+len (NRB, np. PL): cyfry kontrolne przychodza Z DANYCH, wiec mod-97
+    //    jest prawdziwym filtrem — odrzuca okolo 96 na 97 przypadkowych ciagow;
+    //  - galaz 4+len (np. HU, DE, CZ): cyfry kontrolne dopiero LICZYMY, wiec mod-97
+    //    tuz po nich nie ma prawa zawiesc. Zmierzone: 20000/20000 przyjetych losowych
+    //    ciagow. Jedynym zabezpieczeniem jest tam zgodnosc dlugosci z tablica ISO 13616,
+    //    a numer nie zostal z niczym porownany — i uzytkownik musi to wiedziec.
     function tryBuildIban(digits, cc) {
         const L = IBAN_LEN[cc]; if (!L) return null;
-        if (2 + digits.length === L) { const cand = cc + digits; return mod97ok(cand) ? cand : null; }           // NRB juz zawiera cyfry kontrolne (np. PL)
-        if (4 + digits.length === L) { const cand = cc + ibanCheckDigits(digits, cc) + digits; return mod97ok(cand) ? cand : null; } // policz cyfry kontrolne (np. HU)
+        if (2 + digits.length === L) { const cand = cc + digits; return mod97ok(cand) ? { v: cand, sprawdzony: true } : null; }
+        if (4 + digits.length === L) { const cand = cc + ibanCheckDigits(digits, cc) + digits; return mod97ok(cand) ? { v: cand, sprawdzony: false } : null; }
         return null;
     }
     function ccFromName(name) {
@@ -6441,7 +6448,10 @@
     function resolveIban(raw, cc) {
         const cleaned = cleanupIban(raw);
         if (validateClean(cleaned).length === 0) return { value: cleaned, kind: raw === cleaned ? 'ok' : 'format' };
-        if (cc && /^[0-9]+$/.test(cleaned)) { const built = tryBuildIban(cleaned, cc); if (built) return { value: built, kind: 'prefix', cc }; }
+        if (cc && /^[0-9]+$/.test(cleaned)) {
+            const built = tryBuildIban(cleaned, cc);
+            if (built) return { value: built.v, kind: 'prefix', cc, sprawdzony: built.sprawdzony };
+        }
         return { value: null, kind: 'manual', errs: validateClean(cleaned) };
     }
     function centsOf(a) {
@@ -6465,7 +6475,10 @@
     let fileName = 'refunds_fixed.xml';
     let fileCc = '';      // kod kraju z nazwy pliku (fallback dla BBAN bez prefiksu)
 
-    const q = (n, name) => n.getElementsByTagNameNS('*', name);
+    // n bywa nullem, gdy first() nie znalazlo elementu (plik bez GrpHdr). Bez tego
+    // guardu txt(first(doc,'GrpHdr'),'CtrlSum') rzucalo TypeError, catch w loadText
+    // zamienial to na czerwone pudelko i poprawny plik wygladal na niewczytany.
+    const q = (n, name) => (n ? n.getElementsByTagNameNS('*', name) : []);
     const first = (n, name) => { const l = q(n, name); return l.length ? l[0] : null; };
     const txt = (n, name) => { const e = first(n, name); return e ? (e.textContent || '').trim() : ''; };
 
@@ -6559,7 +6572,8 @@
         // IBAN: ok / format do normalizacji / brak prefiksu kraju / realny blad
         const res = resolveIban(r.iban, r.debtorCc);
         if (res.kind === 'format') r.errs.push('IBAN: format do poprawy (spacje/wielkosc liter/prefiks) -> "Popraw zaznaczone"');
-        else if (res.kind === 'prefix') r.errs.push('IBAN: brak prefiksu kraju - dodac ' + res.cc + ' (auto) -> "Popraw zaznaczone"');
+        else if (res.kind === 'prefix') r.errs.push('IBAN: brak prefiksu kraju - dodac ' + res.cc
+            + (res.sprawdzony ? '' : ' i POLICZYC cyfry kontrolne') + ' (auto) -> "Popraw zaznaczone"');
         else if (res.kind === 'manual') res.errs.forEach(e => r.errs.push('IBAN: ' + e));
         // kwota
         const c = centsOf(r.amt);
@@ -6571,6 +6585,22 @@
         // nazwa / tytul - znaki spoza SEPA
         if (hasNonSepa(r.nm)) r.warns.push('nazwa: znaki spoza SEPA (mozna transliterowac)');
         if (hasNonSepa(r.ustrd)) r.warns.push('tytul: znaki spoza SEPA (mozna transliterowac)');
+        // Dlugosci pol wg pain.001 (ISO 20022). Przekroczenie = bank odrzuca CALY plik,
+        // a modul nie sprawdzal tego wcale: nazwa na 80 znakow dostawala zielone "ok".
+        // EndToEndId jest polem obowiazkowym, wiec puste tez jest bledem.
+        const e2e = String(r.e2e || '');
+        if (!e2e) r.errs.push('brak EndToEndId - pole obowiazkowe w pain.001');
+        else if (e2e.length > 35) r.errs.push('EndToEndId za dlugi: ' + e2e.length + '/35 znakow');
+        const nm = String(r.nm || '');
+        if (!nm) r.errs.push('brak nazwy odbiorcy');
+        else if (nm.length > 70) r.errs.push('nazwa za dluga: ' + nm.length + '/70 znakow');
+        const us = String(r.ustrd || '');
+        if (us.length > 140) r.errs.push('tytul za dlugi: ' + us.length + '/140 znakow');
+        // IBAN odbudowany z numeru krajowego w galezi, w ktorej cyfry kontrolne zostaly
+        // POLICZONE, a nie sprawdzone. Zostaje ostrzezeniem takze po naprawie — inaczej
+        // po kliknieciu "Popraw zaznaczone" wiersz robilby sie zielony i slad by zniknal.
+        if (r.zbudowany && cleanupIban(r.iban) === r.zbudowany)
+            r.warns.push('IBAN zbudowany z numeru krajowego - cyfry kontrolne policzone, nie sprawdzone; potwierdz numer u odbiorcy');
     }
     function validateAll() { model.forEach(validateRow); markDuplicates(); }
 
@@ -6589,17 +6619,21 @@
             const e2eEl = first(r.nodes.tx, 'EndToEndId');
             if (e2eEl) e2eEl.textContent = r.e2e;
         });
-        recomputeSums();
+        return recomputeSums();
     }
+    // Zwraca, ile transakcji ma kwote nie do odczytania. NbOfTxs liczy je (bo w pliku
+    // sa), CtrlSum juz nie (bo nie ma czego dodac) — plik wychodzi wewnetrznie sprzeczny
+    // i bank go odrzuca. Sama funkcja tego nie naprawi; ma o tym POWIEDZIEC, zanim plik
+    // pojdzie dalej. Patrz download().
     function recomputeSums() {
         // per PmtInf
-        let grpCents = 0, grpN = 0;
+        let grpCents = 0, grpN = 0, zle = 0;
         Array.from(q(xmlDoc, 'PmtInf')).forEach(pmt => {
             let cents = 0, n = 0;
             Array.from(q(pmt, 'CdtTrfTxInf')).forEach(tx => {
                 const a = first(tx, 'InstdAmt');
                 const c = a ? centsOf(a.textContent) : NaN;
-                if (!isNaN(c)) { cents += c; }
+                if (!isNaN(c)) { cents += c; } else { zle++; }
                 n++;
             });
             const cs = first(pmt, 'CtrlSum'); if (cs) cs.textContent = fmt2(cents);
@@ -6611,9 +6645,17 @@
             const cs = first(gh, 'CtrlSum'); if (cs) cs.textContent = fmt2(grpCents);
             const nb = first(gh, 'NbOfTxs'); if (nb) nb.textContent = String(grpN);
         }
+        return { zle: zle, n: grpN };
     }
     function download() {
-        writeModelToDoc();
+        const st = writeModelToDoc() || { zle: 0 };
+        // Kwota nie do odczytania trafia do pliku doslownie, a do CtrlSum juz nie —
+        // NbOfTxs liczy taka transakcje, suma jej nie obejmuje. Taki plik bank odrzuci.
+        // Nie blokujemy pobrania (modul nigdzie nie blokuje), ale nie wypuszczamy go
+        // po cichu.
+        if (st.zle && !confirm('Uwaga: ' + st.zle + ' poz. ma kwote, ktorej nie da sie odczytac.\\n\\n'
+            + 'Trafia do pliku bez zmian, ale NIE wchodza do CtrlSum, a NbOfTxs je liczy — '
+            + 'plik bedzie wewnetrznie sprzeczny i bank go odrzuci.\\n\\nPobrac mimo to?')) return;
         const xml = new XMLSerializer().serializeToString(xmlDoc);
         const blob = new Blob([xml], { type: 'application/xml' });
         const a = document.createElement('a');
@@ -6625,15 +6667,21 @@
 
     // ---------- Akcje ----------
     function applyFixSelected() {
-        let fixed = 0, left = 0;
+        let fixed = 0, left = 0, zbud = 0;
         model.forEach(r => {
             if (!r.sel) return;
             const res = resolveIban(r.iban, r.debtorCc);
-            if ((res.kind === 'format' || res.kind === 'prefix') && res.value && r.iban !== res.value) { r.iban = res.value; fixed++; }
+            if ((res.kind === 'format' || res.kind === 'prefix') && res.value && r.iban !== res.value) {
+                r.iban = res.value; fixed++;
+                // Slad po odbudowie: przetrwa rewalidacje i zniknie sam, gdy ktos wpisze
+                // w to pole cokolwiek innego (warunek porownania w validateRow).
+                if (res.kind === 'prefix' && !res.sprawdzony) { r.zbudowany = res.value; zbud++; }
+            }
             else if (res.kind === 'manual') left++;        // realny blad, bez bezpiecznej auto-poprawki
         });
         validateAll(); renderTable(); updateSummary();
-        toast(`Poprawiono IBAN: ${fixed}. Wymaga recznej poprawki: ${left}.`);
+        toast(`Poprawiono IBAN: ${fixed}. Wymaga recznej poprawki: ${left}.`
+            + (zbud ? ` Zbudowanych z numeru krajowego bez kontroli: ${zbud} - sprawdz je u odbiorcy.` : ''));
     }
     function applyTranslit() {
         let n = 0;
