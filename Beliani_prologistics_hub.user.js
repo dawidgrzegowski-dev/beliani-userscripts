@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.37
+// @version      3.39
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -3011,6 +3011,16 @@
         return `<span style="color:#7c3aed">ℹ️ Zwrot nadpłaty z tytułu VAT${open} — do zaksięgowania</span>`;
     }
 
+    // Ktory ticket wybrano dla ktorego numeru zamowienia. Trzymane TYLKO w pamieci
+    // karty: ksiegowanie i dopisywanie komentarza dzieja sie kilka sekund po sobie,
+    // wiec ticket na pewno jest ten sam, a powtorne szukanie kosztuje trzy zaladowania
+    // strony (search.php, wyniki, auction.php) — grubo ponad polowe czasu mostu.
+    const tmTicketHref = {};
+    function tmHrefRemember(ff, href){
+        const k = String(ff || '').trim();
+        if (k && href) tmTicketHref[k] = href;
+    }
+    function tmHrefKnown(ff){ return tmTicketHref[String(ff || '').trim()] || ''; }
     async function findBestTicketForOrder(ffNumber, ctx = defaultFrameCtx, preSearch = null, preTickets = null) {
         const search = preSearch || await searchAuctionUrls(ffNumber, ctx);
         if (!search.ok) {
@@ -3060,6 +3070,7 @@
 
         if (bestValid) {
             // Ramka jest już na bestValid.href (inspectTicketCandidate go załadował) — bez ponownego wejścia.
+            tmHrefRemember(ffNumber, bestValid.href);
             return {
                 ok: true,
                 ticket: bestValid,
@@ -3093,6 +3104,7 @@
         }
         await loadInFrame(best.href, 20000, ctx);
         await sleep(500);
+        tmHrefRemember(ffNumber, best.href);
         return {
             ok: true,
             ticket: best,
@@ -3981,9 +3993,36 @@
         if (!addBtn) return { ok: false, error: 'Brak przycisku Add comment' };
 
         addBtn.click();
-        // comments.add('') zwykle robi XHR, czasem przeładowuje ramkę
-        await sleep(1500);
-        return { ok: true };
+        // comments.add() robi XHR, czasem przeladowuje ramke. Dotad czekalismy tu na
+        // slepo 1500 ms i ZAWSZE zwracalismy ok:true — a zaraz potem finally w moscie
+        // wyrywa iframe z DOM, co przerwany XHR kasuje razem z komentarzem. Awaria byla
+        // wiec cicha i klamiaca: panel mowil „dopisane", a w tickecie nie bylo nic.
+        // Teraz czekamy na DOWOD zapisu i wychodzimy, gdy tylko jest — zwykle duzo
+        // szybciej niz po 1500 ms, a przy wolnym serwerze dajemy mu do 10 s.
+        const KOM_MAX = 10000, KOM_KROK = 250;
+        const szukany = String(commentText || '').trim().slice(0, 60);
+        for (let czekano = 0; czekano < KOM_MAX; czekano += KOM_KROK) {
+            await sleep(KOM_KROK);
+            const d2 = getFrameDoc(ctx);
+            if (!d2) continue;
+            const ta = d2.querySelector('textarea#newcomment, textarea[name="newcomment"]');
+            // Strona przeladowala sie po dodaniu — textarea zniknela albo wrocila pusta.
+            if (!ta) return { ok: true, potwierdzone: 'przeładowanie strony' };
+            if (!String(ta.value || '').trim()) return { ok: true, potwierdzone: 'pole wyczyszczone' };
+            // Pole nadal trzyma nasz tekst, ale komentarz juz widnieje na liscie.
+            // ZLICZAMY wystapienia, a nie wycinamy: textContent strony zawiera tresc
+            // textarea DOKLADNIE raz, wiec drugie wystapienie moze pochodzic juz tylko
+            // z listy komentarzy. Wycinanie po wartosci pola kasowalo takze ten wpis
+            // na liscie i potwierdzenie nigdy nie przychodzilo.
+            if (szukany){
+                const body = String((d2.body && d2.body.textContent) || '');
+                const wPolu = (String(ta.value || '').indexOf(szukany) >= 0) ? 1 : 0;
+                let ile = 0, od = 0, p;
+                while ((p = body.indexOf(szukany, od)) >= 0){ ile++; od = p + szukany.length; }
+                if (ile > wPolu) return { ok: true, potwierdzone: 'widoczny na liście' };
+            }
+        }
+        return { ok: false, error: 'kliknąłem „Add comment", ale przez 10 s nie potwierdziło się, że komentarz się zapisał' };
     }
 
     // Most dla modułu „Księgowanie Marketplace's". Po zaksięgowaniu zwrotu potrafi on
@@ -3997,17 +4036,53 @@
         if (!ff || !body) return { ok: false, error: 'brak numeru zamówienia albo treści komentarza' };
         const ctx = createFrameCtx();
         try {
-            const found = await findBestTicketForOrder(ff, ctx);
-            // Gdy nie ma ticketu „poprawnego" (Solution=7 + credit note), komentarz i tak
-            // ma sens — bierzemy wtedy najlepszego kandydata, którego moduł już obejrzał.
-            const href = (found.ok && found.ticket && found.ticket.href)
-                      || (found.noSolutionTickets && found.noSolutionTickets[0] && found.noSolutionTickets[0].href)
-                      || '';
-            if (!href) return { ok: false, error: found.error || 'nie znalazłem ticketu dla ' + ff };
-            await loadInFrame(href, 20000, ctx);
-            await sleep(600);
+            // Ten sam ticket znalazl juz przed chwila modul ksiegujacy — nie szukamy
+            // drugi raz. To oszczedza trzy zaladowania strony na kazda pozycje.
+            let href = tmHrefKnown(ff), naMiejscu = false;
+            if (href){
+                await loadInFrame(href, 20000, ctx);
+                await sleep(400);
+            } else {
+                const found = await findBestTicketForOrder(ff, ctx);
+                // Gdy nie ma ticketu „poprawnego" (Solution=7 + credit note), komentarz i tak
+                // ma sens — bierzemy wtedy najlepszego kandydata, którego moduł już obejrzał.
+                if (found.ok && found.ticket && found.ticket.href){
+                    href = found.ticket.href;
+                    naMiejscu = true;              // findBestTicketForOrder zostawia ramke na tym tickecie
+                } else {
+                    href = (found.noSolutionTickets && found.noSolutionTickets[0] && found.noSolutionTickets[0].href) || '';
+                }
+                if (!href) return { ok: false, error: found.error || 'nie znalazłem ticketu dla ' + ff };
+                if (!naMiejscu){
+                    await loadInFrame(href, 20000, ctx);
+                    await sleep(600);
+                }
+            }
+            // Ticket zamkniety nie ma pola komentarza — modul ksiegujacy tez otwiera go
+            // na czas pracy i zamyka z powrotem (patrz wasClosedAtStart). Most szedl tu
+            // PO nim, wiec trafial na ticket juz zamkniety i odbijal sie od braku pola.
+            let bylZamkniety = false;
+            try {
+                if (getTicketStatus(getFrameDoc(ctx)) === 'Closed'){
+                    bylZamkniety = true;
+                    await setTicketStatus('Open', ctx);
+                    await sleep(600);
+                    await loadInFrame(href, 20000, ctx);
+                    await sleep(500);
+                }
+            } catch (e){ /* nie udalo sie odczytac statusu — probujemy dopisac tak czy owak */ }
             const r = await addEscalationComment(ctx, body);
-            return r.ok ? { ok: true, href: href } : { ok: false, error: r.error, href: href };
+            // Stan ticketu przywracamy ZAWSZE, takze gdy komentarz nie poszedl —
+            // inaczej nieudany zapis zostawialby otwarty ticket, ktory byl zamkniety.
+            if (bylZamkniety){
+                try {
+                    await loadInFrame(href, 20000, ctx);
+                    await sleep(400);
+                    if (getTicketStatus(getFrameDoc(ctx)) !== 'Closed') await setTicketStatus('Closed', ctx);
+                } catch (e){}
+            }
+            return r.ok ? { ok: true, href: href, zamkniety: bylZamkniety, potwierdzone: r.potwierdzone }
+                        : { ok: false, error: r.error, href: href };
         } catch (e) {
             return { ok: false, error: (e && e.message) || String(e) };
         } finally {
@@ -15362,12 +15437,12 @@
         function bcRun(book, pdfs){
             var mm = bcMatch(book.pays, pdfs), items = [], dates = {}, nErr = 0, nWarn = 0, nOk = 0, nMiss = 0;
             mm.pairs.forEach(function(pr){
-                if (!pr.q){ nMiss++; items.push({ p: pr.p, q: null, lv: 'miss', res: [], score: 0, orders: bcPayOrders(pr.p) }); return; }
+                if (!pr.q){ nMiss++; items.push({ p: pr.p, q: null, lv: 'miss', res: [], score: 0, orders: bcPayOrders(pr.p), pens: bcPayPens(pr.p) }); return; }
                 var res = bcCheck(pr.p, pr.q, book.head);
                 res.forEach(function(x){ if (x.lv === 'date') dates[x.m] = 1; });
                 var lv = bcLv(res);
                 if (lv === 'err') nErr++; else if (lv === 'warn') nWarn++; else nOk++;
-                items.push({ p: pr.p, q: pr.q, lv: lv, res: res, score: pr.score, orders: bcPayOrders(pr.p) });
+                items.push({ p: pr.p, q: pr.q, lv: lv, res: res, score: pr.score, orders: bcPayOrders(pr.p), pens: bcPayPens(pr.p) });
             });
             var orph = mm.orphans.map(function(q){
                 return { q: q, test: bcCents(q.amt) === 100 };
@@ -15439,16 +15514,89 @@
             await Promise.all(ws);
             return out;
         }
-        // Numery zamowien jednej platnosci: najpierw wiersze D/B z Excela, potem to,
-        // co stoi w tytule przelewu (tam bywaja zakresy "21454-21458").
+        // --- Numery roszczen to NIE sa numery zamowien ---------------------------
+        // Tytul sklada pcBuildTitle zawsze w tej samej kolejnosci:
+        //   "Order <numery>, Deposit <N>%, <kontenery>, penalty <numery>, overpayment <numery>"
+        // Segment roszczen stoi ZAWSZE na koncu, a kazda grupa zaczyna sie od slowa
+        // kluczowego (pcFormatPens: "<typ> <n1>,<n2>"). bcTitleToks nie zmienia
+        // KOLEJNOSCI tokenow, wiec wystarczy patrzec, co stoi PRZED liczba.
+        // Numery roszczen bywaja 4-cyfrowe (1018) i wygladaja wtedy dokladnie jak stare
+        // zamowienie chinskie — a takie zamowienie zwykle istnieje, wiec nic nie protestuje.
+        // Rozpoznajemy te same typy co pcParsePenalties, zeby zapis tytulu i jego odczyt
+        // nie rozjechaly sie w czasie. Regex zamiast slownika: token "CONSTRUCTOR"
+        // nie ma jak trafic w prototyp.
+        var BC_PEN_KW = /^(?:PENALTY|OVERPAYMENT|UNDERPAYMENT|DISCOUNT)$/;
+        // Zakres, ktorego bcExpandRange NIE rozwinal: rozne dlugosci ("998-1002") albo
+        // skok wiekszy niz 60. Sam zamowieniem nie bedzie, bo nie przechodzi /^\d{4,6}$/,
+        // ale MUSI przepuscic ciag dalej — inaczej liczba stojaca za nim
+        // ("penalty 1018-1200,1500") wypadlaby z wykluczenia.
+        // Tylko ASCII "-": pauze i polpauze bcTitleToks zamienia na spacje.
+        function bcPenIsRange(t){ return /^\d+-\d+$/.test(t); }
+        // Mapa INDEKSOW tokenow nalezacych do segmentu roszczenia.
+        function bcPenIx(toks){
+            var ix = {}, n = (toks || []).length, i = 0;
+            while (i < n){
+                var t = String(toks[i] == null ? '' : toks[i]).toUpperCase();
+                var j = i + 1, kw = BC_PEN_KW.test(t);
+                if (!kw && t === 'OTHER'){
+                    // "other +" / "other -". Samo slowo "other" roszczeniem NIE jest —
+                    // pcParsePenalties tez wymaga znaku zaraz za nim. Znak stoi osobnym
+                    // tokenem, bo bcTitleToks nie usuwa ani "+", ani ASCII "-".
+                    if (j < n && /^[+-]$/.test(String(toks[j] == null ? '' : toks[j]))){ kw = true; j++; }
+                }
+                if (!kw){ i++; continue; }
+                // Opcjonalne "no." / "nos." — kropke skasowal juz bcTitleToks.
+                if (j < n && /^NOS?$/.test(String(toks[j] == null ? '' : toks[j]).toUpperCase())) j++;
+                // Ciag liczb tego roszczenia. Urywa sie na PIERWSZYM tokenie, ktory nie
+                // jest liczba — czyli na kolejnym slowie kluczowym albo na czymkolwiek,
+                // co doklejono za tytulem.
+                var got = 0;
+                while (j < n){
+                    var v = String(toks[j] == null ? '' : toks[j]);
+                    if (!/^\d+$/.test(v) && !/^[+-]\d+$/.test(v) && !bcPenIsRange(v)) break;
+                    ix[j] = 1; j++; got++;
+                }
+                i = got ? j : (i + 1);
+            }
+            return ix;
+        }
+        // Liczby 4-6 cyfrowe z tytulu, rozdzielone na zamowienia i roszczenia.
+        // Wykluczamy POZYCJE, a nie WARTOSCI: w "Order 1018, penalty 1018" numer stojacy
+        // przy slowie Order zostaje zamowieniem.
+        function bcSplitTitleNums(title){
+            var toks = bcTitleToks(title || ''), px = bcPenIx(toks), o = {}, p = {}, k;
+            toks.forEach(function(t, i){
+                if (!/^\d{4,6}$/.test(t)) return;
+                if (px[i]) p[t] = 1; else o[t] = 1;
+            });
+            for (k in o) if (p[k]) delete p[k];
+            return { ord: o, pen: p };
+        }
+        // Numery zamowien jednej platnosci: najpierw wiersze D/B z Excela (zrodlo pewne —
+        // generator wypisuje je dla kazdej pozycji), potem to, co stoi w tytule przelewu
+        // (tam bywaja zakresy "21454-21458"), ale JUZ BEZ numerow roszczen.
+        // Odsiew celowo siedzi TU, a nie w bcOrders: bcOrders jest wolane takze na tresci
+        // z PDF-a, ktorej ksztaltu nie kontrolujemy (bank lamie wiersze i skleja
+        // "PEN-"+"ALTY"). Ruszenie go zmienialoby DOPASOWANIE platnosci do potwierdzen.
+        // Tutaj dzialamy wylacznie na tytule z Excela i wylacznie na tym, co idzie do
+        // kratek, komentarzy i dociagania potwierdzen — czyli dokladnie tam, gdzie boli.
         function bcPayOrders(p){
             var out = [], seen = {};
             (((p || {}).rows) || []).forEach(function(r){
                 var o = String((r && r.order) || '').trim();
                 if (/^\d{4,6}$/.test(o) && !seen[o]){ seen[o] = 1; out.push(o); }
             });
-            var t = bcOrders(bcTitleToks((p || {}).title || ''));
+            var t = bcSplitTitleNums((p || {}).title || '').ord;
             Object.keys(t).sort().forEach(function(o){ if (!seen[o]){ seen[o] = 1; out.push(o); } });
+            return out;
+        }
+        // Liczby odsiane jako numery roszczen. Nie kasujemy ich po cichu — panel pokaze
+        // je jako ODZNACZONE kratki, zeby dalo sie je jednym klikniecem odzyskac, gdyby
+        // ktos dopisal numer zamowienia na koncu recznie poprawionego tytulu.
+        function bcPayPens(p){
+            var s = bcSplitTitleNums((p || {}).title || ''), ord = {}, out = [];
+            bcPayOrders(p).forEach(function(o){ ord[o] = 1; });
+            Object.keys(s.pen).sort().forEach(function(o){ if (!ord[o]) out.push(o); });
             return out;
         }
         function bcAllOrders(book){
@@ -15789,13 +15937,15 @@
         // Numery zamowien platnosci jako kratki: kwadracik do zaznaczenia + odnosnik,
         // ktory otwiera zamowienie w nowej karcie.
         function bcOrdChips(it, sel){
-            var ord = ((it || {}).orders) || [];
-            if (!ord.length) return '';
+            var ord = ((it || {}).orders) || [], pen = ((it || {}).pens) || [];
+            if (!ord.length && !pen.length) return '';
             var S = sel || {}, on = 0;
             ord.forEach(function(o){ if (S[o]) on++; });
-            var h = '<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px;align-items:center">'
-                + '<span style="font-size:10px;color:#888;margin-right:2px">zamówienia (' + ord.length
-                + (on === ord.length ? ', wszystkie zaznaczone' : (on ? (', zaznaczonych ' + on) : '')) + '):</span>';
+            var h = '<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px;align-items:center">';
+            if (ord.length){
+                h += '<span style="font-size:10px;color:#888;margin-right:2px">zamówienia (' + ord.length
+                    + (on === ord.length ? ', wszystkie zaznaczone' : (on ? (', zaznaczonych ' + on) : '')) + '):</span>';
+            }
             ord.forEach(function(o){
                 var chk = !!S[o];
                 h += '<span class="bc-chip" data-o="' + pcAttr(o) + '" style="display:inline-flex;align-items:center;gap:3px;'
@@ -15805,6 +15955,22 @@
                     + '<a href="' + bcOrdUrl(o) + '" target="_blank" rel="noopener" style="color:#0a58ca;text-decoration:none">' + esc(o) + '</a>'
                     + '</span>';
             });
+            // Liczby z segmentu roszczen. Domyslnie NIEzaznaczone i opisane, zeby bylo
+            // widac, ze skrypt pominal je swiadomie, a nie ich przeoczyl. Ta sama klasa
+            // bc-ord, wiec kratka dziala tak samo — mozna ja kliknac i odzyskac numer,
+            // gdyby wyjatkowo naprawde byl zamowieniem.
+            if (pen.length){
+                h += '<span style="font-size:10px;color:#888;margin:0 2px 0 6px">roszczenia (pominięte):</span>';
+                pen.forEach(function(o){
+                    var chk = !!S[o];
+                    h += '<span class="bc-chip" data-o="' + pcAttr(o) + '" title="Numer z segmentu penalty / overpayment / discount — potraktowany jako numer roszczenia, nie zamówienia. Zaznacz tylko wtedy, gdy naprawdę jest to numer zamówienia."'
+                        + ' style="display:inline-flex;align-items:center;gap:3px;border:1px dashed ' + (chk ? '#0a0' : '#ccc')
+                        + ';background:' + (chk ? '#EAF7EA' : '#fafafa') + ';border-radius:5px;padding:1px 4px;font-size:11px;color:#888">'
+                        + '<input type="checkbox" class="bc-ord" data-o="' + pcAttr(o) + '"' + (chk ? ' checked' : '') + ' style="margin:0;cursor:pointer">'
+                        + '<a href="' + bcOrdUrl(o) + '" target="_blank" rel="noopener" style="color:#0a58ca;text-decoration:none">' + esc(o) + '</a>'
+                        + '</span>';
+                });
+            }
             return h + '</div>';
         }
         function bcRowHtml(it, sel){
@@ -21486,6 +21652,9 @@
     // komentarz przy pozycji, ktora nie przeszla, mowilby nieprawde.
     // Samego ticketu nie szukamy: robi to modul „Ksiegowanie w tickecie" przez most
     // __TM_TICKET_COMMENT, ta sama droga, ktora dopisuje „Please add solution".
+    // Zwraca { msg, col } zamiast pisac na pasek. Pasek ma jedna linie (say nadpisuje
+    // #mk-status), a zaraz po tej funkcji szedl komunikat o arkuszu — i kasowal kazda
+    // informacje o tym, ze komentarze NIE poszly. Wynik skladamy teraz na koncu.
     async function refComment(x, done){
         const zOpisem = x.rows.filter(function (r){ return r.note; });
         // Gdy log ticketa nic nie potwierdzil (done puste), komentujemy wszystko —
@@ -21494,18 +21663,15 @@
         // wypadniecie bylo dotad zupelnie nieme.
         const want = zOpisem.filter(function (r){ return !done.length || done.indexOf(r.id) >= 0; });
         if (!zOpisem.length){
-            say('Zwroty zaksięgowane. Opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
-                + '(dziś dostarcza je tylko rozliczenie Wayfaira).', '#666');
-            return;
+            return { msg: 'opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
+                          + '(dziś dostarcza je tylko rozliczenie Wayfaira)', col: '#666' };
         }
         if (!want.length){
-            say('Zwroty zaksięgowane, ale opisów NIE dopisałem: log modułu „Księgowanie w tickecie" '
-                + 'nie potwierdził żadnej z ' + zOpisem.length + ' pozycji z opisem. Sprawdź te tickety ręcznie.', '#c47f00');
-            return;
+            return { msg: 'opisów NIE dopisałem: log modułu „Księgowanie w tickecie" nie potwierdził żadnej z '
+                          + zOpisem.length + ' pozycji z opisem — sprawdź te tickety ręcznie', col: '#c47f00' };
         }
         if (typeof window.__TM_TICKET_COMMENT !== 'function'){
-            say('Zwroty zaksięgowane, ale opisów nie dopiszę — moduł „Księgowanie w tickecie" jest wyłączony w launcherze.', '#c47f00');
-            return;
+            return { msg: 'opisów nie dopiszę — moduł „Księgowanie w tickecie" jest wyłączony w launcherze', col: '#c47f00' };
         }
         let ok = 0; const bad = [];
         for (let i = 0; i < want.length; i++){
@@ -21517,10 +21683,12 @@
             } catch (e){ bad.push(want[i].id + ': ' + ((e && e.message) || e)); }
         }
         const pominiete = zOpisem.length - want.length;
-        say('Opisy potrąceń: dopisane do ' + ok + ' z ' + want.length + ' ticketów'
-            + (bad.length ? ('. Bez komentarza: ' + bad.join('; ')) : '.')
-            + (pominiete ? (' Pominiętych ' + pominiete + ' — log ticketa ich nie potwierdził, dopisz ręcznie.') : ''),
-            (bad.length || pominiete) ? '#c47f00' : '#0a7a2f');
+        return {
+            msg: 'opisy potrąceń dopisane do ' + ok + ' z ' + want.length + ' ticketów'
+               + (bad.length ? ('. BEZ KOMENTARZA: ' + bad.join('; ')) : '')
+               + (pominiete ? ('. Pominiętych ' + pominiete + ' — log ticketa ich nie potwierdził, dopisz ręcznie') : ''),
+            col: (bad.length || pominiete) ? '#c47f00' : '#0a7a2f'
+        };
     }
     async function bookRefunds(x){
         const err = ksFill(x);
@@ -21544,14 +21712,22 @@
         else rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
         // Opis potracenia z rozliczenia trafia do ticketu jako komentarz — tam go szuka
         // ksiegowosc, gdy pyta, skad sie wzial ten zwrot.
-        await refComment(x, done);
+        const kom = await refComment(x, done) || { msg: '', col: '#666' };
         // Zwroty zaksiegowane — odhaczamy je w arkuszu. Niepowodzenie tego kroku nie
         // cofa ksiegowania, trafia tylko na pasek stanu.
+        let ark = '';
         try {
             const res = await shMarkRefunded(x.keys);
-            if (res) say('Zwroty zaksięgowane · w arkuszu oznaczonych ' + (res.updated || 0)
-                + ((res.missing && res.missing.length) ? (', nie znalazłem ' + res.missing.length + ' wierszy') : ''), '#0a7a2f');
-        } catch (e){ say('Zwroty zaksięgowane, ale arkusz: ' + ((e && e.message) || e), '#c47f00'); }
+            if (res) ark = 'w arkuszu oznaczonych ' + (res.updated || 0)
+                + ((res.missing && res.missing.length) ? (', nie znalazłem ' + res.missing.length + ' wierszy') : '');
+        } catch (e){ ark = 'arkusz: ' + ((e && e.message) || e); }
+        // Jeden komunikat na koncu. Dotad komunikat o arkuszu wchodzil PO komunikacie
+        // o komentarzach i go zamazywal — informacja, ze komentarz nie poszedl, ginela
+        // po ulamku sekundy i nie bylo jak sie o niej dowiedziec.
+        const czesci = ['Zwroty zaksięgowane'];
+        if (kom.msg) czesci.push(kom.msg);
+        if (ark) czesci.push(ark);
+        say(czesci.join(' · '), (kom.col === '#c47f00') ? '#c47f00' : '#0a7a2f');
         return '';
     }
     async function bookAllRefunds(b){
