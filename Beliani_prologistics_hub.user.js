@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.50
+// @version      3.51
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18234,6 +18234,17 @@
     // ksiegowania jako date_overwrite_to i do klucza wiersza w arkuszu, wiec roznica
     // jednego dnia potrafi wrzucic wplate w inny miesiac obrachunkowy.
     // Zaksiegowanego zlecenia juz nie zmieniamy — data poszla do prologistics i do arkusza.
+    // Skad wziela sie kwota zlecenia. Kolumna nazywala sie „Z banku", co przy zleceniu
+    // zalozonym z raportu portalu bylo nieprawda: wyciagu nikt nie widzial, a liczba jest
+    // suma wierszy z pliku. Roznica jest istotna, bo kwota z banku to potwierdzenie
+    // zewnetrzne, a suma z pliku to tylko to, co marketplace sam o sobie powiedzial.
+    function mkSkadKwota(j){
+        if (!j) return '';
+        if (j.payer) return '';                       // z wyciagu — naglowek juz to mowi
+        if (j.manual) return 'wpisana ręcznie';
+        if (j.data && (j.data.ebay || j.data.galx || j.data.wayf)) return 'suma z raportu';
+        return '';
+    }
     function mkDataEdyt(j){
         return !!j && j.status !== 'done' && !j.payer;   // zlecenie z wyciagu ma platnika
     }
@@ -21167,7 +21178,7 @@
         }
         h += '<table style="border-collapse:collapse;font-size:11px;width:100%">'
               + '<tr style="color:#999;font-size:10px"><td style="padding:2px 5px"></td><td style="padding:2px 5px">Data</td><td style="padding:2px 5px">Marketplace</td>'
-              + '<td style="padding:2px 5px">Referencja</td><td style="padding:2px 5px;text-align:right">Z banku</td>'
+              + '<td style="padding:2px 5px">Referencja</td><td style="padding:2px 5px;text-align:right">Kwota wpłaty</td>'
               + '<td style="padding:2px 5px">Stan</td><td style="padding:2px 5px">Szczegóły</td></tr>';
         jobs.forEach(function (j){
             const st = j.status || 'new';
@@ -21227,7 +21238,10 @@
                  // ktora trzeba wiedziec: reczne nie ma referencji z przelewu.
                  + (j.manual ? '<div style="font-family:system-ui;font-size:9px;color:#7c3aed;font-weight:700">dodane ręcznie</div>' : '')
                  + '</td>'
-              +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur) + '</td>'
+              +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur)
+                 + (mkSkadKwota(j) ? ('<div style="font-weight:400;font-size:9px;color:#7c3aed">'
+                     + mkSkadKwota(j) + '</div>') : '<div style="font-weight:400;font-size:9px;color:#9ca3af">z wyciągu</div>')
+                 + '</td>'
               +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + steps + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
             if (onProlo && st === 'done' && !j.impId){
