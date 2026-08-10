@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.45
+// @version      3.47
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19453,10 +19453,12 @@
                           aug:8, sep:9, okt:10, oct:10, nov:11, dez:12, dec:12 };
     function ebayDate(v){
         const s = String(v == null ? '' : v).trim();
-        const m = s.match(/(\d{1,2})\.?\s*([A-Za-zÄÖÜäöü]{3,})\.?\s*(\d{4})/);
+        // Rok bywa dwucyfrowy: Excel skraca „2. Aug 2026" na „02. Aug 26" przy zapisie.
+        const m = s.match(/(\d{1,2})\.?\s*([A-Za-zÄÖÜäöü]{3,})\.?\s*(\d{2}|\d{4})\b/);
         if (m){
             const mm = MK_EBAY_MON[m[2].slice(0, 3).toLowerCase()];
-            if (mm) return m[3] + '-' + String(mm).padStart(2, '0') + '-' + String(m[1]).padStart(2, '0');
+            const rr = m[3].length === 2 ? String(2000 + Number(m[3])) : m[3];
+            if (mm) return rr + '-' + String(mm).padStart(2, '0') + '-' + String(m[1]).padStart(2, '0');
         }
         const iso = s.match(/(\d{4})-(\d{2})-(\d{2})/);
         return iso ? iso[0] : '';
@@ -19500,7 +19502,20 @@
         if (hi < 0) return { err: 'to nie wygląda na raport transakcji eBaya — nie znalazłem wiersza nagłówka' };
         const c = ebayCols(hdr);
         const brak = ['typ', 'order', 'net', 'gross', 'vat'].filter(function (k){ return c[k] < 0; });
-        if (brak.length) return { err: 'w nagłówku eBaya brakuje kolumn: ' + brak.join(', ') };
+        if (brak.length){
+            // Najczestsza przyczyna: to nie jest plik z eBaya, tylko wynik makra „ebay"
+            // otwarty i zapisany w Excelu. Makro kopiuje jako naglowek WIERSZ PIERWSZY,
+            // a w pliku eBaya jest nim smieciowa linia „--,--,--…"; prawdziwy naglowek
+            // stoi dopiero pod blokiem opisowym. Przy okazji Excel zamienia dlugie numery
+            // transakcji na notacje wykladnicza (2.36034E+11) — bezpowrotnie.
+            const zMakra = /Suma\s*AH\s*\+\s*Z/i.test(String(text || ''));
+            if (zMakra) return { err: 'to jest wynik makra „ebay", a nie plik z eBaya — nagłówek '
+                + 'z nazwami kolumn zniknął, a Excel zamienił numery transakcji na notację '
+                + 'wykładniczą. Wrzuć oryginalny plik Payout_….csv prosto z portalu, bez '
+                + 'otwierania go w Excelu — moduł zrobi to samo co makro, tylko bez psucia danych.' };
+            return { err: 'w nagłówku eBaya brakuje kolumn: ' + brak.join(', ')
+                + '. Jeśli plik był otwierany w Excelu, weź świeży Payout_….csv z portalu.' };
+        }
 
         // Preambula: sprzedawca i zapowiedziana kwota wyplaty.
         let seller = '', zapow = null, zapowCur = '';
@@ -19516,6 +19531,10 @@
         }
 
         const ord = {}, ref = {}, refNote = {}, ids = {};
+        // Surowe wiersze zostaja, bo plik do importu w prologistics ma UKLAD ZRODLOWY
+        // (38 kolumn), a nie ukladu Mirakla. Agregaty ord/ref sluza do ksiegowania,
+        // te wiersze do wygenerowania pliku — patrz mkCsvEbay.
+        const wOrd = [], wRef = [];
         let netto = 0, gross = 0, refund = 0, nPos = 0, nZwr = 0, pominiete = 0;
         let payNo = '', payDate = '', curNet = zapowCur, curTx = '';
         for (let i = hi + 1; i < linie.length; i++){
@@ -19545,6 +19564,7 @@
                 ord[id] = r2((ord[id] || 0) + kw);
                 gross = r2(gross + kw);
                 nPos++;
+                wOrd.push({ r: r, kw: kw });
             } else {
                 if (!kw) continue;
                 const abs = Math.abs(kw);
@@ -19559,6 +19579,7 @@
                     (kw < 0 ? '' : '+') + kw.toFixed(2) + ' ' + (curTx || '')
                 ].filter(function (x){ return x && x !== '--' && x !== 'SKU --'; }).join(' · ');
                 refNote[id] = refNote[id] ? (refNote[id] + '\n\n' + opis) : opis;
+                wRef.push({ r: r, kw: kw });
             }
         }
         if (!nPos && !nZwr) return { err: 'raport eBaya nie ma ani jednego wiersza „Bestellung” / „Rückerstattung”' };
@@ -19571,8 +19592,46 @@
             netOk: (zapow == null) || eq(netto, zapow),
             ord: ord, ref: ref, refNote: refNote, ids: ids,
             gross: gross, refund: refund, nPos: nPos, nZwr: nZwr, pominiete: pominiete,
+            // do odtworzenia pliku importu: pierwsza linia pliku (makro kopiuje wlasnie ja
+            // jako naglowek), surowe wiersze i numer kolumny, w ktorej ma stanac suma
+            hdr0: linie[0] || '', kolSum: 32, wOrd: wOrd, wRef: wRef,
             n: Object.keys(ord).length + Object.keys(ref).length
         };
+    }
+
+    // Plik do importu w prologistics. Uklad jest ZRODLOWY — 38 kolumn raportu eBaya —
+    // a nie ukladu Mirakla, bo ustawienie importu (bank_setting) jest dopasowane do tego,
+    // co od miesiecy produkuje makro dzialu. Odtwarzamy je co do kolumny:
+    //   wiersz 1  : pierwsza linia pliku zrodlowego (makro kopiuje ws.Rows(1), a jest nia
+    //               smieciowa linia „--,--,…"), z napisem „Suma AH + Z" w kolumnie 33,
+    //   wiersze   : tylko „Bestellung", z kolumna 33 podmieniona na AH + Z.
+    // Roznica na plus wobec makra: nie przepuszczamy pliku przez Excela, wiec dlugie numery
+    // transakcji zostaja cyframi, a nie notacja wykladnicza (2.36034E+11).
+    const MK_EBAY_SUMA = 'Suma AH + Z';
+    function ebayPole(v){
+        const t = String(v == null ? '' : v);
+        return (t.indexOf(';') >= 0 || t.indexOf('"') >= 0 || t.indexOf('\n') >= 0)
+             ? ('"' + t.split('"').join('""') + '"') : t;
+    }
+    // Kwota tak, jak zapisuje ja makro: dwa miejsca po przecinku, przecinek dziesietny.
+    function ebayKwota(n){ return Number(n).toFixed(2).replace('.', ','); }
+    function mkCsvEbay(p, ktore){
+        const kol = (p && p.kolSum != null) ? p.kolSum : 32;
+        const zrodlo = (p && p.hdr0) ? p.hdr0.replace(/\r$/, '') : '';
+        // Naglowek: tresc pierwszej linii w kolumnie 1, „Suma AH + Z" w kolumnie 33,
+        // reszta pusta — dokladnie to, co wychodzi z makra po zapisie z Excela.
+        const nag = new Array(38).fill('');
+        nag[0] = zrodlo;
+        nag[kol] = MK_EBAY_SUMA;
+        const linie = [nag.map(ebayPole).join(';')];
+        const wiersze = (ktore === 'zwroty') ? ((p && p.wRef) || []) : ((p && p.wOrd) || []);
+        wiersze.forEach(function (x){
+            const c = (x.r || []).slice();
+            while (c.length < 38) c.push('');
+            c[kol] = ebayKwota(x.kw);
+            linie.push(c.map(ebayPole).join(';'));
+        });
+        return '\ufeff' + linie.join('\r\n') + '\r\n';
     }
 
     // ---------- reczne dodanie wplaty (bez wyciagu z banku) ----------
@@ -20097,6 +20156,7 @@
         if (j.kind === 'galx' && j.data && j.data.galx) return mkCsvGalx(j.data.galx);
         if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf).text;
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
+        if (j.kind === 'ebay' && j.data && j.data.ebay) return mkCsvEbay(j.data.ebay);
         return mkCsvText(pairsOf(j));
     }
 
