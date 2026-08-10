@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.43
+// @version      3.44
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18227,6 +18227,28 @@
     // Nazwa sklepu bierze sie normalnie z pobranego rozliczenia. Joybuy zadnego nie ma —
     // jego sklep znamy juz z reguly rozpoznajacej wplate, wiec siegamy tam zapasowo.
     // Dla pozostalych nic sie nie zmienia: `data.shop` jest ustawiane pierwsze.
+    // Data ksiegowania. Ze zlecenia z WYCIAGU pochodzi z banku i jest data wejscia na
+    // konto — tej nie ruszamy. Ze zlecenia zalozonego z raportu portalu pochodzi z pola
+    // „data wyplaty", czyli z dnia, w ktorym marketplace ZLECIL przelew; pieniadze wchodza
+    // dzien lub dwa pozniej (eBay pisze wprost: „0-1 Werktagen"). Ta data idzie do
+    // ksiegowania jako date_overwrite_to i do klucza wiersza w arkuszu, wiec roznica
+    // jednego dnia potrafi wrzucic wplate w inny miesiac obrachunkowy.
+    // Zaksiegowanego zlecenia juz nie zmieniamy — data poszla do prologistics i do arkusza.
+    function mkDataEdyt(j){
+        return !!j && j.status !== 'done' && !j.payer;   // zlecenie z wyciagu ma platnika
+    }
+    function mkDataCell(j){
+        if (!mkDataEdyt(j)) return esc(j.date || '—');
+        const zrodlo = j.dateSrc || '';
+        const zmieniona = !!zrodlo && zrodlo !== j.date;
+        return '<input type="date" class="mk-dt" data-k="' + esc(j.__k || '') + '"'
+             + ' value="' + esc(j.date || '') + '"'
+             + ' title="Data wejścia na konto — ta trafia do księgowania. Z raportu bierzemy datę zlecenia wypłaty przez marketplace, a przelew wchodzi zwykle dzień lub dwa później."'
+             + ' style="font-size:11px;padding:1px 3px;border:1px solid ' + (zmieniona ? '#7c3aed' : '#ddd')
+             + ';border-radius:4px;background:' + (zmieniona ? '#faf5ff' : '#fff') + '">'
+             + (zmieniona ? ('<div style="font-size:9px;color:#7c3aed">poprawiona · z raportu ' + esc(zrodlo) + '</div>')
+                          : (zrodlo ? '<div style="font-size:9px;color:#9ca3af">data wypłaty z raportu</div>' : ''));
+    }
     function mkShort(j){
         const shop = (j.data && j.data.shop) || j.shop || '';
         const cc = String(shop).match(/\b([A-Z]{2})\s*$/);
@@ -20979,7 +21001,7 @@
 
     function jobList(){
         const j = jobsLoad();
-        return Object.keys(j).map(function (k){ return j[k]; })
+        return Object.keys(j).map(function (k){ j[k].__k = k; return j[k]; })
             .sort(function (a, b){ return String(a.date).localeCompare(String(b.date)) || String(a.ref).localeCompare(String(b.ref)); });
     }
 
@@ -21102,7 +21124,7 @@
               +  '<td style="padding:3px 5px">' + (onProlo && st === 'ready'
                     ? '<input type="checkbox" class="mk-ck" data-ref="' + esc(j.ref) + '"' + (selOn(j) ? ' checked' : '') + '>'
                     : '') + '</td>'
-              +  '<td style="padding:3px 5px;white-space:nowrap">' + esc(j.date) + '</td>'
+              +  '<td style="padding:3px 5px;white-space:nowrap">' + mkDataCell(j) + '</td>'
               +  '<td style="padding:3px 5px">' + esc(j.mp || '—') + '</td>'
               +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—')
                  // Skad sie wzielo zlecenie. Przy nieudanym dopasowaniu to pierwsza rzecz,
@@ -21177,6 +21199,30 @@
                 }).join(' · ') + (res.urls.length > 5 ? (' … (' + res.urls.length + ')') : '');
             });
         }; });
+        // Poprawiona data wejscia na konto. Zapis idzie na SWIEZO wczytanym magazynie,
+        // zeby nie nadpisac tego, co w miedzyczasie zapisal przelot.
+        out.querySelectorAll('.mk-dt').forEach(function (d){
+            d.onchange = function(){
+                const k = d.getAttribute('data-k'), v = String(d.value || '').trim();
+                if (!k) return;
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(v)){ say('Data musi być pełna (rrrr-mm-dd).', '#c47f00'); return; }
+                const dni = (mkDay(v) - Date.now()) / 86400000;
+                if (dni > 1){ say('Data jest w przyszłości — sprawdź ją.', '#c47f00'); return; }
+                const jobs = jobsLoad();
+                const j = jobs[k];
+                if (!j) return;
+                if (j.status === 'done'){ say('To zlecenie jest już zaksięgowane — daty nie zmieniam.', '#c47f00'); return; }
+                // Pierwotna date z raportu zapamietujemy raz, zeby bylo widac, co podal
+                // portal, a co poprawil czlowiek.
+                if (!j.dateSrc) j.dateSrc = j.date;
+                if (j.date === v) return;
+                const stara = j.date;
+                j.date = v;
+                jobsSave(jobs); render();
+                say('Data wpłaty ' + (j.shop || j.mp || '') + ' ' + f2(j.amount) + ' ' + (j.cur || '')
+                    + ': ' + stara + ' → ' + v + '. Ta data pójdzie do księgowania.', '#0a7a2f');
+            };
+        });
         out.querySelectorAll('.mk-ck').forEach(function (c){
             c.onchange = function(){ mkSel[c.getAttribute('data-ref')] = c.checked; render(); };
         });
@@ -22296,7 +22342,8 @@
                     // wyplaty, ten sam, ktory znajdzie sie potem w tytule przelewu, wiec
                     // pozniejsze wgranie wyciagu NIE utworzy drugiego zlecenia na te sama wplate.
                     k = String(p.payNo || (p.payDate + '_' + p.net));
-                    jobs[k] = { ref: String(p.payNo || ''), date: p.payDate, amount: p.net, cur: p.cur,
+                    jobs[k] = { ref: String(p.payNo || ''), date: p.payDate, dateSrc: p.payDate,
+                                amount: p.net, cur: p.cur,
                                 mp: 'Ebay', brand: 'eBay', short: 'eBay', host: '', kind: 'ebay',
                                 shop: p.shop, docs: null, payer: '', txId: '', status: 'new', msg: '' };
                     zalozone = true;
@@ -22304,7 +22351,7 @@
                 const j = jobs[k];
                 if (j.status === 'done'){ say('Ta wypłata jest już zaksięgowana.', '#c47f00'); return; }
                 if (!j.shop) j.shop = p.shop;
-                if (!j.date) j.date = p.payDate;
+                if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
                 const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
                 j.data = { ebay: p, shop: p.shop, gross: p.gross, refund: p.refund,
                            net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
@@ -23090,7 +23137,7 @@
                 // Numer wyplaty staje sie referencja zlecenia. To ten sam klucz, ktorego
                 // uzywa wgranie raportu, wiec obie drogi zejda sie na jednym zleceniu.
                 if (!j.ref) j.ref = p.id;
-                if (!j.date) j.date = p.date;
+                if (!j.date){ j.date = p.date; j.dateSrc = p.date; }
                 if (!j.cur) j.cur = p.cur;
                 j.payout = { id: p.id, date: p.date, amount: p.amount, cur: p.cur,
                              bankRef: p.bankRef, method: p.method, stan: p.stan, url: p.url };
