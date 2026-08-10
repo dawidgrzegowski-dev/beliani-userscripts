@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.41
+// @version      3.43
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -27,6 +27,8 @@
 // @connect      myvtex.com
 // @connect      galaxus.ch
 // @connect      wayfair.com
+// @connect      ebay.de
+// @connect      www.ebay.de
 // @connect      storage.googleapis.com
 // @connect      googleapis.com
 // @connect      script.google.com
@@ -19551,6 +19553,142 @@
         };
     }
 
+    // ---------- reczne dodanie wplaty (bez wyciagu z banku) ----------
+    // Nie kazdy ma dostep do wyciagu, a wplata i tak przyszla. Ta droga tworzy takie samo
+    // zlecenie, jakie zrobilby plik bankowy — tyle ze kwote i date podaje czlowiek.
+    // ROZMYSLNIE WASKA LISTA. Sa tu wylacznie platformy, w ktorych dopasowanie po kwocie
+    // jest juz dzis normalna droga i istnieje NIEZALEZNE zrodlo do porownania:
+    //   eBay    — panel oddaje liste wyplat z numerem, data i referencja bankowa,
+    //   Galaxus — dopasowanie po sumie wyplaty, bo referencji (UUID) nie ma w pliku,
+    //   Wayfair — wayfPass i tak szuka po kwocie, nie po numerze.
+    // Vente, Home24, Manor, Joybuy i OBI tu NIE WCHODZA: przy nich zlecenie bez numeru
+    // dobieraloby cykl kolejnoscia sklepow, a kontrola kwoty porownywalaby liczbe wpisana
+    // przez czlowieka z ta sama liczba — czyli potwierdzalaby wlasna pomylke. Dojda razem
+    // z wyborem kandydata z listy.
+    const MK_MAN = [
+        { label: 'eBay UK',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay UK', cur: 'CHF' },
+        { label: 'eBay DE',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay DE', cur: 'EUR' },
+        { label: 'eBay IT',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay IT', cur: 'EUR' },
+        { label: 'eBay ES',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay ES', cur: 'EUR' },
+        { label: 'eBay FR',    mp: 'Ebay', brand: 'eBay', short: 'eBay', kind: 'ebay', shop: 'Ebay FR', cur: 'EUR' },
+        { label: 'Galaxus CH', mp: 'Galaxus', brand: 'Galaxus', short: 'Galaxus', kind: 'galx',
+          host: 'partner.galaxus.ch', shop: 'Galaxus CH', cur: 'CHF' },
+        { label: 'Wayfair DE', mp: 'Wayfair', brand: 'Wayfair', short: 'Wayfair', kind: 'wayf',
+          host: 'partners.wayfair.com', shop: 'Wayfair DE', cur: 'EUR' }
+    ];
+    // Ta sama wplata nie moze trafic do modulu dwa razy — raz recznie, raz z wyciagu.
+    // Klucze byloby wtedy rozne, a skutkiem podwojny import i podwojne ksiegowanie.
+    // Dlatego szukamy nie po kluczu, tylko po TOZSAMOSCI: ten sam sklep, ta sama kwota,
+    // data w oknie tygodnia.
+    function manDuplikat(jobs, w, kwota, data){
+        const d0 = mkDay(data);
+        return Object.keys(jobs).filter(function (k){
+            const j = jobs[k];
+            if (j.status === 'done') return false;
+            if (String(j.shop || '') !== w.shop) return false;
+            if (j.amount == null || Math.abs(j.amount - kwota) > 0.005) return false;
+            const d1 = mkDay(j.date);
+            return (d0 == null || d1 == null) ? true : Math.abs(d1 - d0) <= 7 * 86400000;
+        })[0] || '';
+    }
+
+    // ---------- rozmowa z Seller Hubem eBaya ----------
+    // Strona /mes/payouts nie wymaga skrobania HTML: caly model siedzi w jednym skrypcie
+    // jako window.__APP_INITIAL_STATE__, a wyplaty w modules.transactionsModule.transactions.
+    // Uwierzytelnia ciasteczko sesji z domeny ebay.de — czytamy je w locie, nigdzie nie
+    // przechowujemy. Jeden host obsluguje wszystkie kraje (wyplata konta beliani_uk
+    // widnieje na ebay.de), wiec nie ma przelaczania sklepow jak przy Miraklu.
+    const MK_EBAY_HOST = 'www.ebay.de';
+    const MK_EBAY_LIST = 'https://www.ebay.de/mes/payouts';
+
+    // Wyluskanie obiektu po "__APP_INITIAL_STATE__ =" przez zliczanie nawiasow. Naiwne
+    // szukanie "};" nie dziala — w srodku sa tytuly ofert z nawiasami i cudzyslowami.
+    function ebayState(html){
+        const s = String(html == null ? '' : html);
+        let i = s.indexOf('__APP_INITIAL_STATE__');
+        if (i < 0) return null;
+        i = s.indexOf('{', i);
+        if (i < 0) return null;
+        let d = 0, q = false, esc = false;
+        for (let j = i; j < s.length; j++){
+            const c = s.charAt(j);
+            if (q){
+                if (esc) esc = false;
+                else if (c === '\\') esc = true;
+                else if (c === '"') q = false;
+                continue;
+            }
+            if (c === '"'){ q = true; continue; }
+            if (c === '{') d++;
+            else if (c === '}'){
+                d--;
+                if (!d){ try { return JSON.parse(s.slice(i, j + 1)); } catch (e){ return null; } }
+            }
+        }
+        return null;
+    }
+    // eBay opakowuje kazdy napis w TextualDisplay { textSpans:[{ text }] }. Czasem jeszcze
+    // raz, w IconAndText { text: TextualDisplay }. Rozpakowujemy oba warianty.
+    function ebayTxt(o){
+        if (o == null) return '';
+        if (typeof o === 'string') return o.trim();
+        const ts = o.textSpans || (o.text && o.text.textSpans);
+        if (ts && ts.length) return String(ts[0].text == null ? '' : ts[0].text).trim();
+        return '';
+    }
+    function ebayPayoutList(html){
+        const st = ebayState(html);
+        const m = st && st.modules && st.modules.transactionsModule;
+        const tr = m && m.transactions;
+        if (!Array.isArray(tr)) return null;
+        return tr.map(function (t){
+            const kwTxt = ebayTxt(t.amount);
+            const km = kwTxt.match(/(-?[\d.,]+)\s*([A-Z]{3})/);
+            const memo = (t.memo || []).map(ebayTxt).filter(Boolean).join(' · ');
+            // Referencja bankowa — to ona ma szanse stac w tytule przelewu na wyciagu.
+            const br = memo.match(/Bankreferenz-?\s*Nr\.?\s*([A-Z0-9]{6,})/i)
+                    || memo.match(/bank\s*reference\s*(?:no\.?)?\s*([A-Z0-9]{6,})/i);
+            const sp = (t.payoutId && t.payoutId.textSpans && t.payoutId.textSpans[0]) || {};
+            return {
+                id: ebayTxt(t.payoutId),
+                date: ebayDate(ebayTxt(t.date)),
+                czas: ebayTxt(t.date),
+                amount: km ? ebayNum(km[1]) : null,
+                cur: km ? km[2] : '',
+                method: ebayTxt(t.payoutMethod),
+                // Nazwa ikony jest niezalezna od jezyka panelu, tekst juz nie.
+                stan: (t.status && t.status.icon && t.status.icon.name) || '',
+                stanTxt: ebayTxt(t.status),
+                bankRef: br ? br[1] : '',
+                url: (sp.action && sp.action.URL) || '',
+                memo: memo
+            };
+        }).filter(function (x){ return x.id; });
+    }
+    async function ebayFetchPayouts(){
+        const ck = await gmCookies('https://' + MK_EBAY_HOST + '/');
+        const r = await gmGet(MK_EBAY_LIST, ck ? { Cookie: ck } : {});
+        if (r.status === 401 || r.status === 403 || /signin|\/ws\/eBayISAPI/i.test(String(r.finalUrl || '')))
+            throw new Error('eBay nie wpuścił — zaloguj się na ' + MK_EBAY_HOST + ' w tej przeglądarce');
+        if (r.status !== 200) throw new Error('eBay: HTTP ' + r.status);
+        const lista = ebayPayoutList(r.responseText);
+        if (!lista) throw new Error('nie znalazłem listy wypłat na stronie — układ panelu mógł się zmienić');
+        return lista;
+    }
+    // Wyplata pasujaca do zlecenia. NIE zgadujemy: przy kilku kandydatach oddajemy
+    // wszystkie, a wybor nalezy do czlowieka — kwota i data przy zleceniu recznym
+    // pochodza od niego samego, wiec nie sa niezaleznym potwierdzeniem.
+    function ebayMatchPayouts(lista, kwota, data, dni){
+        const okno = (dni == null ? 5 : dni);
+        const d0 = mkDay(data);
+        return (lista || []).filter(function (p){
+            if (p.amount == null || Math.abs(p.amount - kwota) > 0.005) return false;
+            if (d0 == null || !p.date) return true;
+            const d1 = mkDay(p.date);
+            return d1 == null || Math.abs(d1 - d0) <= okno * 86400000;
+        });
+    }
+
     // ================= WAYFAIR =================
     // Rozliczenie („remittance") to CSV z portalu partnerskiego. Uklad NIE jest staly:
     // kolumny „Allowance" pojawiaja sie tylko wtedy, gdy w danym rozliczeniu wystapilo
@@ -20165,7 +20303,9 @@
         return o.filter(function (x){ return x != null && typeof x !== 'object'; }).map(String);
     }
     function mkMatchIn(list, ref){
-        const bare = String(ref).replace(/\D+/g, '');
+        const s = String(ref == null ? '' : ref).trim();
+        if (!s) return null;                       // pusty numer nie jest dopasowaniem
+        const bare = s.replace(/\D+/g, '');
         for (let i = 0; i < (list || []).length; i++){
             const f = cycFields(list[i]);
             for (let k = 0; k < f.length; k++){
@@ -20766,6 +20906,18 @@
               // w nie; gdy nie ma zadnego, zaklada je z danych z pliku.
               + '<label style="font-size:11px;color:#444;border:1px solid #ccc;border-radius:6px;padding:4px 8px;cursor:pointer;background:#f9fafb">📄 Raport eBay'
               + '<input type="file" id="mk-ebay" accept=".csv,text/csv" style="display:none"></label>'
+              // Druga droga zaciagniecia zlecenia: bez wyciagu z banku, z samej kwoty i daty.
+              + '<span style="display:inline-flex;gap:4px;align-items:center;border:1px dashed #c4b5fd;border-radius:6px;padding:3px 6px;background:#faf5ff">'
+              + '<span style="font-size:11px;color:#5b21b6;font-weight:700">bez wyciągu:</span>'
+              + '<select id="mk-man-mp" style="font-size:11px;padding:2px 4px;border:1px solid #ddd;border-radius:4px">'
+              + '<option value="">— marketplace —</option>'
+              + MK_MAN.map(function (w, i){ return '<option value="' + i + '">' + esc(w.label) + '</option>'; }).join('')
+              + '</select>'
+              + '<input id="mk-man-amt" placeholder="kwota" inputmode="decimal" style="width:78px;font-size:11px;padding:2px 4px;border:1px solid #ddd;border-radius:4px">'
+              + '<span id="mk-man-cur" style="font-size:10px;color:#666;min-width:26px"></span>'
+              + '<input id="mk-man-date" type="date" style="font-size:11px;padding:1px 4px;border:1px solid #ddd;border-radius:4px" title="Data wpływu na konto — nie dzisiejsza, tylko z wyciągu albo z awiza">'
+              + '<button id="mk-man-add" style="padding:3px 9px;border:none;border-radius:5px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">+ Dodaj wpłatę</button>'
+              + '</span>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
               + '<button id="mk-sal" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">📊 Salda</button>'
               + '<span id="mk-shops" style="font-size:11px;color:#666"></span>'
@@ -20952,7 +21104,11 @@
                     : '') + '</td>'
               +  '<td style="padding:3px 5px;white-space:nowrap">' + esc(j.date) + '</td>'
               +  '<td style="padding:3px 5px">' + esc(j.mp || '—') + '</td>'
-              +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—') + '</td>'
+              +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—')
+                 // Skad sie wzielo zlecenie. Przy nieudanym dopasowaniu to pierwsza rzecz,
+                 // ktora trzeba wiedziec: reczne nie ma referencji z przelewu.
+                 + (j.manual ? '<div style="font-family:system-ui;font-size:9px;color:#7c3aed;font-weight:700">dodane ręcznie</div>' : '')
+                 + '</td>'
               +  '<td style="padding:3px 5px;text-align:right;font-weight:600">' + f2(j.amount) + ' ' + esc(j.cur) + '</td>'
               +  '<td style="padding:3px 5px;color:' + col + ';font-weight:700;white-space:nowrap">' + lbl + steps + '</td>'
               +  '<td style="padding:3px 5px;color:#374151">' + det + '</td></tr>';
@@ -22045,6 +22201,52 @@
                 + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
                 errs.length ? '#c47f00' : '#0a7a2f');
         };
+        // Reczne dodanie wplaty. Data NIE ma wartosci domyslnej: podpowiedziana „dzisiaj"
+        // bywa zatwierdzana odruchowo, a ta data idzie potem do ksiegowania jako
+        // date_overwrite_to — czyli wplata z konca lipca wpadlaby w sierpien.
+        const manMp = $('#mk-man-mp'), manAmt = $('#mk-man-amt'),
+              manDate = $('#mk-man-date'), manCur = $('#mk-man-cur'), manAdd = $('#mk-man-add');
+        function manWybor(){ const i = manMp && manMp.value; return (i === '' || i == null) ? null : MK_MAN[Number(i)]; }
+        if (manMp) manMp.onchange = function(){ const w = manWybor(); if (manCur) manCur.textContent = w ? w.cur : ''; };
+        // Kwote czytamy tym samym mkNum, ktory obsluguje wyciagi — radzi sobie
+        // i z „1234,56", i z „1.234,56", i z „1 234.56".
+        if (manAmt) manAmt.oninput = function(){
+            const v = mkNum(manAmt.value);
+            manAmt.style.borderColor = (!manAmt.value.trim() || (v != null && v > 0)) ? '#ddd' : '#c00';
+        };
+        if (manAdd) manAdd.onclick = function(){
+            if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj wpłatę po jego zakończeniu.', '#c47f00'); return; }
+            const w = manWybor();
+            if (!w){ say('Wybierz marketplace z listy.', '#c47f00'); return; }
+            const kwota = mkNum(manAmt && manAmt.value);
+            if (kwota == null || kwota <= 0){ say('Podaj kwotę wpłaty — tę, która weszła na konto.', '#c47f00'); return; }
+            const data = String((manDate && manDate.value) || '').trim();
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(data)){ say('Podaj datę wpływu na konto.', '#c47f00'); return; }
+            const dni = (mkDay(data) - Date.now()) / 86400000;
+            if (dni > 1){ say('Data jest w przyszłości — sprawdź ją.', '#c47f00'); return; }
+            if (dni < -400){ say('Data starsza niż rok — sprawdź ją.', '#c47f00'); return; }
+            // Magazyn czytamy TUZ przed zapisem, nie wczesniej — przelot zapisuje caly
+            // obiekt jobs naraz i zlecenie dodane na starej migawce zniknelo by bez sladu.
+            const jobs = jobsLoad();
+            const dup = manDuplikat(jobs, w, kwota, data);
+            if (dup){
+                const d = jobs[dup];
+                say('Ta wpłata już jest na liście: ' + w.label + ' · ' + f2(d.amount) + ' ' + (d.cur || '')
+                    + ' z ' + (d.date || '—') + (d.ref ? (' · nr ' + d.ref) : '')
+                    + '. Nie dodaję drugi raz — podwójne zlecenie znaczyłoby podwójne księgowanie.', '#c47f00');
+                return;
+            }
+            const k = 'MAN_' + w.short + '_' + data + '_' + kwota.toFixed(2);
+            jobs[k] = { ref: '', date: data, amount: r2(kwota), cur: w.cur, mp: w.mp, brand: w.brand,
+                        short: w.short, host: w.host || '', kind: w.kind, shop: w.shop, docs: null,
+                        payer: '', txId: '', status: 'new', msg: '', manual: true, manualAt: new Date().toISOString().slice(0, 10) };
+            jobsSave(jobs); render();
+            if (manAmt) manAmt.value = '';
+            say('Dodano wpłatę bez wyciągu: ' + w.label + ' · ' + f2(kwota) + ' ' + w.cur + ' z ' + data
+                + (w.kind === 'ebay' ? ' — kliknij „⬇ Pobierz zestawienia", żeby moduł rozpoznał, która to wypłata.'
+                                     : ' — teraz wgraj raport z portalu.'), '#0a7a2f');
+        };
+
         // Raport transakcji eBaya. Inaczej niz przy Galaxusie i Wayfairze plik jest
         // SAMOWYSTARCZALNY: w bloku nad naglowkiem stoi sprzedawca i kwota wyplaty, a te
         // same liczby da sie odtworzyc z wierszy (suma kolumny netto). Dlatego gdy nie ma
@@ -22846,6 +23048,60 @@
                 return jobs[k].kind === 'galx' && mkTodo(jobs[k]) && jobs[k].ref;
             }).length;
         }
+        // Zlecenia eBaya, ktorym brakuje ROZPOZNANIA wyplaty. Inaczej niz przy Galaxusie
+        // i Wayfairze nie wymagamy referencji — ona jest wlasnie tym, czego szukamy:
+        // panel eBaya oddaje liste wyplat z kwota, data i numerem, wiec zlecenie z samej
+        // kwoty (z wyciagu albo wpisane z reki) da sie po niej rozpoznac.
+        function ebayLeft(jobs){
+            return Object.keys(jobs).filter(function (k){
+                const j = jobs[k];
+                return j.kind === 'ebay' && mkTodo(j) && !j.data && (j.amount != null);
+            }).length;
+        }
+        // Rozpoznanie wyplaty w panelu eBaya. NIE ksieguje i nie ustawia 'ready' —
+        // pozycje zamowien sa tylko w raporcie CSV, a lista wyplat ich nie niesie.
+        // Zadaniem tego przelotu jest powiedziec, KTORA wyplata to jest: numer, dokladna
+        // data, kwota z portalu i referencja bankowa. Dopiero wtedy wiadomo, ktory raport
+        // pobrac — i dopiero wtedy kontrola kwoty przestaje byc porownaniem liczby
+        // wpisanej przez czlowieka z ta sama liczba.
+        async function ebayPass(jobs){
+            const lista = await ebayFetchPayouts();
+            let n = 0;
+            Object.keys(jobs).forEach(function (k){
+                const j = jobs[k];
+                if (j.kind !== 'ebay' || !mkTodo(j) || j.data || j.amount == null) return;
+                const kand = ebayMatchPayouts(lista, j.amount, j.date, 5);
+                if (!kand.length){
+                    const blisko = lista.slice(0, 4).map(function (p){
+                        return p.date + ' ' + f2(p.amount) + ' ' + p.cur;
+                    }).join(' · ');
+                    j.msg = 'w panelu eBaya nie ma wypłaty na ' + f2(j.amount) + ' ' + (j.cur || '')
+                          + (j.date ? (' w ±5 dni od ' + j.date) : '')
+                          + (blisko ? ('. Widoczne: ' + blisko) : '');
+                    return;
+                }
+                if (kand.length > 1){
+                    j.msg = 'kilka wypłat na ' + f2(j.amount) + ' ' + (j.cur || '') + ': '
+                          + kand.map(function (p){ return p.id + ' z ' + p.date; }).join(', ')
+                          + ' — podaj dokładniejszą datę albo wgraj raport, żeby rozstrzygnąć';
+                    return;
+                }
+                const p = kand[0];
+                // Numer wyplaty staje sie referencja zlecenia. To ten sam klucz, ktorego
+                // uzywa wgranie raportu, wiec obie drogi zejda sie na jednym zleceniu.
+                if (!j.ref) j.ref = p.id;
+                if (!j.date) j.date = p.date;
+                if (!j.cur) j.cur = p.cur;
+                j.payout = { id: p.id, date: p.date, amount: p.amount, cur: p.cur,
+                             bankRef: p.bankRef, method: p.method, stan: p.stan, url: p.url };
+                j.msg = 'rozpoznana wypłata ' + p.id + ' z ' + p.date + ' na ' + f2(p.amount) + ' ' + p.cur
+                      + (p.bankRef ? (' · ref. bankowa ' + p.bankRef) : '')
+                      + ' — pobierz z eBaya raport transakcji tej wypłaty i wrzuć go guzikiem „📄 Raport eBay"';
+                n++;
+            });
+            jobsSave(jobs); render();
+            return n;
+        }
         function wayfLeft(jobs){
             return Object.keys(jobs).filter(function (k){
                 return jobs[k].kind === 'wayf' && mkTodo(jobs[k]) && jobs[k].ref;
@@ -22884,8 +23140,8 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs);
-            if (!mkLeft(jobs) && !nGalx && !nWayf){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs);
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -22895,12 +23151,14 @@
             // ani z OBI — tam nie ma po co siegac do trzeciej domeny.
             const galx = (onMirakl || onVtex) ? 0 : nGalx;
             const wayf = (onMirakl || onVtex) ? 0 : nWayf;
-            if (!hosts.length && !vhosts.length && !galx && !wayf){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-            const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+            const ebay = (onMirakl || onVtex) ? 0 : nEbay;
+            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : []).concat(ebay ? [MK_EBAY_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
                     .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
-                    .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : []).join('\n')
+                    .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : [])
+                    .concat(ebay ? ['  • ' + MK_EBAY_HOST + ' — ' + ebay + ' szt. (rozpoznanie wypłaty)'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -22914,6 +23172,11 @@
                 seen++;
                 try { ok += await wayfPass(jobsLoad()); }
                 catch (e){ problem.push(MK_WAYF_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (ebay){
+                seen++;
+                try { ok += await ebayPass(jobsLoad()); }
+                catch (e){ problem.push(MK_EBAY_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
@@ -22985,7 +23248,7 @@
             // „Nieznalezione" musi liczyc tak samo jak okno potwierdzenia — czyli razem
             // z Galaxusem i Wayfairem, ktore mkLeft celowo pomija.
             const jl = jobsLoad();
-            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl);
+            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl) + ebayLeft(jl);
             if (dup) say('UWAGA: ' + dup + ' z pobranych jest już w arkuszu — sprawdź, zanim zaksięgujesz.', '#c00');
             else say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
                 + (left ? (', nieznalezionych ' + left) : '')
