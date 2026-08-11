@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.68
+// @version      3.69
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18231,6 +18231,25 @@
             return '<a href="' + u + '" target="_blank" rel="noopener" style="color:#2563eb">' + u + '</a>';
         });
     }
+    // v3.69: krotkie powiadomienie bez wlasnego panelu. Na Miraklu modul nie stawia juz
+    // guzika (patrz nizej, przy appendChild), a mimo to ma tam jedna rzecz do powiedzenia:
+    // ze wlasnie zapamietal liste sklepow. Komunikat sam znika.
+    function mkToast(txt){
+        try {
+            const d = document.createElement('div');
+            d.textContent = String(txt || '');
+            d.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483000;max-width:340px;'
+                + 'padding:10px 14px;border-radius:8px;background:#5b21b6;color:#fff;'
+                + 'font:13px Arial,sans-serif;line-height:1.4;box-shadow:0 4px 16px rgba(0,0,0,.28);'
+                + 'opacity:0;transition:opacity .25s';
+            (document.body || document.documentElement).appendChild(d);
+            setTimeout(function (){ d.style.opacity = '1'; }, 30);
+            setTimeout(function (){
+                d.style.opacity = '0';
+                setTimeout(function (){ if (d.parentNode) d.parentNode.removeChild(d); }, 400);
+            }, 7000);
+        } catch (e){}
+    }
     function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
     function r2(n){ return Math.round(Number(n) * 100) / 100; }
     function eq(a, b){ return isFinite(a) && isFinite(b) && Math.abs(a - b) < 0.005; }
@@ -21308,11 +21327,25 @@
     if (onMirakl){
         (function (){
             let last = 0, done = false;
+            // v3.69: ile sklepow tej platformy znalismy PRZED zajrzeniem w DOM. mkShopIdsFrom
+            // dokleja zapamietane do znalezionych i od razu je zapisuje, wiec po pierwszej
+            // udanej wizycie licznik jest > 1 zawsze — bez tej migawki powiadomienie
+            // wyskakiwaloby przy KAZDYM wejsciu na Mirakla. Mowimy tylko o tym, co przybylo.
+            let przed = 0;
+            try { przed = mapArr(MK_SHOPS_KEY, mkHost()).length; } catch (e){}
             function scan(){
                 if (done) return;
                 let n = 0;
                 try { n = mkShopIds().length; } catch (e){}
-                if (n > 1){ done = true; try { shopsInfo(); } catch (e){} }
+                if (n > 1){
+                    done = true;
+                    try { shopsInfo(); } catch (e){}
+                    // Guzika tu nie ma, wiec bez tego nie byloby ZADNEGO znaku, ze rozwiniecie
+                    // przelacznika sklepow cokolwiek dalo. Prologistics pokaze to samo
+                    // w „sklepy: …", ale dopiero gdy tam wrocisz.
+                    if (n > przed) mkToast('Zapamiętałem ' + n + ' sklepów tej platformy. '
+                        + 'Rozliczenia pobierasz z prologistics — „⬇ Pobierz zestawienia".');
+                }
             }
             scan();
             const iv = setInterval(function (){ scan(); if (done) clearInterval(iv); }, 2000);
@@ -21692,8 +21725,27 @@
         panel.style.display = (panel.style.display === 'none' ? 'flex' : 'none');
         if (panel.style.display === 'flex'){ shopsInfo(); render(); }
     };
-    (document.body || document.documentElement).appendChild(btn);
-    (document.body || document.documentElement).appendChild(panel);
+    // v3.69: NA MIRAKLU NIE MA JUZ GUZIKA ANI PANELU.
+    // Ten panel umial mniej niz ten na prologistics, a nie umial nic ponadto:
+    //   • „⬇ Pobierz z tego sklepu" i „🔄 Przeleć wszystkie sklepy" dotyczyly JEDNEJ
+    //     platformy — tej, na ktorej akurat stoisz. „⬇ Pobierz zestawienia" na
+    //     prologistics przelatuje wszystkie platformy i wszystkie sklepy naraz.
+    //   • Przelaczanie sklepow dziala z prologistics tak samo — mkSwitch ma tam galaz
+    //     przez GM_xmlhttpRequest, rownowazna temu fetchowi z samego Mirakla.
+    //   • Zlecen i tak nie da sie tu zaczac: wyciag bankowy wczytuje sie WYLACZNIE
+    //     na prologistics (blok „if (onProlo)" przy wczytywaniu wyciagow).
+    //   • Gdy sesja Mirakla wygasnie, mkApi oddaje „najpewniej strona logowania",
+    //     a withLogin doklada klikalny adres panelu (MK_LOGIN) — po to on jest.
+    // Modul na Miraklu ZOSTAJE zaladowany i to jest tu jedyna rzecz nie do zastapienia:
+    // zdejmuje z DOM-u numery sklepow (mkShopIds), ktorych z prologistics odczytac SIE NIE
+    // DA, bo React rysuje przelacznik dopiero po zaladowaniu strony. Robi to skan przy
+    // starcie i MutationObserver — bez najmniejszego udzialu guzika.
+    // UWAGA na przyszlosc: OBI/VTEX to INNY przypadek i tam guzik ZOSTAJE — ciasteczko
+    // sesji nie jedzie w zapytaniu miedzydomenowym i z prologistics wraca 404.
+    if (!onMirakl){
+        (document.body || document.documentElement).appendChild(btn);
+        (document.body || document.documentElement).appendChild(panel);
+    }
     $('#mk-close').onclick = function(){ panel.style.display = 'none'; };
 
     function jobList(){
