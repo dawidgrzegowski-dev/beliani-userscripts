@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.58
+// @version      3.59
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19900,9 +19900,30 @@
     // ---------- Abrechnung (PDF) ----------
     // Z PDF-u potrzebujemy trzech liczb i numeru gutschrifty. Tekst czytamy pdf.js-em,
     // ktory modul i tak juz ma (@require) i ktorym czyta potwierdzenia z e-finance.
+    // Ten sam sposob dochodzenia do pdf.js, ktorego uzywa juz odczyt potwierdzen
+    // bankowych. Dwie rzeczy sa tu istotne i obu mi wczesniej brakowalo:
+    //  1. w piaskownicy biblioteka bywa widoczna jako goly pdfjsLib, przez window
+    //     albo dopiero przez unsafeWindow — sprawdzamy po kolei,
+    //  2. pdf.js 3.x NIE ruszy bez workerSrc i konczy sie wtedy wyjatkiem
+    //     „No GlobalWorkerOptions.workerSrc specified".
+    function c24PdfLib(){
+        let lib = null;
+        try { if (typeof pdfjsLib !== 'undefined') lib = pdfjsLib; } catch (e){}
+        if (!lib){ try { lib = window.pdfjsLib; } catch (e){} }
+        if (!lib){ try { lib = window['pdfjs-dist/build/pdf']; } catch (e){} }
+        if (!lib){ try { if (typeof unsafeWindow !== 'undefined') lib = unsafeWindow.pdfjsLib; } catch (e){} }
+        if (lib && lib.GlobalWorkerOptions){
+            try {
+                if (!lib.GlobalWorkerOptions.workerSrc)
+                    lib.GlobalWorkerOptions.workerSrc =
+                        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            } catch (e){}
+        }
+        return lib;
+    }
     async function c24PdfTekst(u8){
-        const lib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
-        if (!lib) throw new Error('pdf.js się nie załadował — odśwież stronę');
+        const lib = c24PdfLib();
+        if (!lib) throw new Error('pdf.js się nie załadował — odśwież stronę prologistics');
         const doc = await lib.getDocument({ data: u8 }).promise;
         const out = [];
         for (let s = 1; s <= doc.numPages; s++){
