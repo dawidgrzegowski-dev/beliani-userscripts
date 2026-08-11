@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.52
+// @version      3.54
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19832,7 +19832,7 @@
             zwolniona: zlap(/Auszahlung\s+Einbehalt\s+aus\s+letzter\s+Gutschrift\s+(-?[\d .,]+)/i),
             nowa:      zlap(/Neuer\s+Einbehalt\s+f[^\s]*r\s+Retouren\s+(-?[\d .,]+)/i),
             wyplata:   zlap(/Auszahlungsbetrag\s+(-?[\d .,]+)/i),
-            okres: (t.match(/Leistungszeitraum\s+vom\s+([\d. ]+?)\s+bis\s+([\d. ]+?)\./i) || [])
+            okres: (t.match(/Leistungszeitraum\s+vom\s+(\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{4})\s+bis\s+(\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{4})/i) || [])
                        .slice(1, 3).map(function (x){ return String(x || '').replace(/\s/g, ''); }).join(' – ')
         };
     }
@@ -21385,7 +21385,9 @@
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
                 det += manorBox(j);
                 if (j.msg) det += '<div style="color:#c47f00">' + linkify(j.msg) + '</div>';
+                if (c24Brak(j)) det += '<div style="color:#c47f00">' + esc(c24Brak(j)) + '</div>';
             }
+            if (!j.data && c24Brak(j)) det += '<div style="color:#c47f00">' + esc(c24Brak(j)) + '</div>';
             h += '<tr style="border-top:1px solid #eee">'
               +  '<td style="padding:3px 5px">' + (onProlo && st === 'ready'
                     ? '<input type="checkbox" class="mk-ck" data-ref="' + esc(j.ref) + '"' + (selOn(j) ? ' checked' : '') + '>'
@@ -22639,6 +22641,52 @@
                                      : ' — teraz wgraj raport z portalu.'), '#0a7a2f');
         };
 
+        // Zlozenie zlecenia CHECK24 z tego, co juz o nim wiadomo. Uzywaja tego OBIE drogi
+        // — reczne wgranie plikow i przelot po panelu — zeby nie powstaly dwie kopie tej
+        // samej logiki, ktore z czasem zaczna liczyc inaczej.
+        function c24Zloz(j, skad){
+            j.c24 = j.c24 || {};
+            const csv = j.c24.csv, pdf = j.c24.pdf;
+            if (csv){
+                const both = Object.keys(csv.ord).filter(function (x){ return csv.ref[x] != null; });
+                j.data = { c24: csv, shop: MK_C24_SHOP, gross: csv.zakup, refund: csv.refund,
+                           net: csv.brutto, ord: csv.ord, ref: csv.ref, refNote: csv.refNote,
+                           unknown: {}, skipped: {}, full: true, both: both, pays: 1, split: false,
+                           rows: csv.nZak + csv.nZwr, total: csv.nZak + csv.nZwr, pages: 1,
+                           how: skad || '' };
+                if (!j.ref && csv.nr) j.ref = csv.nr;
+            }
+            // Kwota zlecenia to Auszahlungsbetrag z PDF-u — jedyna liczba, ktora faktycznie
+            // wchodzi na konto. Z CSV jej policzyc nie mozna, bo nie ma w nim kaucji.
+            if (pdf){
+                if (j.amount == null) j.amount = pdf.wyplata;
+                if (!j.ref && pdf.nr) j.ref = pdf.nr;
+                if (j.data) j.data.netOk = (csv && pdf.brutto != null) ? eq(csv.brutto, pdf.brutto) : true;
+            }
+            const brak = [];
+            if (!csv) brak.push('„Details" (CSV) — bez niego nie ma pozycji do importu');
+            if (!pdf) brak.push('„Abrechnung" (PDF) — bez niego nie znam kwoty wypłaty');
+            // Kwota z wyciagu kontra kwota z PDF-u: to JEDYNE miejsce, gdzie liczba
+            // z banku spotyka sie z liczba od marketplace'u. Rozjazd wstrzymuje ksiegowanie.
+            let bank = '';
+            if (pdf && j.payer && j.amount != null && !eq(j.amount, pdf.wyplata))
+                bank = 'wyciąg mówi ' + f2(j.amount) + ', a PDF ' + f2(pdf.wyplata);
+            j.status = (csv && pdf && j.data && j.data.netOk !== false && !bank) ? 'ready' : 'partial';
+            j.msg = brak.length ? ('brakuje: ' + brak.join(' · '))
+                  : (bank ? ('rozjazd z wyciągiem: ' + bank)
+                  : ((j.data && j.data.netOk === false)
+                        ? ('rozjazd: CSV liczy brutto ' + f2(csv.brutto) + ', a PDF podaje ' + f2(pdf.brutto))
+                        : ''));
+            if (csv && pdf){
+                j.note = 'Gesamt Brutto ' + f2(pdf.brutto)
+                       + ' · kaucja na zwroty: zwolniona ' + f2(pdf.zwolniona) + ', nowa ' + f2(pdf.nowa)
+                       + ' → wypłata ' + f2(pdf.wyplata) + ' EUR'
+                       + (pdf.okres ? (' · okres ' + pdf.okres) : '')
+                       + (csv.nZero ? (' · pominięto ' + csv.nZero + ' wierszy zerowych') : '');
+            }
+            return { csv: csv, pdf: pdf, brak: brak };
+        }
+
         // CHECK24 potrzebuje DWOCH plikow i kazdy wnosi co innego: „Details" (CSV) daje
         // pozycje i Gesamt Brutto, „Abrechnung" (PDF) daje kwote wyplaty, ktorej w CSV
         // nie ma, bo zawiera ruch kaucji na zwroty. Zlecenie laczy je po numerze
@@ -22681,37 +22729,8 @@
             if (j.status === 'done'){ say('Ta gutschrift jest już zaksięgowana.', '#c47f00'); return; }
             j.c24 = j.c24 || {};
             if (jestPdf) j.c24.pdf = p; else j.c24.csv = p;
-            const csv = j.c24.csv, pdf = j.c24.pdf;
-
-            if (csv){
-                const both = Object.keys(csv.ord).filter(function (x){ return csv.ref[x] != null; });
-                j.data = { c24: csv, shop: MK_C24_SHOP, gross: csv.zakup, refund: csv.refund,
-                           net: csv.brutto, ord: csv.ord, ref: csv.ref, refNote: csv.refNote,
-                           unknown: {}, skipped: {}, full: true, both: both, pays: 1, split: false,
-                           rows: csv.nZak + csv.nZwr, total: csv.nZak + csv.nZwr, pages: 1,
-                           how: 'plik ' + f.name };
-            }
-            // Kwota zlecenia to Auszahlungsbetrag z PDF-u — jedyna liczba, ktora faktycznie
-            // wchodzi na konto. Z CSV jej policzyc nie mozna.
-            if (pdf){
-                j.amount = pdf.wyplata;
-                if (j.data) j.data.netOk = (csv && pdf.brutto != null) ? eq(csv.brutto, pdf.brutto) : true;
-            }
-            const brak = [];
-            if (!csv) brak.push('„Details" (CSV) — bez niego nie ma pozycji do importu');
-            if (!pdf) brak.push('„Abrechnung" (PDF) — bez niego nie znam kwoty wypłaty');
-            j.status = (csv && pdf && j.data && j.data.netOk !== false) ? 'ready' : 'partial';
-            j.msg = brak.length ? ('brakuje: ' + brak.join(' · '))
-                  : ((j.data && j.data.netOk === false)
-                        ? ('rozjazd: CSV liczy brutto ' + f2(csv.brutto) + ', a PDF podaje ' + f2(pdf.brutto))
-                        : '');
-            if (csv && pdf){
-                j.note = 'Gesamt Brutto ' + f2(pdf.brutto)
-                       + ' · kaucja na zwroty: zwolniona ' + f2(pdf.zwolniona) + ', nowa ' + f2(pdf.nowa)
-                       + ' → wypłata ' + f2(pdf.wyplata) + ' EUR'
-                       + (pdf.okres ? (' · okres ' + pdf.okres) : '')
-                       + (csv.nZero ? (' · pominięto ' + csv.nZero + ' wierszy zerowych') : '');
-            }
+            const z = c24Zloz(j, 'plik ' + f.name);
+            const csv = z.csv, pdf = z.pdf, brak = z.brak;
             jobsSave(jobs); render();
             say('CHECK24 ' + (p.nr || klucz) + ' — wczytany ' + (jestPdf ? 'PDF' : 'CSV')
                 + (csv ? (' · zakupów ' + Object.keys(csv.ord).length + ' na ' + f2(csv.zakup)
@@ -23582,6 +23601,133 @@
             jobsSave(jobs); render();
             return n;
         }
+        // CHECK24 nie ma (jeszcze) automatycznego pobierania — jego rozliczenie sciaga sie
+        // z panelu recznie, dwoma plikami. Zlecenie z wyciagu wisialo wiec z „czeka na dane"
+        // i NIC nie mowilo, czego brakuje, a przelot „Pobierz zestawienia" pomijal je
+        // w milczeniu. Liczymy je osobno, zeby dalo sie o nich powiedziec.
+        function c24Left(jobs){
+            return Object.keys(jobs).filter(function (k){
+                const j = jobs[k];
+                return j.kind === 'c24' && mkTodo(j) && !(j.c24 && j.c24.csv && j.c24.pdf);
+            }).length;
+        }
+        // Czego brakuje konkretnemu zleceniu CHECK24 — do pokazania w wierszu tabeli.
+        function c24Brak(j){
+            if (!j || j.kind !== 'c24' || j.status === 'done') return '';
+            const ma = j.c24 || {};
+            const b = [];
+            if (!ma.csv) b.push('„Details" (CSV)');
+            if (!ma.pdf) b.push('„Abrechnung" (PDF)');
+            if (!b.length) return '';
+            return 'brakuje ' + b.join(' i ') + ' — kliknij „⬇ Pobierz zestawienia", żeby ściągnąć je '
+                 + 'z panelu, albo wgraj ręcznie guzikiem „📎 Dodaj pliki". PDF jest obowiązkowy, '
+                 + 'bo tylko on podaje kwotę wypłaty.';
+        }
+    // ---------- rozmowa z panelem CHECK24 ----------
+    // Strona /finance jest renderowana po stronie serwera i niesie w jednym skrypcie
+    // __NEXT_DATA__ WSZYSTKO, czego potrzeba: token Bearer do core-api, liste rozliczen
+    // z numerem gutschrifty oraz GOTOWE adresy obu plikow. Jedno wejscie zamiast trzech
+    // — nie trzeba osobno pytac o sesje ani skladac adresow z identyfikatorow.
+    const MK_C24_FIN = 'https://mc.moebel.check24.de/finance';
+    function c24State(html){
+        const s = String(html == null ? '' : html);
+        const i = s.indexOf('__NEXT_DATA__');
+        if (i < 0) return null;
+        const a = s.indexOf('>', i);
+        const b = s.indexOf('</script>', a);
+        if (a < 0 || b < 0) return null;
+        try { return JSON.parse(s.slice(a + 1, b)); } catch (e){ return null; }
+    }
+    async function c24Lista(){
+        const ck = await gmCookies('https://' + MK_C24_HOST + '/');
+        const r = await gmGet(MK_C24_FIN, Object.assign({ 'accept': 'text/html' }, ck ? { Cookie: ck } : {}));
+        if (r.status === 401 || r.status === 403 || /login|signin|auth/i.test(String(r.finalUrl || '')))
+            throw new Error('CHECK24 nie wpuścił — zaloguj się na ' + MK_C24_HOST + ' w tej przeglądarce');
+        if (r.status !== 200) throw new Error('CHECK24: HTTP ' + r.status);
+        const st = c24State(r.responseText);
+        const pp = st && st.props && st.props.pageProps;
+        const cr = pp && pp.merchantClearingRunMerchant;
+        if (!pp || !cr || !Array.isArray(cr.clearedAmounts))
+            throw new Error('nie znalazłem listy rozliczeń na stronie Finanzen — układ panelu mógł się zmienić');
+        if (!pp.accessToken)
+            throw new Error('strona Finanzen nie podała tokena — wejdź tam w przeglądarce i spróbuj ponownie');
+        return {
+            token: pp.accessToken,
+            partner: (pp.merchantSlimmed && pp.merchantSlimmed.internalId) || '',
+            poz: cr.clearedAmounts.map(function (x){
+                const kw = x.clearedAmount || {};
+                return {
+                    nr: String(x.externalId || ''), klucz: c24Key(x.externalId),
+                    csvUrl: String(x.detailsFileUrl || ''), pdfUrl: String(x.settlementFileUrl || ''),
+                    brutto: (kw.grossTotal == null) ? null : Number(kw.grossTotal),
+                    netto: (kw.netTotal == null) ? null : Number(kw.netTotal),
+                    zamowien: x.countOrders, data: String(kw.createdAt || '')
+                };
+            }).filter(function (x){ return x.klucz; })
+        };
+    }
+    // Pliki z core-api chodza na tokenie Bearer, nie na ciasteczku — dlatego osobna
+    // sciezka niz reszta modulu. Tokena nigdzie nie zapisujemy; zyje tyle, co przelot.
+    async function c24Plik(url, token, binarnie){
+        return new Promise(function (resolve, reject){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 90000,
+                headers: { 'accept': '*/*', 'authorization': 'Bearer ' + token },
+                responseType: binarnie ? 'arraybuffer' : undefined,
+                onload: function (r){
+                    if (r.status !== 200){ reject(new Error('HTTP ' + r.status)); return; }
+                    resolve(binarnie ? new Uint8Array(r.response) : String(r.responseText || ''));
+                },
+                onerror: function (){ reject(new Error('nie mogę pobrać pliku z core-api')); },
+                ontimeout: function (){ reject(new Error('core-api nie odpowiedziało na czas')); }
+            });
+        });
+    }
+    async function c24Pass(jobs){
+        const lista = await c24Lista();
+        let n = 0;
+        const czekaja = Object.keys(jobs).filter(function (k){
+            const j = jobs[k];
+            return j.kind === 'c24' && mkTodo(j) && !(j.c24 && j.c24.csv && j.c24.pdf);
+        });
+        for (let i = 0; i < czekaja.length; i++){
+            const k = czekaja[i], j = jobs[k];
+            const szukany = c24Key(j.ref);
+            const poz = lista.poz.filter(function (x){ return x.klucz === szukany; })[0];
+            if (!poz){
+                j.msg = 'w panelu CHECK24 nie ma rozliczenia ' + (j.ref || '—')
+                      + '. Widoczne: ' + lista.poz.slice(0, 4).map(function (x){ return x.nr; }).join(', ');
+                continue;
+            }
+            j.c24 = j.c24 || {};
+            try {
+                if (!j.c24.csv){
+                    const txt = await c24Plik(poz.csvUrl, lista.token, false);
+                    const p = mkParseCheck24(txt, poz.nr);
+                    if (p.err) throw new Error('Details: ' + p.err);
+                    // Numer bierzemy z panelu, bo w tresci CSV go nie ma.
+                    p.nr = poz.nr; p.klucz = poz.klucz;
+                    j.c24.csv = p;
+                }
+                if (!j.c24.pdf){
+                    const u8 = await c24Plik(poz.pdfUrl, lista.token, true);
+                    const q = mkParseC24Pdf(await c24PdfTekst(u8));
+                    if (q.err) throw new Error('Abrechnung: ' + q.err);
+                    j.c24.pdf = q;
+                }
+            } catch (e){
+                j.status = 'err';
+                j.msg = 'CHECK24 ' + (j.ref || '') + ': ' + ((e && e.message) || e);
+                continue;
+            }
+            c24Zloz(j, 'panel CHECK24');
+            n++;
+        }
+        jobsSave(jobs); render();
+        return n;
+    }
+
         function wayfLeft(jobs){
             return Object.keys(jobs).filter(function (k){
                 return jobs[k].kind === 'wayf' && mkTodo(jobs[k]) && jobs[k].ref;
@@ -23620,8 +23766,9 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs);
-            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs);
+            // CHECK24 doliczamy do komunikatu, ale NIE do przelotu — nie ma czym go pobrac.
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -23632,13 +23779,16 @@
             const galx = (onMirakl || onVtex) ? 0 : nGalx;
             const wayf = (onMirakl || onVtex) ? 0 : nWayf;
             const ebay = (onMirakl || onVtex) ? 0 : nEbay;
-            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-            const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : []).concat(ebay ? [MK_EBAY_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+            const c24p = (onMirakl || onVtex) ? 0 : nC24;
+            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : [])
+                              .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
                     .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
                     .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : [])
-                    .concat(ebay ? ['  • ' + MK_EBAY_HOST + ' — ' + ebay + ' szt. (rozpoznanie wypłaty)'] : []).join('\n')
+                    .concat(ebay ? ['  • ' + MK_EBAY_HOST + ' — ' + ebay + ' szt. (rozpoznanie wypłaty)'] : [])
+                    .concat(c24p ? ['  • ' + MK_C24_HOST + ' — ' + c24p + ' szt. (Details + Abrechnung)'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -23657,6 +23807,11 @@
                 seen++;
                 try { ok += await ebayPass(jobsLoad()); }
                 catch (e){ problem.push(MK_EBAY_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (c24p){
+                seen++;
+                try { ok += await c24Pass(jobsLoad()); }
+                catch (e){ problem.push(MK_C24_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
@@ -23728,7 +23883,7 @@
             // „Nieznalezione" musi liczyc tak samo jak okno potwierdzenia — czyli razem
             // z Galaxusem i Wayfairem, ktore mkLeft celowo pomija.
             const jl = jobsLoad();
-            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl) + ebayLeft(jl);
+            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl) + ebayLeft(jl) + c24Left(jl);
             if (dup) say('UWAGA: ' + dup + ' z pobranych jest już w arkuszu — sprawdź, zanim zaksięgujesz.', '#c00');
             else say('Przejrzanych sklepów ' + seen + ', pobranych rozliczeń ' + ok
                 + (left ? (', nieznalezionych ' + left) : '')
