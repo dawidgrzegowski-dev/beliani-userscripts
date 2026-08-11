@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.61
+// @version      3.62
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19940,6 +19940,54 @@
         }
         return lib;
     }
+    // Zlozenie zlecenia CHECK24 z tego, co juz o nim wiadomo.
+    // ZASIEG: musi byc w zasiegu MODULU, bo wolaja ja dwie rozne drogi z DWOCH
+    // roznych domkniec — reczne wgranie plikow i przelot po panelu. Gdy stala
+    // przy obsludze plikow, przelot konczyl sie na „c24Zloz is not defined". Uzywaja tego OBIE drogi
+    // — reczne wgranie plikow i przelot po panelu — zeby nie powstaly dwie kopie tej
+    // samej logiki, ktore z czasem zaczna liczyc inaczej.
+    function c24Zloz(j, skad){
+        j.c24 = j.c24 || {};
+        const csv = j.c24.csv, pdf = j.c24.pdf;
+        if (csv){
+            const both = Object.keys(csv.ord).filter(function (x){ return csv.ref[x] != null; });
+            j.data = { c24: csv, shop: MK_C24_SHOP, gross: csv.zakup, refund: csv.refund,
+                       net: csv.brutto, ord: csv.ord, ref: csv.ref, refNote: csv.refNote,
+                       unknown: {}, skipped: {}, full: true, both: both, pays: 1, split: false,
+                       rows: csv.nZak + csv.nZwr, total: csv.nZak + csv.nZwr, pages: 1,
+                       how: skad || '' };
+            if (!j.ref && csv.nr) j.ref = csv.nr;
+        }
+        // Kwota zlecenia to Auszahlungsbetrag z PDF-u — jedyna liczba, ktora faktycznie
+        // wchodzi na konto. Z CSV jej policzyc nie mozna, bo nie ma w nim kaucji.
+        if (pdf){
+            if (j.amount == null) j.amount = pdf.wyplata;
+            if (!j.ref && pdf.nr) j.ref = pdf.nr;
+            if (j.data) j.data.netOk = (csv && pdf.brutto != null) ? eq(csv.brutto, pdf.brutto) : true;
+        }
+        const brak = [];
+        if (!csv) brak.push('„Details" (CSV) — bez niego nie ma pozycji do importu');
+        if (!pdf) brak.push('„Abrechnung" (PDF) — bez niego nie znam kwoty wypłaty');
+        // Kwota z wyciagu kontra kwota z PDF-u: to JEDYNE miejsce, gdzie liczba
+        // z banku spotyka sie z liczba od marketplace'u. Rozjazd wstrzymuje ksiegowanie.
+        let bank = '';
+        if (pdf && j.payer && j.amount != null && !eq(j.amount, pdf.wyplata))
+            bank = 'wyciąg mówi ' + f2(j.amount) + ', a PDF ' + f2(pdf.wyplata);
+        j.status = (csv && pdf && j.data && j.data.netOk !== false && !bank) ? 'ready' : 'partial';
+        j.msg = brak.length ? ('brakuje: ' + brak.join(' · '))
+              : (bank ? ('rozjazd z wyciągiem: ' + bank)
+              : ((j.data && j.data.netOk === false)
+                    ? ('rozjazd: CSV liczy brutto ' + f2(csv.brutto) + ', a PDF podaje ' + f2(pdf.brutto))
+                    : ''));
+        if (csv && pdf){
+            j.note = 'Gesamt Brutto ' + f2(pdf.brutto)
+                   + ' · kaucja na zwroty: zwolniona ' + f2(pdf.zwolniona) + ', nowa ' + f2(pdf.nowa)
+                   + ' → wypłata ' + f2(pdf.wyplata) + ' EUR'
+                   + (pdf.okres ? (' · okres ' + pdf.okres) : '')
+                   + (csv.nZero ? (' · pominięto ' + csv.nZero + ' wierszy zerowych') : '');
+        }
+        return { csv: csv, pdf: pdf, brak: brak };
+    }
     // Endpoint PDF-u potrafi oddac to samo co endpoint CSV: koperte JSON z plikiem
     // w srodku, tyle ze zakodowanym base64. Zamiast zakladac ktorykolwiek wariant,
     // sprawdzamy, co faktycznie przyszlo, i sprowadzamy to do bajtow zaczynajacych
@@ -22813,51 +22861,6 @@
                                      : ' — teraz wgraj raport z portalu.'), '#0a7a2f');
         };
 
-        // Zlozenie zlecenia CHECK24 z tego, co juz o nim wiadomo. Uzywaja tego OBIE drogi
-        // — reczne wgranie plikow i przelot po panelu — zeby nie powstaly dwie kopie tej
-        // samej logiki, ktore z czasem zaczna liczyc inaczej.
-        function c24Zloz(j, skad){
-            j.c24 = j.c24 || {};
-            const csv = j.c24.csv, pdf = j.c24.pdf;
-            if (csv){
-                const both = Object.keys(csv.ord).filter(function (x){ return csv.ref[x] != null; });
-                j.data = { c24: csv, shop: MK_C24_SHOP, gross: csv.zakup, refund: csv.refund,
-                           net: csv.brutto, ord: csv.ord, ref: csv.ref, refNote: csv.refNote,
-                           unknown: {}, skipped: {}, full: true, both: both, pays: 1, split: false,
-                           rows: csv.nZak + csv.nZwr, total: csv.nZak + csv.nZwr, pages: 1,
-                           how: skad || '' };
-                if (!j.ref && csv.nr) j.ref = csv.nr;
-            }
-            // Kwota zlecenia to Auszahlungsbetrag z PDF-u — jedyna liczba, ktora faktycznie
-            // wchodzi na konto. Z CSV jej policzyc nie mozna, bo nie ma w nim kaucji.
-            if (pdf){
-                if (j.amount == null) j.amount = pdf.wyplata;
-                if (!j.ref && pdf.nr) j.ref = pdf.nr;
-                if (j.data) j.data.netOk = (csv && pdf.brutto != null) ? eq(csv.brutto, pdf.brutto) : true;
-            }
-            const brak = [];
-            if (!csv) brak.push('„Details" (CSV) — bez niego nie ma pozycji do importu');
-            if (!pdf) brak.push('„Abrechnung" (PDF) — bez niego nie znam kwoty wypłaty');
-            // Kwota z wyciagu kontra kwota z PDF-u: to JEDYNE miejsce, gdzie liczba
-            // z banku spotyka sie z liczba od marketplace'u. Rozjazd wstrzymuje ksiegowanie.
-            let bank = '';
-            if (pdf && j.payer && j.amount != null && !eq(j.amount, pdf.wyplata))
-                bank = 'wyciąg mówi ' + f2(j.amount) + ', a PDF ' + f2(pdf.wyplata);
-            j.status = (csv && pdf && j.data && j.data.netOk !== false && !bank) ? 'ready' : 'partial';
-            j.msg = brak.length ? ('brakuje: ' + brak.join(' · '))
-                  : (bank ? ('rozjazd z wyciągiem: ' + bank)
-                  : ((j.data && j.data.netOk === false)
-                        ? ('rozjazd: CSV liczy brutto ' + f2(csv.brutto) + ', a PDF podaje ' + f2(pdf.brutto))
-                        : ''));
-            if (csv && pdf){
-                j.note = 'Gesamt Brutto ' + f2(pdf.brutto)
-                       + ' · kaucja na zwroty: zwolniona ' + f2(pdf.zwolniona) + ', nowa ' + f2(pdf.nowa)
-                       + ' → wypłata ' + f2(pdf.wyplata) + ' EUR'
-                       + (pdf.okres ? (' · okres ' + pdf.okres) : '')
-                       + (csv.nZero ? (' · pominięto ' + csv.nZero + ' wierszy zerowych') : '');
-            }
-            return { csv: csv, pdf: pdf, brak: brak };
-        }
 
         // CHECK24 potrzebuje DWOCH plikow i kazdy wnosi co innego: „Details" (CSV) daje
         // pozycje i Gesamt Brutto, „Abrechnung" (PDF) daje kwote wyplaty, ktorej w CSV
