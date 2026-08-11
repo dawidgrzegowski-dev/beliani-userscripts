@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.63
+// @version      3.64
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13705,7 +13705,7 @@
         // ===== Komentarz wskazujacy KONKRETNY numer konta do zaplaty =====
         // „Please pay total balance to the old bank account: 101670241991" — to nie jest ani
         // potwierdzenie, ani zmiana danych w karcie dostawcy. To polecenie zaplaty na numer
-        // INNY niz ten, ktory ERP poda sam z siebie, i przy balансie potrafi byc jedynym
+        // INNY niz ten, ktory ERP poda sam z siebie, i przy balancie potrafi byc jedynym
         // sladem, ze pieniadze maja pojsc gdzie indziej. Slownik zmiany tego nie lapal, bo
         // pada tam „old"/„stare", a nie „changed"/„new".
         var PC_OLDACC_RE = /\b(?:old|previous|former|stare|stary|starego|starym|poprzedni[a-ząęó]*)\b/i;
@@ -16873,7 +16873,7 @@
             var s = v;
             try { s = s.normalize('NFKC'); } catch (e){}
             return s
-                .replace(/[​‌‍﻿]/g, '')                 // zerowej szerokosci i BOM
+                .replace(/[\u200B\u200C\u200D\uFEFF]/g, '')                 // zerowej szerokosci i BOM (zapis \u, zeby byly widoczne)
                 .replace(/[  -   　]/g, ' ')                // twarde i egzotyczne spacje
                 .replace(/[∶ː˸᠄꞉]/g, ':')                 // dwukropki spoza NFKC
                 .replace(/[‐-―−⁃]/g, '-')               // myslniki i minusy
@@ -23932,6 +23932,57 @@
         return n;
     }
 
+        // ===== dlaczego nic sie nie dzieje =====
+        // Kazda platforma potrafila zawiesc po cichu: wyjatek szedl do zbiorczego
+        // „Problemy: …" na pasku, a przy zleceniu zostawalo gole „czeka na dane".
+        // Przy kilku platformach naraz pasek i tak nadpisuje sie w ulamku sekundy.
+        // Dlatego kazdy przelot przepuszczamy przez to samo opakowanie: powod laduje
+        // w zleceniu i zostaje tam do nastepnej proby. Nowa platforma dostaje to samo
+        // za darmo — wystarczy, ze przejdzie przez mkPrzelot.
+        function mkCzekajace(jobs, kind){
+            return Object.keys(jobs).filter(function (k){
+                const j = jobs[k];
+                return (j.kind || 'mirakl') === kind && mkTodo(j);
+            });
+        }
+        // Zapisuje powod przy wszystkich zleceniach danego rodzaju, ktore nadal czekaja.
+        // Nie tyka tych, ktore w tym przebiegu dostaly juz wlasny, konkretniejszy opis.
+        function mkPowod(kind, tekst, jakoBlad, tylkoBezOpisu){
+            const jobs = jobsLoad();
+            let n = 0;
+            mkCzekajace(jobs, kind).forEach(function (k){
+                const j = jobs[k];
+                if (tylkoBezOpisu && j.msg) return;
+                j.msg = tekst;
+                if (jakoBlad) j.status = 'err';
+                n++;
+            });
+            if (n){ jobsSave(jobs); render(); }
+            return n;
+        }
+        // etykieta — nazwa platformy do komunikatu; kind — rodzaj zlecen; host — do linku
+        // logowania; fn — wlasciwy przelot. Zwraca liczbe pobranych rozliczen.
+        async function mkPrzelot(etykieta, kind, host, marka, fn){
+            let ile = 0;
+            try {
+                ile = await fn(jobsLoad());
+            } catch (e){
+                const tresc = (e && e.message) || String(e);
+                // withLogin doklada adres logowania platformy — przy wygaslej sesji to
+                // najczestsza przyczyna i od razu widac, gdzie kliknac.
+                let txt;
+                try { txt = withLogin({ brand: marka || etykieta, shop: '' }, tresc); }
+                catch (e2){ txt = tresc; }
+                mkPowod(kind, etykieta + ': ' + txt, true, false);
+                throw e;                       // przelot policzy to takze w „Problemy: …"
+            }
+            // Przelot przeszedl bez wyjatku, ale zlecenia nadal bez danych i bez wlasnego
+            // opisu — to tez jest informacja i tez ma zostac widoczna.
+            mkPowod(kind, etykieta + ': przelot przeszedł, ale nie znalazł tego rozliczenia. '
+                        + 'Sprawdź, czy jesteś zalogowany na ' + (host || etykieta)
+                        + ' i czy wypłata jest już widoczna w panelu.', false, true);
+            return ile;
+        }
         function wayfLeft(jobs){
             return Object.keys(jobs).filter(function (k){
                 return jobs[k].kind === 'wayf' && mkTodo(jobs[k]) && jobs[k].ref;
@@ -23999,22 +24050,22 @@
             let ok = 0, seen = 0; const problem = [];
             if (galx){
                 seen++;
-                try { ok += await galxPass(jobsLoad()); }
+                try { ok += await mkPrzelot('Galaxus', 'galx', MK_GALX_HOST, 'Galaxus', galxPass); }
                 catch (e){ problem.push(MK_GALX_HOST + ': ' + ((e && e.message) || e)); }
             }
             if (wayf){
                 seen++;
-                try { ok += await wayfPass(jobsLoad()); }
+                try { ok += await mkPrzelot('Wayfair', 'wayf', MK_WAYF_HOST, 'Wayfair', wayfPass); }
                 catch (e){ problem.push(MK_WAYF_HOST + ': ' + ((e && e.message) || e)); }
             }
             if (ebay){
                 seen++;
-                try { ok += await ebayPass(jobsLoad()); }
+                try { ok += await mkPrzelot('eBay', 'ebay', MK_EBAY_HOST, 'eBay', ebayPass); }
                 catch (e){ problem.push(MK_EBAY_HOST + ': ' + ((e && e.message) || e)); }
             }
             if (c24p){
                 seen++;
-                try { ok += await c24Pass(jobsLoad()); }
+                try { ok += await mkPrzelot('CHECK24', 'c24', MK_C24_HOST, 'CHECK24', c24Pass); }
                 catch (e){ problem.push(MK_C24_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
