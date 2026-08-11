@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.59
+// @version      3.61
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19774,12 +19774,16 @@
     // napis, bo to zawsze bedzie plik, a nie znacznik czasu czy identyfikator. Dzieki
     // temu zmiana nazwy pola po stronie CHECK24 niczego nie zepsuje.
     // Plik pobrany guzikiem w panelu jest zwyklym CSV i przechodzi tedy bez zmian.
-    function c24Rozpakuj(text){
+    // Wyluskanie tresci z koperty JSON. Zwraca SUROWY napis — bez zgadywania, czy to
+    // CSV, czy base64. Decyzje podejmuje wolajacy, bo inaczej sciezka PDF-u i sciezka
+    // CSV wchodza sobie w droge: PDF po odkodowaniu zawiera sredniki, wiec test „czy to
+    // wyglada na CSV" przepuszczal go i oddawal binaria jako tekst.
+    function c24Json(text){
         const s = String(text == null ? '' : text);
         const t = s.replace(/^﻿/, '').trim();
-        if (t.charAt(0) !== '{' && t.charAt(0) !== '[') return { txt: s };
+        if (t.charAt(0) !== '{' && t.charAt(0) !== '[') return { surowy: true, napis: s };
         let j;
-        try { j = JSON.parse(t); } catch (e){ return { txt: s }; }
+        try { j = JSON.parse(t); } catch (e){ return { surowy: true, napis: s }; }
         const meta = (j && j.metadata) || {};
         if (meta.errorMessage)
             return { err: 'core-api odmówiło: ' + String(meta.errorMessage).slice(0, 160) };
@@ -19794,18 +19798,33 @@
             Object.keys(o).forEach(function (k){ chodz(o[k], d + 1); });
         })(j, 0);
         if (!naj) return { err: 'core-api oddało JSON bez treści pliku' };
-        // Bywa, ze plik jest jeszcze zakodowany base64 — poznajemy po zestawie znakow
-        // i po tym, ze po odkodowaniu wyglada na CSV.
-        if (naj.length > 200 && /^[A-Za-z0-9+/\s]+={0,2}$/.test(naj)){
+        return { napis: naj };
+    }
+    // Base64 -> bajty. Znosi prefiks data: i biale znaki. null, gdy to nie base64.
+    function c24Base64(napis){
+        const b = String(napis == null ? '' : napis).replace(/^data:[^,]*,/, '').replace(/\s/g, '');
+        if (b.length < 200 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b)) return null;
+        try {
+            const bin = atob(b);
+            const u8 = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+            return u8;
+        } catch (e){ return null; }
+    }
+    // Sciezka CSV: tresc bywa zwyklym tekstem albo base64. Dekodujemy tylko wtedy, gdy
+    // po odkodowaniu widac naglowek CHECK24 — inaczej zostawiamy napis, jaki byl.
+    function c24Rozpakuj(text){
+        const j = c24Json(text);
+        if (j.err) return { err: j.err };
+        if (j.surowy) return { txt: j.napis };
+        const u8 = c24Base64(j.napis);
+        if (u8){
             try {
-                const bin = atob(naj.replace(/\s/g, ''));
-                const u8 = new Uint8Array(bin.length);
-                for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
                 const dec = new TextDecoder('utf-8').decode(u8);
-                if (/Bestell|Wareneinkauf|;/.test(dec)) return { txt: dec };
+                if (/Bestell-Nr|Wareneinkauf|Partnernummer/i.test(dec)) return { txt: dec };
             } catch (e){}
         }
-        return { txt: naj };
+        return { txt: j.napis };
     }
     function mkParseCheck24(text, nazwaPliku){
         const rozp = c24Rozpakuj(text);
@@ -19921,10 +19940,42 @@
         }
         return lib;
     }
+    // Endpoint PDF-u potrafi oddac to samo co endpoint CSV: koperte JSON z plikiem
+    // w srodku, tyle ze zakodowanym base64. Zamiast zakladac ktorykolwiek wariant,
+    // sprawdzamy, co faktycznie przyszlo, i sprowadzamy to do bajtow zaczynajacych
+    // sie od „%PDF". Gdy sie nie da — mowimy CO przyszlo, a nie tylko ze sie nie udalo.
+    function c24PdfBajty(u8){
+        if (!u8 || !u8.length) return { err: 'core-api oddało pustą odpowiedź' };
+        const glowa = function (a, n){
+            let t = '';
+            for (let i = 0; i < Math.min(n, a.length); i++) t += String.fromCharCode(a[i]);
+            return t;
+        };
+        if (glowa(u8, 5).indexOf('%PDF') === 0) return { u8: u8 };
+        let txt = '';
+        try { txt = new TextDecoder('utf-8').decode(u8); } catch (e){ txt = ''; }
+        const t = txt.replace(/^﻿/, '').trim();
+        if (t.charAt(0) === '{' || t.charAt(0) === '['){
+            const j = c24Json(t);
+            if (j.err) return { err: j.err };
+            const out = c24Base64(j.napis);
+            if (out){
+                if (glowa(out, 5).indexOf('%PDF') === 0) return { u8: out };
+                return { err: 'w kopercie JSON jest base64, ale po odkodowaniu to nie PDF (początek: „'
+                            + glowa(out, 8).replace(/[^ -~]/g, '.') + '”)' };
+            }
+            return { err: 'core-api oddało JSON, ale treść nie jest base64 z PDF-em · początek: „'
+                        + String(j.napis || '').slice(0, 90).replace(/\s+/g, ' ') + '”' };
+        }
+        return { err: 'to nie jest PDF — długość ' + u8.length + ' B, pierwsze bajty: „'
+                    + glowa(u8, 12).replace(/[^ -~]/g, '.') + '”' };
+    }
     async function c24PdfTekst(u8){
         const lib = c24PdfLib();
         if (!lib) throw new Error('pdf.js się nie załadował — odśwież stronę prologistics');
-        const doc = await lib.getDocument({ data: u8 }).promise;
+        const b = c24PdfBajty(u8 && u8.byteLength != null && !u8.subarray ? new Uint8Array(u8) : u8);
+        if (b.err) throw new Error(b.err);
+        const doc = await lib.getDocument({ data: b.u8 }).promise;
         const out = [];
         for (let s = 1; s <= doc.numPages; s++){
             const tc = await (await doc.getPage(s)).getTextContent();
@@ -23795,7 +23846,15 @@
                 responseType: binarnie ? 'arraybuffer' : undefined,
                 onload: function (r){
                     if (r.status !== 200){ reject(new Error('HTTP ' + r.status)); return; }
-                    resolve(binarnie ? new Uint8Array(r.response) : String(r.responseText || ''));
+                    if (!binarnie){ resolve(String(r.responseText || '')); return; }
+                    // Nie kazda przegladarka i nie kazdy menedzer skryptow honoruje
+                    // responseType — gdy go zignoruje, dostajemy tekst i musimy odzyskac
+                    // bajty samodzielnie, bo inaczej PDF przychodzi uszkodzony.
+                    if (r.response && r.response.byteLength != null){ resolve(new Uint8Array(r.response)); return; }
+                    const t = String(r.responseText || '');
+                    const u8 = new Uint8Array(t.length);
+                    for (let i = 0; i < t.length; i++) u8[i] = t.charCodeAt(i) & 0xFF;
+                    resolve(u8);
                 },
                 onerror: function (){ reject(new Error('nie mogę pobrać pliku z core-api')); },
                 ontimeout: function (){ reject(new Error('core-api nie odpowiedziało na czas')); }
