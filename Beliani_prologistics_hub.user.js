@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.56
+// @version      3.57
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19729,8 +19729,47 @@
     // odartym ze znakow rozdzielajacych — inaczej te same dane nie trafialyby na siebie.
     function c24Key(v){ return String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
 
+    // mkCsvRows dzieli WYLACZNIE po sredniku — tak wychodzi plik pobrany guzikiem
+    // w panelu. Plik z core-api moze miec inny separator, wiec nie zakladamy go,
+    // tylko wybieramy ten, ktory daje najwiecej kolumn w pierwszym wierszu.
+    function c24Rows(text){
+        const s = String(text == null ? '' : text).replace(/^﻿/, '');
+        const pierwsza = s.split(/\r?\n/)[0] || '';
+        let sep = ';', ile = 0;
+        [';', ',', '\t', '|'].forEach(function (z){
+            const n = pierwsza.split(z).length;
+            if (n > ile){ ile = n; sep = z; }
+        });
+        if (sep === ';') return mkCsvRows(s);
+        // ten sam odczyt co mkCsvRows, tylko z innym rozdzielnikiem
+        const rows = []; let f = '', row = [], q = false;
+        for (let i = 0; i < s.length; i++){
+            const c = s.charAt(i);
+            if (q){
+                if (c !== '"'){ f += c; continue; }
+                if (s.charAt(i + 1) === '"'){ f += '"'; i++; continue; }
+                q = false; continue;
+            }
+            if (c === '"'){ q = true; continue; }
+            if (c === sep){ row.push(f); f = ''; continue; }
+            if (c === '\r') continue;
+            if (c === '\n'){ row.push(f); rows.push(row); row = []; f = ''; continue; }
+            f += c;
+        }
+        if (f !== '' || row.length){ row.push(f); rows.push(row); }
+        return rows;
+    }
+    // Gdy plik nie da sie odczytac, komunikat ma powiedziec CO przyszlo, a nie tylko
+    // ze sie nie udalo — inaczej kazda taka sytuacja kosztuje osobne dochodzenie.
+    function c24Podglad(text){
+        const s = String(text == null ? '' : text);
+        const l1 = (s.split(/\r?\n/)[0] || '').slice(0, 110);
+        return 'długość ' + s.length + ' zn., separatory w 1. wierszu: ; ' + ((l1.match(/;/g) || []).length)
+             + ' , ' + ((l1.match(/,/g) || []).length) + ' tab ' + ((l1.match(/\t/g) || []).length)
+             + ' · początek: „' + l1.replace(/\s+/g, ' ') + '”';
+    }
     function mkParseCheck24(text, nazwaPliku){
-        const rows = mkCsvRows(text).filter(function (r){ return r && r.join('').trim(); });
+        const rows = c24Rows(text).filter(function (r){ return r && r.join('').trim(); });
         if (!rows.length) return { err: 'pusty plik' };
         const naglowek = rows[0].map(function (c){ return String(c || '').toLowerCase(); }).join('|');
         const poNazwie = naglowek.indexOf('bestell-nr. (check24)') >= 0
@@ -19739,7 +19778,8 @@
             return r.length >= 14 && C24_FF_RE.test(String(r[C24_FF] || '').trim());
         });
         if (!poNazwie && !poDanych)
-            return { err: 'to nie wygląda na „Details" z CHECK24 — brak kolumny „Bestell-Nr. (CHECK24)"' };
+            return { err: 'to nie wygląda na „Details" z CHECK24 — brak kolumny „Bestell-Nr. (CHECK24)". '
+                        + c24Podglad(text) };
 
         const ord = {}, ref = {}, refNote = {}, ids = {};
         // Wiersze do pliku importu. Plik idzie do prologistics BEZ ZMIAN — poza wierszami
@@ -19778,7 +19818,17 @@
                 nZak++;
             }
         }
-        if (!nZak && !nZwr) return { err: 'w pliku CHECK24 nie ma ani jednej pozycji z kwotą' };
+        if (!nZak && !nZwr){
+            // Naglowek sie zgodzil, ale zaden wiersz nie mial numeru w kolumnie 4 albo kwoty.
+            // Podajemy, ile kolumn ma pierwszy wiersz danych i co w nim stoi — to wystarcza,
+            // zeby odroznic zly separator od innego ukladu kolumn.
+            const w1 = rows[1] || [];
+            return { err: 'w pliku CHECK24 nie ma ani jednej pozycji z kwotą. Kolumn w nagłówku: '
+                        + (rows[0] || []).length + ', w 1. wierszu danych: ' + w1.length
+                        + ', kol.4 = „' + String(w1[C24_FF] == null ? '' : w1[C24_FF]).slice(0, 24) + '”'
+                        + ', kol.8 = „' + String(w1[C24_H] == null ? '' : w1[C24_H]).slice(0, 16) + '”. '
+                        + c24Podglad(text) };
+        }
         // Numer gutschrifty jest tylko w NAZWIE pliku („…-MCRM-YH9CVF9B.csv") — w tresci
         // go nie ma. Z PDF-u czytamy go z naglowka i porownujemy.
         const m = String(nazwaPliku || '').toUpperCase().match(/(MCRM[-_]?[A-Z0-9]{6,})/);
