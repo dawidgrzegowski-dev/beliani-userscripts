@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.65
+// @version      3.66
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -4005,7 +4005,20 @@
         // Teraz czekamy na DOWOD zapisu i wychodzimy, gdy tylko jest — zwykle duzo
         // szybciej niz po 1500 ms, a przy wolnym serwerze dajemy mu do 10 s.
         const KOM_MAX = 10000, KOM_KROK = 250;
-        const szukany = String(commentText || '').trim().slice(0, 60);
+        // v3.66: porownujemy tekst ZE SPLASZCZONYMI bialymi znakami.
+        // Opis potracenia z Wayfaira jest WIELOLINIJKOWY i ma tabulatory („Deduction<TAB>
+        // UK666896713…<NL>Item: …<NL>Desc: …"). Ticket wyswietla go jako HTML, wiec
+        // w textContent strony nie ma juz ani tych tabulatorow, ani zlaman wiersza —
+        // doslowne indexOf nie mialo szans trafic i KAZDY taki komentarz konczyl sie
+        // „nie potwierdzilo sie", chociaz zapis szedl. Jednolinijkowe „Please add solution"
+        // trafialo zawsze i dlatego eskalacje wygladaly na sprawne, a opisy potracen nie.
+        const szukany = normalizeSpaces(commentText).slice(0, 60);
+        const ileRazy = function (hay, needle) {
+            if (!needle) return 0;
+            let n = 0, od = 0, p;
+            while ((p = hay.indexOf(needle, od)) >= 0) { n++; od = p + needle.length; }
+            return n;
+        };
         for (let czekano = 0; czekano < KOM_MAX; czekano += KOM_KROK) {
             await sleep(KOM_KROK);
             const d2 = getFrameDoc(ctx);
@@ -4020,13 +4033,26 @@
             // z listy komentarzy. Wycinanie po wartosci pola kasowalo takze ten wpis
             // na liscie i potwierdzenie nigdy nie przychodzilo.
             if (szukany){
-                const body = String((d2.body && d2.body.textContent) || '');
-                const wPolu = (String(ta.value || '').indexOf(szukany) >= 0) ? 1 : 0;
-                let ile = 0, od = 0, p;
-                while ((p = body.indexOf(szukany, od)) >= 0){ ile++; od = p + szukany.length; }
-                if (ile > wPolu) return { ok: true, potwierdzone: 'widoczny na liście' };
+                const body = normalizeSpaces((d2.body && d2.body.textContent) || '');
+                const wPolu = (normalizeSpaces(ta.value).indexOf(szukany) >= 0) ? 1 : 0;
+                if (ileRazy(body, szukany) > wPolu) return { ok: true, potwierdzone: 'widoczny na liście' };
             }
         }
+        // v3.66: ostatnie slowo ma STRONA, nie nasz podglad. Przeladowujemy ticket i
+        // patrzymy, czy komentarz na nim jest. Bez tego kroku dlugi zapis na wolnym
+        // serwerze wygladal jak porazka, a modul Marketplace zglaszal „BEZ KOMENTARZA"
+        // przy komentarzu, ktory sie zapisal.
+        try {
+            const w = getFrameWin(ctx);
+            const url = (w && w.location && w.location.href) || '';
+            if (url && !/^about:/i.test(url)) {
+                await loadInFrame(url, 20000, ctx);
+                await sleep(600);
+                const d3 = getFrameDoc(ctx);
+                const body3 = normalizeSpaces((d3 && d3.body && d3.body.textContent) || '');
+                if (szukany && body3.indexOf(szukany) >= 0) return { ok: true, potwierdzone: 'widoczny po przeładowaniu' };
+            }
+        } catch (e) { /* nie udalo sie przeladowac — zostaje uczciwe „nie potwierdzilo sie" */ }
         return { ok: false, error: 'kliknąłem „Add comment", ale przez 10 s nie potwierdziło się, że komentarz się zapisał' };
     }
 
@@ -4035,7 +4061,7 @@
     // nie ma po co pisać drugi raz, bo druga implementacja tego samego prędzej czy
     // później rozjedzie się z pierwszą. Wystawiamy więc TO JEDNO działanie.
     // Pracuje we własnej ramce, żeby nie wchodzić w drogę temu, co akurat robi panel.
-    window.__TM_TICKET_COMMENT = async function (ffNumber, text) {
+    async function tmKomentarzRaz(ffNumber, text) {
         const ff = String(ffNumber || '').trim();
         const body = String(text || '').trim();
         if (!ff || !body) return { ok: false, error: 'brak numeru zamówienia albo treści komentarza' };
@@ -4063,6 +4089,17 @@
                     await sleep(600);
                 }
             }
+            // v3.66: ten komentarz juz tam jest — nie dokladamy drugiego. Chroni przy
+            // powtorzeniu mostu (nizej) i przy „↻ Zaksieguj ponownie" na tej samej
+            // grupie zwrotow: opis potracenia z rozliczenia jest za kazdym razem
+            // identyczny, wiec drugi wpis nic nie wnosi, a smieci w tickecie.
+            const jest = normalizeSpaces(body).slice(0, 60);
+            try {
+                const d0 = getFrameDoc(ctx);
+                const b0 = normalizeSpaces((d0 && d0.body && d0.body.textContent) || '');
+                if (jest && b0.indexOf(jest) >= 0)
+                    return { ok: true, href: href, duplikat: true, potwierdzone: 'komentarz już był na tickecie' };
+            } catch (e){ /* nie odczytalem strony — probujemy dopisac normalnie */ }
             // Ticket zamkniety nie ma pola komentarza — modul ksiegujacy tez otwiera go
             // na czas pracy i zamyka z powrotem (patrz wasClosedAtStart). Most szedl tu
             // PO nim, wiec trafial na ticket juz zamkniety i odbijal sie od braku pola.
@@ -4093,6 +4130,23 @@
         } finally {
             destroyFrameCtx(ctx);
         }
+    }
+    // v3.66: jedno powtórzenie. Najczęstsze porażki mostu są przejściowe — ticket nie
+    // zdążył się wyrenderować, serwer oddał 500, ramka padła na przeładowaniu. Druga
+    // próba kosztuje kilka sekund, a bez niej opis potrącenia przepada bezpowrotnie:
+    // nikt później nie wie, że go zabrakło, i nikt go ręcznie nie dopisze.
+    // Przed dopisaniem most sprawdza, czy tego komentarza już tam nie ma, więc
+    // powtórzenie nie grozi drugim wpisem.
+    window.__TM_TICKET_COMMENT = async function (ffNumber, text) {
+        const r1 = await tmKomentarzRaz(ffNumber, text);
+        if (r1 && r1.ok) return r1;
+        // Braku numeru albo pustej treści druga próba nie naprawi.
+        if (r1 && /brak numeru zamówienia/i.test(r1.error || '')) return r1;
+        await sleep(1500);
+        const r2 = await tmKomentarzRaz(ffNumber, text);
+        if (r2 && r2.ok) return { ...r2, poPowtorzeniu: true };
+        return { ok: false, href: (r2 && r2.href) || (r1 && r1.href) || '',
+                 error: ((r1 && r1.error) || '?') + ' | po powtórzeniu: ' + ((r2 && r2.error) || '?') };
     };
 
     async function reassignTicketToUser(ctx, ticketHref, openedByName) {
@@ -22049,6 +22103,57 @@
         const left = x.rows.filter(function (r){ return d.ids.indexOf(r.id) < 0; });
         return { at: d.at, sure: d.sure !== false, done: x.rows.length - left.length, left: left };
     }
+
+    // ---------- slad po dopisanych opisach potracen ----------
+    // v3.66. Wynik dopisywania szedl dotad WYLACZNIE na pasek stanu, a pasek ma jedna
+    // linie i przepada przy nastepnym komunikacie — a nastepny komunikat przychodzil
+    // zawsze, bo wywolujacy zaraz po powrocie mowil swoje „Zwroty zaksiegowane".
+    // Skutek: opis potracenia albo szedl do ticketu, albo nie, i NIE BYLO JAK sie o tym
+    // dowiedziec inaczej niz otwierajac tickety po kolei. Trzymamy wiec wynik per numer
+    // zamowienia i pokazujemy go przy pozycji, tak samo jak slad po zaksiegowaniu.
+    const MK_RCOM = 'mkt_refund_comments';
+    // Lista zwrotow rysuje sie w calosci przy kazdym odswiezeniu, a stan sprawdzamy przy
+    // KAZDEJ pozycji — bez tego podreczna kopia byloby to kilkaset odczytow i parsowan
+    // tego samego zapisu na jedno przerysowanie panelu.
+    let _rcCache = null;
+    function rcLoad(){
+        if (_rcCache) return _rcCache;
+        try { _rcCache = JSON.parse(GM_getValue(MK_RCOM, '{}')) || {}; } catch (e){ _rcCache = {}; }
+        return _rcCache;
+    }
+    function rcSave(o){
+        // Ten sam limit co przy zaksiegowanych zwrotach — po pol roku wpis nikomu
+        // juz nie sluzy, a zapis rosnie bez konca.
+        const cut = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+        Object.keys(o).forEach(function (k){
+            if (!o[k] || String(o[k].at || '').slice(0, 10) < cut) delete o[k];
+        });
+        _rcCache = o;
+        try { GM_setValue(MK_RCOM, JSON.stringify(o)); } catch (e){}
+    }
+    function rcMark(id, ok, powod){
+        if (!id) return;
+        const all = rcLoad();
+        const prev = all[String(id)];
+        // Sukcesu NIE cofamy. Przy „↻ Zaksieguj ponownie" pozycja opisana wczesniej nie
+        // trafia juz do „want" (nie ma jej w done tego przebiegu) i bez tego zastrzezenia
+        // jej ✔ zamienialoby sie w ✖ „zwrot sie nie zaksiegowal" — chociaz komentarz od
+        // dawna siedzi w tickecie i nikt go stamtad nie usunal.
+        if (prev && prev.ok && !ok) return;
+        all[String(id)] = { at: new Date().toISOString().slice(0, 16).replace('T', ' '),
+                            ok: !!ok, powod: String(powod || '') };
+        rcSave(all);
+    }
+    function rcState(id){ return rcLoad()[String(id)] || null; }
+    // Podsumowanie dla grupy: ile pozycji z opisem ma go juz w tickecie.
+    function rcGroup(x){
+        const zOpisem = (x.rows || []).filter(function (r){ return r.note; });
+        if (!zOpisem.length) return null;
+        let ok = 0, zle = 0;
+        zOpisem.forEach(function (r){ const s = rcState(r.id); if (s){ if (s.ok) ok++; else zle++; } });
+        return { n: zOpisem.length, ok: ok, zle: zle, nietkniete: zOpisem.length - ok - zle };
+    }
+
     // Ktore pozycje modul ticketa naprawde potwierdzil. Czytamy jego wlasny log —
     // dzieki temu przy czesciowym niepowodzeniu nie oznaczymy calej grupy jako zrobionej.
     function ksDone(x){
@@ -22129,6 +22234,16 @@
                     return '<span style="font-size:11px;color:#c47f00;font-weight:700">częściowo: ' + s.done + ' z ' + x.rows.length
                         + ', zostało ' + s.left.length + '</span>';
                  })()
+              // v3.66: stan opisów potrąceń obok stanu księgowania. To jest ta jedna
+              // informacja, po którą dotąd trzeba było wchodzić do ticketów po kolei.
+              +  (function (){
+                    const c = rcGroup(x);
+                    if (!c) return '';
+                    if (c.ok === c.n) return '<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ opisy w ticketach (' + c.n + ')</span>';
+                    if (!c.ok && !c.zle) return '<span style="font-size:11px;color:#888">opisy: jeszcze nie dopisywane (' + c.n + ')</span>';
+                    return '<span style="font-size:11px;color:#c47f00;font-weight:700">opisy: ' + c.ok + ' z ' + c.n
+                        + (c.zle ? (', bez komentarza ' + c.zle) : '') + '</span>';
+                 })()
               +  '<button class="mk-rt" data-g="' + i + '"' + (x.acct ? '' : ' disabled') + ' style="padding:3px 10px;border:none;border-radius:6px;background:'
               +  (x.acct ? ((st[k] && !st[k].left.length) ? '#9ca3af' : '#5b21b6') : '#c7c7c7')
               +  ';color:#fff;font-weight:700;cursor:' + (x.acct ? 'pointer' : 'default') + ';font-size:11px">'
@@ -22147,8 +22262,19 @@
                     if (!withNote.length) return '';
                     return '<details style="margin-top:4px"><summary style="font-size:10px;color:#5b21b6;cursor:pointer">opisy potrąceń (' + withNote.length + ')</summary>'
                          + withNote.map(function (r){
+                               // v3.66: przy kazdym opisie widac, czy trafil do ticketu.
+                               // Bez tego jedynym sladem byl komunikat na pasku, ktory
+                               // przepadal w ulamku sekundy po zakonczeniu ksiegowania.
+                               const s = rcState(r.id);
+                               const stan = !s
+                                   ? '<span style="color:#888">— nie dopisywałem</span>'
+                                   : (s.ok
+                                       ? '<span style="color:#0a7a2f">✔ w tickecie ' + esc(s.at)
+                                         + (s.powod ? (' <span style="color:#888">(' + esc(s.powod) + ')</span>') : '') + '</span>'
+                                       : '<span style="color:#c47f00">✖ bez komentarza ' + esc(s.at) + ' — ' + esc(s.powod || '?') + '</span>');
                                return '<div style="margin:4px 0 0;padding:4px 6px;background:#fff;border:1px solid #ede9fe;border-radius:5px">'
-                                    + '<div style="font-size:10px;font-weight:700;color:#374151">' + esc(r.id) + ' · ' + f2(r.amt) + '</div>'
+                                    + '<div style="font-size:10px;font-weight:700;color:#374151">' + esc(r.id) + ' · ' + f2(r.amt)
+                                    + ' <span style="font-weight:400">' + stan + '</span></div>'
                                     + '<pre style="margin:2px 0 0;font:10px/1.35 monospace;color:#555;white-space:pre-wrap;word-break:break-word">' + esc(r.note) + '</pre></div>';
                            }).join('')
                          + '</details>';
@@ -22160,10 +22286,16 @@
         if (ra) ra.onclick = function(){ bookAllRefunds(ra); };
         box.querySelectorAll('.mk-rt').forEach(function (b){ b.onclick = async function(){
             b.disabled = true;
-            const r = await bookRefunds(g[keys[+b.getAttribute('data-g')]]);
+            await bookRefunds(g[keys[+b.getAttribute('data-g')]]);
             b.disabled = false;
             renderRef();                                  // zeby od razu bylo widac „zaksięgowane"
-            if (!r) say('Zwroty zaksięgowane — wynik w panelu Księgowanie w tickecie.', '#0a7a2f');
+            // v3.66: NIC tu juz nie mowimy. bookRefunds sklada jeden komunikat na koncu —
+            // razem z tym, czy opisy potracen poszly do ticketow — a stojace tu wczesniej
+            // „Zwroty zaksiegowane" nadpisywalo go w tym samym ulamku sekundy. Dokladnie
+            // ta sama pomylka, ktora v3.65 naprawila WEWNATRZ bookRefunds (komunikat
+            // o arkuszu kasowal komunikat o komentarzach) — tylko pietro wyzej.
+            // Skutek byl taki, ze „opisy potracen dopisane do 0 z 1. BEZ KOMENTARZA: …"
+            // nie mialo jak dotrzec i modul wygladal, jakby komentarzy w ogole nie robil.
         }; });
         box.querySelectorAll('.mk-rc').forEach(function (b){ b.onclick = function(){
             const x = g[keys[+b.getAttribute('data-g')]];
@@ -22626,16 +22758,25 @@
             return { msg: 'opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
                           + '(dziś dostarcza je tylko rozliczenie Wayfaira)', col: '#666' };
         }
+        // v3.66: powod pominiecia zapisujemy PRZY POZYCJI. Dotad zostawal wylacznie
+        // w komunikacie na pasku, ktory znikal — i pozycja bez komentarza wygladala
+        // dokladnie tak samo jak ta, ktorej nikt nigdy nie probowal skomentowac.
+        const pominietePowod = function (r){
+            rcMark(r.id, false, 'zwrot się nie zaksięgował'
+                   + (powodyPre[r.id] ? (' — ' + powodyPre[r.id]) : ''));
+        };
         if (!want.length){
             const powody = powodyPre;
             const lista = Object.keys(powody).slice(0, 4)
                 .map(function (id){ return id + ' (' + powody[id] + ')'; }).join(', ');
+            zOpisem.forEach(pominietePowod);
             return { msg: 'opisów NIE dopisałem — żadna z ' + zOpisem.length
                           + ' pozycji z opisem nie została zaksięgowana'
                           + (lista ? ('. Powody z logu: ' + lista) : '')
                           + ksRada(powody), col: '#c47f00' };
         }
         if (typeof window.__TM_TICKET_COMMENT !== 'function'){
+            zOpisem.forEach(function (r){ rcMark(r.id, false, 'moduł „Księgowanie w tickecie" wyłączony'); });
             return { msg: 'opisów nie dopiszę — moduł „Księgowanie w tickecie" jest wyłączony w launcherze', col: '#c47f00' };
         }
         let ok = 0; const bad = [];
@@ -22643,10 +22784,22 @@
             say('Dopisuję opis potrącenia do ticketu ' + (i + 1) + '/' + want.length + ' — ' + want[i].id + '…');
             try {
                 const r = await window.__TM_TICKET_COMMENT(want[i].id, want[i].note);
-                if (r && r.ok) ok++;
-                else bad.push(want[i].id + ': ' + ((r && r.error) || 'nie powiodło się'));
-            } catch (e){ bad.push(want[i].id + ': ' + ((e && e.message) || e)); }
+                if (r && r.ok){
+                    ok++;
+                    rcMark(want[i].id, true, r.duplikat ? 'był już na tickecie'
+                                           : ((r.potwierdzone || '') + (r.poPowtorzeniu ? ', za drugim razem' : '')));
+                } else {
+                    const p = (r && r.error) || 'nie powiodło się';
+                    bad.push(want[i].id + ': ' + p);
+                    rcMark(want[i].id, false, p);
+                }
+            } catch (e){
+                const p = (e && e.message) || String(e);
+                bad.push(want[i].id + ': ' + p);
+                rcMark(want[i].id, false, p);
+            }
         }
+        zOpisem.forEach(function (r){ if (want.indexOf(r) < 0) pominietePowod(r); });
         const pominiete = zOpisem.length - want.length;
         const powody = pominiete ? powodyPre : {};
         const czemu = Object.keys(powody).slice(0, 4)
@@ -22735,9 +22888,25 @@
         } finally { window.__MKT_AUTO = false; }
         b.disabled = false;
         renderRef();
+        // v3.66: przelot zbiorczy przykrywa komunikaty poszczegolnych grup — kazda
+        // kolejna grupa nadpisuje pasek. Bilans opisow potracen skladamy wiec tutaj,
+        // z zapisanego sladu, zeby nie przepadl razem z tamtymi komunikatami.
+        let komOk = 0, komZle = 0, komBrak = 0;
+        keys.forEach(function (k){
+            const c = rcGroup(g[k]);
+            if (!c) return;
+            komOk += c.ok; komZle += c.zle; komBrak += c.nietkniete;
+        });
+        const komTxt = (komOk + komZle + komBrak)
+            ? (' Opisy potrąceń: w ticketach ' + komOk + ' z ' + (komOk + komZle + komBrak)
+               + (komZle ? (', bez komentarza ' + komZle) : '')
+               + (komBrak ? (', nietkniętych ' + komBrak) : '')
+               + '. Szczegóły przy pozycjach na liście zwrotów.')
+            : '';
         say('Zwroty: zaksięgowanych grup ' + ok + ' z ' + keys.length
             + (skip.length ? (', pominiętych jako już zrobione ' + skip.length) : '')
-            + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.', bad.length ? '#c47f00' : '#0a7a2f');
+            + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.' + komTxt,
+            (bad.length || komZle) ? '#c47f00' : '#0a7a2f');
     }
 
     // ---------- prologistics: wczytanie wyciagu ----------
