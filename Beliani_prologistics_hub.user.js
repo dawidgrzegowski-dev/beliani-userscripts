@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.64
+// @version      3.65
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22067,6 +22067,36 @@
         });
         return ok;
     }
+    // Czemu pozycja nie przeszla. ksDone czyta z logu ticketa potwierdzenia; tu czytamy
+    // z tego samego logu POWODY niepowodzenia, zeby nie trzeba bylo szukac ich wzrokiem
+    // w kilkudziesieciu liniach. Rozpoznajemy trzy najczestsze: przekroczony czas,
+    // brak ticketu i blad przy sprawdzaniu.
+    function ksBledy(x){
+        const list = document.getElementById('tm-t-progress-list');
+        if (!list) return {};
+        const txt = Array.prototype.slice.call(list.querySelectorAll('*'))
+            .map(function (e){ return String(e.textContent || ''); })
+            .filter(function (t){ return t && t.length < 400; });
+        const out = {};
+        (x.rows || []).forEach(function (r){
+            for (let i = 0; i < txt.length; i++){
+                const t = txt[i];
+                if (t.indexOf(r.id) < 0) continue;
+                if (/timeout/i.test(t)) { out[r.id] = 'przekroczony czas'; return; }
+                if (/brak\s+ticketu/i.test(t)) { out[r.id] = 'brak ticketu'; return; }
+                if (/BŁĄD|blad|błąd/i.test(t)) { out[r.id] = 'błąd'; return; }
+            }
+        });
+        return out;
+    }
+    // Podpowiedz przy przekroczeniach czasu — modul ticketa ma na to dwa pokretla,
+    // a jego wlasna instrukcja mowi, ze przy wiekszej liczbie workerow trzeba podniesc
+    // mnoznik. Bez tego zdania czlowiek szuka bledu w kodzie zamiast w ustawieniach.
+    function ksRada(powody){
+        const ile = Object.keys(powody).filter(function (k){ return powody[k] === 'przekroczony czas'; }).length;
+        return ile ? (' Przekroczeń czasu: ' + ile + ' — w panelu „Księgowanie w tickecie" zmniejsz '
+                    + 'liczbę workerów do 2–3 albo podnieś „× timeout" na 2–3 i powtórz.') : '';
+    }
     function renderRef(){
         const box = $('#mk-ref'); if (!box) return;
         const g = refGroups(), keys = Object.keys(g).sort();
@@ -22582,18 +22612,28 @@
     // informacje o tym, ze komentarze NIE poszly. Wynik skladamy teraz na koncu.
     async function refComment(x, done){
         const zOpisem = x.rows.filter(function (r){ return r.note; });
-        // Gdy log ticketa nic nie potwierdzil (done puste), komentujemy wszystko —
-        // przebieg sie zakonczyl, wiec brak potwierdzenia znaczy „nie odczytalem",
-        // a nie „nie poszlo". Gdy potwierdzil CZESC, reszta wypada — i wlasnie to
-        // wypadniecie bylo dotad zupelnie nieme.
-        const want = zOpisem.filter(function (r){ return !done.length || done.indexOf(r.id) >= 0; });
+        // Puste „done" znaczylo dotad „nie odczytalem logu" i komentowalismy wszystko.
+        // To bylo sluszne, dopoki nie umielismy odczytac POWODOW. Teraz umiemy: gdy log
+        // wprost mowi „Timeout" albo „Brak ticketu", brak potwierdzenia nie jest juz
+        // niewiedza, tylko informacja, ze pozycja NIE przeszla — a komentarz o potraceniu
+        // przy niezaksiegowanym zwrocie mowilby nieprawde.
+        const powodyPre = ksBledy(x);
+        const want = zOpisem.filter(function (r){
+            if (done.length) return done.indexOf(r.id) >= 0;
+            return !powodyPre[r.id];
+        });
         if (!zOpisem.length){
             return { msg: 'opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
                           + '(dziś dostarcza je tylko rozliczenie Wayfaira)', col: '#666' };
         }
         if (!want.length){
-            return { msg: 'opisów NIE dopisałem: log modułu „Księgowanie w tickecie" nie potwierdził żadnej z '
-                          + zOpisem.length + ' pozycji z opisem — sprawdź te tickety ręcznie', col: '#c47f00' };
+            const powody = powodyPre;
+            const lista = Object.keys(powody).slice(0, 4)
+                .map(function (id){ return id + ' (' + powody[id] + ')'; }).join(', ');
+            return { msg: 'opisów NIE dopisałem — żadna z ' + zOpisem.length
+                          + ' pozycji z opisem nie została zaksięgowana'
+                          + (lista ? ('. Powody z logu: ' + lista) : '')
+                          + ksRada(powody), col: '#c47f00' };
         }
         if (typeof window.__TM_TICKET_COMMENT !== 'function'){
             return { msg: 'opisów nie dopiszę — moduł „Księgowanie w tickecie" jest wyłączony w launcherze', col: '#c47f00' };
@@ -22608,10 +22648,14 @@
             } catch (e){ bad.push(want[i].id + ': ' + ((e && e.message) || e)); }
         }
         const pominiete = zOpisem.length - want.length;
+        const powody = pominiete ? powodyPre : {};
+        const czemu = Object.keys(powody).slice(0, 4)
+            .map(function (id){ return id + ' (' + powody[id] + ')'; }).join(', ');
         return {
             msg: 'opisy potrąceń dopisane do ' + ok + ' z ' + want.length + ' ticketów'
                + (bad.length ? ('. BEZ KOMENTARZA: ' + bad.join('; ')) : '')
-               + (pominiete ? ('. Pominiętych ' + pominiete + ' — log ticketa ich nie potwierdził, dopisz ręcznie') : ''),
+               + (pominiete ? ('. Pominiętych ' + pominiete + ' — nie zaksięgowały się'
+                    + (czemu ? (': ' + czemu) : '') + ksRada(powody)) : ''),
             col: (bad.length || pominiete) ? '#c47f00' : '#0a7a2f'
         };
     }
