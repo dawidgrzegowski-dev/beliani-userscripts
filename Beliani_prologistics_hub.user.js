@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.62
+// @version      3.63
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23676,10 +23676,25 @@
             });
             if (!lo){ say('Wayfair: zlecenia bez daty — nie mam czego szukać.', '#c47f00'); return 0; }
             say('Wayfair — pobieram listę wypłat…');
+            // Komunikat musi zostac PRZY ZLECENIU, nie tylko na pasku — pasek ma jedna
+            // linie i nadpisze go nastepna platforma, zanim zdazysz przeczytac.
+            const wszystkim = function (tekst, blad){
+                left.forEach(function (k){ jobs[k].msg = tekst; if (blad) jobs[k].status = 'err'; });
+                jobsSave(jobs); render();
+                say('Wayfair: ' + tekst, '#c47f00');
+            };
             let list;
             try { list = await wayfList(mkShift(lo, -14), mkShift(up, 3)); }
-            catch (e){ say('Wayfair: ' + withLogin({ brand: 'Wayfair', shop: 'Wayfair DE' }, e), '#c47f00'); return 0; }
-            if (!list.length){ say('Wayfair: w tym okresie portal nie pokazuje żadnej wypłaty.', '#c47f00'); return 0; }
+            catch (e){
+                wszystkim(withLogin({ brand: 'Wayfair', shop: 'Wayfair DE' }, (e && e.message) || String(e)), true);
+                return 0;
+            }
+            if (!list.length){
+                wszystkim('w oknie ' + mkShift(lo, -14) + ' – ' + mkShift(up, 3)
+                        + ' portal nie pokazuje żadnej wypłaty. Sprawdź, czy jesteś zalogowany na '
+                        + MK_WAYF_HOST + ' i czy wypłata już tam jest.', false);
+                return 0;
+            }
             let ok = 0;
             for (let i = 0; i < left.length; i++){
                 const j = jobs[left[i]];
@@ -23688,7 +23703,16 @@
                 const exact = same.filter(function (p){ return String(p.paymentDate || '').slice(0, 10) === j.date; });
                 const hit = exact.length ? exact : same;
                 if (!hit.length){
-                    j.msg = 'nie ma wypłaty na ' + f2(j.amount) + ' wśród ' + list.length + ' z tego okresu';
+                    // Sama informacja „nie ma" jest bezuzyteczna — dopisujemy kwoty, ktore
+                    // portal faktycznie pokazuje, zeby bylo widac, czy to pomylka o grosz,
+                    // zly okres, czy wyplata jeszcze nie powstala.
+                    const bliskie = list.slice()
+                        .sort(function (a, b){ return Math.abs(mkNum(a.paymentAmount) - j.amount)
+                                                    - Math.abs(mkNum(b.paymentAmount) - j.amount); })
+                        .slice(0, 3)
+                        .map(function (p){ return f2(mkNum(p.paymentAmount)) + ' z ' + String(p.paymentDate || '').slice(0, 10); });
+                    j.msg = 'nie ma wypłaty na ' + f2(j.amount) + ' wśród ' + list.length
+                          + ' z tego okresu' + (bliskie.length ? ('. Najbliższe: ' + bliskie.join(' · ')) : '');
                     jobsSave(jobs); continue;
                 }
                 if (hit.length > 1){
