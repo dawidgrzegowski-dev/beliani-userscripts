@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.55
+// @version      3.56
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18230,6 +18230,21 @@
     // Nazwa sklepu bierze sie normalnie z pobranego rozliczenia. Joybuy zadnego nie ma —
     // jego sklep znamy juz z reguly rozpoznajacej wplate, wiec siegamy tam zapasowo.
     // Dla pozostalych nic sie nie zmienia: `data.shop` jest ustawiane pierwsze.
+    // Czego brakuje konkretnemu zleceniu CHECK24 — do pokazania w wierszu tabeli.
+    // UWAGA na zasieg: to wola render(), ktore siedzi w ZEWNETRZNYM domknieciu modulu.
+    // Wczesniej funkcja stala przy c24Left, w domknieciu obslugi guzikow (wciecie 8),
+    // i render wywalal sie na ReferenceError — tabela w ogole przestawala sie rysowac.
+    function c24Brak(j){
+        if (!j || j.kind !== 'c24' || j.status === 'done') return '';
+        const ma = j.c24 || {};
+        const b = [];
+        if (!ma.csv) b.push('„Details" (CSV)');
+        if (!ma.pdf) b.push('„Abrechnung" (PDF)');
+        if (!b.length) return '';
+        return 'brakuje ' + b.join(' i ') + ' — kliknij „⬇ Pobierz zestawienia", żeby ściągnąć je '
+             + 'z panelu, albo wgraj ręcznie guzikiem „📎 Dodaj pliki". PDF jest obowiązkowy, '
+             + 'bo tylko on podaje kwotę wypłaty.';
+    }
     // Data ksiegowania. Ze zlecenia z WYCIAGU pochodzi z banku i jest data wejscia na
     // konto — tej nie ruszamy. Ze zlecenia zalozonego z raportu portalu pochodzi z pola
     // „data wyplaty", czyli z dnia, w ktorym marketplace ZLECIL przelew; pieniadze wchodza
@@ -23612,18 +23627,6 @@
                 const j = jobs[k];
                 return j.kind === 'c24' && mkTodo(j) && !(j.c24 && j.c24.csv && j.c24.pdf);
             }).length;
-        }
-        // Czego brakuje konkretnemu zleceniu CHECK24 — do pokazania w wierszu tabeli.
-        function c24Brak(j){
-            if (!j || j.kind !== 'c24' || j.status === 'done') return '';
-            const ma = j.c24 || {};
-            const b = [];
-            if (!ma.csv) b.push('„Details" (CSV)');
-            if (!ma.pdf) b.push('„Abrechnung" (PDF)');
-            if (!b.length) return '';
-            return 'brakuje ' + b.join(' i ') + ' — kliknij „⬇ Pobierz zestawienia", żeby ściągnąć je '
-                 + 'z panelu, albo wgraj ręcznie guzikiem „📎 Dodaj pliki". PDF jest obowiązkowy, '
-                 + 'bo tylko on podaje kwotę wypłaty.';
         }
     // ---------- rozmowa z panelem CHECK24 ----------
     // Strona /finance jest renderowana po stronie serwera i niesie w jednym skrypcie
