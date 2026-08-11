@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.66
+// @version      3.67
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5003,12 +5003,31 @@
         }
         const tdTicket = document.createElement('td');
         tdTicket.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;white-space:nowrap;';
-        const tLink = document.createElement('a');
-        tLink.href = row.ticketHref;
-        tLink.target = '_blank';
-        tLink.textContent = `#${row.ticketId}`;
-        tLink.style.cssText = 'color:#7c3aed;text-decoration:none;';
-        tdTicket.appendChild(tLink);
+        // v3.67: bez adresu NIE robimy odsyłacza. Przypisanie undefined do .href daje
+        // dosłowny ciąg „undefined", rozwiązywany względem strony — i kliknięcie w numer
+        // ticketu lądowało na https://www.prologistics.info/undefined zamiast na tickecie.
+        // Zdarza się to po wznowieniu przerwanego przebiegu: zapis postępu niósł do tej
+        // pory sam ticketId (bez adresu), pozycja jest już zaksięgowana, więc processOne
+        // ją pomija i checkOne — jedyne miejsce, które ustawia ticketHref — w ogóle nie
+        // rusza. Sam adres dopisujemy teraz do zapisu (saveProgress), ale wiersze zapisane
+        // starszą wersją tego pola nie mają, więc zabezpieczenie zostaje na stałe.
+        const ticketNr = (row.ticketId != null && row.ticketId !== '') ? ('#' + row.ticketId) : '';
+        if (row.ticketHref) {
+            const tLink = document.createElement('a');
+            tLink.href = row.ticketHref;
+            tLink.target = '_blank';
+            tLink.textContent = ticketNr || '#?';
+            tLink.style.cssText = 'color:#7c3aed;text-decoration:none;';
+            tdTicket.appendChild(tLink);
+        } else {
+            const tTxt = document.createElement('span');
+            tTxt.textContent = ticketNr || '—';
+            tTxt.style.cssText = ticketNr ? 'color:#7c3aed;' : 'color:#9ca3af;';
+            tTxt.title = ticketNr
+                ? 'Numer z zapisu postępu — adresu nie mam, bo pozycja była już zaksięgowana i nie sprawdzałem jej ponownie. Wyszukaj ticket po numerze fulfilment.'
+                : 'Brak ticketu';
+            tdTicket.appendChild(tTxt);
+        }
         tr.appendChild(tdTicket);
 
         const tdStatus = document.createElement('td');
@@ -5088,7 +5107,12 @@
                 bookingDate: r.bookingDate, source: r.source || '', isGoodwill: !!r.isGoodwill,
                 dupTotal: r.dupTotal, dupIndex: r.dupIndex,
                 booked: !!r.booked, alreadyBooked: !!r.alreadyBooked, skipped: !!r.skipped,
-                error: r.error || null, ticketId: r.ticketId || null, vatRefund: !!r.vatRefund
+                // v3.67: adres ticketu idzie do zapisu razem z numerem. Bez niego wiersz
+                // przywrocony po wznowieniu mial numer, ale nie mial dokad prowadzic —
+                // a przywrocona pozycja jest juz zaksiegowana, wiec nikt tego adresu
+                // ponownie nie ustali (processOne pomija ja przed checkOne).
+                error: r.error || null, ticketId: r.ticketId || null,
+                ticketHref: r.ticketHref || null, vatRefund: !!r.vatRefund
             }));
             localStorage.setItem(PROGRESS_KEY, JSON.stringify({
                 ts: Date.now(),
@@ -5112,7 +5136,7 @@
         let n = 0;
         rows.forEach(r => {
             const s = done.get(key(r));
-            if (s) { r.booked = !!s.booked; r.alreadyBooked = !!s.alreadyBooked; r.ticketId = s.ticketId || r.ticketId; r.loading = false; n++; } // v3.54: nie pokazuj “ladowanie…” dla przywroconych
+            if (s) { r.booked = !!s.booked; r.alreadyBooked = !!s.alreadyBooked; r.ticketId = s.ticketId || r.ticketId; r.ticketHref = s.ticketHref || r.ticketHref; r.loading = false; n++; } // v3.54: nie pokazuj “ladowanie…” dla przywroconych; v3.67: razem z adresem ticketu
         });
         return n;
     }
