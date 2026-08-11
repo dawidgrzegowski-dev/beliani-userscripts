@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.67
+// @version      3.68
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13315,7 +13315,21 @@
             + '.chn-btn{padding:9px 16px;border:none;border-radius:8px;cursor:pointer;font:700 13px system-ui;color:#fff}'
             + '.chn-btn.red{background:#FF2F00}.chn-btn.red:hover{background:#cc2600}'
             + '.chn-btn.maroon{background:#750000}.chn-btn.maroon:hover{background:#5a0000}'
-            + '.chn-btn.ghost{background:#F6E7E6;color:#750000;border:1px solid #FFCCB7}.chn-btn.ghost:hover{background:#FFCCB7}';
+            + '.chn-btn.ghost{background:#F6E7E6;color:#750000;border:1px solid #FFCCB7}.chn-btn.ghost:hover{background:#FFCCB7}'
+            // v3.68: dostawca z kompletem komentarzy schodzi na szaro. Kolor grupy niesie
+            // informacje „to jest jedna platnosc" i przy kilkudziesieciu dostawcach nie da
+            // sie z niego wyczytac, ktorych juz tknieto — a znacznik „✓ komentarz dodany"
+            // siedzi w ostatniej kolumnie, czyli dokladnie tam, gdzie sie nie patrzy.
+            // !important, bo tlo kazdej kratki jest wpisane w atrybut style (funkcja cel).
+            + '#wp-out-merged tr.pc-done > td{background:#f4f4f4 !important;border-color:#e3e3e3 !important}'
+            + '#wp-out-merged tr.pc-done > td, #wp-out-merged tr.pc-done > td *{color:#8b8b8b !important}'
+            // Sam znacznik zostaje czytelny — po to sie go stawia.
+            + '#wp-out-merged tr.pc-done .pc-st{color:#2e7d32 !important}'
+            + '#wp-out-merged tr.pc-suphdr.pc-done > td{background:#ececec !important;border-top-color:#b9b9b9 !important}'
+            // Uchwyt szerokosci: pasek przy prawej krawedzi okna Wprowadzania.
+            + '#wp-grip{position:absolute;right:0;top:0;bottom:0;width:12px;cursor:ew-resize;z-index:9;background:linear-gradient(to right, rgba(117,0,0,0), rgba(117,0,0,.10))}'
+            + '#wp-grip:hover{background:linear-gradient(to right, rgba(117,0,0,.05), rgba(117,0,0,.22))}'
+            + '#wp-grip::after{content:"";position:absolute;right:4px;top:50%;transform:translateY(-50%);width:2px;height:34px;border-left:2px dotted #750000;opacity:.45}';
         document.head.appendChild(st);
 
         var depBtn0 = document.getElementById('deposit-btn'); if (depBtn0) depBtn0.style.display = 'none';
@@ -13338,7 +13352,11 @@
 
         var wp = document.createElement('div');
         wp.id = 'chinskie-wprow';
-        wp.style.cssText = 'position:fixed;left:50%;top:40px;transform:translateX(-50%);z-index:2147483007;background:#fff;border:1px solid #FFCCB7;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.25);padding:0;width:min(900px, calc(100vw - 32px));max-height:calc(100vh - 60px);overflow:hidden;font-family:system-ui;color:#332524;flex-direction:column';
+        // v3.68: domyslna szerokosc z 900 na 1400 px. Tabela scalona ma osiem kolumn, z tego
+        // trzy z dluga trescia (P/I, OK depo/komentarz, Note) — w 900 px zawijaly sie do
+        // trzech linii i wiersz jednego zamowienia zajmowal pol ekranu. Szerokosc mozna
+        // dociagnac uchwytem przy prawej krawedzi; zapisana wraca przy nastepnym otwarciu.
+        wp.style.cssText = 'position:fixed;left:50%;top:40px;transform:translateX(-50%);z-index:2147483007;background:#fff;border:1px solid #FFCCB7;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.25);padding:0;width:min(1400px, calc(100vw - 32px));max-height:calc(100vh - 60px);overflow:hidden;font-family:system-ui;color:#332524;flex-direction:column';
         wp.style.display = 'none';
         wp.innerHTML =
             '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Wprowadzanie (balance + depo) <span style="font-weight:400;font-size:11px;opacity:.6">v' + VER + '</span></div><button id="wp-close" class="chn-btn ghost" style="padding:4px 12px">\u2715</button></div>'
@@ -13422,6 +13440,61 @@
           + '</div>';
         document.body.appendChild(sp);
         sp.querySelector('#sp-close').onclick = function(){ sp.style.display = 'none'; };
+
+        // ===== v3.68: szerokosc okna Wprowadzania — uchwyt przy prawej krawedzi =====
+        // Stoi TU, a nie wyzej, celowo: „sp.style.cssText = wp.style.cssText" kopiuje styl
+        // wpisany w atrybut, wiec zapisana szerokosc nalozona wczesniej przykleilaby sie
+        // takze do okna Sprawdzania. Tamto ma zostac przy swoim domyslnym rozmiarze.
+        var WP_W_KEY = 'chn_wp_width';
+        // Dolna granica to szerokosc, ponizej ktorej dwa pola wklejania (min-width 300 px
+        // kazde) i tak przestaja miescic sie obok siebie. Gorna — cale okno przegladarki.
+        function wpWidthClamp(v){ return Math.max(720, Math.min(Math.round(v), Math.max(400, window.innerWidth - 32))); }
+        function wpWidthLoad(){ var v = 0; try { v = parseInt(GM_getValue(WP_W_KEY, '0'), 10) || 0; } catch(e){ v = 0; } return v; }
+        function wpWidthSave(v){ try { GM_setValue(WP_W_KEY, String(v || 0)); } catch(e){} }
+        function wpWidthApply(v){
+            // 0 = „nic nie zapisano" i wtedy wraca zachowanie domyslne, ktore samo kurczy
+            // sie na waskim ekranie. Zapisana wartosc i tak przechodzi przez clamp, bo
+            // okno mogl otworzyc mniejszy monitor niz ten, na ktorym ja ustawiono.
+            wp.style.width = v ? (wpWidthClamp(v) + 'px') : 'min(1400px, calc(100vw - 32px))';
+        }
+        wpWidthApply(wpWidthLoad());
+        var wpGrip = document.createElement('div');
+        wpGrip.id = 'wp-grip';
+        wpGrip.title = 'Przeciągnij w bok, żeby zmienić szerokość okna.\nPodwójne kliknięcie — powrót do szerokości domyślnej.';
+        wp.appendChild(wpGrip);          // position:absolute, wiec nie wchodzi w uklad flex okna
+        (function(){
+            var ciagne = false, x0 = 0, w0 = 0;
+            wpGrip.addEventListener('mousedown', function(e){
+                ciagne = true; x0 = e.clientX; w0 = wp.getBoundingClientRect().width;
+                document.body.style.userSelect = 'none';
+                e.preventDefault();
+            });
+            document.addEventListener('mousemove', function(e){
+                if (!ciagne) return;
+                // Okno stoi na srodku (left:50% + translateX(-50%)), wiec srodek sie nie rusza,
+                // a prawa krawedz odjezdza od niego o polowe szerokosci. Zeby krawedz szla
+                // dokladnie za kursorem, szerokosc musi rosnac o DWA razy tyle, ile przejechala
+                // mysz — inaczej uchwyt „ucieka" spod kursora o polowe drogi.
+                wpWidthApply(w0 + (e.clientX - x0) * 2);
+                try { pcSyncScroll(); } catch(err){}
+            });
+            document.addEventListener('mouseup', function(){
+                if (!ciagne) return;
+                ciagne = false;
+                document.body.style.userSelect = '';
+                wpWidthSave(Math.round(wp.getBoundingClientRect().width));
+                try { pcSyncScroll(); } catch(err){}
+            });
+            wpGrip.addEventListener('dblclick', function(){
+                wpWidthSave(0); wpWidthApply(0);
+                try { pcSyncScroll(); } catch(err){}
+            });
+            // Zwezenie okna przegladarki ponizej zapisanej szerokosci wypchnelo by okno
+            // poza ekran — clamp przy kazdej zmianie rozmiaru trzyma je w kadrze.
+            window.addEventListener('resize', function(){
+                var v = wpWidthLoad(); if (v) wpWidthApply(v);
+            });
+        })();
 
         chooser.querySelector('#ch-ksieg').onclick = function(){ chooser.style.display = 'none'; wp.style.display = 'none'; sp.style.display = 'none'; var b = document.getElementById('deposit-btn'); if (b) { b.style.display = ''; setTimeout(function(){ b.click(); b.style.display = 'none'; }, 0); } };
         // pcSyncScroll po pokazaniu panelu: przy display:none clientWidth wynosi 0, wiec
@@ -16496,7 +16569,10 @@
             var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord);
             var du = (state._dupDep || {})[ord] || null;
             if (du) A = '<span title="' + pcAttr(pcDupTitle(ord, du)) + '">' + A + '</span>';
-            return '<tr>' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, du ? du.bg : bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel(pcOkCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>';
+            // v3.68: data-sup i data-order na samym <tr>. Do tej pory numer grupy siedzial
+            // wylacznie w checkboksie wewnatrz ostatniej kratki, wiec nie bylo jak siegnac
+            // po „wszystkie wiersze tego dostawcy" i wyszarzyc ich razem z naglowkiem.
+            return '<tr class="pc-row" data-sup="' + gi + '" data-order="' + esc(ord) + '">' + cel('<b style="color:#a15c00">D</b>', bg) + cel(A, du ? du.bg : bg) + cel('', bg) + cel(pcAmtCellHtml(r, rid), bg, true) + cel(pcPiCellHtml(r), bg) + cel(pcOkCellHtml(r), bg) + cel('', bg) + cel(pcChkHtml(r, gi), bg) + '</tr>';
         }
         function pcBalPiCellHtml(r){
             if (!r || !r.bpi) return '';
@@ -16517,7 +16593,7 @@
             var A = /^\d+$/.test(ord) ? aLink(r.orderUrl, ord) : esc(ord);
             var du = (state._dupBal || {})[ord] || null;
             if (du) A = '<span title="' + pcAttr(pcDupTitle(ord, du)) + '">' + A + '</span>';
-            return '<tr>' + cel('<b style="color:#0a6">B</b>', bg)
+            return '<tr class="pc-row" data-sup="' + gi + '" data-order="' + esc(ord) + '">' + cel('<b style="color:#0a6">B</b>', bg)
                  + cel(A, du ? du.bg : bg, false, (du && du.warn) ? ';border:2px solid #c00' : '')
                  + cel(pcContHtml(r.container), bg) + cel(pcBalCellHtml(r, rid), bg, true) + cel(pcBalPiCellHtml(r), bg) + cel(pcBalComCellHtml(r), bg) + cel(esc(r.note || ''), bg) + cel(pcChkHtml(r, gi), bg) + '</tr>';
         }
@@ -16547,9 +16623,12 @@
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
             var accBase = G.cid ? (_acc[G.cid] || '') : ''; var accShown = (state.pcAccEdit && state.pcAccEdit[G.key] != null) ? state.pcAccEdit[G.key] : accBase;
-            var h = '<tr class="pc-suphdr"><td colspan="8" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
+            var h = '<tr class="pc-suphdr" data-sup="' + gi + '"><td colspan="8" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
                 + ''
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
+                // Puste miejsce na znacznik postepu komentarzy — wypelnia je pcRefreshDone
+                // po kazdym renderze i po kazdym dodanym komentarzu.
+                + '<span class="pc-done-badge" data-sup="' + gi + '" style="margin-left:8px;font-size:10px;font-weight:700"></span>'
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
                 + '<span style="font-weight:400;margin-left:12px">Konto: <span class="pc-acc" data-key="' + esc(G.key) + '" title="Kliknij, aby edytowac konto" style="cursor:text;font-weight:700;border-bottom:1px dashed #999">' + esc(accShown || '—') + '</span></span>'
                 + pcConfBadge(pcConfG(G)) + pcHintBadge(pcConfG(G), accShown)
@@ -16566,7 +16645,13 @@
             var MG = pcMergedGroups(); state._groups = []; state._rowMap = {}; var CM = pcCombinedColorMap();
             // Mapy duplikatow liczone raz na render — pcRowDepo/pcRowBal tylko z nich czytaja.
             state._dupDep = pcDupOrderMap('dep'); state._dupBal = pcDupOrderMap('bal');
-            var gi = 0, html = '<table style="border-collapse:collapse;font-size:11px;width:100%">';
+            // v3.68: min-width. Przy samym width:100% tabela NIGDY nie wychodzila poza
+            // kontener — zamiast tego zgniatala osiem kolumn do szerokosci okna, a trzy
+            // kolumny z dluga trescia zawijaly sie do kilku linii. Przy okazji gorny suwak
+            // byl martwy, bo pcSyncScroll pokazuje go dopiero, gdy scrollWidth > clientWidth.
+            // Teraz tabela ma swoja minimalna szerokosc: w szerokim oknie rozciaga sie do
+            // 100%, w waskim wychodzi poza i wtedy suwak (gorny i dolny) naprawde dziala.
+            var gi = 0, html = '<table style="border-collapse:collapse;font-size:11px;width:100%;min-width:1150px">';
             function colhead(){ return '<tr style="color:#999;font-size:10px"><td style="padding:1px 5px">Typ</td><td style="padding:1px 5px">Order</td><td style="padding:1px 5px">Kontener</td><td style="padding:1px 5px;text-align:right">Kwota</td><td style="padding:1px 5px">P/I</td><td style="padding:1px 5px">OK depo / komentarz</td><td style="padding:1px 5px">Note</td><td style="padding:1px 5px">PC</td></tr>'; }
             function section(title, groups){
                 if (!groups.length) return;
@@ -16588,6 +16673,41 @@
             if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
             el.innerHTML = html + '</table>';
             pcSyncScroll();
+            // Render buduje tabele od zera, wiec wyszarzenie trzeba nalozyc ponownie —
+            // stan siedzi w pcDone.cm, nie w DOM-ie.
+            try { pcRefreshDone(); } catch (e){}
+        }
+        // ===== v3.68: dostawca „już wprowadzony" =====
+        // Komentarz mozna dodac WYLACZNIE do wiersza z numerycznym numerem zamowienia —
+        // tylko takie dostaja checkbox (patrz pcChkHtml). Gdyby liczyc wszystkie wiersze
+        // grupy, dostawca z jedna pozycja bez numeru nigdy nie doczekalby sie kompletu
+        // i zostawalby kolorowy mimo wykonanej roboty.
+        function pcGroupOrders(g){
+            var out = [];
+            ((g && g.dep) || []).concat((g && g.bal) || []).forEach(function(r){
+                var o = String((r && r.order) || '');
+                if (/^\d+$/.test(o) && out.indexOf(o) === -1) out.push(o);
+            });
+            return out;
+        }
+        function pcRefreshDone(){
+            var el = wp.querySelector('#wp-out-merged'); if (!el) return;
+            (state._groups || []).forEach(function(g){
+                var orders = pcGroupOrders(g);
+                var ile = 0;
+                orders.forEach(function(o){ if (pcDone.cm[o]) ile++; });
+                var komplet = orders.length > 0 && ile === orders.length;
+                var hdr = el.querySelector('tr.pc-suphdr[data-sup="' + g.gi + '"]');
+                if (hdr) hdr.classList.toggle('pc-done', komplet);
+                el.querySelectorAll('tr.pc-row[data-sup="' + g.gi + '"]').forEach(function(tr){
+                    tr.classList.toggle('pc-done', komplet);
+                });
+                var b = el.querySelector('.pc-done-badge[data-sup="' + g.gi + '"]');
+                if (!b) return;
+                if (komplet){ b.textContent = '✓ wprowadzony'; b.style.color = '#2e7d32'; b.title = 'Komentarz poszedł do wszystkich ' + orders.length + ' zamówień tego dostawcy w tej sesji.'; }
+                else if (ile){ b.textContent = '✓ ' + ile + ' z ' + orders.length; b.style.color = '#c47f00'; b.title = 'Komentarz poszedł do części zamówień — dostawca zostaje kolorowy, dopóki nie przejdą wszystkie.'; }
+                else { b.textContent = ''; b.title = ''; }
+            });
         }
         // Gorny suwak jest tylko atrapa: pusty div o szerokosci tabeli. Przewijanie jednego
         // przestawia drugi. Flaga „lock" przerywa odbicie zwrotne — bez niej oba suwaki
@@ -18051,6 +18171,10 @@
                         pcDone.cm[o] = 1; pcUncheck(o);
                         if (pcCountOcc(after, text) > pcCountOcc(before, text)){ okc++; pcSetMark(o, '✓ komentarz dodany', '#0a0'); }
                         else { warnc++; pcSetMark(o, '⚠ Wysłany; nie potwierdzono (sprawdź)', '#c47f00'); }
+                        // v3.68: dostawca schodzi na szaro w chwili, gdy komplet jego zamowien
+                        // ma komentarz. Wolamy po KAZDYM zamowieniu, bo pula robi po piec naraz
+                        // i ostatnie z grupy potrafi skonczyc jako pierwsze.
+                        try { pcRefreshDone(); } catch (e2){}
                     }
                     done++; status.textContent = 'Dodaję komentarz ' + done + '/' + orders.length + '…';
                 }, 5);
@@ -18060,6 +18184,8 @@
                 status.textContent = 'Przerwane po ' + done + '/' + orders.length + ': ' + _cm;
             } finally {
                 cBtn.disabled = false;
+                // Takze po przerwaniu: to, co zdazylo przejsc, ma byc widoczne jako szare.
+                try { pcRefreshDone(); } catch (e3){}
             }
         };
     })();
