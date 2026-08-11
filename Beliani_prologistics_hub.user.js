@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.54
+// @version      3.55
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22484,10 +22484,8 @@
         // wiec mozna wskazac kilka naraz albo dokladac je pojedynczo, w dowolnej kolejnosci.
         // Czytamy je po kolei, a nie rownolegle — kazdy plik robi wczytaj-zmien-zapisz na
         // tym samym magazynie i przy rownoleglym odczycie ostatni zapis zjadlby wczesniejsze.
-        $('#mk-file').onchange = async function(){
-            const fs = Array.prototype.slice.call(this.files || []);
-            try { this.value = ''; } catch (e){}
-            if (!fs.length) return;
+        async function mkWczytajWyciagi(fs){
+            if (!fs || !fs.length) return;
             let addT = 0, knownT = 0, otherT = 0;
             const per = [], errs = [];
             for (let i = 0; i < fs.length; i++){
@@ -22517,6 +22515,11 @@
                 + (otherT ? (', pozostałych marketplace’ów ' + otherT + ' — na razie poza zakresem') : '') + '.'
                 + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
                 errs.length ? '#c47f00' : '#0a7a2f');
+        }
+        $('#mk-file').onchange = function(){
+            const fs = Array.prototype.slice.call(this.files || []);
+            try { this.value = ''; } catch (e){}
+            mkWczytajWyciagi(fs);
         };
         // Rodzaj pliku poznajemy pytajac PARSERY, a nie przepisujac ich warunki wejscia
         // do osobnej tabelki sygnatur — taka tabelka rozjechalaby sie przy pierwszej
@@ -22531,20 +22534,6 @@
             try { if (!mkParseWayf(txt).err) return 'wayf'; } catch (e){}
             try { if (!mkParseCheck24(txt, '').err) return 'c24'; } catch (e){}
             return '';
-        }
-        // Podanie pliku dawnemu, ukrytemu wejsciu. DataTransfer to jedyna droga, zeby
-        // ustawic input.files z kodu; dzieki temu sprawdzona obsluga kazdego rodzaju
-        // zostaje nietknieta.
-        function mkPodrzuc(sel, pliki){
-            const el = $(sel);
-            if (!el || !pliki.length) return false;
-            try {
-                const dt = new DataTransfer();
-                pliki.forEach(function (f){ dt.items.add(f); });
-                el.files = dt.files;
-                el.dispatchEvent(new Event('change'));
-                return true;
-            } catch (e){ return false; }
         }
         const anyIn = $('#mk-any');
         if (anyIn) anyIn.onchange = async function(){
@@ -22566,11 +22555,15 @@
                 if (typ) kubelki[typ].push(f); else nieznane.push(f);
             }
             // Wyciagi ida razem — ich obsluga sama zlicza i podsumowuje kilka plikow naraz.
-            if (kubelki.bank.length) mkPodrzuc('#mk-file', kubelki.bank);
+            // Obsluge wolamy WPROST. Wczesniej szlo to przez podrzucenie pliku ukrytemu
+            // wejsciu (input.files = DataTransfer.files) — w piaskownicy ScriptCata takie
+            // przypisanie bywa odrzucane, a blad byl lapany po cichu, wiec plik z wyciagu
+            // znikal bez sladu. Wywolanie funkcji nie zalezy od granicy piaskownicy.
+            if (kubelki.bank.length) await mkWczytajWyciagi(kubelki.bank);
             // Raporty pojedynczo: kazdy dotyczy jednej wyplaty i kazdy ma wlasny komunikat.
-            ['ebay', 'galx', 'wayf'].forEach(function (t){
-                kubelki[t].forEach(function (f){ mkPodrzuc('#mk-' + t, [f]); });
-            });
+            kubelki.ebay.forEach(function (f){ ebayWczytaj(f); });
+            kubelki.galx.forEach(function (f){ galxWczytaj(f); });
+            kubelki.wayf.forEach(function (f){ wayfWczytaj(f); });
             // CHECK24: najpierw „Details" (buduje zlecenie), potem „Abrechnung" (dokłada
             // kwote wyplaty). Kolejnosc w jednym rzucie ma znaczenie, przy osobnym
             // wrzucaniu nie — obie drogi dopisuja sie do tego samego zlecenia po numerze.
@@ -22586,12 +22579,12 @@
             // Dzieki temu nietrafione rozpoznanie degraduje sie do zachowania sprzed
             // scalenia guzikow, a nie do ciszy.
             if (nieznane.length){
-                mkPodrzuc('#mk-file', nieznane);
+                await mkWczytajWyciagi(nieznane);
                 say('Nie rozpoznałem po zawartości: ' + nieznane.map(function (f){ return f.name; }).join(', ')
                     + ' — próbuję jako wyciąg bankowy.'
                     + (rozpoznane.length ? (' Pozostałe: ' + rozpoznane.join(', ') + '.') : ''), '#c47f00');
-            } else if (rozpoznane.length > 1){
-                say('Wczytuję: ' + rozpoznane.join(', ') + '.', '#666');
+            } else if (rozpoznane.length){
+                say('Rozpoznałem: ' + rozpoznane.join(', ') + ' — wczytuję…', '#666');
             }
         };
 
@@ -22745,10 +22738,7 @@
         // same liczby da sie odtworzyc z wierszy (suma kolumny netto). Dlatego gdy nie ma
         // zlecenia z wyciagu, zakladamy je z pliku — o to chodzilo w prosbie „nie kazdy
         // wchodzi na bank, a chcialbym zeby wszyscy mogli ksiegowac".
-        const ebayIn = $('#mk-ebay');
-        if (ebayIn) ebayIn.onchange = function(){
-            const f = this.files && this.files[0];
-            try { this.value = ''; } catch (e){}
+        function ebayWczytaj(f){
             if (!f) return;
             const rd = new FileReader();
             rd.onload = function(){
@@ -22827,13 +22817,16 @@
                     '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
+        }
+        const ebayIn = $('#mk-ebay');
+        if (ebayIn) ebayIn.onchange = function(){
+            const f = this.files && this.files[0];
+            try { this.value = ''; } catch (e){}
+            ebayWczytaj(f);
         };
         // Rozliczenie Galaxusa wrzucane recznie. Dopasowanie idzie po SUMIE „Amount paid out",
         // bo to ona trafia na konto — referencja z przelewu (UUID) nie wystepuje w pliku.
-        const galxIn = $('#mk-galx');
-        if (galxIn) galxIn.onchange = function(){
-            const f = this.files && this.files[0];
-            try { this.value = ''; } catch (e){}
+        function galxWczytaj(f){
             if (!f) return;
             const rd = new FileReader();
             rd.onload = function(){
@@ -22870,14 +22863,17 @@
                     + ', na konto ' + f2(p.net) + '. Kolumna N policzona.', '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
+        }
+        const galxIn = $('#mk-galx');
+        if (galxIn) galxIn.onchange = function(){
+            const f = this.files && this.files[0];
+            try { this.value = ''; } catch (e){}
+            galxWczytaj(f);
         };
         // Rozliczenie Wayfaira wrzucane recznie. Dopasowanie idzie po SUMIE wyplaty
         // (pozycje + potracenia), bo to ona trafia na konto — numer z tytulu przelewu
         // sluzy dopiero do potwierdzenia, ze to wlasciwy plik.
-        const wayfIn = $('#mk-wayf');
-        if (wayfIn) wayfIn.onchange = function(){
-            const f = this.files && this.files[0];
-            try { this.value = ''; } catch (e){}
+        function wayfWczytaj(f){
             if (!f) return;
             const rd = new FileReader();
             rd.onload = function(){
@@ -22907,6 +22903,12 @@
                     bad.length ? '#c47f00' : '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
+        }
+        const wayfIn = $('#mk-wayf');
+        if (wayfIn) wayfIn.onchange = function(){
+            const f = this.files && this.files[0];
+            try { this.value = ''; } catch (e){}
+            wayfWczytaj(f);
         };
         $('#mk-clear').onclick = function(){
             if (!confirm('Usunąć wszystkie zlecenia (także pobrane rozliczenia)?')) return;
