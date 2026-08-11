@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.57
+// @version      3.58
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19768,7 +19768,49 @@
              + ' , ' + ((l1.match(/,/g) || []).length) + ' tab ' + ((l1.match(/\t/g) || []).length)
              + ' · początek: „' + l1.replace(/\s+/g, ' ') + '”';
     }
+    // core-api nie oddaje CSV wprost, tylko JSON z plikiem w srodku:
+    //   {"metadata":{"now":…,"errorMessage":null,…},"…":"<tresc CSV>"}
+    // Nazwy pola z trescia NIE zakladamy — przechodzimy drzewo i bierzemy najdluzszy
+    // napis, bo to zawsze bedzie plik, a nie znacznik czasu czy identyfikator. Dzieki
+    // temu zmiana nazwy pola po stronie CHECK24 niczego nie zepsuje.
+    // Plik pobrany guzikiem w panelu jest zwyklym CSV i przechodzi tedy bez zmian.
+    function c24Rozpakuj(text){
+        const s = String(text == null ? '' : text);
+        const t = s.replace(/^﻿/, '').trim();
+        if (t.charAt(0) !== '{' && t.charAt(0) !== '[') return { txt: s };
+        let j;
+        try { j = JSON.parse(t); } catch (e){ return { txt: s }; }
+        const meta = (j && j.metadata) || {};
+        if (meta.errorMessage)
+            return { err: 'core-api odmówiło: ' + String(meta.errorMessage).slice(0, 160) };
+        if (Array.isArray(meta.validationErrors) && meta.validationErrors.length)
+            return { err: 'core-api zgłosiło błąd danych: '
+                        + meta.validationErrors.map(function (x){ return (x && (x.message || x.field)) || String(x); }).join('; ').slice(0, 160) };
+        let naj = '';
+        (function chodz(o, d){
+            if (d > 8 || o == null) return;
+            if (typeof o === 'string'){ if (o.length > naj.length) naj = o; return; }
+            if (typeof o !== 'object') return;
+            Object.keys(o).forEach(function (k){ chodz(o[k], d + 1); });
+        })(j, 0);
+        if (!naj) return { err: 'core-api oddało JSON bez treści pliku' };
+        // Bywa, ze plik jest jeszcze zakodowany base64 — poznajemy po zestawie znakow
+        // i po tym, ze po odkodowaniu wyglada na CSV.
+        if (naj.length > 200 && /^[A-Za-z0-9+/\s]+={0,2}$/.test(naj)){
+            try {
+                const bin = atob(naj.replace(/\s/g, ''));
+                const u8 = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+                const dec = new TextDecoder('utf-8').decode(u8);
+                if (/Bestell|Wareneinkauf|;/.test(dec)) return { txt: dec };
+            } catch (e){}
+        }
+        return { txt: naj };
+    }
     function mkParseCheck24(text, nazwaPliku){
+        const rozp = c24Rozpakuj(text);
+        if (rozp.err) return { err: rozp.err };
+        text = rozp.txt;
         const rows = c24Rows(text).filter(function (r){ return r && r.join('').trim(); });
         if (!rows.length) return { err: 'pusty plik' };
         const naglowek = rows[0].map(function (c){ return String(c || '').toLowerCase(); }).join('|');
