@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.51
+// @version      3.52
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -28,6 +28,9 @@
 // @connect      galaxus.ch
 // @connect      wayfair.com
 // @connect      ebay.de
+// @connect      check24.de
+// @connect      mc.moebel.check24.de
+// @connect      core-api.moebel.check24.de
 // @connect      www.ebay.de
 // @connect      storage.googleapis.com
 // @connect      googleapis.com
@@ -18683,7 +18686,11 @@
         { mp: 'Worldline',      ok: false, payer: /WORLDLINE/i },
         { mp: 'Amex',           ok: false, payer: /AMERICAN EXPRESS/i },
         { mp: 'Wayfair',        ok: false, payer: /WAYFAIR/i },
-        { mp: 'Check24',        ok: false, payer: /CHECK24/i },
+        // CHECK24 placi jako „CHECK24 VERGLEICHSPORTAL MOBEL GMBH", a w tytule podaje
+        // numer gutschrifty BEZ myslnika („GUTSCHRIFT MCRMYH9CVF9B"), podczas gdy portal
+        // i PDF pisza go z myslnikiem. Porownanie idzie przez c24Key, wiec to nie przeszkadza.
+        { mp: 'Check24',        ok: true,  payer: /CHECK24/i, ref: /GUTSCHRIFT\s*(MCRM[-_ ]?[A-Z0-9]{6,})/i,
+          brand: 'CHECK24', short: 'Check24', host: 'mc.moebel.check24.de', kind: 'c24', shop: 'Check24 DE' },
         { mp: 'Worten',         ok: false, payer: /WORTEN/i },
         { mp: 'JD / Joybuy',    ok: false, payer: /JINGDONG/i },
         { mp: 'Cdiscount',      ok: false, payer: /CNOVA/i },
@@ -19679,6 +19686,157 @@
         return '\ufeff' + linie.join('\r\n') + '\r\n';
     }
 
+    // ================= CHECK24 =================
+    // Zrodla sa DWA i oba sa potrzebne:
+    //   „Details" (CSV)   — pozycje: zakupy, zwroty, korekty. Z niego robimy plik importu
+    //                       i liste zwrotow. Konczy sie na „Gesamt Brutto".
+    //   „Abrechnung" (PDF) — ten sam Gesamt Brutto PLUS ruch kaucji na zwroty
+    //                       („Einbehalt fuer Retouren"), ktorego w CSV NIE MA.
+    // Dlatego kwoty wyplaty nie da sie policzyc z samego CSV — sprawdzone na MCRM-YH9CVF9B:
+    //   Gesamt Brutto 26 173,70 + zwolniona kaucja 7 559,61 − nowa kaucja 6 171,19
+    //   = Auszahlungsbetrag 27 562,12, i dokladnie tyle weszlo na UBS.
+    const MK_C24_HOST = 'mc.moebel.check24.de';
+    const MK_C24_SHOP = 'Check24 DE';
+    // Kolumny (0-idx) — te same, ktorych uzywa juz modul „Ksiegowanie w tickecie".
+    const C24_FF = 3, C24_H = 7, C24_J = 9, C24_L = 11, C24_N = 13, C24_TXT = 15;
+    const C24_FF_RE = /^F[A-Z0-9]{4,}$/i;
+
+    function c24Num(v){
+        const s = String(v == null ? '' : v).trim();
+        if (!s) return 0;
+        // format niemiecki: kropka to tysiace, przecinek dziesietny
+        const t = s.replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+        const n = Number(t);
+        return isFinite(n) ? n : 0;
+    }
+    // Numer gutschrifty bywa zapisany z myslnikiem (portal, PDF: „MCRM-YH9CVF9B") albo
+    // bez niego (tytul przelewu: „GUTSCHRIFT MCRMYH9CVF9B"). Porownujemy po ksztalcie
+    // odartym ze znakow rozdzielajacych — inaczej te same dane nie trafialyby na siebie.
+    function c24Key(v){ return String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+
+    function mkParseCheck24(text, nazwaPliku){
+        const rows = mkCsvRows(text).filter(function (r){ return r && r.join('').trim(); });
+        if (!rows.length) return { err: 'pusty plik' };
+        const naglowek = rows[0].map(function (c){ return String(c || '').toLowerCase(); }).join('|');
+        const poNazwie = naglowek.indexOf('bestell-nr. (check24)') >= 0
+                      || (naglowek.indexOf('wareneinkauf') >= 0 && naglowek.indexOf('korrekturbuchungen') >= 0);
+        const poDanych = rows.some(function (r){
+            return r.length >= 14 && C24_FF_RE.test(String(r[C24_FF] || '').trim());
+        });
+        if (!poNazwie && !poDanych)
+            return { err: 'to nie wygląda na „Details" z CHECK24 — brak kolumny „Bestell-Nr. (CHECK24)"' };
+
+        const ord = {}, ref = {}, refNote = {}, ids = {};
+        // Wiersze do pliku importu. Plik idzie do prologistics BEZ ZMIAN — poza wierszami
+        // w calosci zerowymi, ktorych nie ma po co ksiegowac.
+        const doImportu = [];
+        let brutto = 0, zakup = 0, zwrot = 0, nZak = 0, nZwr = 0, nZero = 0;
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i];
+            const ff = String(r[C24_FF] || '').trim();
+            if (!C24_FF_RE.test(ff)) continue;
+            const H = c24Num(r[C24_H]), J = c24Num(r[C24_J]), L = c24Num(r[C24_L]), N = c24Num(r[C24_N]);
+            brutto = r2(brutto + H + J + L + N);
+            ids[ff] = 1;
+            // Wiersz calkowicie zerowy nie niesie zadnej kwoty — pomijamy go w imporcie.
+            if (!H && !J && !L && !N){ nZero++; continue; }
+            doImportu.push(r);
+            // Zwroty — regula wprost z modulu „Ksiegowanie w tickecie", zeby obie drogi
+            // liczyly to samo. Calosciowy: H<0 (J na tym wierszu celowo pomijamy).
+            // Czesciowy: H=0 i N<0.
+            let z = 0;
+            if (H < -0.005) z = Math.abs(H);
+            else if (Math.abs(H) < 0.005 && N < -0.005) z = Math.abs(N);
+            if (z > 0){
+                ref[ff] = r2((ref[ff] || 0) + z);
+                zwrot = r2(zwrot + z);
+                nZwr++;
+                const opis = [String(r[C24_TXT] || '').trim() || (H < 0 ? 'zwrot całościowy' : 'zwrot częściowy'),
+                              String(r[17] || '').trim(), z.toFixed(2) + ' EUR']
+                             .filter(Boolean).join(' · ');
+                refNote[ff] = refNote[ff] ? (refNote[ff] + '\n\n' + opis) : opis;
+                continue;
+            }
+            if (H > 0.005){
+                ord[ff] = r2((ord[ff] || 0) + H);
+                zakup = r2(zakup + H);
+                nZak++;
+            }
+        }
+        if (!nZak && !nZwr) return { err: 'w pliku CHECK24 nie ma ani jednej pozycji z kwotą' };
+        // Numer gutschrifty jest tylko w NAZWIE pliku („…-MCRM-YH9CVF9B.csv") — w tresci
+        // go nie ma. Z PDF-u czytamy go z naglowka i porownujemy.
+        const m = String(nazwaPliku || '').toUpperCase().match(/(MCRM[-_]?[A-Z0-9]{6,})/);
+        return {
+            nr: m ? m[1] : '', klucz: m ? c24Key(m[1]) : '',
+            shop: MK_C24_SHOP, cur: 'EUR',
+            ord: ord, ref: ref, refNote: refNote, ids: ids,
+            brutto: brutto, zakup: zakup, refund: zwrot,
+            nZak: nZak, nZwr: nZwr, nZero: nZero,
+            wiersze: doImportu, naglowekWiersz: rows[0],
+            n: Object.keys(ord).length + Object.keys(ref).length
+        };
+    }
+
+    // Plik do importu: nagłowek + wiersze bez calkowicie zerowych, uklad zrodlowy.
+    function mkCsvCheck24(p){
+        const pole = function (v){
+            const t = String(v == null ? '' : v);
+            return (t.indexOf(';') >= 0 || t.indexOf('"') >= 0 || t.indexOf('\n') >= 0)
+                 ? ('"' + t.split('"').join('""') + '"') : t;
+        };
+        const linie = [(p.naglowekWiersz || []).map(pole).join(';')];
+        (p.wiersze || []).forEach(function (r){ linie.push(r.map(pole).join(';')); });
+        return '﻿' + linie.join('\r\n') + '\r\n';
+    }
+
+    // ---------- Abrechnung (PDF) ----------
+    // Z PDF-u potrzebujemy trzech liczb i numeru gutschrifty. Tekst czytamy pdf.js-em,
+    // ktory modul i tak juz ma (@require) i ktorym czyta potwierdzenia z e-finance.
+    async function c24PdfTekst(u8){
+        const lib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
+        if (!lib) throw new Error('pdf.js się nie załadował — odśwież stronę');
+        const doc = await lib.getDocument({ data: u8 }).promise;
+        const out = [];
+        for (let s = 1; s <= doc.numPages; s++){
+            const tc = await (await doc.getPage(s)).getTextContent();
+            const wiersze = {};
+            tc.items.forEach(function (it){
+                const y = Math.round(it.transform[5]);
+                (wiersze[y] = wiersze[y] || []).push([it.transform[4], it.str]);
+            });
+            Object.keys(wiersze).map(Number).sort(function (a, b){ return b - a; }).forEach(function (y){
+                out.push(wiersze[y].sort(function (a, b){ return a[0] - b[0]; })
+                    .map(function (x){ return x[1]; }).join(' ').replace(/\s+/g, ' ').trim());
+            });
+        }
+        return out.join('\n');
+    }
+    // W PDF-ie liczby bywaja rozbite spacja („27 .562,12", „-1.337 ,05") — pdf.js oddaje
+    // je tak, jak sa rozstawione na stronie. Dlatego przed odczytem sklejamy spacje
+    // przylegajace do kropki i przecinka.
+    function c24PdfNum(s){
+        const t = String(s == null ? '' : s).replace(/\s*([.,])\s*/g, '$1');
+        return c24Num(t);
+    }
+    function mkParseC24Pdf(tekst){
+        const t = String(tekst || '');
+        if (!/Gutschrift|Auszahlungsbetrag/i.test(t))
+            return { err: 'to nie wygląda na „Abrechnung" z CHECK24 — nie ma pozycji „Auszahlungsbetrag"' };
+        const zlap = function (re){ const m = t.match(re); return m ? c24PdfNum(m[1]) : null; };
+        const nr = (t.match(/Gutschrift\s*Nr\.?\s*:?\s*(MCRM[-_ ]?[A-Z0-9]{6,})/i) || [])[1] || '';
+        return {
+            nr: nr.replace(/\s/g, ''), klucz: c24Key(nr),
+            brutto:  zlap(/Gesamt\s*Brutto\s+(-?[\d .,]+)/i),
+            netto:   zlap(/Gesamt\s*Netto\s+(-?[\d .,]+)/i),
+            zwolniona: zlap(/Auszahlung\s+Einbehalt\s+aus\s+letzter\s+Gutschrift\s+(-?[\d .,]+)/i),
+            nowa:      zlap(/Neuer\s+Einbehalt\s+f[^\s]*r\s+Retouren\s+(-?[\d .,]+)/i),
+            wyplata:   zlap(/Auszahlungsbetrag\s+(-?[\d .,]+)/i),
+            okres: (t.match(/Leistungszeitraum\s+vom\s+([\d. ]+?)\s+bis\s+([\d. ]+?)\./i) || [])
+                       .slice(1, 3).map(function (x){ return String(x || '').replace(/\s/g, ''); }).join(' – ')
+        };
+    }
+
     // ---------- reczne dodanie wplaty (bez wyciagu z banku) ----------
     // Nie kazdy ma dostep do wyciagu, a wplata i tak przyszla. Ta droga tworzy takie samo
     // zlecenie, jakie zrobilby plik bankowy — tyle ze kwote i date podaje czlowiek.
@@ -20207,6 +20365,7 @@
         if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf).text;
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
         if (j.kind === 'ebay' && j.data && j.data.ebay) return mkCsvEbay(j.data.ebay);
+        if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         return mkCsvText(pairsOf(j));
     }
 
@@ -21026,7 +21185,7 @@
               // ani nie po tym, w ktory guzik ktos trafil — kazdy parser ma wlasny warunek
               // wejscia (naglowek, komplet kolumn), wiec pytamy ich po kolei.
               + '<label style="font-size:12px;font-weight:700;color:#fff;background:#7c3aed;border:none;border-radius:6px;padding:5px 12px;cursor:pointer">📎 Dodaj pliki'
-              + '<input type="file" id="mk-any" accept=".csv,text/csv" multiple style="display:none"></label>'
+              + '<input type="file" id="mk-any" accept=".csv,.pdf,text/csv,application/pdf" multiple style="display:none"></label>'
               + '<button id="mk-all" style="padding:5px 12px;border:1px solid #7c3aed;border-radius:6px;background:#fff;color:#7c3aed;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               // Dawne osobne wejscia zostaja w DOM, tylko ukryte. Ich obsluga jest
               // sprawdzona i dziala — nowe wejscie tylko podrzuca im wlasciwy plik,
@@ -22368,6 +22527,7 @@
             try { if (!mkParseEbay(txt).err) return 'ebay'; } catch (e){}
             try { if (!mkParseGalx(txt, 'Galaxus CH').err) return 'galx'; } catch (e){}
             try { if (!mkParseWayf(txt).err) return 'wayf'; } catch (e){}
+            try { if (!mkParseCheck24(txt, '').err) return 'c24'; } catch (e){}
             return '';
         }
         // Podanie pliku dawnemu, ukrytemu wejsciu. DataTransfer to jedyna droga, zeby
@@ -22390,12 +22550,17 @@
             try { this.value = ''; } catch (e){}
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
-            const kubelki = { bank: [], ebay: [], galx: [], wayf: [] }, nieznane = [];
+            const kubelki = { bank: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
-                try { typ = mkTypPliku(mkDecode(await readBuf(f))); }
-                catch (e){ typ = ''; }
+                try {
+                    const buf = await readBuf(f);
+                    const u8 = new Uint8Array(buf);
+                    // PDF poznajemy po naglowku pliku, nie po rozszerzeniu.
+                    if (u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46) typ = 'c24pdf';
+                    else typ = mkTypPliku(mkDecode(buf));
+                } catch (e){ typ = ''; }
                 if (typ) kubelki[typ].push(f); else nieznane.push(f);
             }
             // Wyciagi ida razem — ich obsluga sama zlicza i podsumowuje kilka plikow naraz.
@@ -22404,9 +22569,15 @@
             ['ebay', 'galx', 'wayf'].forEach(function (t){
                 kubelki[t].forEach(function (f){ mkPodrzuc('#mk-' + t, [f]); });
             });
-            const rozpoznane = ['bank', 'ebay', 'galx', 'wayf']
+            // CHECK24: najpierw „Details" (buduje zlecenie), potem „Abrechnung" (dokłada
+            // kwote wyplaty). Kolejnosc w jednym rzucie ma znaczenie, przy osobnym
+            // wrzucaniu nie — obie drogi dopisuja sie do tego samego zlecenia po numerze.
+            for (let i = 0; i < kubelki.c24.length; i++) await c24Wczytaj(kubelki.c24[i], false);
+            for (let i = 0; i < kubelki.c24pdf.length; i++) await c24Wczytaj(kubelki.c24pdf[i], true);
+            const rozpoznane = ['bank', 'ebay', 'galx', 'wayf', 'c24', 'c24pdf']
                 .filter(function (t){ return kubelki[t].length; })
-                .map(function (t){ return kubelki[t].length + '× ' + ({ bank: 'wyciąg', ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair' })[t]; });
+                .map(function (t){ return kubelki[t].length + '× ' + ({ bank: 'wyciąg', ebay: 'raport eBay', galx: 'raport Galaxus',
+                    wayf: 'raport Wayfair', c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung' })[t]; });
             // Plik, ktorego nie przypisalismy, NIE moze skonczyc w prozni. Oddajemy go
             // obsludze wyciagu: to najczestszy przypadek, a jej komunikat bledu jest
             // najbardziej konkretny („nie rozpoznaje naglowka — obsluguje UBS…").
@@ -22467,6 +22638,88 @@
                 + (w.kind === 'ebay' ? ' — kliknij „⬇ Pobierz zestawienia", żeby moduł rozpoznał, która to wypłata.'
                                      : ' — teraz wgraj raport z portalu.'), '#0a7a2f');
         };
+
+        // CHECK24 potrzebuje DWOCH plikow i kazdy wnosi co innego: „Details" (CSV) daje
+        // pozycje i Gesamt Brutto, „Abrechnung" (PDF) daje kwote wyplaty, ktorej w CSV
+        // nie ma, bo zawiera ruch kaucji na zwroty. Zlecenie laczy je po numerze
+        // gutschrifty — tym samym, ktory stoi w tytule przelewu.
+        async function c24Wczytaj(f, jestPdf){
+            let buf;
+            try { buf = await readBuf(f); }
+            catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); return; }
+            let p, klucz;
+            if (jestPdf){
+                try { p = mkParseC24Pdf(await c24PdfTekst(new Uint8Array(buf))); }
+                catch (e){ say('PDF ' + f.name + ': ' + ((e && e.message) || e), '#c00'); return; }
+                if (p.err){ say(p.err, '#c47f00'); return; }
+                if (p.wyplata == null){ say('W PDF-ie nie znalazłem pozycji „Auszahlungsbetrag".', '#c00'); return; }
+                klucz = p.klucz;
+            } else {
+                p = mkParseCheck24(mkDecode(buf), f.name);
+                if (p.err){ say(p.err, '#c47f00'); return; }
+                klucz = p.klucz;
+            }
+            if (!klucz){
+                say('Nie odczytałem numeru gutschrifty z ' + f.name
+                    + (jestPdf ? '.' : ' — nazwa pliku powinna zawierać „MCRM-…".'), '#c47f00');
+                return;
+            }
+            const jobs = jobsLoad();
+            // Zlecenie z wyciagu ma ten sam numer po odarciu ze znakow — szukamy po nim,
+            // zeby obie drogi trafily w jedno zlecenie zamiast tworzyc dwa.
+            let k = Object.keys(jobs).filter(function (x){
+                return jobs[x].kind === 'c24' && c24Key(jobs[x].ref) === klucz;
+            })[0];
+            if (!k){
+                k = klucz;
+                jobs[k] = { ref: (p.nr || klucz), date: '', amount: null, cur: 'EUR',
+                            mp: 'Check24', brand: 'CHECK24', short: 'Check24', host: MK_C24_HOST,
+                            kind: 'c24', shop: MK_C24_SHOP, docs: null, payer: '', txId: '',
+                            status: 'new', msg: '' };
+            }
+            const j = jobs[k];
+            if (j.status === 'done'){ say('Ta gutschrift jest już zaksięgowana.', '#c47f00'); return; }
+            j.c24 = j.c24 || {};
+            if (jestPdf) j.c24.pdf = p; else j.c24.csv = p;
+            const csv = j.c24.csv, pdf = j.c24.pdf;
+
+            if (csv){
+                const both = Object.keys(csv.ord).filter(function (x){ return csv.ref[x] != null; });
+                j.data = { c24: csv, shop: MK_C24_SHOP, gross: csv.zakup, refund: csv.refund,
+                           net: csv.brutto, ord: csv.ord, ref: csv.ref, refNote: csv.refNote,
+                           unknown: {}, skipped: {}, full: true, both: both, pays: 1, split: false,
+                           rows: csv.nZak + csv.nZwr, total: csv.nZak + csv.nZwr, pages: 1,
+                           how: 'plik ' + f.name };
+            }
+            // Kwota zlecenia to Auszahlungsbetrag z PDF-u — jedyna liczba, ktora faktycznie
+            // wchodzi na konto. Z CSV jej policzyc nie mozna.
+            if (pdf){
+                j.amount = pdf.wyplata;
+                if (j.data) j.data.netOk = (csv && pdf.brutto != null) ? eq(csv.brutto, pdf.brutto) : true;
+            }
+            const brak = [];
+            if (!csv) brak.push('„Details" (CSV) — bez niego nie ma pozycji do importu');
+            if (!pdf) brak.push('„Abrechnung" (PDF) — bez niego nie znam kwoty wypłaty');
+            j.status = (csv && pdf && j.data && j.data.netOk !== false) ? 'ready' : 'partial';
+            j.msg = brak.length ? ('brakuje: ' + brak.join(' · '))
+                  : ((j.data && j.data.netOk === false)
+                        ? ('rozjazd: CSV liczy brutto ' + f2(csv.brutto) + ', a PDF podaje ' + f2(pdf.brutto))
+                        : '');
+            if (csv && pdf){
+                j.note = 'Gesamt Brutto ' + f2(pdf.brutto)
+                       + ' · kaucja na zwroty: zwolniona ' + f2(pdf.zwolniona) + ', nowa ' + f2(pdf.nowa)
+                       + ' → wypłata ' + f2(pdf.wyplata) + ' EUR'
+                       + (pdf.okres ? (' · okres ' + pdf.okres) : '')
+                       + (csv.nZero ? (' · pominięto ' + csv.nZero + ' wierszy zerowych') : '');
+            }
+            jobsSave(jobs); render();
+            say('CHECK24 ' + (p.nr || klucz) + ' — wczytany ' + (jestPdf ? 'PDF' : 'CSV')
+                + (csv ? (' · zakupów ' + Object.keys(csv.ord).length + ' na ' + f2(csv.zakup)
+                          + ' · zwrotów ' + Object.keys(csv.ref).length + ' na ' + f2(csv.refund)) : '')
+                + (pdf ? (' · wypłata ' + f2(pdf.wyplata) + ' EUR') : '')
+                + (brak.length ? ('. Brakuje jeszcze: ' + brak.join('; ')) : '.'),
+                brak.length ? '#c47f00' : '#0a7a2f');
+        }
 
         // Raport transakcji eBaya. Inaczej niz przy Galaxusie i Wayfairze plik jest
         // SAMOWYSTARCZALNY: w bloku nad naglowkiem stoi sprzedawca i kwota wyplaty, a te
