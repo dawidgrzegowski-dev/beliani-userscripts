@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.71
+// @version      3.74
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20039,6 +20039,27 @@
         es: { acc: '1335', vat: { 'B2C': '3257', 'B2B': '3283', 'B2B 0%': '3268' } },
         it: { acc: '1337', vat: { 'B2C': '3258', 'B2B': '3283', 'B2B 0%': '3269' } }
     };
+    // ===== v3.73: pozycje „do wyjaśnienia" =====
+    // Czesc wierszy raportu nie ma jak trafic na auftrag: albo w ogole nie ma numeru
+    // zamowienia (Goodwill Concession, other-transaction), albo numer jest wewnetrznym
+    // identyfikatorem Amazona, a nie numerem zamowienia klienta (Liquidations, removal).
+    // U Was odklada sie je do arkusza, w ktorym marketing dopisuje wlasciwe zamowienie.
+    // Modul robi teraz te liste sam — sprawdzone na 12 raportach: z 43 pozycji Waszego
+    // arkusza znalazlem 38, a pozostale 5 to 4 sprzed zakresu tych plikow i 1 z Amazon.it.
+    //
+    // ŚWIADOMIE POMIJANE (decyzja z 12.08.2026): ruch rezerwy, etykiety zwrotne i oplaty
+    // FBA. To czyste koszty potracone w wyplacie, bez czego kolwiek do dopasowania.
+    const MK_AMZ_POMIN = /^(?:Current Reserve Amount|Previous Reserve Amount Balance|Shipping label purchase for return|FBA Inventory Storage Fee|FBA Removal Order:|ServiceFee)/i;
+    // Typy, o ktorych wiemy, ze maja isc na liste. Reszta nieznanych typow tez tam trafia
+    // (patrz nizej) — nowy typ Amazona ma sie POKAZAC, a nie zniknac po cichu.
+    const MK_AMZ_WYJ = /^(?:Liquidations|Liquidations Adjustments|Goodwill Concession|other-transaction|REMOVAL_ORDER_LOST)$/i;
+    // Typy, ktore modul KSIEGUJE (nie ida na liste do wyjasnienia).
+    const MK_AMZ_OBSL = /^(?:Order|Refund|Chargeback Refund|SAFE-T Reimbursement|REVERSAL_REIMBURSEMENT)$/i;
+    // ===== Regula znaku (decyzja z 12.08.2026) =====
+    // Kwota w raporcie UJEMNA  -> to zwrot, ksiegujemy normalnie w tickecie.
+    // Kwota DODATNIA           -> Amazon oddaje pieniadze, ksiegujemy ZE ZNAKIEM MINUS.
+    // W obu przypadkach zostawiamy komentarz. Dotyczy SAFE-T, REVERSAL_REIMBURSEMENT
+    // i Chargeback Refund; zwykly Refund jest zawsze ujemny, wiec wpada w pierwszy wariant.
     function amzNum(v){
         const s = String(v == null ? '' : v).trim();
         if (!s || /^nan$/i.test(s)) return 0;
@@ -20100,8 +20121,8 @@
         let setId = '', payDate = '', total = null, cur = '';
         const ord = {}, ref = {}, refNote = {}, refSign = {}, ids = {};
         const ptOrd = {}, ptRef = {}, ctryO = {}, ctryR = {};
-        const gw = [], safeT = [], mktCnt = {};
-        let gross = 0, refund = 0, nOrd = 0, nRef = 0, sumAll = 0, gwKolizja = 0;
+        const gw = [], rekomp = {}, chgOrd = {}, mktCnt = {}, doWyj = [], nieznane = {};
+        let gross = 0, refund = 0, nOrd = 0, nRef = 0, sumAll = 0, gwKolizja = 0, rekompN = 0;
 
         for (let i = 1; i < linie.length; i++){
             const L = linie[i];
@@ -20122,10 +20143,31 @@
             const on = String(r[C.ord] == null ? '' : r[C.ord]).trim();
             const kraj = String(r[C.mkt] == null ? '' : r[C.mkt]).trim().toLowerCase();
             if (kraj && kraj !== 'nan') mktCnt[kraj] = (mktCnt[kraj] || 0) + 1;
+            // v3.73: lista „do wyjasnienia" — PRZED odsianiem wierszy bez numeru zamowienia,
+            // bo wlasnie te sa najciekawsze (Goodwill Concession i other-transaction nie maja
+            // numeru wcale). Bierzemy wszystko, co nie jest zamowieniem, zwrotem, SAFE-T ani
+            // pozycja z listy swiadomie pomijanych.
+            if (tt && !MK_AMZ_POMIN.test(tt) && !MK_AMZ_OBSL.test(tt)){
+                // Kwota: przy Liquidations stoi w price-amount (wiersz „Principal"), przy
+                // reszcie w other-amount. Drugi wiersz likwidacji — sama oplata brokerska
+                // w item-related-fee-amount — wychodzi zerem i wypada, i tak ma byc:
+                // w arkuszu kazda likwidacja to JEDNA linia, z kwota Principal.
+                const kwW = amzNum(r[C.py]) || amzNum(r[C.oth]);
+                if (kwW){
+                    doWyj.push({ id: on, typ: tt, kwota: r2(kwW), kraj: kraj,
+                                 data: String(r[C.post] == null ? '' : r[C.post]).slice(0, 10),
+                                 znany: MK_AMZ_WYJ.test(tt) });
+                    if (!MK_AMZ_WYJ.test(tt)) nieznane[tt] = (nieznane[tt] || 0) + 1;
+                }
+            }
             if (!on) continue;
             const pt = String(r[C.pt] == null ? '' : r[C.pt]).trim().toUpperCase();
             const y = amzNum(r[C.py]), ag = amzNum(r[C.ag]);
-            const isOrd = (ttU === 'ORDER'), isRef = (ttU === 'REFUND');
+            // Chargeback Refund liczymy DOKLADNIE jak zwykly zwrot — ta sama lista
+            // dozwolonych typow pozycji, ta sama agregacja po numerze. W raporcie wychodzi
+            // ujemny (obciazenie zwrotne), wiec regula znaku zostawia go bez zmian.
+            const isOrd = (ttU === 'ORDER'), isRef = (ttU === 'REFUND' || ttU === 'CHARGEBACK REFUND');
+            if (ttU === 'CHARGEBACK REFUND') chgOrd[on] = 1;
             let v = 0;
             if (isOrd || isRef){
                 // Lista dozwolonych typow 1:1 z dzisiejsza aplikacja. UWAGA na zerowanie:
@@ -20152,17 +20194,17 @@
                     if (pt && pt !== 'NAN') ptRef[on][pt] = 1;
                     if (kraj && kraj !== 'nan') ctryR[on] = kraj;
                 }
-            } else if (ttU === 'SAFE-T REIMBURSEMENT'){
-                // Kwota SAFE-T NIE stoi w price-amount (te sa puste we wszystkich osmiu
-                // wierszach tego pliku) tylko w other-amount. Dzisiejsza aplikacja liczy
-                // wylacznie price-amount + promotion-amount, wiec dla SAFE-T wychodzilo jej
-                // 0.00 i pozycje przepadaly. Tu bierzemy other-amount.
+            } else if (ttU === 'SAFE-T REIMBURSEMENT' || ttU === 'REVERSAL_REIMBURSEMENT'){
+                // Kwota tych pozycji NIE stoi w price-amount (te sa puste) tylko
+                // w other-amount. Dzisiejsza aplikacja liczy wylacznie price-amount +
+                // promotion-amount, wiec wychodzilo jej 0.00 i pozycje przepadaly.
                 const sv = amzNum(r[C.oth]);
                 if (sv){
-                    safeT.push({ order: on, amt: sv, ctry: kraj,
-                                 sku: String(r[C.sku] == null ? '' : r[C.sku]).trim(),
-                                 adj: String(r[C.adj] == null ? '' : r[C.adj]).trim(),
-                                 date: String(r[C.post] == null ? '' : r[C.post]).slice(0, 10) });
+                    const e = rekomp[on] || (rekomp[on] = { suma: 0, typy: {}, data: '' });
+                    e.suma = r2(e.suma + sv);
+                    e.typy[tt] = 1;
+                    if (!e.data) e.data = String(r[C.post] == null ? '' : r[C.post]).slice(0, 10);
+                    rekompN++;
                     ids[on] = 1;
                 }
             }
@@ -20186,35 +20228,45 @@
         let dom = '', domN = 0;
         Object.keys(mktCnt).forEach(function (k){ if (mktCnt[k] > domN){ domN = mktCnt[k]; dom = k; } });
         const shop = MK_AMZ_SHOP[dom] || (amzKraj(dom) ? ('Amazon ' + amzKraj(dom).toUpperCase()) : 'Amazon');
+        // Wiersze Goodwill Concession i other-transaction nie maja pola marketplace-name —
+        // w calym wierszu wypelnione sa tylko cztery pola. Kraj bierzemy wtedy z rozliczenia,
+        // bo caly raport dotyczy jednego kraju; w arkuszu i tak stoi tam „de".
+        doWyj.forEach(function (x){ if (!x.kraj) x.kraj = dom; });
 
         // ---- lista zwrotow (idzie do ticketa, nie do importu) ----
         // Zwroty: w pliku ujemne -> na liste ida jako zwykly zwrot (wartosc bezwzgledna).
         // SAFE-T: w pliku dodatnie -> ksiegujemy ZE ZNAKIEM MINUS (refSign), bo to nie zwrot
         // do klienta, tylko zwrot kosztu OD Amazona.
         const opisWspolny = 'rozliczenie ' + setId + ' · wypłata ' + (payDate || '—') + ' · ' + shop;
-        Object.keys(ref).forEach(function (id){
-            const a = ref[id];
-            if (!a) { delete ref[id]; return; }
-            const typ = amzTyp(ptRef[id] || {}), kk = amzKonta(ctryR[id] || dom, typ);
-            refNote[id] = 'Refund — ' + opisWspolny + '\n'
-                + 'Zamówienie ' + id + ' · ' + f2(Math.abs(a)) + ' ' + (cur || '')
-                + (typ ? (' · ' + typ) : '')
-                + (kk.acc ? (' · konto ' + kk.acc + (kk.vat ? (' / VAT ' + kk.vat) : '')) : '')
-                + '\nPozycje: ' + (Object.keys(ptRef[id] || {}).sort().join(', ') || '—');
+        // v3.72: ZWYKLY ZWROT NIE DOSTAJE KOMENTARZA. Ticket zwrotu i tak mowi, czego
+        // dotyczy, a dopisek powtarzajacy numer zamowienia i kwote niczego nie wnosil —
+        // kosztowal za to jedno wejscie na ticket na kazda pozycje. Komentarz zostaje
+        // tam, gdzie naprawde tlumaczy nieoczywista pozycje: SAFE-T i Goodwill.
+        Object.keys(ref).forEach(function (id){ if (!ref[id]) delete ref[id]; });
+        // Chargeback Refund — zaksiegowany jak zwykly zwrot, ale Z KOMENTARZEM: to nie jest
+        // zwyczajna reklamacja i ksiegowosc ma prawo zapytac, skad sie wziela.
+        Object.keys(chgOrd).forEach(function (id){
+            if (ref[id] == null) return;
+            refNote[id] = (refNote[id] ? refNote[id] + '\n\n' : '')
+                + 'Chargeback Refund — ' + opisWspolny + '\n'
+                + 'Zamówienie ' + id + ' · ' + f2(Math.abs(ref[id])) + ' ' + (cur || '');
         });
-        safeT.forEach(function (x){
-            // Suma po numerze — jedno zamowienie potrafi miec kilka wierszy SAFE-T.
-            ref[x.order] = r2((ref[x.order] || 0) + x.amt);
-            refSign[x.order] = -1;
-            const bylo = refNote[x.order] ? (refNote[x.order] + '\n\n') : '';
-            refNote[x.order] = bylo + 'SAFE-T Reimbursement — ' + opisWspolny + '\n'
-                + 'Zamówienie ' + x.order + ' · +' + f2(x.amt) + ' ' + (cur || '') + ' (other-amount)'
-                + (x.date ? (' · ' + x.date) : '')
-                + '\nAmazon oddaje koszt — księgowane ze znakiem minus.'
-                + (x.sku ? ('\nSKU ' + x.sku) : '')
-                + (x.adj ? ('\nadjustment-id ' + x.adj) : '');
+        // SAFE-T i REVERSAL_REIMBURSEMENT — sumowane po numerze, bo jedno zamowienie
+        // potrafi miec kilka takich wierszy (sprawdzone: 377102020614 ma 5 wierszy
+        // SAFE-T na 4 numerach). Znak wg reguly wyzej.
+        let rekompSum = 0;
+        Object.keys(rekomp).forEach(function (id){
+            const e = rekomp[id];
+            if (!e.suma) return;
+            rekompSum = r2(rekompSum + e.suma);
+            ref[id] = r2((ref[id] || 0) + e.suma);
+            if (e.suma > 0) refSign[id] = -1;          // dodatnia w raporcie -> ksieguj z minusem
+            const nazwy = Object.keys(e.typy).sort().join(' + ');
+            refNote[id] = (refNote[id] ? refNote[id] + '\n\n' : '')
+                + nazwy + ' — ' + opisWspolny + '\n'
+                + 'Zamówienie ' + id + ' · ' + (e.suma > 0 ? '+' : '') + f2(e.suma) + ' ' + (cur || '')
+                + (e.data ? (' · ' + e.data) : '');
         });
-        const safeTSum = safeT.reduce(function (a, x){ return r2(a + x.amt); }, 0);
 
         // ---- wiersze do pliku importu: DOKLADNIE arkusz „Order" dzisiejszej aplikacji ----
         // 35 kolumn; 6 = „Order", 7 = numer, 23 = „Goodwill", 24 = kwota, 25 = Type,
@@ -20257,8 +20309,12 @@
             net: total, sumAll: r2(sumAll), netOk: netOk,
             ord: ord, ref: ref, refNote: refNote, refSign: refSign, ids: ids,
             gross: gross, refund: refund, nOrd: nOrd, nRef: nRef,
-            safeT: safeT.length, safeTSum: safeTSum,
+            rekomp: rekompN, rekompSum: rekompSum, rekompN: Object.keys(rekomp).length,
+            chargeback: Object.keys(chgOrd).length,
+            tylkoDE: (amzKraj(dom) === 'de'),
             goodwill: gw.length, gwKolizja: gwKolizja,
+            doWyj: doWyj, nieznane: nieznane,
+            doWyjSum: doWyj.reduce(function (a, x){ return r2(a + x.kwota); }, 0),
             wOrd: wOrd,
             n: Object.keys(ord).length + Object.keys(ref).length
         };
@@ -22269,6 +22325,9 @@
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span> ' : '')
                   +  (Object.keys(j.data.ref || {}).length ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
+                  +  ((j.data.amz && j.data.amz.doWyj && j.data.amz.doWyj.length)
+                        ? '<button class="mk-cpw" data-ref="' + esc(j.ref) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + j.data.amz.doWyj.length + ')</button> '
+                        : '')
                   +  '<button class="mk-csv" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz „do prolo" CSV</button>'
                   +  '</td></tr>';
             }
@@ -22288,6 +22347,7 @@
             jobsSave(jobs); render();
         }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-inv').forEach(function (b){ b.onclick = function(){
             const ref = b.getAttribute('data-ref');
             const span = out.querySelector('.mk-invout[data-ref="' + ref + '"]');
@@ -23316,7 +23376,7 @@
         });
         if (!zOpisem.length){
             return { msg: 'opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
-                          + '(dziś dostarcza je tylko rozliczenie Wayfaira)', col: '#666' };
+                          + '(dostarcza je rozliczenie Wayfaira, a przy Amazonie SAFE-T i Goodwill)', col: '#666' };
         }
         // v3.66: powod pominiecia zapisujemy PRZY POZYCJI. Dotad zostawal wylacznie
         // w komunikacie na pasku, ktory znikal — i pozycja bez komentarza wygladala
@@ -23825,9 +23885,18 @@
                 // a jest normalnym ukladem tego marketplace'u.
                 j.note = 'suma zamówień ≠ wypłata i tak ma być: prowizje, FBA, ServiceFee, '
                        + 'etykiety zwrotne i ruch rezerwy są już potrącone w wypłacie'
-                       + (p.safeT ? (' · SAFE-T ' + p.safeT + ' poz. na ' + f2(p.safeTSum)
+                       + (p.rekomp ? (' · SAFE-T / REVERSAL ' + p.rekomp + ' poz. na ' + f2(p.rekompSum)
                             + ' — na listę zwrotów ze znakiem minus') : '')
-                       + (p.goodwill ? (' · Goodwill ' + p.goodwill + ' poz.') : '');
+                       + (p.chargeback ? (' · Chargeback Refund ' + p.chargeback + ' zam. — jak zwykły zwrot') : '')
+                       + (p.tylkoDE ? '' : ' · UWAGA: to nie jest Amazon DE — tabela kont dla tego kraju NIE była sprawdzona na żywych danych')
+                       + (p.goodwill ? (' · Goodwill ' + p.goodwill + ' poz.') : '')
+                       + (p.doWyj.length ? (' · do wyjaśnienia ' + p.doWyj.length + ' poz. na ' + f2(p.doWyjSum)
+                            + ' — guzik „Do wyjaśnienia"') : '')
+                       + (Object.keys(p.nieznane).length
+                            ? (' · UWAGA, typy nieznane modułowi: '
+                               + Object.keys(p.nieznane).map(function (k){ return k + ' ×' + p.nieznane[k]; }).join(', ')
+                               + ' — trafiły na listę do wyjaśnienia, sprawdź je')
+                            : '');
                 if (p.gwKolizja) j.note += ' · UWAGA: ' + p.gwKolizja + ' wierszy Goodwill zostało policzonych także w zamówieniu — sprawdź, czy kwota nie weszła dwa razy';
                 jobsSave(jobs); render();
                 say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
@@ -23836,7 +23905,7 @@
                     + ' · zamówień ' + Object.keys(p.ord).length + ' brutto ' + f2(p.gross)
                     + (Object.keys(p.ref).length ? (' · na listę zwrotów ' + Object.keys(p.ref).length
                         + ' poz. (zwroty ' + f2(Math.abs(p.refund))
-                        + (p.safeT ? (', SAFE-T ' + f2(p.safeTSum) + ' ze znakiem minus') : '') + ')') : '')
+                        + (p.rekomp ? (', SAFE-T/REVERSAL ' + f2(p.rekompSum) + ' ze znakiem minus') : '') + ')') : '')
                     + ' · kontrola pliku ✓', '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
@@ -25011,6 +25080,41 @@
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
         say('Zapisano ' + fileName(j));
+    }
+    // v3.74: lista „do wyjasnienia" do schowka, w UKLADZIE KOLUMN WASZEGO ARKUSZA:
+    //   A Order ID · B Purchase Date · C Payments Date · D Shipment Date · E Merchant SKU
+    //   F Title · G Dispatched Quantity · H Item Price · I Item Tax · J Old Order ID
+    //   K Ticket link · L Booked · M · N data wyplaty
+    // Wypelniamy tylko to, co raport naprawde podaje: A (identyfikator), F (typ),
+    // H (kwota), I (kraj) i N (data wyplaty, w formacie d.mm jak w arkuszu). Kolumny
+    // J–M zostaja puste, bo to one sa do wypelnienia przez marketing.
+    // „no number" w kolumnie A tam, gdzie raport nie podaje numeru (Goodwill Concession,
+    // other-transaction) — dokladnie tak, jak wpisuje sie to dzis recznie.
+    function amzDataPL(iso){
+        const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        return m ? (String(parseInt(m[3], 10)) + '.' + m[2]) : '';
+    }
+    function doCopyWyj(ref){
+        const j = jobsLoad()[ref];
+        const p = j && j.data && j.data.amz;
+        if (!p || !p.doWyj || !p.doWyj.length) return;
+        const t = p.doWyj.map(function (x){
+            const c = new Array(14).fill('');
+            c[0]  = x.id || 'no number';               // A Order ID
+            c[5]  = x.typ;                             // F Title
+            c[7]  = f2(x.kwota);                       // H Item Price
+            c[8]  = amzKraj(x.kraj) || '';             // I Item Tax (u Was: kod kraju)
+            c[13] = amzDataPL(p.payDate);              // N data wypłaty
+            return c.join('\t');
+        }).join('\n');
+        try {
+            if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text');
+            else navigator.clipboard.writeText(t);
+            say('Skopiowano ' + p.doWyj.length + ' pozycji do wyjaśnienia na ' + f2(p.doWyjSum)
+                + ' — wklej do arkusza w pierwszą wolną komórkę kolumny A. Wypełnione: '
+                + 'A (Order ID), F (Title), H (Item Price), I (kraj), N (data). '
+                + 'Kolumny J–M zostają puste dla marketingu.', '#0a7a2f');
+        } catch (e){ say('Nie udało się skopiować.', '#c00'); }
     }
     function doCopyRef(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
