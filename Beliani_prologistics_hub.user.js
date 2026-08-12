@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.83
+// @version      3.84
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18501,7 +18501,12 @@
         // (pomijajac wpisy inactive). Wejdz raz w ⚙ Konta i przyjmij podpowiedz.
         // Konto 1323 jest tu tylko informacyjne: przy Amazonie numery kont i kont VAT ida
         // DO PLIKU IMPORTU, per wiersz, zaleznie od kraju i typu (B2C/B2B/B2B 0%).
-        'Amazon · Amazon DE':          { bank: '',    booking: '9', acct: '1323' }
+        'Amazon · Amazon DE':          { bank: '',    booking: '9', acct: '1323' },
+        // v3.84: IT i FR mialy sie dotad dorabiac same przy pierwszym rozliczeniu, ale
+        // wtedy konto wchodzilo z podpowiedzi po nazwie. Tu jest wprost z tabeli kont.
+        'Amazon · Amazon IT':          { bank: '',    booking: '9', acct: '1337' },
+        'Amazon · Amazon FR':          { bank: '',    booking: '9', acct: '1285' },
+        'Amazon · Amazon NL':          { bank: '',    booking: '9', acct: '1452' }
     };
     function setLoad(){
         let d = null;
@@ -18723,7 +18728,9 @@
         const shop = (j.data && j.data.shop) || j.shop || '';
         const cc = String(shop).match(/\b([A-Z]{2})\s*$/);
         const s = j.brand || j.short || j.mp || '';
-        return cc ? (s + ' ' + cc[1]).trim() : (s || shop || '');
+        // Bez marki nie zostawiamy samego kodu kraju („FR"), tylko pelna nazwe sklepu —
+        // od v3.84 ta funkcja rysuje tez kolumne Marketplace na liscie zlecen.
+        return cc ? (s ? (s + ' ' + cc[1]) : shop) : (s || shop || '');
     }
     function shRow(j, c){
         const rf = (j.data && j.data.ref) || {};
@@ -20166,16 +20173,25 @@
         'item-related-fee-amount', 'misc-fee-amount', 'other-fee-amount', 'promotion-amount',
         'direct-payment-amount', 'other-amount'];
     const MK_AMZ_SHOP = { 'amazon.de': 'Amazon DE', 'amazon.co.uk': 'Amazon UK', 'amazon.uk': 'Amazon UK',
-        'amazon.fr': 'Amazon FR', 'amazon.es': 'Amazon ES', 'amazon.it': 'Amazon IT' };
+        'amazon.fr': 'Amazon FR', 'amazon.es': 'Amazon ES', 'amazon.it': 'Amazon IT',
+        'amazon.nl': 'Amazon NL' };
     // Konta 1:1 z dzisiejsza aplikacja (get_accounts). Numer konta i konta VAT ida
     // DO PLIKU IMPORTU, kolumna po kolumnie — prologistics czyta je z wiersza, a nie
     // z bank_settingu, i na tym polega roznica wobec pozostalych marketplace'ow.
     const MK_AMZ_ACC = {
         de: { acc: '1323', vat: { 'B2C': '3252', 'B2B': '3283', 'B2B 0%': '3264' } },
         uk: { acc: '1282', vat: { 'B2C': '3289', 'B2B': '3205' } },
+        // FR nie ma konta dla „B2B" i to jest stan swiadomy, a nie przeoczenie: w 7
+        // rozliczeniach FR (26.05–09.08.2026, 1898 zamowien) nie bylo ANI JEDNEGO B2B —
+        // same B2C (1706) i B2B 0% (192). Nie zgadujemy numeru konta. Gdyby FR B2B kiedys
+        // sie pojawilo, modul NIE wygeneruje pliku i powie, czego brakuje (amzBrakKont).
         fr: { acc: '1285', vat: { 'B2C': '3223', 'B2B 0%': '3230' } },
         es: { acc: '1335', vat: { 'B2C': '3257', 'B2B': '3283', 'B2B 0%': '3268' } },
-        it: { acc: '1337', vat: { 'B2C': '3258', 'B2B': '3283', 'B2B 0%': '3269' } }
+        it: { acc: '1337', vat: { 'B2C': '3258', 'B2B': '3283', 'B2B 0%': '3269' } },
+        // v3.85: Holandia. Wszystkie trzy numery podane wprost (12.08.2026). B2B tak samo
+        // jak przy FR nie wystepuje — w 6 rozliczeniach NL (28.05–06.08.2026, 80 zamowien)
+        // sa wylacznie B2C, wiec 3272 czeka na pierwsze zamowienie 0%.
+        nl: { acc: '1452', vat: { 'B2C': '3261', 'B2B 0%': '3272' } }
     };
     // ===== v3.73: pozycje „do wyjaśnienia" =====
     // Czesc wierszy raportu nie ma jak trafic na auftrag: albo w ogole nie ma numeru
@@ -20190,9 +20206,28 @@
     // „Subscription Fee" to miesieczny abonament Amazona — czysty koszt bez numeru
     // zamowienia, tak jak ServiceFee (decyzja z 12.08.2026).
     const MK_AMZ_POMIN = /^(?:Current Reserve Amount|Previous Reserve Amount Balance|Shipping label purchase for return|FBA Inventory Storage Fee|FBA Removal Order:|ServiceFee|Subscription Fee)/i;
+    // ===== v3.84: oplaty EPR (Amazon FR) =====
+    // Francuskie „Pay on Behalf": eko-kontrybucja za wprowadzenie towaru na rynek plus
+    // prowizja Amazona za jej odprowadzenie. Osobno dla kategorii (Construction, TEXTILE).
+    // Bez numeru zamowienia, czysty koszt potracony w wyplacie — ta sama klasa co ServiceFee,
+    // wiec NIE ida na liste do wyjasnienia (decyzja z 12.08.2026). Pokazujemy jednak sume
+    // w podsumowaniu zlecenia, zeby byla kontrola kwoty.
+    // UWAGA na dopasowanie po PREFIKSIE: pelna nazwa niesie okres rozliczeniowy
+    // „(Period 01.01.2025 - 31.12.2025)", ktory zmienia sie co rok.
+    const MK_AMZ_EPR = /^(?:Eco-contribution for EPR|Amazon service fee for EPR)/i;
+    // ===== v3.84: cofnieta wyplata =====
+    // Amazon anulowal wlasny przelew i pieniadze wrocily do salda — w nastepnym rozliczeniu
+    // widac je jako JEDNA dodatnia pozycja bez numeru zamowienia. Widziane na FR: rozliczenie
+    // z 04.08.2026 mialo wyplate 27 408.24, ktora 09.08 wrocila co do grosza. To nie jest
+    // przychod, tylko odkrecenie poprzedniej wyplaty, i zmienia sens TAMTEGO rozliczenia:
+    // tamte pieniadze nigdy nie doszly do banku. Stad osobne, glosne ostrzezenie.
+    const MK_AMZ_COFN = /^Transfer of funds unsuccessful/i;
     // Typy, o ktorych wiemy, ze maja isc na liste. Reszta nieznanych typow tez tam trafia
     // (patrz nizej) — nowy typ Amazona ma sie POKAZAC, a nie zniknac po cichu.
-    const MK_AMZ_WYJ = /^(?:Liquidations|Liquidations Adjustments|Goodwill Concession|other-transaction|REMOVAL_ORDER_LOST)$/i;
+    // Kotwica „$" zostaje przy starej liscie — nowy typ zaczynajacy sie tak samo ma nadal
+    // wyjsc jako nieznany. Cofnieta wyplata jest bez kotwicy, bo Amazon dokleja do nazwy
+    // zdanie „: Amazon has cancelled your transfer of funds.".
+    const MK_AMZ_WYJ = /^(?:(?:Liquidations|Liquidations Adjustments|Goodwill Concession|other-transaction|REMOVAL_ORDER_LOST)$|Transfer of funds unsuccessful)/i;
     // Typy, ktore modul KSIEGUJE (nie ida na liste do wyjasnienia).
     const MK_AMZ_OBSL = /^(?:Order|Refund|Chargeback Refund|SAFE-T Reimbursement|REVERSAL_REIMBURSEMENT)$/i;
     // ===== Regula znaku (decyzja z 12.08.2026) =====
@@ -20214,6 +20249,7 @@
         if (c.indexOf('amazon.fr') >= 0 || c === 'fr') return 'fr';
         if (c.indexOf('amazon.es') >= 0 || c === 'es') return 'es';
         if (c.indexOf('amazon.it') >= 0 || c === 'it') return 'it';
+        if (c.indexOf('amazon.nl') >= 0 || c === 'nl') return 'nl';
         return '';
     }
     // Typ transakcji 1:1 z determine_type: bez PRINCIPAL nie ma typu, TAX + VAT pobrany
@@ -20270,6 +20306,7 @@
         const ptOrd = {}, ptRef = {}, ctryO = {}, ctryR = {};
         const gw = [], rekomp = {}, chgOrd = {}, mktCnt = {}, doWyj = [], nieznane = {};
         let gross = 0, refund = 0, nOrd = 0, nRef = 0, sumAll = 0, gwKolizja = 0, rekompN = 0;
+        let eprN = 0, eprSum = 0, cofN = 0, cofSum = 0;   // v3.84
 
         for (let i = 1; i < linie.length; i++){
             const L = linie[i];
@@ -20300,6 +20337,16 @@
             // bo wlasnie te sa najciekawsze (Goodwill Concession i other-transaction nie maja
             // numeru wcale). Bierzemy wszystko, co nie jest zamowieniem, zwrotem, SAFE-T ani
             // pozycja z listy swiadomie pomijanych.
+            // v3.84: oplaty EPR zliczamy i pomijamy — do importu nie ida, na liste tez nie,
+            // ale suma idzie do podsumowania zlecenia, zeby bylo co porownac.
+            if (tt && MK_AMZ_EPR.test(tt)){
+                eprN++;
+                eprSum = r2(eprSum + (amzNum(r[C.oth]) || amzNum(r[C.py])));
+                continue;
+            }
+            // v3.84: cofnieta wyplata — liczymy osobno, ale ZOSTAJE na liscie do wyjasnienia
+            // (nizej), bo to pozycja, ktora ktos musi zobaczyc i rozliczyc z bankiem.
+            if (tt && MK_AMZ_COFN.test(tt)) { cofN++; cofSum = r2(cofSum + (amzNum(r[C.oth]) || amzNum(r[C.py]))); }
             if (tt && !MK_AMZ_POMIN.test(tt) && !MK_AMZ_OBSL.test(tt)){
                 // Kwota: przy Liquidations stoi w price-amount (wiersz „Principal"), przy
                 // reszcie w other-amount. Drugi wiersz likwidacji — sama oplata brokerska
@@ -20441,11 +20488,28 @@
         // porownuje je z tym, co realnie stoi na auftragu.
         const typOrd = {}, vatOrd = {};
         const wOrd = [];
+        // v3.84: brakujace konto VAT. Pusty typ (brak PRINCIPAL) to inna sprawa i tak bylo
+        // od zawsze — tu chodzi o uklad „typ znam, konta nie mam", czyli np. FR B2B.
+        // Zbieramy je, zeby zablokowac wygenerowanie pliku zamiast wpisac pusta kolumne.
+        // v3.85: brakAcc to druga polowa tego samego problemu — konto rozliczeniowe
+        // (kolumna 26 pliku importu) jest per KRAJ, nie per typ, i tak samo nie wolno
+        // go wyslac pustego.
+        const brakVat = {}, brakAcc = {};
         Object.keys(ord).forEach(function (id){
             const typ = amzTyp(ptOrd[id] || {});
+            const kr = ctryO[id] || dom;
+            const kk = amzKonta(kr, typ);
             typOrd[id] = typ;
-            vatOrd[id] = amzKonta(ctryO[id] || dom, typ).vat;
-            wOrd.push({ r: amzRow(id, ord[id], typ, ctryO[id] || dom, false), t: typ, id: id });
+            vatOrd[id] = kk.vat;
+            if (!kk.acc){
+                const ka = (amzKraj(kr) || '?').toUpperCase();
+                brakAcc[ka] = (brakAcc[ka] || 0) + 1;
+            }
+            if (typ && !vatOrd[id]){
+                const kl = (amzKraj(kr) || '?').toUpperCase() + ' ' + typ;
+                brakVat[kl] = (brakVat[kl] || 0) + 1;
+            }
+            wOrd.push({ r: amzRow(id, ord[id], typ, kr, false), t: typ, id: id });
         });
         gw.filter(function (x){ return x.ord; }).forEach(function (x){
             wOrd.push({ r: amzRow(x.order, x.amt, '', x.ctry || dom, true), t: '', id: x.order });
@@ -20475,8 +20539,12 @@
             // v3.83: DE i IT sa sprawdzone na zywych rozliczeniach (11 raportow DE,
             // 7 rozliczen IT). UK/FR/ES maja tabele kont przepisana z dzisiejszej
             // aplikacji, ale nie widzialem stamtad ani jednego pliku — stad ostrzezenie.
-            tylkoDE: (['de', 'it'].indexOf(amzKraj(dom)) >= 0),
+            // v3.85: NL dolacza do sprawdzonych — konta sprzedazy przyszly wprost od Was,
+            // a wszystkie 6 rozliczen NL przeszlo kontrole sumy. UK/FR/ES nadal ostrzegaja.
+            tylkoDE: (['de', 'it', 'nl'].indexOf(amzKraj(dom)) >= 0),
             goodwill: gw.length, gwKolizja: gwKolizja,
+            epr: eprN, eprSum: eprSum, cofN: cofN, cofSum: cofSum,
+            brakVat: brakVat, brakAcc: brakAcc,
             doWyj: doWyj, nieznane: nieznane, typOrd: typOrd, vatOrd: vatOrd,
             doWyjSum: doWyj.reduce(function (a, x){ return r2(a + x.kwota); }, 0),
             wOrd: wOrd,
@@ -20491,6 +20559,21 @@
             return (x.r || []).map(function (c){ return (c == null) ? '' : String(c); }).join(';');
         });
         return '﻿' + linie.join('\r\n') + '\r\n';
+    }
+    // v3.84: bramka przed wygenerowaniem pliku. Wolimy nie dac pliku wcale niz dac plik
+    // z pusta kolumna konta VAT — prologistics przyjmie taki wiersz i zaksieguje go bylejak,
+    // a wychodzi to dopiero przy zamknieciu miesiaca. Zwraca komunikat albo pusty string.
+    function amzBrakKont(j){
+        const p = j && j.data && j.data.amz;
+        const b = (p && p.brakVat) || {}, a = (p && p.brakAcc) || {};
+        const kb = Object.keys(b), ka = Object.keys(a);
+        if (!kb.length && !ka.length) return '';
+        const cz = [];
+        if (ka.length) cz.push('brak konta rozliczeniowego dla: '
+            + ka.map(function (x){ return x + ' (' + a[x] + ' zam.)'; }).join(', '));
+        if (kb.length) cz.push('brak konta VAT dla: '
+            + kb.map(function (x){ return x + ' (' + b[x] + ' zam.)'; }).join(', '));
+        return cz.join(' · ') + ' — uzupełnij tabelę kont MK_AMZ_ACC w skrypcie, pliku nie generuję';
     }
 
     // ================= CHECK24 =================
@@ -22476,7 +22559,12 @@
                     ? '<input type="checkbox" class="mk-ck" data-ref="' + esc(j.ref) + '"' + (selOn(j) ? ' checked' : '') + '>'
                     : '') + '</td>'
               +  '<td style="padding:3px 5px;white-space:nowrap">' + mkDataCell(j) + '</td>'
-              +  '<td style="padding:3px 5px">' + esc(j.mp || '—') + '</td>'
+                 // v3.84: nazwa Z KRAJEM. Dotad stalo tu samo j.mp, wiec przy trzech
+                 // rozliczeniach Amazona w jednym dniu kolumna pokazywala trzy razy
+                 // „Amazon" i nie bylo jak poznac, ktore jest ktore. mkShort() sklada
+                 // marke z koncowka kraju ze sklepu — to ta sama nazwa, ktora idzie
+                 // do arkusza, wiec lista i arkusz mowia teraz tak samo.
+              +  '<td style="padding:3px 5px;white-space:nowrap">' + esc(mkShort(j) || j.mp || '—') + '</td>'
               +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—')
                  // Skad sie wzielo zlecenie. Przy nieudanym dopasowaniu to pierwsza rzecz,
                  // ktora trzeba wiedziec: reczne nie ma referencji z przelewu.
@@ -24079,8 +24167,18 @@
                 j.msg = '';
                 // Bez tej adnotacji rozjazd miedzy suma pozycji a wplata wyglada na blad,
                 // a jest normalnym ukladem tego marketplace'u.
-                j.note = 'suma zamówień ≠ wypłata i tak ma być: prowizje, FBA, ServiceFee, '
+                // v3.84: cofnieta wyplata idzie NA POCZATEK adnotacji, przed cala reszta.
+                // To jedyna pozycja w tym raporcie, ktora mowi cos o INNYM rozliczeniu.
+                j.note = (p.cofN
+                            ? ('⚠ UWAGA: Amazon cofnął własną wypłatę na ' + f2(Math.abs(p.cofSum)) + ' ' + p.cur
+                               + ' — te pieniądze wróciły do salda i siedzą w tej wypłacie. '
+                               + 'Sprawdź na banku, czy poprzedni payout w tej kwocie faktycznie NIE wpłynął; '
+                               + 'jeśli ktoś go zaksięgował jako otrzymany, wisi podwójnie. · ')
+                            : '')
+                       + 'suma zamówień ≠ wypłata i tak ma być: prowizje, FBA, ServiceFee, '
                        + 'etykiety zwrotne i ruch rezerwy są już potrącone w wypłacie'
+                       + (p.epr ? (' · opłaty EPR (Pay on Behalf): ' + f2(p.eprSum) + ' ' + p.cur
+                            + ' w ' + p.epr + ' poz. — pominięte jak ServiceFee') : '')
                        + (p.rekomp ? (' · SAFE-T / REVERSAL ' + p.rekomp + ' poz. na ' + f2(p.rekompSum)
                             + ' — na listę zwrotów ze znakiem minus') : '')
                        + (p.chargeback ? (' · Chargeback Refund ' + p.chargeback + ' zam. — jak zwykły zwrot') : '')
@@ -24094,7 +24192,16 @@
                                + ' — trafiły na listę do wyjaśnienia, sprawdź je')
                             : '');
                 if (p.gwKolizja) j.note += ' · UWAGA: ' + p.gwKolizja + ' wierszy Goodwill zostało policzonych także w zamówieniu — sprawdź, czy kwota nie weszła dwa razy';
+                const brakK = amzBrakKont(j);
+                if (brakK) j.note = '⚠ ' + brakK + ' · ' + j.note;
                 jobsSave(jobs); render();
+                if (brakK){ say('Wczytałem, ale NIE zaksięgujesz tego rozliczenia: ' + brakK, '#c00'); return; }
+                if (p.cofN){
+                    say('Wczytałem ' + p.shop + ' · rozliczenie ' + p.setId
+                        + ' · ⚠ w środku jest cofnięta wypłata ' + f2(Math.abs(p.cofSum)) + ' ' + p.cur
+                        + ' — sprawdź na banku, czy poprzedni payout w tej kwocie nie został zaksięgowany jako otrzymany.', '#c47f00');
+                    return;
+                }
                 say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
                     + ': ' + p.shop + ' · rozliczenie ' + p.setId + ' z ' + (p.payDate || '—')
                     + ' · wypłata ' + f2(p.net) + ' ' + p.cur
@@ -25272,6 +25379,8 @@
     }
     function doCsv(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
+        const blok = (j.kind === 'amz') ? amzBrakKont(j) : '';
+        if (blok){ say(blok, '#c00'); return; }
         const blob = csvBlob(j);
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
@@ -26262,6 +26371,7 @@
         if (!cur || cur.status === 'done') return 'już zaksięgowane';
         const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
         if (!d) return 'nie umiem odczytać daty wypłaty';
+        if (j.kind === 'amz'){ const blok = amzBrakKont(j); if (blok) return blok; }
         const dateIso = d[1] + '-' + d[2] + '-' + d[3];
         const pairs = pairsOf(j);
         try {
