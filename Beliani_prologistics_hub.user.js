@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.74
+// @version      3.75
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22267,6 +22267,33 @@
                      + ' · przewijanie ' + (j.data.how ? esc(j.data.how) : 'niepotrzebne/nieznane')
                      + ' · wierszy wypłaty ' + (j.data.pays == null ? '?' : j.data.pays)
                      + (j.data.cycle ? (' · cykl ' + esc(String(j.data.cycle).slice(0, 8))) : '') + '</div>';
+                // v3.75: podglad listy „do wyjasnienia" — zwiniety, zeby nie rozpychal listy
+                // zlecen, ale pod reka. Bez niego jedyna droga do zobaczenia, CO tam wpadlo,
+                // bylo skopiowanie w ciemno i wklejenie do arkusza.
+                const dw = (j.data.amz && j.data.amz.doWyj) || [];
+                if (dw.length){
+                    const grp = {};
+                    dw.forEach(function (x){ grp[x.typ] = (grp[x.typ] || 0) + 1; });
+                    det += '<details style="margin-top:4px"><summary style="font-size:11px;color:#92400e;cursor:pointer">'
+                        + 'do wyjaśnienia: <b>' + dw.length + '</b> poz. na <b>' + f2(j.data.amz.doWyjSum) + '</b> — '
+                        + esc(Object.keys(grp).sort().map(function (k){ return k + ' ×' + grp[k]; }).join(', '))
+                        + '</summary>'
+                        + '<table style="border-collapse:collapse;font-size:10px;margin-top:4px">'
+                        + '<tr style="color:#999"><td style="padding:1px 6px">Order ID</td><td style="padding:1px 6px">Title</td>'
+                        + '<td style="padding:1px 6px;text-align:right">Item Price</td><td style="padding:1px 6px">kraj</td>'
+                        + '<td style="padding:1px 6px">data</td></tr>'
+                        + dw.map(function (x){
+                              const brak = !x.id;
+                              return '<tr>'
+                                + '<td style="padding:1px 6px;font-family:ui-monospace,monospace' + (brak ? ';color:#c47f00' : '') + '">'
+                                + esc(x.id || 'no number') + '</td>'
+                                + '<td style="padding:1px 6px">' + esc(x.typ) + '</td>'
+                                + '<td style="padding:1px 6px;text-align:right;font-weight:700">' + f2(x.kwota) + '</td>'
+                                + '<td style="padding:1px 6px">' + esc(amzKraj(x.kraj) || '') + '</td>'
+                                + '<td style="padding:1px 6px;color:#888">' + esc(x.data || '') + '</td></tr>';
+                          }).join('')
+                        + '</table></details>';
+                }
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
@@ -25094,13 +25121,25 @@
         const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
         return m ? (String(parseInt(m[3], 10)) + '.' + m[2]) : '';
     }
+    // v3.75: identyfikatory likwidacji to 11–15 cyfr. Wklejone jako zwykla liczba Excel
+    // i Sheets pokazuja w notacji naukowej — „149999325558552" wyglada jak 1.49999E+14
+    // i nie da sie po nim nic znalezc ani porownac wzrokowo. Sama WARTOSC przy 15 cyfrach
+    // jeszcze sie nie psuje (granica dokladnosci to 2^53, czyli 16 cyfr) — problem jest
+    // z wyswietlaniem, ale skutek dla czlowieka ten sam.
+    // Apostrof na poczatku to standardowy znacznik „to jest tekst": arkusz go zjada przy
+    // wklejeniu, w komorce zostaje sam numer, a formatowanie kolumny nie ma znaczenia.
+    // Numery zamowien (304-…, S02-…) maja myslniki, wiec i tak sa tekstem i ich nie ruszamy.
+    function amzTekst(v){
+        const s = String(v == null ? '' : v);
+        return /^\d{10,}$/.test(s) ? ("'" + s) : s;
+    }
     function doCopyWyj(ref){
         const j = jobsLoad()[ref];
         const p = j && j.data && j.data.amz;
         if (!p || !p.doWyj || !p.doWyj.length) return;
         const t = p.doWyj.map(function (x){
             const c = new Array(14).fill('');
-            c[0]  = x.id || 'no number';               // A Order ID
+            c[0]  = amzTekst(x.id || 'no number');     // A Order ID (długie ID jako tekst)
             c[5]  = x.typ;                             // F Title
             c[7]  = f2(x.kwota);                       // H Item Price
             c[8]  = amzKraj(x.kraj) || '';             // I Item Tax (u Was: kod kraju)
@@ -25113,7 +25152,8 @@
             say('Skopiowano ' + p.doWyj.length + ' pozycji do wyjaśnienia na ' + f2(p.doWyjSum)
                 + ' — wklej do arkusza w pierwszą wolną komórkę kolumny A. Wypełnione: '
                 + 'A (Order ID), F (Title), H (Item Price), I (kraj), N (data). '
-                + 'Kolumny J–M zostają puste dla marketingu.', '#0a7a2f');
+                + 'Kolumny J–M zostają puste dla marketingu. Długie ID idą jako tekst, '
+                + 'więc nie zamienią się w 1.49999E+14.', '#0a7a2f');
         } catch (e){ say('Nie udało się skopiować.', '#c00'); }
     }
     function doCopyRef(ref){
