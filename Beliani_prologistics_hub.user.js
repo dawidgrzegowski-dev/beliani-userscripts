@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.79
+// @version      3.80
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25332,6 +25332,9 @@
         return n;
     }
     function amzTypCel(t){ return /^B2C$/i.test(String(t || '')) ? 'B2C' : (/^B2B/i.test(String(t || '')) ? 'B2B' : ''); }
+    // v3.80: pula NIE POLYKA juz wyjatkow. Wczesniej stalo tu „catch (e){}" i kazdy blad
+    // — nawet literowka w nazwie funkcji — konczyl sie tym, ze przelot przebiegal w ciszy
+    // i nic sie nie pokazywalo. Blad ma wyladowac PRZY POZYCJI, zeby bylo widac, co siadlo.
     async function amzPula(items, fn, n){
         const kolejka = items.slice(), robot = [];
         for (let i = 0; i < Math.max(1, n || 5); i++){
@@ -25339,7 +25342,10 @@
                 while (kolejka.length){
                     const x = kolejka.shift();
                     if (x === undefined) break;
-                    try { await fn(x); } catch (e){}
+                    try { await fn(x); }
+                    catch (e){
+                        try { x.st = 'blad'; x.msg = (e && e.message) || String(e); x.aufs = x.aufs || []; } catch (e2){}
+                    }
                 }
             })());
         }
@@ -25377,6 +25383,15 @@
             h += '<div style="font-size:10px;color:#5b21b6;margin-bottom:4px">'
                + '⚠ ' + wielo.length + ' zamówień ma po kilka auftragów (rozbicie na wysyłki, numery z sufiksem -T1/-T2) — '
                + 'sprawdzam i poprawiam każdy osobno.</div>';
+        }
+        // v3.80: ile auftragow odsialismy jako CUDZE i ile nie potwierdzilo numeru.
+        const obce = lista.reduce(function (a, x){ return a + (x.obce || 0); }, 0);
+        const bezFf = lista.reduce(function (a, x){ return a + (x.bezFf || 0); }, 0);
+        if (obce || bezFf){
+            h += '<div style="font-size:10px;color:#c47f00;margin-bottom:4px">'
+               + (obce ? ('odsiane jako niepasujące do szukanego numeru: <b>' + obce + '</b>. ') : '')
+               + (bezFf ? ('bez czytelnego numeru fulfilmentu na stronie: <b>' + bezFf + '</b> — te zostawiam, ale sprawdź je wzrokowo. ') : '')
+               + '</div>';
         }
         if (reczne.length){
             h += '<details style="margin-top:2px"><summary style="font-size:10px;color:#0a7a2f;cursor:pointer">'
@@ -25462,13 +25477,21 @@
             const stare = mkTyp[ref].filter(function (x){ return filtr.indexOf(x.order) < 0; });
             mkTyp[ref] = stare.concat(doSpr);
         } else mkTyp[ref] = doSpr;
+        // v3.80: znak zycia NATYCHMIAST po klikniecie. Wczesniej pierwszy komunikat szedl
+        // dopiero po dziesiatej sprawdzonej pozycji, a pobranie przypisan z paczki potrafi
+        // potrwac — przez kilkanascie sekund panel wygladal, jakby guzik nie dzialal.
+        say('Sprawdzam typ klienta: 0 z ' + doSpr.length + '…');
+        amzTypRender(ref);
         // Zanim ruszymy: sprobuj wziac przypisanie zamowienie -> auftrag z paczki importu.
         // Jedno zapytanie zamiast osmiuset.
         let zPaczki = 0;
+        if (j.impId) say('Czytam paczkę importu ' + j.impId + ', żeby pominąć wyszukiwarkę…');
         try { zPaczki = await amzZPaczki(j); } catch (e){}
         const znane = doSpr.filter(function (x){ return !!aufGet(x.order); }).length;
-        say(znane ? ('Adresy auftragów znam już dla ' + znane + ' z ' + doSpr.length
-                     + (zPaczki ? (' (z paczki importu ' + zPaczki + ')') : '') + ' — pomijam wyszukiwarkę.') : '');
+        say('Sprawdzam typ klienta: 0 z ' + doSpr.length + '…'
+            + (znane ? ('  Adresy auftragów znam już dla ' + znane
+                        + (zPaczki ? (', z tego ' + zPaczki + ' z paczki importu') : '')
+                        + ' — pomijam wyszukiwarkę.') : ''));
         let done = 0;
         await amzPula(doSpr, async function (x){
             // v3.78: readAll, nie read — jedno zamowienie Amazona potrafi miec kilka
@@ -25480,10 +25503,31 @@
                 x.aufs = [];
             }
             else {
+                // v3.80: ODSIEW CUDZYCH AUFTRAGOW. readAll zbiera wszystkie odsylacze
+                // „auction.php?number=" ze strony wynikow, a strona potrafi zawierac takze
+                // linki niezwiazane z szukanym numerem. Zmiana typu klienta na cudzym
+                // auftragu to blad, ktorego nikt by nie zauwazyl, wiec kazdy znaleziony
+                // auftrag musi POTWIERDZIC swoja tozsamosc: numer fulfilmentu na jego
+                // stronie ma sie zaczynac od szukanego numeru zamowienia (dopuszczamy
+                // sufiks wysylki -T1/-T2). Gdy numeru nie da sie odczytac, zostawiamy
+                // pozycje, ale liczymy ja osobno — lepiej pokazac niepewnosc niz milczec.
+                const pasuje = r.list.filter(function (a){
+                    const ff = String(a.ff || '');
+                    return !ff || ff.indexOf(x.order) === 0;
+                });
+                x.obce = r.list.length - pasuje.length;
+                x.bezFf = pasuje.filter(function (a){ return !a.ff; }).length;
+                if (!pasuje.length){
+                    x.st = 'brak';
+                    x.msg = 'znalazłem ' + r.list.length + ' auftragów, ale żaden nie ma numeru zaczynającego się od ' + x.order;
+                    x.aufs = [];
+                    return;
+                }
                 // Adresy zapamietujemy — przy ponowieniu i przy nastepnym rozliczeniu tego
-                // samego zamowienia nie trzeba juz pytac wyszukiwarki.
-                aufPut(x.order, r.list.map(function (a){ return a.auctionUrl; }));
-                x.aufs = r.list.map(function (a){
+                // samego zamowienia nie trzeba juz pytac wyszukiwarki. Zapisujemy TYLKO
+                // potwierdzone, zeby pamiec nie utrwalila cudzych.
+                aufPut(x.order, pasuje.map(function (a){ return a.auctionUrl; }));
+                x.aufs = pasuje.map(function (a){
                     const jest = String(a.current || '').trim();
                     const selling = String(a.selling || '').trim();
                     const w = { number: a.number, auction: a.auction, auctionUrl: a.auctionUrl,
