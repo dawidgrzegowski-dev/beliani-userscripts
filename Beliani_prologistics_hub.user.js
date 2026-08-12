@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.75
+// @version      3.76
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -8374,7 +8374,15 @@
 
             if (!vatAccount) return; // bez konta docelowego nie ma czego weryfikować
 
-            const description = (typeText || 'B2B') +
+            // v3.76 POPRAWKA. Do tej pory \u201EtypeText" bylo tylko odczytywane i wpisywane
+            // do opisu, a \u201EtargetType" stalo na sztywno 'B2B'. Skutek: KAZDY wklejony
+            // wiersz szedl na B2B \u2014 takze ten, ktory w raporcie ma B2C. Wklejenie calego
+            // arkusza \u201EOrder" (na lipcowym rozliczeniu: 708 \u00D7 B2C, 67 \u00D7 B2B, 11 \u00D7 B2B 0%)
+            // probowaloby przestawic 708 poprawnych zamowien B2C na B2B.
+            // Teraz cel bierzemy z wiersza. \u201EB2B 0%" to na auftragu zwykle B2B \u2014 raport
+            // rozroznia je wylacznie po to, zeby dobrac konto VAT w pliku importu.
+            const cel = /B2C/i.test(typeText) ? 'B2C' : 'B2B';
+            const description = (typeText || cel) +
                 ' \u00B7 Account ' + (account || '1323') +
                 ' \u00B7 VAT/selling ' + vatAccount +
                 (amount ? (' \u00B7 ' + amount) : '');
@@ -8382,13 +8390,13 @@
             items.push({
                 marketplace: 'amazon_de',
                 orderNumber: orderNumber,
-                operation: 'zmiana na B2B',
+                operation: 'zmiana na ' + cel,
                 buyer: description,
                 amount: amount,
                 description: description,
                 orderAccount: vatAccount,   // docelowy selling/VAT account (3283 = B2B, 3264 = B2B 0%)
                 exportAccount: '',
-                targetType: 'B2B',
+                targetType: cel,
                 reviewOnly: false,
                 reviewReason: '',
                 selected: false,
@@ -10160,14 +10168,25 @@
             return fetch(BASE + '/js_backend.php', { method:'POST', credentials:'same-origin', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With':'XMLHttpRequest' }, body: body })
                 .then(function(r){ return r.ok; }).catch(function(){ return false; });
         }
+        // v3.76: most dla modulu „Ksiegowanie Marketplace's". Kontrola typu klienta przy
+        // Amazonie potrzebuje dokladnie tych dwoch czynnosci, a obie sa tutaj sprawdzone
+        // i chodza po samym fetchu — bez ramek, wiec nadaja sie do przelotu przez cale
+        // rozliczenie. Drugiej implementacji nie piszemy: rozjechalaby sie z ta.
+        //   read(numer)            -> { ok, current, auction, auctionUrl, error }
+        //   change(auction, typ)   -> true/false   (POST js_backend.php)
+        // „auction" to identyfikator ze zmiennej __AUCTION na stronie auftragu — bez niego
+        // zmiana nie przejdzie, dlatego read zwraca go razem z typem.
+        window.__TM_CUSTOMER_TYPE = { read: fastRead, change: fastChange };
 
         var wrap = document.createElement('div');
         wrap.style.cssText = 'margin-top:10px;padding-top:10px;border-top:2px dashed #FF2F00;';
         wrap.innerHTML =
-            '<button id="tm-c-fast-btn" style="padding:9px;width:100%;background:#FF2F00;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">\u26A1 SZYBKO (API): pokaz typ + zmien na B2B</button>'
+            // v3.76: napisy bez \u201Ena B2B". Cel bierze sie teraz z wklejonego wiersza
+            // (parseAmazonDeWide), wiec tryb szybki potrafi takze B2B -> B2C.
+            '<button id="tm-c-fast-btn" style="padding:9px;width:100%;background:#FF2F00;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">\u26A1 SZYBKO (API): pokaz typ + popraw wg raportu</button>'
           + '<div id="tm-c-fast-status" style="font-size:11px;color:#666;margin-top:6px;"></div>'
           + '<div id="tm-c-fast-list" style="margin-top:6px;font-size:12px;max-height:260px;overflow-y:auto;font-family:monospace;"></div>'
-          + '<button id="tm-c-fast-change" style="display:none;margin-top:8px;padding:8px;width:100%;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Zmien zaznaczone na B2B</button>';
+          + '<button id="tm-c-fast-change" style="display:none;margin-top:8px;padding:8px;width:100%;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Popraw zaznaczone wg raportu</button>';
         panel.appendChild(wrap);
 
         var fastItems = [];
@@ -20281,9 +20300,13 @@
             c[25] = typ || ''; c[26] = kk.acc; c[27] = kk.vat;
             return c;
         }
+        // typOrd — typ per zamowienie, potrzebny nie tylko do pliku importu, ale takze
+        // do kontroli typu klienta na auftragu (v3.76).
+        const typOrd = {};
         const wOrd = [];
         Object.keys(ord).forEach(function (id){
             const typ = amzTyp(ptOrd[id] || {});
+            typOrd[id] = typ;
             wOrd.push({ r: amzRow(id, ord[id], typ, ctryO[id] || dom, false), t: typ, id: id });
         });
         gw.filter(function (x){ return x.ord; }).forEach(function (x){
@@ -20313,7 +20336,7 @@
             chargeback: Object.keys(chgOrd).length,
             tylkoDE: (amzKraj(dom) === 'de'),
             goodwill: gw.length, gwKolizja: gwKolizja,
-            doWyj: doWyj, nieznane: nieznane,
+            doWyj: doWyj, nieznane: nieznane, typOrd: typOrd,
             doWyjSum: doWyj.reduce(function (a, x){ return r2(a + x.kwota); }, 0),
             wOrd: wOrd,
             n: Object.keys(ord).length + Object.keys(ref).length
@@ -22101,6 +22124,7 @@
       // Podglad postepu stoi POD lista i zwrotami — tam, gdzie klikasz — ale wciaz POZA
       // #mk-out, zeby przerysowanie listy go nie kasowalo.
       +   '<div id="mk-imp-box" style="display:none;margin-top:10px;padding:8px;background:#fbfaff;border:1px solid #ede9fe;border-radius:8px"></div>'
+      +   '<div id="mk-typ-box" style="display:none;margin-top:10px;padding:8px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px"></div>'
       +   '<div id="mk-prog" style="display:none;margin-top:10px;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px"></div>'
       + '</div>';
 
@@ -22352,6 +22376,9 @@
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span> ' : '')
                   +  (Object.keys(j.data.ref || {}).length ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
+                  +  ((j.data.amz && Object.keys(j.data.amz.ord || {}).length)
+                        ? '<button class="mk-typ" data-ref="' + esc(j.ref) + '" title="Porównuje typ klienta na auftragu z typem wyliczonym z raportu Amazona (B2C / B2B / B2B 0%) — dla wszystkich zamówień tego rozliczenia" style="padding:4px 10px;border:1px solid #7c3aed;border-radius:6px;background:#faf5ff;color:#5b21b6;cursor:pointer;font-size:11px">🔍 Sprawdź typy klienta</button> '
+                        : '')
                   +  ((j.data.amz && j.data.amz.doWyj && j.data.amz.doWyj.length)
                         ? '<button class="mk-cpw" data-ref="' + esc(j.ref) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + j.data.amz.doWyj.length + ')</button> '
                         : '')
@@ -22375,6 +22402,7 @@
         }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-typ').forEach(function (b){ b.onclick = function(){ amzTypCheck(b.getAttribute('data-ref'), b); }; });
         out.querySelectorAll('.mk-inv').forEach(function (b){ b.onclick = function(){
             const ref = b.getAttribute('data-ref');
             const span = out.querySelector('.mk-invout[data-ref="' + ref + '"]');
@@ -25155,6 +25183,147 @@
                 + 'Kolumny J–M zostają puste dla marketingu. Długie ID idą jako tekst, '
                 + 'więc nie zamienią się w 1.49999E+14.', '#0a7a2f');
         } catch (e){ say('Nie udało się skopiować.', '#c00'); }
+    }
+    // ===== v3.76: kontrola typu klienta na auftragu (Amazon) =====
+    // Zamowienia bywaja zakladane z zlym typem — B2C zamiast B2B albo odwrotnie — a typ
+    // decyduje o koncie VAT. Raport Amazona mowi, jak byc POWINNO: obecnosc pozycji
+    // MarketplaceFacilitatorVAT znaczy, ze VAT pobral Amazon (B2C); jej brak przy pozycji
+    // Tax to B2B; brak jednego i drugiego to B2B 0%. Na auftragu istnieja tylko dwie
+    // wartosci, wiec B2B 0% porownujemy jak B2B — rozroznienie sluzy wylacznie doborowi
+    // konta VAT w pliku importu (3283 vs 3264) i nie ma odpowiednika w polu customer_type.
+    //
+    // Czytanie i zmiane oddajemy modulowi „Zmiana typu klienta" przez most
+    // __TM_CUSTOMER_TYPE — tam ta mechanika jest sprawdzona i chodzi po samym fetchu.
+    const mkTyp = {};                      // ref zlecenia -> [{order, chce, jest, ...}]
+    function amzTypCel(t){ return /^B2C$/i.test(String(t || '')) ? 'B2C' : (/^B2B/i.test(String(t || '')) ? 'B2B' : ''); }
+    async function amzPula(items, fn, n){
+        const kolejka = items.slice(), robot = [];
+        for (let i = 0; i < Math.max(1, n || 5); i++){
+            robot.push((async function (){
+                while (kolejka.length){
+                    const x = kolejka.shift();
+                    if (x === undefined) break;
+                    try { await fn(x); } catch (e){}
+                }
+            })());
+        }
+        await Promise.all(robot);
+    }
+    function amzTypBox(){ return $('#mk-typ-box'); }
+    function amzTypRender(ref){
+        const box = amzTypBox(); if (!box) return;
+        const lista = mkTyp[ref] || [];
+        const zle = lista.filter(function (x){ return x.st === 'zle'; });
+        const ok = lista.filter(function (x){ return x.st === 'ok'; }).length;
+        const bad = lista.filter(function (x){ return x.st === 'brak' || x.st === 'blad'; });
+        box.style.display = 'block';
+        let h = '<div style="font-size:11px;font-weight:700;color:#92400e;margin-bottom:4px">'
+              + 'Typ klienta — rozliczenie ' + esc(ref) + '</div>'
+              + '<div style="font-size:11px;margin-bottom:6px">sprawdzonych <b>' + lista.length + '</b>'
+              + ' · zgodnych <b style="color:#0a7a2f">' + ok + '</b>'
+              + ' · rozbieżnych <b style="color:#c00">' + zle.length + '</b>'
+              + (bad.length ? (' · nie sprawdzone <b style="color:#c47f00">' + bad.length + '</b>') : '') + '</div>';
+        if (zle.length){
+            h += '<table style="border-collapse:collapse;font-size:11px">'
+               + zle.map(function (x, i){
+                     return '<tr>'
+                       + '<td style="padding:1px 5px"><input type="checkbox" class="mk-typ-cb" data-i="' + i + '" checked></td>'
+                       + '<td style="padding:1px 5px;font-family:ui-monospace,monospace">'
+                       + (x.auctionUrl ? ('<a href="' + esc(x.auctionUrl) + '" target="_blank" style="color:#2563eb">' + esc(x.order) + '</a>') : esc(x.order))
+                       + '</td>'
+                       + '<td style="padding:1px 5px">' + esc(x.jest || '—') + ' → <b>' + esc(x.chce) + '</b></td>'
+                       + '<td style="padding:1px 5px;color:#888">raport: ' + esc(x.raport) + '</td>'
+                       + '<td style="padding:1px 5px" class="mk-typ-st"></td></tr>';
+                 }).join('')
+               + '</table>'
+               + '<button id="mk-typ-fix" style="margin-top:6px;padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔧 Popraw zaznaczone (' + zle.length + ')</button>';
+        } else if (lista.length){
+            h += '<div style="font-size:11px;color:#0a7a2f">✓ Wszystkie sprawdzone zamówienia mają typ zgodny z raportem.</div>';
+        }
+        if (bad.length){
+            h += '<details style="margin-top:5px"><summary style="font-size:10px;color:#c47f00;cursor:pointer">nie udało się sprawdzić (' + bad.length + ')</summary>'
+               + bad.slice(0, 40).map(function (x){ return '<div style="font-size:10px;color:#666">' + esc(x.order) + ' — ' + esc(x.msg || '?') + '</div>'; }).join('')
+               + '</details>';
+        }
+        box.innerHTML = h;
+        const fix = box.querySelector('#mk-typ-fix');
+        if (fix) fix.onclick = function(){ amzTypFix(ref, zle, fix); };
+    }
+    async function amzTypCheck(ref, btn){
+        const j = jobsLoad()[ref], p = j && j.data && j.data.amz;
+        if (!p){ say('To zlecenie nie ma danych z raportu Amazona.', '#c47f00'); return; }
+        if (typeof window.__TM_CUSTOMER_TYPE !== 'object' || !window.__TM_CUSTOMER_TYPE){
+            say('Kontrola typu wymaga modułu „Zmiana typu klienta" — włącz go w launcherze (⚙ Moduły).', '#c47f00');
+            return;
+        }
+        // Bierzemy ZAMOWIENIA (te ida do importu i to im ustawia sie typ). Pozycje, dla
+        // ktorych raport nie umial wyliczyc typu (brak PRINCIPAL), pomijamy — nie ma z czym
+        // porownywac, a zgadywanie konczy sie zmiana typu na chybil trafil.
+        const doSpr = Object.keys(p.ord).map(function (id){
+            const raport = (p.typOrd || {})[id] || '';
+            return { order: id, raport: raport, chce: amzTypCel(raport), st: '', jest: '', msg: '' };
+        }).filter(function (x){ return x.chce; });
+        if (!doSpr.length){ say('Żadne zamówienie z tego rozliczenia nie ma wyliczonego typu.', '#c47f00'); return; }
+        if (btn) btn.disabled = true;
+        mkTyp[ref] = doSpr;
+        let done = 0;
+        say('Sprawdzam typ klienta: 0 z ' + doSpr.length + '…');
+        await amzPula(doSpr, async function (x){
+            const r = await window.__TM_CUSTOMER_TYPE.read(x.order);
+            if (!r || !r.ok){ x.st = 'brak'; x.msg = (r && r.error) || 'nie znalazłem auftragu'; }
+            else {
+                x.jest = String(r.current || '').trim();
+                x.auction = r.auction || '';
+                x.auctionUrl = r.auctionUrl || '';
+                if (!x.jest){ x.st = 'blad'; x.msg = 'auftrag nie ma pola customer_type'; }
+                else if (!x.auction){ x.st = 'blad'; x.msg = 'brak identyfikatora __AUCTION — nie da się zmienić'; }
+                else x.st = (x.jest.toUpperCase() === x.chce.toUpperCase()) ? 'ok' : 'zle';
+            }
+            done++;
+            if (done % 10 === 0 || done === doSpr.length){
+                say('Sprawdzam typ klienta: ' + done + ' z ' + doSpr.length + '…');
+                amzTypRender(ref);
+            }
+        }, 6);
+        if (btn) btn.disabled = false;
+        amzTypRender(ref);
+        const zle = doSpr.filter(function (x){ return x.st === 'zle'; }).length;
+        const bad = doSpr.filter(function (x){ return x.st === 'brak' || x.st === 'blad'; }).length;
+        say('Typ klienta: sprawdzonych ' + doSpr.length + ', rozbieżnych ' + zle
+            + (bad ? (', nie sprawdzonych ' + bad) : '') + '.', zle ? '#c00' : '#0a7a2f');
+    }
+    async function amzTypFix(ref, zle, btn){
+        const wybrane = [];
+        const box = amzTypBox();
+        if (box) box.querySelectorAll('.mk-typ-cb').forEach(function (cb){
+            if (cb.checked) wybrane.push(zle[+cb.getAttribute('data-i')]);
+        });
+        if (!wybrane.length){ say('Nic nie zaznaczono.', '#c47f00'); return; }
+        if (!confirm('Zmienić typ klienta na ' + wybrane.length + ' auftragach?\n\n'
+            + wybrane.slice(0, 10).map(function (x){ return '  • ' + x.order + '  ' + x.jest + ' → ' + x.chce; }).join('\n')
+            + (wybrane.length > 10 ? ('\n  … i ' + (wybrane.length - 10) + ' więcej') : '')
+            + '\n\nTego się nie cofa jednym kliknięciem.')) return;
+        btn.disabled = true;
+        let ok = 0, zleN = 0, i = 0;
+        for (const x of wybrane){
+            i++;
+            say('Poprawiam ' + i + ' z ' + wybrane.length + ' — ' + x.order + '…');
+            let udane = false;
+            try {
+                await window.__TM_CUSTOMER_TYPE.change(x.auction, x.chce);
+                // Potwierdzamy ODCZYTEM, a nie samym HTTP 200 — backend oddaje 200 takze
+                // wtedy, gdy nic nie zmienil.
+                const po = await window.__TM_CUSTOMER_TYPE.read(x.order);
+                udane = !!(po && po.ok && String(po.current || '').toUpperCase() === x.chce.toUpperCase());
+                if (udane){ x.st = 'ok'; x.jest = po.current; ok++; }
+                else { x.msg = 'po zmianie nadal ' + ((po && po.current) || '?'); zleN++; }
+            } catch (e){ x.msg = (e && e.message) || String(e); zleN++; }
+        }
+        btn.disabled = false;
+        amzTypRender(ref);
+        say('Typ klienta poprawiony na ' + ok + ' z ' + wybrane.length + ' auftragach'
+            + (zleN ? ('. Nie udało się: ' + zleN + ' — sprawdź je ręcznie') : '') + '.',
+            zleN ? '#c47f00' : '#0a7a2f');
     }
     function doCopyRef(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
