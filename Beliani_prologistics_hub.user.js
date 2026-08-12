@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.69
+// @version      3.70
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -16619,6 +16619,56 @@
                  + '<span class="pc-nofx-txt" style="font-family:ui-monospace,monospace;background:#fff;color:#c00;padding:1px 6px;border-radius:4px">' + esc(PC_NOFX_TXT) + '</span>'
                  + '<button class="chn-btn ghost pc-nofx-copy" style="padding:1px 8px" title="Kopiuj ten tekst do schowka">📋</button></div>';
         }
+        // ===== v3.70: zamienione kwoty miedzy dwoma zamowieniami tego samego dostawcy =====
+        // Zdarzylo sie naprawde (ANHUI HUAYANG, 12.08.2026): lista balance przypisala
+        // zamowieniu 20217 kwote nalezna 20218 i odwrotnie. Komentarze w OBU zamowieniach
+        // byly poprawne, wiec modul slusznie oflagowal oba wiersze — ale kazdy z osobna
+        // wygladal tylko na „kwota ≠ …" (−198.00 i −402.00) i dopiero rachunek na kartce
+        // pokazywal, ze te dwie liczby pasuja do siebie na krzyz.
+        // Sprawdzamy to za czlowieka: czy PODMIANA kwot miejscami naprawia OBA wiersze naraz.
+        // To WYLACZNIE podpowiedz — zadnej kwoty nie ruszamy i nic sie samo nie poprawia.
+        function pcSwapPary(G){
+            var rows = ((G && G.bal) || []).filter(function(r){
+                return r && r.bc && !r.bc.ok && r.bc.okAmts && r.bc.okAmts.length && isFinite(r.bc.paid);
+            });
+            var out = [];
+            for (var i = 0; i < rows.length; i++){
+                for (var j = i + 1; j < rows.length; j++){
+                    var A = rows[i], B = rows[j];
+                    // kwota wklejona przy A jest poprawna dla B — i odwrotnie
+                    var aDoB = B.bc.okAmts.some(function(v){ return pcAmtEq(v, A.bc.paid); });
+                    var bDoA = A.bc.okAmts.some(function(v){ return pcAmtEq(v, B.bc.paid); });
+                    if (aDoB && bDoA) out.push({ a: A, b: B });
+                }
+            }
+            return out;
+        }
+        function pcSwapBar(G){
+            var pary = pcSwapPary(G);
+            if (!pary.length) return '';
+            return pary.map(function(p){
+                var ao = String(p.a.order || '?'), bo = String(p.b.order || '?');
+                return '<div style="margin-top:5px;display:inline-flex;align-items:center;gap:8px;background:#c47f00;color:#fff;border-radius:6px;padding:3px 8px;font-size:11px;font-weight:700">'
+                     + '<span>⇄ Wygląda na ZAMIENIONE KWOTY: ' + esc(ao) + ' ↔ ' + esc(bo) + '</span>'
+                     + '<span style="font-weight:400">po zamianie obie zgadzają się co do grosza — '
+                     + esc(ao) + ' powinno mieć ' + esc(Number(p.b.bc.paid).toFixed(2))
+                     + ', a ' + esc(bo) + ' — ' + esc(Number(p.a.bc.paid).toFixed(2))
+                     + '. Sprawdź listę balance, nic sam nie poprawiam.</span></div>';
+            }).join('');
+        }
+        // v3.70: tytul przelewu + nazwa dostawcy, gotowy do wklejenia w okno „Zapisz jako"
+        // przy pobieraniu potwierdzenia z banku — zeby nie skladac nazwy z dwoch kawalkow.
+        // Znaki zakazane w nazwach plikow Windows (\ / : * ? " < > |) zamieniamy na myslnik:
+        // ukosnik w nazwie dostawcy wystepuje naprawde („ANDERLY INDUSTRIAL CORPORATION / poufs”,
+        // „…CO.,LTD. / Taizhou Hofen Sanitary Ware Co.,Ltd”) i bez tego zapis by sie nie udal.
+        function pcSaveTitle(G, title){
+            var sup = String((G && G.sup) || '').replace(/\s+/g, ' ').trim();
+            var t = String(title || '').trim();
+            // Sklejamy tylko to, co niepuste — inaczej grupa bez tytulu przelewu dawala
+            // nazwe zaczynajaca sie od przecinka.
+            var s = [t, sup].filter(function (x){ return x; }).join(', ');
+            return s.replace(/[\\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
+        }
         function pcGroupHeader(G, gi, gcol){
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
@@ -16636,8 +16686,20 @@
                 + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b class="pc-balsum" data-sup="' + gi + '">' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
                 + (pcHasInfoG(G) ? '<span class="pc-infobadge" title="' + pcAttr(pcDecodeInfo(pcInfoG(G))) + '" style="margin-left:12px;background:#c00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">! Info box</span>' : '');
-            var t = pcTitleFor(G); if (t){ var _ov = t.length > PC_TITLE_MAX; h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button> <span style="font-size:10px;color:' + (_ov ? '#c00;font-weight:700' : '#888') + '">(' + t.length + '/' + PC_TITLE_MAX + ')</span></div>'; }
+            var t = pcTitleFor(G); if (t){ var _ov = t.length > PC_TITLE_MAX; h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button> <span style="font-size:10px;color:' + (_ov ? '#c00;font-weight:700' : '#888') + '">(' + t.length + '/' + PC_TITLE_MAX + ')</span></div>';
+                // v3.70: druga linia — nazwa do zapisania pliku pobranego z banku.
+                // Limit 140 znakow dotyczy TYTULU PRZELEWU, nie nazwy pliku, wiec tu go nie ma;
+                // pokazujemy samą długość, a ostrzegamy dopiero przy 200 znakach, bo tyle
+                // zaczyna być kłopotliwe dla Windows przy głębokich ścieżkach.
+                var _sv = pcSaveTitle(G, t), _svLong = _sv.length > 200;
+                h += '<div style="margin-top:2px;font-family:ui-monospace,monospace;font-size:11px">'
+                   + '<span style="color:#750000;font-weight:700">Tytuł zapisu:</span> '
+                   + '<span class="pc-save-txt">' + esc(_sv) + '</span> '
+                   + '<button class="chn-btn ghost pc-save-copy" style="padding:1px 8px" title="Kopiuj nazwę pliku — tytuł przelewu + dostawca, gotowe do wklejenia w „Zapisz jako”">📋</button> '
+                   + '<span style="font-size:10px;color:' + (_svLong ? '#c00;font-weight:700' : '#888') + '">(' + _sv.length + ' zn.)</span></div>';
+            }
             h += pcNoFxBar(G);
+            h += pcSwapBar(G);
             return h + '</td></tr>';
         }
         function renderMerged(){
@@ -16919,7 +16981,18 @@
                     var d = (best != null) ? (w - best) : null;
                     var extra = '';
                     if (best != null && adjs && adjs.length) extra = '\nZ korekta penalty byloby: ' + adjs.map(function(a){ return (best + a.sum).toFixed(2) + ' (' + pcPenLabel(a) + ')'; }).join('; ');
-                    return { warn: true, msg: 'kwota ≠ ' + (best != null ? best.toFixed(2) : '?') + (d != null ? ' (' + (d > 0 ? '+' : '') + d.toFixed(2) + ')' : ''), title: 'Wklejona kwota: ' + w.toFixed(2) + '\nKomentarz: ' + pcCandDesc(c) + extra };
+                    // v3.70: liczby zostaja NA WERDYKCIE. Po nich pcSwapPary sprawdza, czy dwa
+                    // wiersze tego samego dostawcy nie maja kwot zamienionych miejscami —
+                    // z osobna kazdy taki wiersz wyglada tylko na „kwota ≠ …" i trzeba bylo
+                    // recznie zauwazyc, ze te dwie liczby pasuja do siebie na krzyz.
+                    // okAmts = kwoty, ktore dla TEGO wiersza bylyby poprawne: prosto z komentarza
+                    // oraz po kazdej mozliwej korekcie o penalty (tak samo liczy to pcCandHit).
+                    var okAmts = [];
+                    if (best != null){
+                        okAmts.push(best);
+                        (adjs || []).forEach(function(a){ okAmts.push(best + a.sum); });
+                    }
+                    return { warn: true, msg: 'kwota ≠ ' + (best != null ? best.toFixed(2) : '?') + (d != null ? ' (' + (d > 0 ? '+' : '') + d.toFixed(2) + ')' : ''), title: 'Wklejona kwota: ' + w.toFixed(2) + '\nKomentarz: ' + pcCandDesc(c) + extra, paid: w, okAmts: okAmts };
                 });
             // 5) nic nie pasuje
             var left = [];
@@ -18100,6 +18173,7 @@
             else if (t.classList.contains('pc-acc')){ pcBeginEditAcc(t); }
             // Zmienna nazywala sie „sp" i przykrywala panel Sprawdzania o tej samej nazwie.
             else if (t.classList.contains('pc-title-copy')){ var tr = t.closest ? t.closest('tr') : null, ttx = tr ? tr.querySelector('.pc-title-txt') : null; if (ttx){ var ok = pcCopyText(ttx.textContent || ''); var st = wp.querySelector('#wp-status'); if (st) st.textContent = ok ? 'Skopiowano tytuł przelewu.' : 'Nie udało się skopiować.'; } }
+            else if (t.classList.contains('pc-save-copy')){ var trs = t.closest ? t.closest('tr') : null, stx = trs ? trs.querySelector('.pc-save-txt') : null; if (stx){ var oks = pcCopyText(stx.textContent || ''); var sts = wp.querySelector('#wp-status'); if (sts) sts.textContent = oks ? 'Skopiowano tytuł zapisu — wklej w „Zapisz jako”.' : 'Nie udało się skopiować.'; } }
             else if (t.classList.contains('pc-nofx-copy')){ var nb = t.parentNode, ntx = nb ? nb.querySelector('.pc-nofx-txt') : null; if (ntx){ var okn = pcCopyText(ntx.textContent || ''); var stn = wp.querySelector('#wp-status'); if (stn) stn.textContent = okn ? ('Skopiowano: ' + ntx.textContent) : 'Nie udało się skopiować.'; } }
             else if (t.id === 'wp-copy-titles'){ var ts = pcTransferTitles(); var ok2 = pcCopyText(ts.map(function(x){ return x.title; }).join('\n')); var st2 = wp.querySelector('#wp-status'); if (st2) st2.textContent = ok2 ? ('Skopiowano ' + ts.length + ' tytułów.') : 'Nie udało się skopiować.'; }
         });
