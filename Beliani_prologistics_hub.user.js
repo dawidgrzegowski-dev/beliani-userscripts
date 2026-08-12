@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.70
+// @version      3.71
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18357,7 +18357,13 @@
         'Manor · Manor CH':            { bank: '149', booking: '9', acct: '1092' },
         // Joybuy nie ma importu, wiec bank_setting jest mu niepotrzebny — liczy sie
         // samo konto, na ktore idzie platnosc ksiegowana wprost na auftragu.
-        'Joybuy · Joybuy DE':          { bank: '',    booking: '9', acct: '1169' }
+        'Joybuy · Joybuy DE':          { bank: '',    booking: '9', acct: '1169' },
+        // v3.71: bank_setting zostaje PUSTY celowo. Nie znamy go z gory, a modul potrafi
+        // go podpowiedziec sam — bsGuess dopasowuje po nazwie z /api/bankSettings/index/
+        // (pomijajac wpisy inactive). Wejdz raz w ⚙ Konta i przyjmij podpowiedz.
+        // Konto 1323 jest tu tylko informacyjne: przy Amazonie numery kont i kont VAT ida
+        // DO PLIKU IMPORTU, per wiersz, zaleznie od kraju i typu (B2C/B2B/B2B 0%).
+        'Amazon · Amazon DE':          { bank: '',    booking: '9', acct: '1323' }
     };
     function setLoad(){
         let d = null;
@@ -19998,6 +20004,275 @@
         return '\ufeff' + linie.join('\r\n') + '\r\n';
     }
 
+    // ================= AMAZON =================
+    // Zrodlo: „Settlement Report V2" — plik .txt, tabulator, 36 kolumn, naglowek w 1. wierszu.
+    // Plik jest SAMOWYSTARCZALNY jak raport eBaya: drugi wiersz to naglowek wyplaty
+    // (settlement-id, deposit-date, total-amount, waluta), wiec zlecenie zakladamy z samego
+    // pliku — wyciag bankowy nie jest do tego potrzebny.
+    //
+    // KONTROLA WEJSCIA, sprawdzona na 381396020642 (Amazon.de, 5388 wierszy):
+    // suma WSZYSTKICH kolumn kwotowych ze wszystkich wierszy = total-amount co do grosza
+    // (68 468.41 = 68 468.41). To odpowiednik netOk z eBaya — gdy sie nie zgadza, nie wiadomo,
+    // ktora liczba jest prawdziwa, wiec nie ksiegujemy.
+    //
+    // I rzecz, ktora trzeba rozumiec, zeby nie szukac bledu tam, gdzie go nie ma:
+    // SUMA ZAMOWIEN NIE ROWNA SIE WYPLACIE i nigdy nie bedzie. Na tym pliku zamowienia
+    // brutto 115 723.46, zwroty −10 818.12, a na konto weszlo 68 468.41. Roznica 36 436.93
+    // to prowizje, FBA, ServiceFee, etykiety zwrotne i ruch rezerwy — wszystko juz potracone
+    // w wyplacie. Dlatego „net" bierzemy z NAGLOWKA, a nie z sumy pozycji; tak samo jak eBay.
+    const MK_AMZ_HDR0 = 'settlement-id';
+    // Nazwy kolumn, na ktorych stoi caly odczyt. Szukamy ich PO NAZWIE, nie po numerze:
+    // uklad V2 jest staly od lat, ale gdyby Amazon dolozyl kolumne w srodku, odczyt po
+    // numerze przesunalby sie po cichu na sasiednie pole — a to blad ksiegowy, nie usterka.
+    const MK_AMZ_AMT_COLS = ['shipment-fee-amount', 'order-fee-amount', 'price-amount',
+        'item-related-fee-amount', 'misc-fee-amount', 'other-fee-amount', 'promotion-amount',
+        'direct-payment-amount', 'other-amount'];
+    const MK_AMZ_SHOP = { 'amazon.de': 'Amazon DE', 'amazon.co.uk': 'Amazon UK', 'amazon.uk': 'Amazon UK',
+        'amazon.fr': 'Amazon FR', 'amazon.es': 'Amazon ES', 'amazon.it': 'Amazon IT' };
+    // Konta 1:1 z dzisiejsza aplikacja (get_accounts). Numer konta i konta VAT ida
+    // DO PLIKU IMPORTU, kolumna po kolumnie — prologistics czyta je z wiersza, a nie
+    // z bank_settingu, i na tym polega roznica wobec pozostalych marketplace'ow.
+    const MK_AMZ_ACC = {
+        de: { acc: '1323', vat: { 'B2C': '3252', 'B2B': '3283', 'B2B 0%': '3264' } },
+        uk: { acc: '1282', vat: { 'B2C': '3289', 'B2B': '3205' } },
+        fr: { acc: '1285', vat: { 'B2C': '3223', 'B2B 0%': '3230' } },
+        es: { acc: '1335', vat: { 'B2C': '3257', 'B2B': '3283', 'B2B 0%': '3268' } },
+        it: { acc: '1337', vat: { 'B2C': '3258', 'B2B': '3283', 'B2B 0%': '3269' } }
+    };
+    function amzNum(v){
+        const s = String(v == null ? '' : v).trim();
+        if (!s || /^nan$/i.test(s)) return 0;
+        const n = Number(s.replace(/\s/g, '').replace(',', '.'));
+        return isFinite(n) ? n : 0;
+    }
+    function amzKraj(country){
+        const c = String(country || '').toLowerCase().trim();
+        if (!c) return '';
+        if (c.indexOf('amazon.co.uk') >= 0 || c.indexOf('amazon.uk') >= 0 || c === 'uk') return 'uk';
+        if (c.indexOf('amazon.de') >= 0 || c === 'de') return 'de';
+        if (c.indexOf('amazon.fr') >= 0 || c === 'fr') return 'fr';
+        if (c.indexOf('amazon.es') >= 0 || c === 'es') return 'es';
+        if (c.indexOf('amazon.it') >= 0 || c === 'it') return 'it';
+        return '';
+    }
+    // Typ transakcji 1:1 z determine_type: bez PRINCIPAL nie ma typu, TAX + VAT pobrany
+    // przez Amazona = B2C, sam TAX = B2B, ani jedno ani drugie = B2B 0%.
+    function amzTyp(set){
+        const t = {};
+        Object.keys(set || {}).forEach(function (x){
+            const u = String(x).toUpperCase().trim();
+            if (u && u !== 'NAN') t[u] = 1;
+        });
+        if (!t['PRINCIPAL']) return '';
+        const hasTax = !!t['TAX'];
+        const hasVat = Object.keys(t).some(function (x){ return x.indexOf('MARKETPLACEFACILITATORVAT') >= 0; });
+        if (hasTax && hasVat) return 'B2C';
+        if (hasTax && !hasVat) return 'B2B';
+        if (!hasTax && !hasVat) return 'B2B 0%';
+        return '';
+    }
+    function amzKonta(country, typ){
+        const k = MK_AMZ_ACC[amzKraj(country)];
+        if (!k) return { acc: '', vat: '' };
+        return { acc: k.acc, vat: (k.vat[typ] || '') };
+    }
+    // Kolejnosc sortowania z dzisiejszej aplikacji: B2B 0%, B2B, B2C, reszta na koniec.
+    function amzSortKey(typ){ return ({ 'B2B 0%': 0, 'B2B': 1, 'B2C': 2 })[typ] != null ? ({ 'B2B 0%': 0, 'B2B': 1, 'B2C': 2 })[typ] : 999; }
+    function mkParseAmz(text){
+        const s = String(text == null ? '' : text).replace(/^﻿/, '');
+        const linie = s.split(/\r?\n/);
+        if (!linie.length || !linie[0]) return { err: 'pusty plik' };
+        const hdr = linie[0].split('\t');
+        if (String(hdr[0] || '').trim().toLowerCase() !== MK_AMZ_HDR0)
+            return { err: 'to nie wygląda na „Settlement Report" Amazona — pierwsza kolumna to nie „settlement-id"' };
+        const ix = {};
+        hdr.forEach(function (h, i){ const k = String(h || '').trim().toLowerCase(); if (k && ix[k] == null) ix[k] = i; });
+        const need = ['settlement-id', 'deposit-date', 'total-amount', 'transaction-type', 'order-id',
+                      'marketplace-name', 'price-type', 'price-amount', 'promotion-amount', 'other-amount'];
+        const brak = need.filter(function (k){ return ix[k] == null; });
+        if (brak.length) return { err: 'raport Amazona bez kolumn: ' + brak.join(', ') + ' — sprawdź, czy to na pewno Settlement Report V2' };
+        const C = { set: ix['settlement-id'], dep: ix['deposit-date'], tot: ix['total-amount'], cur: ix['currency'],
+                    tt: ix['transaction-type'], ord: ix['order-id'], mkt: ix['marketplace-name'],
+                    pt: ix['price-type'], py: ix['price-amount'], ag: ix['promotion-amount'],
+                    oth: ix['other-amount'], sku: ix['sku'], adj: ix['adjustment-id'], post: ix['posted-date'] };
+        const amtCols = MK_AMZ_AMT_COLS.map(function (k){ return ix[k]; }).filter(function (i){ return i != null; });
+
+        let setId = '', payDate = '', total = null, cur = '';
+        const ord = {}, ref = {}, refNote = {}, refSign = {}, ids = {};
+        const ptOrd = {}, ptRef = {}, ctryO = {}, ctryR = {};
+        const gw = [], safeT = [], mktCnt = {};
+        let gross = 0, refund = 0, nOrd = 0, nRef = 0, sumAll = 0, gwKolizja = 0;
+
+        for (let i = 1; i < linie.length; i++){
+            const L = linie[i];
+            if (!L || !L.trim()) continue;
+            const r = L.split('\t');
+            amtCols.forEach(function (c){ sumAll += amzNum(r[c]); });
+            const tt = String(r[C.tt] == null ? '' : r[C.tt]).trim();
+            const ttU = tt.toUpperCase();
+            // Naglowek wyplaty: jedyny wiersz z suma i data, a bez typu transakcji.
+            if (!setId && !tt && String(r[C.set] || '').trim()){
+                setId = String(r[C.set]).trim();
+                const d = String(r[C.dep] || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+                if (d) payDate = d[1] + '-' + d[2] + '-' + d[3];
+                const t = amzNum(r[C.tot]); if (t) total = t;
+                cur = String(r[C.cur] == null ? '' : r[C.cur]).trim().toUpperCase();
+                continue;
+            }
+            const on = String(r[C.ord] == null ? '' : r[C.ord]).trim();
+            const kraj = String(r[C.mkt] == null ? '' : r[C.mkt]).trim().toLowerCase();
+            if (kraj && kraj !== 'nan') mktCnt[kraj] = (mktCnt[kraj] || 0) + 1;
+            if (!on) continue;
+            const pt = String(r[C.pt] == null ? '' : r[C.pt]).trim().toUpperCase();
+            const y = amzNum(r[C.py]), ag = amzNum(r[C.ag]);
+            const isOrd = (ttU === 'ORDER'), isRef = (ttU === 'REFUND');
+            let v = 0;
+            if (isOrd || isRef){
+                // Lista dozwolonych typow 1:1 z dzisiejsza aplikacja. UWAGA na zerowanie:
+                // kwote z price-amount bierzemy TYLKO przy dozwolonym typie, ale
+                // promotion-amount dodajemy ZAWSZE — bo Amazon zapisuje rabaty w OSOBNYCH
+                // wierszach z pustym price-type (promotion-type Principal / TaxDiscount).
+                // Sprawdzone na tym pliku: 20 takich wierszy na −151.00, i ani jeden wiersz
+                // nie ma promotion-amount przy dozwolonym price-type, wiec te dwa zrodla
+                // nigdy sie nie nakladaja. Wymaganie dozwolonego typu dla calego wiersza
+                // zgubiloby wszystkie rabaty i kazde promowane zamowienie poszloby zawyzone.
+                const okPt = isOrd
+                    ? (pt === 'PRINCIPAL' || pt === 'TAX' || pt === 'SHIPPING' || pt === 'SHIPPINGTAX')
+                    : (pt === 'PRINCIPAL' || pt === 'TAX' || pt === 'RETURNSHIPPING' || pt === 'SHIPPINGTAX' || pt === 'SHIPPING');
+                v = (okPt ? y : 0) + ag;
+                ids[on] = 1;
+                if (isOrd){
+                    ord[on] = r2((ord[on] || 0) + v); gross = r2(gross + v); nOrd++;
+                    if (!ptOrd[on]) ptOrd[on] = {};
+                    if (pt && pt !== 'NAN') ptOrd[on][pt] = 1;
+                    if (kraj && kraj !== 'nan') ctryO[on] = kraj;
+                } else {
+                    ref[on] = r2((ref[on] || 0) + v); refund = r2(refund + v); nRef++;
+                    if (!ptRef[on]) ptRef[on] = {};
+                    if (pt && pt !== 'NAN') ptRef[on][pt] = 1;
+                    if (kraj && kraj !== 'nan') ctryR[on] = kraj;
+                }
+            } else if (ttU === 'SAFE-T REIMBURSEMENT'){
+                // Kwota SAFE-T NIE stoi w price-amount (te sa puste we wszystkich osmiu
+                // wierszach tego pliku) tylko w other-amount. Dzisiejsza aplikacja liczy
+                // wylacznie price-amount + promotion-amount, wiec dla SAFE-T wychodzilo jej
+                // 0.00 i pozycje przepadaly. Tu bierzemy other-amount.
+                const sv = amzNum(r[C.oth]);
+                if (sv){
+                    safeT.push({ order: on, amt: sv, ctry: kraj,
+                                 sku: String(r[C.sku] == null ? '' : r[C.sku]).trim(),
+                                 adj: String(r[C.adj] == null ? '' : r[C.adj]).trim(),
+                                 date: String(r[C.post] == null ? '' : r[C.post]).slice(0, 10) });
+                    ids[on] = 1;
+                }
+            }
+            // Goodwill — logika przepisana z dzisiejszej aplikacji: slowo szukane
+            // w DOWOLNEJ kolumnie wiersza, kwota wprost z price-amount, pozycja wystawiana
+            // OSOBNO (nie doliczana do zamowienia). W pliku, na ktorym to skladalem, nie ma
+            // ani jednego Goodwill, wiec ta sciezka jest NIESPRAWDZONA na zywych danych.
+            // Licznik kolizji nizej pilnuje jedynego realnego ryzyka tej reguly: gdyby ten
+            // sam wiersz zostal juz policzony wyzej, kwota trafilaby dwa razy.
+            if (/goodwill/i.test(L) && y !== 0){
+                gw.push({ order: on, amt: y, ctry: kraj, ord: isOrd, ref: isRef });
+                if (v !== 0) gwKolizja++;
+            }
+        }
+
+        if (!setId) return { err: 'nie znalazłem wiersza nagłówka wypłaty (settlement-id bez transaction-type)' };
+        if (total == null) return { err: 'nagłówek wypłaty nie ma total-amount' };
+        if (!nOrd && !nRef && !safeT.length && !gw.length)
+            return { err: 'w raporcie nie ma ani jednej pozycji Order / Refund / SAFE-T' };
+
+        let dom = '', domN = 0;
+        Object.keys(mktCnt).forEach(function (k){ if (mktCnt[k] > domN){ domN = mktCnt[k]; dom = k; } });
+        const shop = MK_AMZ_SHOP[dom] || (amzKraj(dom) ? ('Amazon ' + amzKraj(dom).toUpperCase()) : 'Amazon');
+
+        // ---- lista zwrotow (idzie do ticketa, nie do importu) ----
+        // Zwroty: w pliku ujemne -> na liste ida jako zwykly zwrot (wartosc bezwzgledna).
+        // SAFE-T: w pliku dodatnie -> ksiegujemy ZE ZNAKIEM MINUS (refSign), bo to nie zwrot
+        // do klienta, tylko zwrot kosztu OD Amazona.
+        const opisWspolny = 'rozliczenie ' + setId + ' · wypłata ' + (payDate || '—') + ' · ' + shop;
+        Object.keys(ref).forEach(function (id){
+            const a = ref[id];
+            if (!a) { delete ref[id]; return; }
+            const typ = amzTyp(ptRef[id] || {}), kk = amzKonta(ctryR[id] || dom, typ);
+            refNote[id] = 'Refund — ' + opisWspolny + '\n'
+                + 'Zamówienie ' + id + ' · ' + f2(Math.abs(a)) + ' ' + (cur || '')
+                + (typ ? (' · ' + typ) : '')
+                + (kk.acc ? (' · konto ' + kk.acc + (kk.vat ? (' / VAT ' + kk.vat) : '')) : '')
+                + '\nPozycje: ' + (Object.keys(ptRef[id] || {}).sort().join(', ') || '—');
+        });
+        safeT.forEach(function (x){
+            // Suma po numerze — jedno zamowienie potrafi miec kilka wierszy SAFE-T.
+            ref[x.order] = r2((ref[x.order] || 0) + x.amt);
+            refSign[x.order] = -1;
+            const bylo = refNote[x.order] ? (refNote[x.order] + '\n\n') : '';
+            refNote[x.order] = bylo + 'SAFE-T Reimbursement — ' + opisWspolny + '\n'
+                + 'Zamówienie ' + x.order + ' · +' + f2(x.amt) + ' ' + (cur || '') + ' (other-amount)'
+                + (x.date ? (' · ' + x.date) : '')
+                + '\nAmazon oddaje koszt — księgowane ze znakiem minus.'
+                + (x.sku ? ('\nSKU ' + x.sku) : '')
+                + (x.adj ? ('\nadjustment-id ' + x.adj) : '');
+        });
+        const safeTSum = safeT.reduce(function (a, x){ return r2(a + x.amt); }, 0);
+
+        // ---- wiersze do pliku importu: DOKLADNIE arkusz „Order" dzisiejszej aplikacji ----
+        // 35 kolumn; 6 = „Order", 7 = numer, 23 = „Goodwill", 24 = kwota, 25 = Type,
+        // 26 = Account, 27 = VAT account, reszta pusta. Do CSV ida TYLKO zamowienia —
+        // zwroty ksieguje sie w tickecie, tak jak przy kazdym innym marketplace.
+        function amzRow(numer, kwota, typ, kraj, goodwill){
+            const c = new Array(35).fill('');
+            const kk = amzKonta(kraj, typ);
+            c[6] = 'Order'; c[7] = numer;
+            if (goodwill) c[23] = 'Goodwill';
+            c[24] = f2(kwota);
+            c[25] = typ || ''; c[26] = kk.acc; c[27] = kk.vat;
+            return c;
+        }
+        const wOrd = [];
+        Object.keys(ord).forEach(function (id){
+            const typ = amzTyp(ptOrd[id] || {});
+            wOrd.push({ r: amzRow(id, ord[id], typ, ctryO[id] || dom, false), t: typ, id: id });
+        });
+        gw.filter(function (x){ return x.ord; }).forEach(function (x){
+            wOrd.push({ r: amzRow(x.order, x.amt, '', x.ctry || dom, true), t: '', id: x.order });
+        });
+        wOrd.sort(function (a, b){
+            const d = amzSortKey(a.t) - amzSortKey(b.t);
+            return d !== 0 ? d : String(a.id).localeCompare(String(b.id));
+        });
+
+        // Goodwill po stronie zwrotow — te nie ida do CSV, tylko na liste zwrotow,
+        // i tez maja zostawic komentarz w tickecie.
+        gw.filter(function (x){ return x.ref; }).forEach(function (x){
+            ref[x.order] = r2((ref[x.order] || 0) + x.amt);
+            const bylo = refNote[x.order] ? (refNote[x.order] + '\n\n') : '';
+            refNote[x.order] = bylo + 'Goodwill (Refund) — ' + opisWspolny + '\n'
+                + 'Zamówienie ' + x.order + ' · ' + f2(Math.abs(x.amt)) + ' ' + (cur || '');
+        });
+
+        const netOk = Math.abs(sumAll - total) < 0.01;
+        return {
+            setId: setId, payDate: payDate, cur: cur || 'EUR', shop: shop,
+            net: total, sumAll: r2(sumAll), netOk: netOk,
+            ord: ord, ref: ref, refNote: refNote, refSign: refSign, ids: ids,
+            gross: gross, refund: refund, nOrd: nOrd, nRef: nRef,
+            safeT: safeT.length, safeTSum: safeTSum,
+            goodwill: gw.length, gwKolizja: gwKolizja,
+            wOrd: wOrd,
+            n: Object.keys(ord).length + Object.keys(ref).length
+        };
+    }
+    // Plik importu — 35 kolumn, srednik, BOM, bez naglowka. Kwoty z kropka dziesietna
+    // i zawsze na dwa miejsca: dzisiejsza aplikacja zapisuje surowe floaty i do prologistics
+    // trafialy zapisy w rodzaju 1160.6799999999998. Wartosc jest ta sama, zapis czytelniejszy.
+    function mkCsvAmz(p){
+        const linie = ((p && p.wOrd) || []).map(function (x){
+            return (x.r || []).map(function (c){ return (c == null) ? '' : String(c); }).join(';');
+        });
+        return '﻿' + linie.join('\r\n') + '\r\n';
+    }
+
     // ================= CHECK24 =================
     // Zrodla sa DWA i oba sa potrzebne:
     //   „Details" (CSV)   — pozycje: zakupy, zwroty, korekty. Z niego robimy plik importu
@@ -20889,6 +21164,7 @@
         if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf).text;
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
         if (j.kind === 'ebay' && j.data && j.data.ebay) return mkCsvEbay(j.data.ebay);
+        if (j.kind === 'amz'  && j.data && j.data.amz)  return mkCsvAmz(j.data.amz);
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         return mkCsvText(pairsOf(j));
     }
@@ -21723,7 +21999,9 @@
               // ani nie po tym, w ktory guzik ktos trafil — kazdy parser ma wlasny warunek
               // wejscia (naglowek, komplet kolumn), wiec pytamy ich po kolei.
               + '<label style="font-size:12px;font-weight:700;color:#fff;background:#7c3aed;border:none;border-radius:6px;padding:5px 12px;cursor:pointer">📎 Dodaj pliki'
-              + '<input type="file" id="mk-any" accept=".csv,.pdf,text/csv,application/pdf" multiple style="display:none"></label>'
+              // v3.71: doszlo .txt — raport Amazona („Settlement Report V2") przychodzi
+              // jako plik tekstowy z tabulatorami i bez tego nie dalo sie go nawet wskazac.
+              + '<input type="file" id="mk-any" accept=".csv,.txt,.pdf,text/csv,text/plain,application/pdf" multiple style="display:none"></label>'
               + '<button id="mk-all" style="padding:5px 12px;border:1px solid #7c3aed;border-radius:6px;background:#fff;color:#7c3aed;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               // Dawne osobne wejscia zostaja w DOM, tylko ukryte. Ich obsluga jest
               // sprawdzona i dziala — nowe wejscie tylko podrzuca im wlasciwy plik,
@@ -22329,7 +22607,13 @@
             // jedno zestawienie = jeden wiersz w arkuszu, nawet gdy ma kilka zwrotow
             if (!g[key].seen[j.ref]){ g[key].seen[j.ref] = 1; g[key].keys.push(shKey(j, c.acct)); }
             ids.forEach(function (id){
-                const v = Math.abs(j.data.ref[id]);
+                // v3.71: domyslnie na liste idzie WARTOSC BEZWZGLEDNA — parsery zapisuja
+                // zwroty raz na plus, raz na minus i lista ma je pokazywac jednolicie.
+                // Wyjatkiem sa pozycje oznaczone przez parser jako refSign = −1: SAFE-T
+                // Amazona jest w pliku DODATNI (Amazon oddaje koszt), a zaksiegowac trzeba
+                // go ze znakiem minus. Znak wedruje az do pola kwoty w module ticketa.
+                const sgn = ((j.data.refSign || {})[id] === -1) ? -1 : 1;
+                const v = Math.abs(j.data.ref[id]) * sgn;
                 if (!v) return;                                  // zerowe wiersze wysylki pomijamy
                 // Opis potracenia (Wayfair) zostaje przy pozycji — bez niego przy
                 // ksiegowaniu nie widac, czego zwrot dotyczyl i skad sie wzial.
@@ -23245,6 +23529,9 @@
         // Kolejnosc od najostrzejszego. Parsery sa czyste — nic nie zapisuja.
         function mkTypPliku(txt){
             try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
+            // Amazon pyta sie WCZESNIE, bo jego warunek wejscia jest najostrzejszy z calej
+            // listy: pierwsza kolumna naglowka musi brzmiec doslownie „settlement-id".
+            try { if (!mkParseAmz(txt).err) return 'amz'; } catch (e){}
             try { if (!mkParseEbay(txt).err) return 'ebay'; } catch (e){}
             try { if (!mkParseGalx(txt, 'Galaxus CH').err) return 'galx'; } catch (e){}
             try { if (!mkParseWayf(txt).err) return 'wayf'; } catch (e){}
@@ -23257,7 +23544,7 @@
             try { this.value = ''; } catch (e){}
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
-            const kubelki = { bank: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [] }, nieznane = [];
+            const kubelki = { bank: [], amz: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -23277,6 +23564,7 @@
             // znikal bez sladu. Wywolanie funkcji nie zalezy od granicy piaskownicy.
             if (kubelki.bank.length) await mkWczytajWyciagi(kubelki.bank);
             // Raporty pojedynczo: kazdy dotyczy jednej wyplaty i kazdy ma wlasny komunikat.
+            kubelki.amz.forEach(function (f){ amzWczytaj(f); });
             kubelki.ebay.forEach(function (f){ ebayWczytaj(f); });
             kubelki.galx.forEach(function (f){ galxWczytaj(f); });
             kubelki.wayf.forEach(function (f){ wayfWczytaj(f); });
@@ -23285,9 +23573,9 @@
             // wrzucaniu nie — obie drogi dopisuja sie do tego samego zlecenia po numerze.
             for (let i = 0; i < kubelki.c24.length; i++) await c24Wczytaj(kubelki.c24[i], false);
             for (let i = 0; i < kubelki.c24pdf.length; i++) await c24Wczytaj(kubelki.c24pdf[i], true);
-            const rozpoznane = ['bank', 'ebay', 'galx', 'wayf', 'c24', 'c24pdf']
+            const rozpoznane = ['bank', 'amz', 'ebay', 'galx', 'wayf', 'c24', 'c24pdf']
                 .filter(function (t){ return kubelki[t].length; })
-                .map(function (t){ return kubelki[t].length + '× ' + ({ bank: 'wyciąg', ebay: 'raport eBay', galx: 'raport Galaxus',
+                .map(function (t){ return kubelki[t].length + '× ' + ({ bank: 'wyciąg', amz: 'raport Amazon', ebay: 'raport eBay', galx: 'raport Galaxus',
                     wayf: 'raport Wayfair', c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung' })[t]; });
             // Plik, ktorego nie przypisalismy, NIE moze skonczyc w prozni. Oddajemy go
             // obsludze wyciagu: to najczestszy przypadek, a jej komunikat bledu jest
@@ -23486,6 +23774,70 @@
                     + (p.nZwr ? (' · zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund) + ' ' + p.curTx
                                  + ' — idą na listę zwrotów') : ''),
                     '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
+        }
+        // Raport Amazona. Zlecenie zakladamy z samego pliku — kluczem jest settlement-id
+        // ZE SRODKA, nie nazwa pliku: ta sama wyplata pobrana drugi raz przyjdzie jako
+        // „381396020642 (1).txt" i po nazwie zrobilaby drugie zlecenie na te sama kwote.
+        function amzWczytaj(f){
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                const p = mkParseAmz(mkDecode(rd.result));
+                if (p.err){ say(p.err, '#c00'); return; }
+                // Plik sam sie kontroluje: suma wszystkich kolumn kwotowych kontra
+                // total-amount z naglowka. Gdy sie rozjezdza, nie wiadomo, ktora liczba
+                // jest prawdziwa — nie ksiegujemy, tak samo jak przy eBayu.
+                if (!p.netOk){
+                    say('Raport Amazona jest niespójny: suma wszystkich kwot ' + f2(p.sumAll) + ' ' + p.cur
+                        + ', a nagłówek wypłaty mówi ' + f2(p.net) + ' ' + p.cur
+                        + '. Nie wczytuję — sprawdź plik.', '#c00');
+                    return;
+                }
+                const jobs = jobsLoad();
+                let k = Object.keys(jobs).filter(function (x){
+                    return jobs[x].kind === 'amz' && String(jobs[x].ref || '') === String(p.setId);
+                })[0];
+                let zalozone = false;
+                if (!k){
+                    k = String(p.setId);
+                    jobs[k] = { ref: String(p.setId), date: p.payDate, dateSrc: p.payDate,
+                                amount: p.net, cur: p.cur,
+                                mp: 'Amazon', brand: 'Amazon', short: 'Amazon', host: '', kind: 'amz',
+                                shop: p.shop, docs: null, payer: '', txId: '', status: 'new', msg: '' };
+                    zalozone = true;
+                }
+                const j = jobs[k];
+                if (j.status === 'done'){ say('To rozliczenie jest już zaksięgowane.', '#c47f00'); return; }
+                if (!j.shop) j.shop = p.shop;
+                if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
+                const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
+                j.data = { amz: p, shop: p.shop, gross: p.gross, refund: Math.abs(p.refund),
+                           net: p.net, netOk: true, ord: p.ord, ref: p.ref,
+                           refNote: p.refNote, refSign: p.refSign,
+                           unknown: {}, skipped: {}, full: true, both: both,
+                           pays: 1, split: false, rows: p.nOrd + p.nRef, total: p.nOrd + p.nRef,
+                           pages: 1, how: 'plik ' + f.name };
+                j.status = 'ready';
+                j.msg = '';
+                // Bez tej adnotacji rozjazd miedzy suma pozycji a wplata wyglada na blad,
+                // a jest normalnym ukladem tego marketplace'u.
+                j.note = 'suma zamówień ≠ wypłata i tak ma być: prowizje, FBA, ServiceFee, '
+                       + 'etykiety zwrotne i ruch rezerwy są już potrącone w wypłacie'
+                       + (p.safeT ? (' · SAFE-T ' + p.safeT + ' poz. na ' + f2(p.safeTSum)
+                            + ' — na listę zwrotów ze znakiem minus') : '')
+                       + (p.goodwill ? (' · Goodwill ' + p.goodwill + ' poz.') : '');
+                if (p.gwKolizja) j.note += ' · UWAGA: ' + p.gwKolizja + ' wierszy Goodwill zostało policzonych także w zamówieniu — sprawdź, czy kwota nie weszła dwa razy';
+                jobsSave(jobs); render();
+                say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
+                    + ': ' + p.shop + ' · rozliczenie ' + p.setId + ' z ' + (p.payDate || '—')
+                    + ' · wypłata ' + f2(p.net) + ' ' + p.cur
+                    + ' · zamówień ' + Object.keys(p.ord).length + ' brutto ' + f2(p.gross)
+                    + (Object.keys(p.ref).length ? (' · na listę zwrotów ' + Object.keys(p.ref).length
+                        + ' poz. (zwroty ' + f2(Math.abs(p.refund))
+                        + (p.safeT ? (', SAFE-T ' + f2(p.safeTSum) + ' ze znakiem minus') : '') + ')') : '')
+                    + ' · kontrola pliku ✓', '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
         }
