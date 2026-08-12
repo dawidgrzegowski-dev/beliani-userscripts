@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.76
+// @version      3.79
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10158,7 +10158,18 @@
                         var sel = ad.querySelector('select[name="customer_type"]');
                         var current = (sel && sel.options[sel.selectedIndex]) ? String(sel.options[sel.selectedIndex].value || '').trim() : '';
                         var m = ah.match(/var __AUCTION = "([^"]+)"/);
-                        return { ok:true, auctionUrl:auctionUrl, current:current, auction: m ? m[1] : '' };
+                        // v3.77: konta ksiegowe spod formularza platnosci. Bywa, ze ktos
+                        // poprawil je RECZNIE, nie ruszajac customer_type — wtedy typ
+                        // wyglada na zly, ale ksiegowanie jest juz dobre i zmiana typu
+                        // kazalaby prologistics wyliczyc konta od nowa, czyli zepsulaby
+                        // recznie zrobiona poprawke. Kto czyta, ten musi to widziec.
+                        // UWAGA na nazewnictwo: to, co raport Amazona nazywa „VAT account"
+                        // (3252 / 3283 / 3264), na tej stronie nazywa sie „Selling Account".
+                        // Tutejsze „VAT Account" (np. 2268) to zupelnie co innego.
+                        var mSell = ah.match(/Selling Account:\s*(\d+)/i);
+                        var mVat = ah.match(/VAT Account:\s*(\d+)/i);
+                        return { ok:true, auctionUrl:auctionUrl, current:current, auction: m ? m[1] : '',
+                                 selling: mSell ? mSell[1] : '', vatAccount: mVat ? mVat[1] : '' };
                     });
                 })
                 .catch(function(e){ return { ok:false, error:e.message }; });
@@ -10176,7 +10187,79 @@
         //   change(auction, typ)   -> true/false   (POST js_backend.php)
         // „auction" to identyfikator ze zmiennej __AUCTION na stronie auftragu — bez niego
         // zmiana nie przejdzie, dlatego read zwraca go razem z typem.
-        window.__TM_CUSTOMER_TYPE = { read: fastRead, change: fastChange };
+        // v3.78: fastRead bierze PIERWSZY znaleziony auftrag (querySelector) i milczy
+        // o pozostalych. Numer zamowienia Amazona bywa w prologistics zapisany z sufiksem
+        // fulfilmentu („303-7321964-2195563" -> „303-7321964-2195563-T1"), a zamowienie
+        // rozbite na kilka wysylek ma kilka auftragow: -T1, -T2… Przy kontroli typu klienta
+        // pierwszy z brzegu to za malo — trzeba sprawdzic (i ewentualnie poprawic) KAZDY,
+        // bo wszystkie naleza do tego samego klienta i musza miec ten sam typ.
+        // Dlatego osobna funkcja, ktora oddaje CALA liste; fastRead zostaje nietkniety,
+        // zeby nie ruszac tego, co juz dziala w tym module.
+        // v3.79: pojedyncze pobranie z POWTORZENIAMI. Przy przelocie przez ~800 zamowien
+        // serwer zaczyna zrywac polaczenia i przegladarka rzuca „Failed to fetch" — to blad
+        // sieciowy, nie brak danych, wiec porzucanie pozycji po pierwszej probie kosztowalo
+        // rece pracy przy szukaniu, czego zabraklo. Trzy podejscia z rosnaca przerwa.
+        function fastFetch(u, prob){
+            var n = prob || 3;
+            function raz(i){
+                return fetch(u, { credentials:'same-origin' }).then(function(r){
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.text();
+                }).catch(function(e){
+                    if (i >= n) throw e;
+                    return new Promise(function(res){ setTimeout(res, i * 1200); }).then(function(){ return raz(i + 1); });
+                });
+            }
+            return raz(1);
+        }
+        function fastParseAuction(u, ah){
+            var ad = new DOMParser().parseFromString(ah, 'text/html');
+            var sel = ad.querySelector('select[name="customer_type"]');
+            var mA = ah.match(/var __AUCTION = "([^"]+)"/);
+            var mS = ah.match(/Selling Account:\s*(\d+)/i);
+            var mV = ah.match(/VAT Account:\s*(\d+)/i);
+            var mN = String(u).match(/number=(\d+)/);
+            // Numer fulfilmentu TAK, JAK STOI NA AUFTRAGU — z sufiksem -T1, jesli go ma.
+            // Bez tego nie widac, co wyszukiwarka naprawde trafila.
+            var mF = ah.match(/\b(\d{3}-\d{7}-\d{7}(?:-T\d+)?)\b/);
+            return { auctionUrl: u, number: mN ? mN[1] : '', auction: mA ? mA[1] : '',
+                     current: (sel && sel.options[sel.selectedIndex]) ? String(sel.options[sel.selectedIndex].value || '').trim() : '',
+                     selling: mS ? mS[1] : '', vatAccount: mV ? mV[1] : '', ff: mF ? mF[1] : '' };
+        }
+        // urlsHint: gdy wolajacy ZNA JUZ adresy auftragow (np. z paczki importu albo
+        // z wlasnej pamieci podrecznej), pomijamy zapytanie do wyszukiwarki. To polowa
+        // wszystkich zapytan przy przelocie przez cale rozliczenie.
+        function fastReadAll(orderNumber, urlsHint){
+            var gotowe = (urlsHint && urlsHint.length)
+                ? Promise.resolve(urlsHint.slice())
+                : fastFetch(BASE + '/search.php?what=ff_number&ff_number=' + encodeURIComponent(orderNumber))
+                    .then(function(html){
+                        var urls = [];
+                        var d = new DOMParser().parseFromString(html, 'text/html');
+                        Array.prototype.forEach.call(d.querySelectorAll('a[href*="auction.php?number="]'), function(a){
+                            var h = a.getAttribute('href') || '';
+                            if (h.indexOf('shipping_auction.php') >= 0) return;
+                            var u = absoluteUrl(h), m = u.match(/number=(\d+)/);
+                            if (!m) return;
+                            if (!urls.some(function(x){ return x.indexOf('number=' + m[1]) >= 0; })) urls.push(u);
+                        });
+                        // Przy jednym trafieniu serwer przekierowuje prosto na auftrag i na
+                        // stronie nie ma juz linku do samej siebie — wtedy adres bierzemy
+                        // z tresci (numer w formularzu platnosci).
+                        if (!urls.length){
+                            var mn = html.match(/name="number"\s+value="(\d+)"/);
+                            if (mn) urls.push(BASE + '/auction.php?number=' + mn[1]);
+                        }
+                        return urls;
+                    });
+            return gotowe.then(function(urls){
+                if (!urls.length) return { ok:false, error:'nie znaleziono zamowienia' };
+                return Promise.all(urls.map(function(u){
+                    return fastFetch(u).then(function(ah){ return fastParseAuction(u, ah); });
+                })).then(function(list){ return { ok:true, list:list }; });
+            }).catch(function(e){ return { ok:false, error:(e && e.message) || String(e) }; });
+        }
+        window.__TM_CUSTOMER_TYPE = { read: fastRead, readAll: fastReadAll, change: fastChange };
 
         var wrap = document.createElement('div');
         wrap.style.cssText = 'margin-top:10px;padding-top:10px;border-top:2px dashed #FF2F00;';
@@ -20302,11 +20385,15 @@
         }
         // typOrd — typ per zamowienie, potrzebny nie tylko do pliku importu, ale takze
         // do kontroli typu klienta na auftragu (v3.76).
-        const typOrd = {};
+        // vatOrd — konto sprzedazy (w raporcie zwane „VAT account", na stronie auftragu
+        // „Selling Account"), ktorego dla tego zamowienia oczekujemy. Kontrola typu klienta
+        // porownuje je z tym, co realnie stoi na auftragu.
+        const typOrd = {}, vatOrd = {};
         const wOrd = [];
         Object.keys(ord).forEach(function (id){
             const typ = amzTyp(ptOrd[id] || {});
             typOrd[id] = typ;
+            vatOrd[id] = amzKonta(ctryO[id] || dom, typ).vat;
             wOrd.push({ r: amzRow(id, ord[id], typ, ctryO[id] || dom, false), t: typ, id: id });
         });
         gw.filter(function (x){ return x.ord; }).forEach(function (x){
@@ -20336,7 +20423,7 @@
             chargeback: Object.keys(chgOrd).length,
             tylkoDE: (amzKraj(dom) === 'de'),
             goodwill: gw.length, gwKolizja: gwKolizja,
-            doWyj: doWyj, nieznane: nieznane, typOrd: typOrd,
+            doWyj: doWyj, nieznane: nieznane, typOrd: typOrd, vatOrd: vatOrd,
             doWyjSum: doWyj.reduce(function (a, x){ return r2(a + x.kwota); }, 0),
             wOrd: wOrd,
             n: Object.keys(ord).length + Object.keys(ref).length
@@ -25195,6 +25282,55 @@
     // Czytanie i zmiane oddajemy modulowi „Zmiana typu klienta" przez most
     // __TM_CUSTOMER_TYPE — tam ta mechanika jest sprawdzona i chodzi po samym fetchu.
     const mkTyp = {};                      // ref zlecenia -> [{order, chce, jest, ...}]
+    // v3.79: pamiec adresow auftragow. Wyszukiwarka to POLOWA zapytan calego przelotu,
+    // a odpowiedz na nia sie nie zmienia — numer auftragu przypisany do zamowienia jest
+    // staly. Zapamietujemy go, wiec drugi przebieg (i ponowienie nieudanych) leci dwa razy
+    // szybciej i nie dobija serwera bez potrzeby.
+    const MK_AUF_KEY = 'mkt_amz_auftragi';
+    let _aufCache = null;
+    function aufLoad(){
+        if (_aufCache) return _aufCache;
+        try { _aufCache = JSON.parse(GM_getValue(MK_AUF_KEY, '{}')) || {}; } catch (e){ _aufCache = {}; }
+        return _aufCache;
+    }
+    function aufSave(){
+        const o = aufLoad(), k = Object.keys(o);
+        // Po pol roku i tak nikt tych rozliczen nie rusza, a zapis rosnie bez konca.
+        if (k.length > 20000) k.slice(0, k.length - 20000).forEach(function (x){ delete o[x]; });
+        try { GM_setValue(MK_AUF_KEY, JSON.stringify(o)); } catch (e){}
+    }
+    function aufPut(order, urls){
+        if (!order || !urls || !urls.length) return;
+        aufLoad()[String(order)] = urls;
+    }
+    function aufGet(order){ const v = aufLoad()[String(order)]; return (v && v.length) ? v : null; }
+    // Paczka importu zna juz przypisanie zamowienie -> auftrag dla CALEGO rozliczenia,
+    // i to w jednym zapytaniu. Gdy zlecenie zostalo zaimportowane, bierzemy je stamtad
+    // zamiast pytac wyszukiwarke 800 razy. Numeru zamowienia szukamy po KSZTALCIE we
+    // wszystkich polach wiersza, a nie po nazwie pola — nazwy pol tej odpowiedzi znam
+    // tylko z podgladu i nie chce, zeby przemianowanie jednego z nich cicho to wylaczylo.
+    async function amzZPaczki(job){
+        if (!job || !job.impId) return 0;
+        let d = null;
+        try { d = await impRows(job.impId); } catch (e){ return 0; }
+        let n = 0;
+        (d.rows || []).forEach(function (x){
+            let ord = '';
+            Object.keys(x).forEach(function (k){
+                if (ord) return;
+                const m = String(x[k] == null ? '' : x[k]).match(/\b(\d{3}-\d{7}-\d{7})\b/);
+                if (m) ord = m[1];
+            });
+            const a = impAuction(x);
+            if (ord && a && a.num){
+                const u = location.origin + '/auction.php?number=' + a.num;
+                const juz = aufGet(ord) || [];
+                if (juz.indexOf(u) < 0){ aufPut(ord, juz.concat([u])); n++; }
+            }
+        });
+        if (n) aufSave();
+        return n;
+    }
     function amzTypCel(t){ return /^B2C$/i.test(String(t || '')) ? 'B2C' : (/^B2B/i.test(String(t || '')) ? 'B2B' : ''); }
     async function amzPula(items, fn, n){
         const kolejka = items.slice(), robot = [];
@@ -25213,43 +25349,97 @@
     function amzTypRender(ref){
         const box = amzTypBox(); if (!box) return;
         const lista = mkTyp[ref] || [];
-        const zle = lista.filter(function (x){ return x.st === 'zle'; });
-        const ok = lista.filter(function (x){ return x.st === 'ok'; }).length;
-        const bad = lista.filter(function (x){ return x.st === 'brak' || x.st === 'blad'; });
+        // v3.78: liczymy i pokazujemy AUFTRAGI, nie zamowienia — jedno zamowienie moze mieć
+        // ich kilka (…-T1, …-T2) i kazdy ma wlasny typ do sprawdzenia.
+        function poAuf(stan){
+            const out = [];
+            lista.forEach(function (x){ (x.aufs || []).forEach(function (w){ if (w.st === stan) out.push({ x: x, w: w }); }); });
+            return out;
+        }
+        const zle = poAuf('zle');
+        const ok = poAuf('ok').length;
+        const reczne = poAuf('reczne');
+        const konta = poAuf('konta');
+        const bad = poAuf('blad').concat(lista.filter(function (x){ return x.st === 'brak'; })
+                                              .map(function (x){ return { x: x, w: { msg: x.msg } }; }));
+        const wielo = lista.filter(function (x){ return (x.aufs || []).length > 1; });
         box.style.display = 'block';
         let h = '<div style="font-size:11px;font-weight:700;color:#92400e;margin-bottom:4px">'
               + 'Typ klienta — rozliczenie ' + esc(ref) + '</div>'
-              + '<div style="font-size:11px;margin-bottom:6px">sprawdzonych <b>' + lista.length + '</b>'
+              + '<div style="font-size:11px;margin-bottom:6px">zamówień <b>' + lista.length + '</b>'
+              + ' · auftragów <b>' + (ok + zle.length + reczne.length + konta.length + poAuf('blad').length) + '</b>'
               + ' · zgodnych <b style="color:#0a7a2f">' + ok + '</b>'
               + ' · rozbieżnych <b style="color:#c00">' + zle.length + '</b>'
+              + (reczne.length ? (' · <b style="color:#0a7a2f">' + reczne.length + '</b> poprawionych ręcznie — nie ruszam') : '')
+              + (konta.length ? (' · <b style="color:#c47f00">' + konta.length + '</b> z innym kontem sprzedaży') : '')
               + (bad.length ? (' · nie sprawdzone <b style="color:#c47f00">' + bad.length + '</b>') : '') + '</div>';
+        if (wielo.length){
+            h += '<div style="font-size:10px;color:#5b21b6;margin-bottom:4px">'
+               + '⚠ ' + wielo.length + ' zamówień ma po kilka auftragów (rozbicie na wysyłki, numery z sufiksem -T1/-T2) — '
+               + 'sprawdzam i poprawiam każdy osobno.</div>';
+        }
+        if (reczne.length){
+            h += '<details style="margin-top:2px"><summary style="font-size:10px;color:#0a7a2f;cursor:pointer">'
+               + 'typ nie pasuje, ale konta są już poprawne — pomijam (' + reczne.length + ')</summary>'
+               + reczne.slice(0, 40).map(function (p){
+                     return '<div style="font-size:10px;color:#666">' + esc(p.w.ff || p.x.order) + ' — ' + esc(p.w.jest)
+                          + ' zamiast ' + esc(p.x.chce) + ', ale Selling Account ' + esc(p.w.selling)
+                          + ' zgadza się z raportem (' + esc(p.x.raport) + ')</div>'; }).join('')
+               + '</details>';
+        }
+        if (konta.length){
+            h += '<details style="margin-top:2px"><summary style="font-size:10px;color:#c47f00;cursor:pointer">'
+               + 'typ zgodny, ale konto sprzedaży inne niż z raportu (' + konta.length + ') — do ręcznego sprawdzenia</summary>'
+               + konta.slice(0, 40).map(function (p){
+                     return '<div style="font-size:10px;color:#666">' + esc(p.w.ff || p.x.order) + ' — ' + esc(p.w.msg) + '</div>'; }).join('')
+               + '</details>';
+        }
         if (zle.length){
             h += '<table style="border-collapse:collapse;font-size:11px">'
-               + zle.map(function (x, i){
+               + zle.map(function (p, i){
+                     // Pokazujemy numer fulfilmentu TAK, JAK STOI NA AUFTRAGU (z sufiksem
+                     // -T1, jesli go ma) — inaczej przy rozbitym zamowieniu nie widac,
+                     // ktory z auftragow jest ktory.
+                     const etyk = p.w.ff && p.w.ff !== p.x.order ? p.w.ff : p.x.order;
                      return '<tr>'
                        + '<td style="padding:1px 5px"><input type="checkbox" class="mk-typ-cb" data-i="' + i + '" checked></td>'
                        + '<td style="padding:1px 5px;font-family:ui-monospace,monospace">'
-                       + (x.auctionUrl ? ('<a href="' + esc(x.auctionUrl) + '" target="_blank" style="color:#2563eb">' + esc(x.order) + '</a>') : esc(x.order))
+                       + (p.w.auctionUrl ? ('<a href="' + esc(p.w.auctionUrl) + '" target="_blank" style="color:#2563eb">' + esc(etyk) + '</a>') : esc(etyk))
+                       + (p.w.number ? ('<span style="color:#94a3b8"> · auftrag ' + esc(p.w.number) + '</span>') : '')
                        + '</td>'
-                       + '<td style="padding:1px 5px">' + esc(x.jest || '—') + ' → <b>' + esc(x.chce) + '</b></td>'
-                       + '<td style="padding:1px 5px;color:#888">raport: ' + esc(x.raport) + '</td>'
+                       + '<td style="padding:1px 5px">' + esc(p.w.jest || '—') + ' → <b>' + esc(p.x.chce) + '</b></td>'
+                       + '<td style="padding:1px 5px;color:#888">raport: ' + esc(p.x.raport) + '</td>'
                        + '<td style="padding:1px 5px" class="mk-typ-st"></td></tr>';
                  }).join('')
                + '</table>'
                + '<button id="mk-typ-fix" style="margin-top:6px;padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔧 Popraw zaznaczone (' + zle.length + ')</button>';
         } else if (lista.length){
-            h += '<div style="font-size:11px;color:#0a7a2f">✓ Wszystkie sprawdzone zamówienia mają typ zgodny z raportem.</div>';
+            h += '<div style="font-size:11px;color:#0a7a2f">✓ Nie ma nic do poprawienia — typ zgodny z raportem albo konta ustawione ręcznie.</div>';
         }
         if (bad.length){
-            h += '<details style="margin-top:5px"><summary style="font-size:10px;color:#c47f00;cursor:pointer">nie udało się sprawdzić (' + bad.length + ')</summary>'
-               + bad.slice(0, 40).map(function (x){ return '<div style="font-size:10px;color:#666">' + esc(x.order) + ' — ' + esc(x.msg || '?') + '</div>'; }).join('')
+            h += '<details style="margin-top:5px" open><summary style="font-size:10px;color:#c47f00;cursor:pointer">nie udało się sprawdzić (' + bad.length + ')</summary>'
+               + bad.slice(0, 40).map(function (p){ return '<div style="font-size:10px;color:#666">' + esc((p.w && p.w.ff) || p.x.order) + ' — ' + esc((p.w && p.w.msg) || p.x.msg || '?') + '</div>'; }).join('')
+               + (bad.length > 40 ? ('<div style="font-size:10px;color:#888">… i ' + (bad.length - 40) + ' więcej</div>') : '')
+               + '<button id="mk-typ-retry" style="margin-top:5px;padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">🔁 Sprawdź ponownie te ' + bad.length + '</button>'
                + '</details>';
         }
         box.innerHTML = h;
         const fix = box.querySelector('#mk-typ-fix');
         if (fix) fix.onclick = function(){ amzTypFix(ref, zle, fix); };
+        const ret = box.querySelector('#mk-typ-retry');
+        // „Failed to fetch" to zerwane polaczenie, a nie brak danych — te pozycje trzeba
+        // po prostu odpytac jeszcze raz, a nie szukac recznie. Ponawiamy TYLKO nieudane.
+        if (ret) ret.onclick = function(){
+            const znowu = [];
+            lista.forEach(function (x){
+                if (x.st === 'brak' || (x.aufs || []).some(function (w){ return w.st === 'blad'; })) znowu.push(x.order);
+            });
+            amzTypCheck(ref, ret, znowu);
+        };
     }
-    async function amzTypCheck(ref, btn){
+    // tylkoTe — gdy podane, sprawdzamy WYLACZNIE te numery i doklejamy wynik do
+    // poprzedniego przebiegu. Sluzy ponowieniu pozycji, ktore padly na sieci.
+    async function amzTypCheck(ref, btn, tylkoTe){
         const j = jobsLoad()[ref], p = j && j.data && j.data.amz;
         if (!p){ say('To zlecenie nie ma danych z raportu Amazona.', '#c47f00'); return; }
         if (typeof window.__TM_CUSTOMER_TYPE !== 'object' || !window.__TM_CUSTOMER_TYPE){
@@ -25259,37 +25449,96 @@
         // Bierzemy ZAMOWIENIA (te ida do importu i to im ustawia sie typ). Pozycje, dla
         // ktorych raport nie umial wyliczyc typu (brak PRINCIPAL), pomijamy — nie ma z czym
         // porownywac, a zgadywanie konczy sie zmiana typu na chybil trafil.
+        const filtr = (tylkoTe && tylkoTe.length) ? tylkoTe : null;
         const doSpr = Object.keys(p.ord).map(function (id){
             const raport = (p.typOrd || {})[id] || '';
-            return { order: id, raport: raport, chce: amzTypCel(raport), st: '', jest: '', msg: '' };
-        }).filter(function (x){ return x.chce; });
+            return { order: id, raport: raport, chce: amzTypCel(raport),
+                     chceKonto: (p.vatOrd || {})[id] || '', st: '', jest: '', selling: '', msg: '' };
+        }).filter(function (x){ return x.chce && (!filtr || filtr.indexOf(x.order) >= 0); });
         if (!doSpr.length){ say('Żadne zamówienie z tego rozliczenia nie ma wyliczonego typu.', '#c47f00'); return; }
         if (btn) btn.disabled = true;
-        mkTyp[ref] = doSpr;
+        // Przy ponowieniu podmieniamy TYLKO te pozycje, reszta wyniku zostaje na ekranie.
+        if (filtr && mkTyp[ref]){
+            const stare = mkTyp[ref].filter(function (x){ return filtr.indexOf(x.order) < 0; });
+            mkTyp[ref] = stare.concat(doSpr);
+        } else mkTyp[ref] = doSpr;
+        // Zanim ruszymy: sprobuj wziac przypisanie zamowienie -> auftrag z paczki importu.
+        // Jedno zapytanie zamiast osmiuset.
+        let zPaczki = 0;
+        try { zPaczki = await amzZPaczki(j); } catch (e){}
+        const znane = doSpr.filter(function (x){ return !!aufGet(x.order); }).length;
+        say(znane ? ('Adresy auftragów znam już dla ' + znane + ' z ' + doSpr.length
+                     + (zPaczki ? (' (z paczki importu ' + zPaczki + ')') : '') + ' — pomijam wyszukiwarkę.') : '');
         let done = 0;
-        say('Sprawdzam typ klienta: 0 z ' + doSpr.length + '…');
         await amzPula(doSpr, async function (x){
-            const r = await window.__TM_CUSTOMER_TYPE.read(x.order);
-            if (!r || !r.ok){ x.st = 'brak'; x.msg = (r && r.error) || 'nie znalazłem auftragu'; }
+            // v3.78: readAll, nie read — jedno zamowienie Amazona potrafi miec kilka
+            // auftragow (rozbicie na wysylki: …-T1, …-T2). Sprawdzamy KAZDY.
+            // v3.79: gdy adresy juz znamy, podajemy je i oszczedzamy zapytanie do wyszukiwarki.
+            const r = await window.__TM_CUSTOMER_TYPE.readAll(x.order, aufGet(x.order));
+            if (!r || !r.ok || !r.list || !r.list.length){
+                x.st = 'brak'; x.msg = (r && r.error) || 'nie znalazłem auftragu';
+                x.aufs = [];
+            }
             else {
-                x.jest = String(r.current || '').trim();
-                x.auction = r.auction || '';
-                x.auctionUrl = r.auctionUrl || '';
-                if (!x.jest){ x.st = 'blad'; x.msg = 'auftrag nie ma pola customer_type'; }
-                else if (!x.auction){ x.st = 'blad'; x.msg = 'brak identyfikatora __AUCTION — nie da się zmienić'; }
-                else x.st = (x.jest.toUpperCase() === x.chce.toUpperCase()) ? 'ok' : 'zle';
+                // Adresy zapamietujemy — przy ponowieniu i przy nastepnym rozliczeniu tego
+                // samego zamowienia nie trzeba juz pytac wyszukiwarki.
+                aufPut(x.order, r.list.map(function (a){ return a.auctionUrl; }));
+                x.aufs = r.list.map(function (a){
+                    const jest = String(a.current || '').trim();
+                    const selling = String(a.selling || '').trim();
+                    const w = { number: a.number, auction: a.auction, auctionUrl: a.auctionUrl,
+                                ff: a.ff || '', jest: jest, selling: selling, st: '', msg: '' };
+                    if (!jest){ w.st = 'blad'; w.msg = 'auftrag nie ma pola customer_type'; return w; }
+                    if (!a.auction){ w.st = 'blad'; w.msg = 'brak identyfikatora __AUCTION — nie da się zmienić'; return w; }
+                    const typOk = (jest.toUpperCase() === x.chce.toUpperCase());
+                    const kontoOk = !!(x.chceKonto && selling && selling === x.chceKonto);
+                    if (typOk && (kontoOk || !x.chceKonto || !selling)) w.st = 'ok';
+                    else if (typOk){
+                        // Typ sie zgadza, ale konto sprzedazy jest inne niz z raportu.
+                        // Zmiana typu tego NIE naprawi — pokazujemy do recznego sprawdzenia.
+                        w.st = 'konta';
+                        w.msg = 'konto sprzedaży ' + selling + ', a z raportu wychodzi ' + x.chceKonto;
+                    }
+                    else if (kontoOk){
+                        // v3.77: TYP sie nie zgadza, ale KONTA sa juz poprawne — ktos je
+                        // ustawil recznie. Przestawienie typu kazaloby prologistics wyliczyc
+                        // konta od nowa i zepsuloby te poprawke. Nie ruszamy.
+                        w.st = 'reczne';
+                        w.msg = 'konta ustawione ręcznie i zgodne z raportem (Selling Account ' + selling + ')';
+                    }
+                    else w.st = 'zle';
+                    return w;
+                });
+                // Status zamowienia = najgorszy ze statusow jego auftragow. Kolejnosc wagi:
+                // cokolwiek do poprawy przebija wszystko inne.
+                const waga = { zle: 4, blad: 3, konta: 2, reczne: 1, ok: 0 };
+                x.st = x.aufs.reduce(function (a, w){ return (waga[w.st] > waga[a]) ? w.st : a; }, 'ok');
+                x.jest = x.aufs.map(function (w){ return w.jest || '?'; }).join(' / ');
+                x.selling = x.aufs.map(function (w){ return w.selling || '?'; }).join(' / ');
+                if (x.aufs.length > 1) x.msg = 'zamówienie ma ' + x.aufs.length + ' auftragów (rozbite na wysyłki)';
+                else if (x.aufs[0].msg) x.msg = x.aufs[0].msg;
             }
             done++;
             if (done % 10 === 0 || done === doSpr.length){
                 say('Sprawdzam typ klienta: ' + done + ' z ' + doSpr.length + '…');
                 amzTypRender(ref);
             }
-        }, 6);
+        }, 5);
+        aufSave();
         if (btn) btn.disabled = false;
         amzTypRender(ref);
-        const zle = doSpr.filter(function (x){ return x.st === 'zle'; }).length;
-        const bad = doSpr.filter(function (x){ return x.st === 'brak' || x.st === 'blad'; }).length;
-        say('Typ klienta: sprawdzonych ' + doSpr.length + ', rozbieżnych ' + zle
+        function ileAuf(stan){
+            let n = 0;
+            doSpr.forEach(function (x){ (x.aufs || []).forEach(function (w){ if (w.st === stan) n++; }); });
+            return n;
+        }
+        const zle = ileAuf('zle');
+        const rec = ileAuf('reczne');
+        const kon = ileAuf('konta');
+        const bad = ileAuf('blad') + doSpr.filter(function (x){ return x.st === 'brak'; }).length;
+        say('Typ klienta: sprawdzonych ' + doSpr.length + ', do poprawy ' + zle
+            + (rec ? (', poprawionych już ręcznie ' + rec + ' — pomijam') : '')
+            + (kon ? (', z innym kontem sprzedaży ' + kon) : '')
             + (bad ? (', nie sprawdzonych ' + bad) : '') + '.', zle ? '#c00' : '#0a7a2f');
     }
     async function amzTypFix(ref, zle, btn){
@@ -25300,24 +25549,27 @@
         });
         if (!wybrane.length){ say('Nic nie zaznaczono.', '#c47f00'); return; }
         if (!confirm('Zmienić typ klienta na ' + wybrane.length + ' auftragach?\n\n'
-            + wybrane.slice(0, 10).map(function (x){ return '  • ' + x.order + '  ' + x.jest + ' → ' + x.chce; }).join('\n')
+            + wybrane.slice(0, 10).map(function (p){ return '  • ' + (p.w.ff || p.x.order) + '  ' + p.w.jest + ' → ' + p.x.chce; }).join('\n')
             + (wybrane.length > 10 ? ('\n  … i ' + (wybrane.length - 10) + ' więcej') : '')
             + '\n\nTego się nie cofa jednym kliknięciem.')) return;
         btn.disabled = true;
         let ok = 0, zleN = 0, i = 0;
-        for (const x of wybrane){
+        for (const p of wybrane){
             i++;
-            say('Poprawiam ' + i + ' z ' + wybrane.length + ' — ' + x.order + '…');
-            let udane = false;
+            const etyk = p.w.ff || p.x.order;
+            say('Poprawiam ' + i + ' z ' + wybrane.length + ' — ' + etyk + '…');
             try {
-                await window.__TM_CUSTOMER_TYPE.change(x.auction, x.chce);
+                await window.__TM_CUSTOMER_TYPE.change(p.w.auction, p.x.chce);
                 // Potwierdzamy ODCZYTEM, a nie samym HTTP 200 — backend oddaje 200 takze
-                // wtedy, gdy nic nie zmienil.
-                const po = await window.__TM_CUSTOMER_TYPE.read(x.order);
-                udane = !!(po && po.ok && String(po.current || '').toUpperCase() === x.chce.toUpperCase());
-                if (udane){ x.st = 'ok'; x.jest = po.current; ok++; }
-                else { x.msg = 'po zmianie nadal ' + ((po && po.current) || '?'); zleN++; }
-            } catch (e){ x.msg = (e && e.message) || String(e); zleN++; }
+                // wtedy, gdy nic nie zmienil. Czytamy PONOWNIE CALA liste i szukamy TEGO
+                // auftragu po numerze: przy zamowieniu rozbitym na wysylki odczyt „pierwszego
+                // z brzegu" potwierdzalby cudza zmiane.
+                const po = await window.__TM_CUSTOMER_TYPE.readAll(p.x.order);
+                const ten = (po && po.ok && po.list) ? po.list.filter(function (a){ return a.number === p.w.number; })[0] : null;
+                const udane = !!(ten && String(ten.current || '').toUpperCase() === p.x.chce.toUpperCase());
+                if (udane){ p.w.st = 'ok'; p.w.jest = ten.current; ok++; }
+                else { p.w.msg = 'po zmianie nadal ' + ((ten && ten.current) || '?'); zleN++; }
+            } catch (e){ p.w.msg = (e && e.message) || String(e); zleN++; }
         }
         btn.disabled = false;
         amzTypRender(ref);
