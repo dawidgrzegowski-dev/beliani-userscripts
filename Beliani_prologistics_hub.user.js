@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.80
+// @version      3.83
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10199,12 +10199,17 @@
         // serwer zaczyna zrywac polaczenia i przegladarka rzuca „Failed to fetch" — to blad
         // sieciowy, nie brak danych, wiec porzucanie pozycji po pierwszej probie kosztowalo
         // rece pracy przy szukaniu, czego zabraklo. Trzy podejscia z rosnaca przerwa.
-        function fastFetch(u, prob){
+        // Zwraca { text, url } — ADRES KONCOWY JEST TU NIEZBEDNY. Przy jednym trafieniu
+        // search.php przekierowuje prosto na auftrag i to z adresu odczytujemy jego numer.
+        // v3.79 gubila ten adres (oddawala sama tresc), wiec kod zawsze schodzil do zbierania
+        // odsylaczy ze strony — a na stronie auftragu jest pelno linkow do INNYCH auftragow.
+        // Stad bralo sie 62 auftragi na 20 zamowien i falszywe „odsiane jako niepasujace".
+        function fastFetchU(u, prob){
             var n = prob || 3;
             function raz(i){
                 return fetch(u, { credentials:'same-origin' }).then(function(r){
                     if (!r.ok) throw new Error('HTTP ' + r.status);
-                    return r.text();
+                    return r.text().then(function(t){ return { text: t, url: String(r.url || u) }; });
                 }).catch(function(e){
                     if (i >= n) throw e;
                     return new Promise(function(res){ setTimeout(res, i * 1200); }).then(function(){ return raz(i + 1); });
@@ -10212,6 +10217,7 @@
             }
             return raz(1);
         }
+        function fastFetch(u, prob){ return fastFetchU(u, prob).then(function(o){ return o.text; }); }
         function fastParseAuction(u, ah){
             var ad = new DOMParser().parseFromString(ah, 'text/html');
             var sel = ad.querySelector('select[name="customer_type"]');
@@ -10219,37 +10225,67 @@
             var mS = ah.match(/Selling Account:\s*(\d+)/i);
             var mV = ah.match(/VAT Account:\s*(\d+)/i);
             var mN = String(u).match(/number=(\d+)/);
-            // Numer fulfilmentu TAK, JAK STOI NA AUFTRAGU — z sufiksem -T1, jesli go ma.
-            // Bez tego nie widac, co wyszukiwarka naprawde trafila.
-            var mF = ah.match(/\b(\d{3}-\d{7}-\d{7}(?:-T\d+)?)\b/);
+            // Numer fulfilmentu. v3.81: NIE bierzemy juz pierwszego z brzegu numeru
+            // w ksztalcie zamowienia — na stronie auftragu takich numerow jest wiecej
+            // (komentarze, powiazane zamowienia) i pierwszy trafiony bywal cudzy.
+            // Szukamy go w POLACH FORMULARZA, gdzie stoi wlasny numer auftragu, a gdy
+            // tam go nie ma — zostawiamy puste. „Nie wiem" jest uczciwsze niz zla wartosc.
+            var ff = '';
+            var inp = ad.querySelector('input[name="ff_number"], input[name="fulfilment_number"], input[name="fulfillment_number"]');
+            if (inp && inp.getAttribute('value')) ff = String(inp.getAttribute('value')).trim();
+            if (!ff){
+                var t1 = ad.querySelector('#ff_number, .ff_number, [data-ff-number]');
+                if (t1) ff = String(t1.getAttribute('data-ff-number') || t1.textContent || '').trim();
+            }
+            if (!/^\d{3}-\d{7}-\d{7}(?:-T\d+)?$/.test(ff)) ff = '';
+            // OPEN AMOUNT — „Auftrag value - Total of Payments". To najtwardsza identyfikacja
+            // auftragu, jaka mamy: przed zaksiegowaniem musi byc rowna kwocie zamowienia
+            // z rozliczenia. Fraza stoi na stronie DWA razy — w podsumowaniu tabeli Payments
+            // (w <b>) i jako zwykly tekst w komentarzu wczesniejszego ksiegowania; bierzemy
+            // OSTATNIA z <b>, dokladnie tak jak sprawdzony crOpen w module Chinskie.
+            var open = null;
+            try {
+                var bs = ad.querySelectorAll('b'), node = null;
+                for (var bi = 0; bi < bs.length; bi++)
+                    if (/Auftrag value\s*-\s*Total of Payments/i.test(bs[bi].textContent || '')) node = bs[bi];
+                if (node){
+                    var box = (node.closest && node.closest('td')) || node.parentNode;
+                    var tt = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
+                    var mo = tt.match(/-?\s*\d[\d'’\s]*(?:[.,]\d{1,2})?/);
+                    if (mo){
+                        var s = mo[0].replace(/[\s'’]/g, '').replace(',', '.');
+                        var v = Number(s);
+                        if (isFinite(v)) open = v;
+                    }
+                }
+            } catch (e){}
             return { auctionUrl: u, number: mN ? mN[1] : '', auction: mA ? mA[1] : '',
                      current: (sel && sel.options[sel.selectedIndex]) ? String(sel.options[sel.selectedIndex].value || '').trim() : '',
-                     selling: mS ? mS[1] : '', vatAccount: mV ? mV[1] : '', ff: mF ? mF[1] : '' };
+                     selling: mS ? mS[1] : '', vatAccount: mV ? mV[1] : '', ff: ff, open: open };
         }
         // urlsHint: gdy wolajacy ZNA JUZ adresy auftragow (np. z paczki importu albo
         // z wlasnej pamieci podrecznej), pomijamy zapytanie do wyszukiwarki. To polowa
         // wszystkich zapytan przy przelocie przez cale rozliczenie.
         function fastReadAll(orderNumber, urlsHint){
+            // Szukanie 1:1 z modulem „Ksiegowanie w auftragu" (searchOne): NAJPIERW adres
+            // koncowy — przy jednym trafieniu serwer przekierowuje prosto na auftrag i to
+            // jest odpowiedz jednoznaczna. Dopiero gdy przekierowania nie bylo, mamy liste
+            // wynikow i zbieramy z niej odsylacze.
             var gotowe = (urlsHint && urlsHint.length)
                 ? Promise.resolve(urlsHint.slice())
-                : fastFetch(BASE + '/search.php?what=ff_number&ff_number=' + encodeURIComponent(orderNumber))
-                    .then(function(html){
+                : fastFetchU(BASE + '/search.php?what=ff_number&ff_number=' + encodeURIComponent(orderNumber))
+                    .then(function(o){
                         var urls = [];
-                        var d = new DOMParser().parseFromString(html, 'text/html');
+                        var m = String(o.url || '').match(/auction\.php\?number=(\d+)/i);
+                        if (m) return [BASE + '/auction.php?number=' + m[1]];
+                        var d = new DOMParser().parseFromString(o.text, 'text/html');
                         Array.prototype.forEach.call(d.querySelectorAll('a[href*="auction.php?number="]'), function(a){
                             var h = a.getAttribute('href') || '';
                             if (h.indexOf('shipping_auction.php') >= 0) return;
-                            var u = absoluteUrl(h), m = u.match(/number=(\d+)/);
-                            if (!m) return;
-                            if (!urls.some(function(x){ return x.indexOf('number=' + m[1]) >= 0; })) urls.push(u);
+                            var u = absoluteUrl(h), mm = u.match(/number=(\d+)/);
+                            if (!mm) return;
+                            if (!urls.some(function(x){ return x.indexOf('number=' + mm[1]) >= 0; })) urls.push(u);
                         });
-                        // Przy jednym trafieniu serwer przekierowuje prosto na auftrag i na
-                        // stronie nie ma juz linku do samej siebie — wtedy adres bierzemy
-                        // z tresci (numer w formularzu platnosci).
-                        if (!urls.length){
-                            var mn = html.match(/name="number"\s+value="(\d+)"/);
-                            if (mn) urls.push(BASE + '/auction.php?number=' + mn[1]);
-                        }
                         return urls;
                     });
             return gotowe.then(function(urls){
@@ -20151,7 +20187,9 @@
     //
     // ŚWIADOMIE POMIJANE (decyzja z 12.08.2026): ruch rezerwy, etykiety zwrotne i oplaty
     // FBA. To czyste koszty potracone w wyplacie, bez czego kolwiek do dopasowania.
-    const MK_AMZ_POMIN = /^(?:Current Reserve Amount|Previous Reserve Amount Balance|Shipping label purchase for return|FBA Inventory Storage Fee|FBA Removal Order:|ServiceFee)/i;
+    // „Subscription Fee" to miesieczny abonament Amazona — czysty koszt bez numeru
+    // zamowienia, tak jak ServiceFee (decyzja z 12.08.2026).
+    const MK_AMZ_POMIN = /^(?:Current Reserve Amount|Previous Reserve Amount Balance|Shipping label purchase for return|FBA Inventory Storage Fee|FBA Removal Order:|ServiceFee|Subscription Fee)/i;
     // Typy, o ktorych wiemy, ze maja isc na liste. Reszta nieznanych typow tez tam trafia
     // (patrz nizej) — nowy typ Amazona ma sie POKAZAC, a nie zniknac po cichu.
     const MK_AMZ_WYJ = /^(?:Liquidations|Liquidations Adjustments|Goodwill Concession|other-transaction|REMOVAL_ORDER_LOST)$/i;
@@ -20210,8 +20248,15 @@
             return { err: 'to nie wygląda na „Settlement Report" Amazona — pierwsza kolumna to nie „settlement-id"' };
         const ix = {};
         hdr.forEach(function (h, i){ const k = String(h || '').trim().toLowerCase(); if (k && ix[k] == null) ix[k] = i; });
+        // v3.83: „promotion-*" i „other-amount" NIE SA juz wymagane. Amazon wysyla raport
+        // o roznej liczbie kolumn — gdy w okresie nie bylo zadnej promocji, pomija cala
+        // trojke promotion-id / promotion-type / promotion-amount i plik ma 33 kolumny
+        // zamiast 36. Na dostarczonych rozliczeniach Amazon.it taki byl KAZDY drugi
+        // (4 z 7), wiec wymaganie tych kolumn odrzucalo polowe raportow.
+        // Brakujaca kolumna to po prostu zero: amzNum(undefined) = 0, a amtCols odsiewa
+        // nieistniejace indeksy, wiec kontrola sumy dalej sie spina.
         const need = ['settlement-id', 'deposit-date', 'total-amount', 'transaction-type', 'order-id',
-                      'marketplace-name', 'price-type', 'price-amount', 'promotion-amount', 'other-amount'];
+                      'marketplace-name', 'price-type', 'price-amount'];
         const brak = need.filter(function (k){ return ix[k] == null; });
         if (brak.length) return { err: 'raport Amazona bez kolumn: ' + brak.join(', ') + ' — sprawdź, czy to na pewno Settlement Report V2' };
         const C = { set: ix['settlement-id'], dep: ix['deposit-date'], tot: ix['total-amount'], cur: ix['currency'],
@@ -20238,7 +20283,13 @@
                 setId = String(r[C.set]).trim();
                 const d = String(r[C.dep] || '').match(/(\d{4})-(\d{2})-(\d{2})/);
                 if (d) payDate = d[1] + '-' + d[2] + '-' + d[3];
-                const t = amzNum(r[C.tot]); if (t) total = t;
+                // v3.83: ZERO TEZ JEST POPRAWNA WYPLATA. Wczesniej stalo tu „if (t)", wiec
+                // 0.00 traktowalismy jak brak i odrzucalismy caly raport. A zero zdarza sie
+                // naprawde: Amazon.it zatrzymal w rezerwie calosc dwoch okresow (−21 755.31,
+                // potem zwolnienie +21 755.31 i −44 883.49) i wyplata wyszla 0.00 — przy
+                // 1547 i 1460 zamowieniach w srodku. Rozrozniamy wiec PUSTE pole od zera.
+                const rawTot = String(r[C.tot] == null ? '' : r[C.tot]).trim();
+                if (rawTot !== '') total = amzNum(rawTot);
                 cur = String(r[C.cur] == null ? '' : r[C.cur]).trim().toUpperCase();
                 continue;
             }
@@ -20421,7 +20472,10 @@
             gross: gross, refund: refund, nOrd: nOrd, nRef: nRef,
             rekomp: rekompN, rekompSum: rekompSum, rekompN: Object.keys(rekomp).length,
             chargeback: Object.keys(chgOrd).length,
-            tylkoDE: (amzKraj(dom) === 'de'),
+            // v3.83: DE i IT sa sprawdzone na zywych rozliczeniach (11 raportow DE,
+            // 7 rozliczen IT). UK/FR/ES maja tabele kont przepisana z dzisiejszej
+            // aplikacji, ale nie widzialem stamtad ani jednego pliku — stad ostrzezenie.
+            tylkoDE: (['de', 'it'].indexOf(amzKraj(dom)) >= 0),
             goodwill: gw.length, gwKolizja: gwKolizja,
             doWyj: doWyj, nieznane: nieznane, typOrd: typOrd, vatOrd: vatOrd,
             doWyjSum: doWyj.reduce(function (a, x){ return r2(a + x.kwota); }, 0),
@@ -22463,9 +22517,10 @@
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span> ' : '')
                   +  (Object.keys(j.data.ref || {}).length ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
-                  +  ((j.data.amz && Object.keys(j.data.amz.ord || {}).length)
-                        ? '<button class="mk-typ" data-ref="' + esc(j.ref) + '" title="Porównuje typ klienta na auftragu z typem wyliczonym z raportu Amazona (B2C / B2B / B2B 0%) — dla wszystkich zamówień tego rozliczenia" style="padding:4px 10px;border:1px solid #7c3aed;border-radius:6px;background:#faf5ff;color:#5b21b6;cursor:pointer;font-size:11px">🔍 Sprawdź typy klienta</button> '
-                        : '')
+                  // v3.82: osobnego guzika „Sprawdź typy klienta" juz nie ma. Kontrola
+                  // przeniosla sie do widoku PACZKI IMPORTU, gdzie prologistics podaje juz
+                  // gotowe przypisanie zamowienie -> auftrag. Nie trzeba niczego szukac,
+                  // a przy okazji nie da sie zaksiegowac przed sprawdzeniem typow.
                   +  ((j.data.amz && j.data.amz.doWyj && j.data.amz.doWyj.length)
                         ? '<button class="mk-cpw" data-ref="' + esc(j.ref) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + j.data.amz.doWyj.length + ')</button> '
                         : '')
@@ -22489,7 +22544,6 @@
         }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-ref')); }; });
-        out.querySelectorAll('.mk-typ').forEach(function (b){ b.onclick = function(){ amzTypCheck(b.getAttribute('data-ref'), b); }; });
         out.querySelectorAll('.mk-inv').forEach(function (b){ b.onclick = function(){
             const ref = b.getAttribute('data-ref');
             const span = out.querySelector('.mk-invout[data-ref="' + ref + '"]');
@@ -24030,7 +24084,7 @@
                        + (p.rekomp ? (' · SAFE-T / REVERSAL ' + p.rekomp + ' poz. na ' + f2(p.rekompSum)
                             + ' — na listę zwrotów ze znakiem minus') : '')
                        + (p.chargeback ? (' · Chargeback Refund ' + p.chargeback + ' zam. — jak zwykły zwrot') : '')
-                       + (p.tylkoDE ? '' : ' · UWAGA: to nie jest Amazon DE — tabela kont dla tego kraju NIE była sprawdzona na żywych danych')
+                       + (p.tylkoDE ? '' : ' · UWAGA: tabela kont dla tego kraju NIE była sprawdzona na żywych danych (sprawdzone: DE, IT)')
                        + (p.goodwill ? (' · Goodwill ' + p.goodwill + ' poz.') : '')
                        + (p.doWyj.length ? (' · do wyjaśnienia ' + p.doWyj.length + ' poz. na ' + f2(p.doWyjSum)
                             + ' — guzik „Do wyjaśnienia"') : '')
@@ -25452,6 +25506,91 @@
             amzTypCheck(ref, ret, znowu);
         };
     }
+    // ===== v3.82: kontrola typu klienta PROSTO Z PACZKI IMPORTU =====
+    // Paczka zawiera juz przypisanie zamowienie -> auftrag, zrobione przez prologistics
+    // („auction_number" w kazdym wierszu, np. „15059130/3"). Dzieki temu odpada CALE
+    // szukanie: zadnego search.php, zadnych kandydatow, zadnego zgadywania, ktory auftrag
+    // nalezy do ktorego zamowienia. Jedno zapytanie na auftrag i tyle.
+    // To zamyka historie bledow z 3.79–3.81: nadmiarowych auftragow, odsiewu po numerze
+    // fulfilmentu i „sprawdz wzrokowo 56 pozycji".
+    async function amzTypZPaczki(job, d, btn){
+        const p = job && job.data && job.data.amz;
+        if (!p){ say('To zlecenie nie ma danych z raportu Amazona.', '#c47f00'); return; }
+        if (!window.__TM_CUSTOMER_TYPE || typeof window.__TM_CUSTOMER_TYPE.readAll !== 'function'){
+            say('Kontrola typu wymaga modułu „Zmiana typu klienta" — włącz go w launcherze (⚙ Moduły).', '#c47f00');
+            return;
+        }
+        const lista = [];
+        (d.rows || []).forEach(function (x){
+            const a = impAuction(x);
+            if (!a || !a.num) return;                       // NOT FOUND — nie ma czego sprawdzac
+            // Numer zamowienia szukamy po KSZTALCIE we wszystkich polach wiersza, a nie po
+            // nazwie pola — nazwy tej odpowiedzi znam tylko z podgladu.
+            let ord = '';
+            Object.keys(x).forEach(function (k){
+                if (ord) return;
+                const m = String(x[k] == null ? '' : x[k]).match(/\b(\d{3}-\d{7}-\d{7})\b/);
+                if (m) ord = m[1];
+            });
+            if (!ord) return;
+            const raport = (p.typOrd || {})[ord] || '';
+            const chce = amzTypCel(raport);
+            if (!chce) return;                              // raport nie umial wyliczyc typu
+            lista.push({ order: ord, raport: raport, chce: chce,
+                         chceKonto: (p.vatOrd || {})[ord] || '',
+                         num: a.num, url: a.url, st: '', msg: '', aufs: [] });
+        });
+        if (!lista.length){ say('W tej paczce nie ma wierszy z auftragiem i wyliczonym typem.', '#c47f00'); return; }
+        if (btn) btn.disabled = true;
+        mkTyp[job.ref] = lista;
+        say('Sprawdzam typ klienta: 0 z ' + lista.length + '…');
+        amzTypRender(job.ref);
+        let done = 0;
+        await amzPula(lista, async function (x){
+            const r = await window.__TM_CUSTOMER_TYPE.readAll(x.order, [location.origin + x.url]);
+            if (!r || !r.ok || !r.list || !r.list.length){
+                x.st = 'blad'; x.msg = (r && r.error) || 'nie odczytałem auftragu';
+            } else {
+                const a = r.list[0];
+                const jest = String(a.current || '').trim(), selling = String(a.selling || '').trim();
+                const w = { number: x.num, auction: a.auction, auctionUrl: a.auctionUrl,
+                            ff: a.ff || '', jest: jest, selling: selling, st: '', msg: '' };
+                if (!jest){ w.st = 'blad'; w.msg = 'auftrag nie ma pola customer_type'; }
+                else if (!a.auction){ w.st = 'blad'; w.msg = 'brak identyfikatora __AUCTION — nie da się zmienić'; }
+                else {
+                    const typOk = (jest.toUpperCase() === x.chce.toUpperCase());
+                    const kontoOk = !!(x.chceKonto && selling && selling === x.chceKonto);
+                    if (typOk && (kontoOk || !x.chceKonto || !selling)) w.st = 'ok';
+                    else if (typOk){ w.st = 'konta'; w.msg = 'konto sprzedaży ' + selling + ', a z raportu wychodzi ' + x.chceKonto; }
+                    else if (kontoOk){ w.st = 'reczne'; w.msg = 'konta ustawione ręcznie i zgodne z raportem (Selling Account ' + selling + ')'; }
+                    else w.st = 'zle';
+                }
+                x.aufs = [w];
+                x.st = w.st;
+                x.jest = jest;
+                x.selling = selling;
+                if (w.msg) x.msg = w.msg;
+            }
+            done++;
+            if (done % 10 === 0 || done === lista.length){
+                say('Sprawdzam typ klienta: ' + done + ' z ' + lista.length + '…');
+                amzTypRender(job.ref);
+            }
+        }, 5);
+        if (btn) btn.disabled = false;
+        // Flaga bramkujaca ksiegowanie. Zapisujemy przy zleceniu, zeby przetrwala
+        // przerysowanie panelu i zamkniecie okna.
+        const jobs = jobsLoad();
+        if (jobs[job.ref]){ jobs[job.ref].typChecked = true; jobsSave(jobs); }
+        amzTypRender(job.ref);
+        function ile(s){ return lista.filter(function (x){ return x.st === s; }).length; }
+        say('Typ klienta: sprawdzonych ' + lista.length + ', do poprawy ' + ile('zle')
+            + (ile('reczne') ? (', poprawionych już ręcznie ' + ile('reczne') + ' — pomijam') : '')
+            + (ile('konta') ? (', z innym kontem sprzedaży ' + ile('konta')) : '')
+            + (ile('blad') ? (', nie sprawdzonych ' + ile('blad')) : '')
+            + '. Teraz możesz księgować.', ile('zle') ? '#c00' : '#0a7a2f');
+        try { impRender(jobsLoad()[job.ref] || job, d); } catch (e){}
+    }
     // tylkoTe — gdy podane, sprawdzamy WYLACZNIE te numery i doklejamy wynik do
     // poprzedniego przebiegu. Sluzy ponowieniu pozycji, ktore padly na sieci.
     async function amzTypCheck(ref, btn, tylkoTe){
@@ -25503,26 +25642,46 @@
                 x.aufs = [];
             }
             else {
-                // v3.80: ODSIEW CUDZYCH AUFTRAGOW. readAll zbiera wszystkie odsylacze
-                // „auction.php?number=" ze strony wynikow, a strona potrafi zawierac takze
-                // linki niezwiazane z szukanym numerem. Zmiana typu klienta na cudzym
-                // auftragu to blad, ktorego nikt by nie zauwazyl, wiec kazdy znaleziony
-                // auftrag musi POTWIERDZIC swoja tozsamosc: numer fulfilmentu na jego
-                // stronie ma sie zaczynac od szukanego numeru zamowienia (dopuszczamy
-                // sufiks wysylki -T1/-T2). Gdy numeru nie da sie odczytac, zostawiamy
-                // pozycje, ale liczymy ja osobno — lepiej pokazac niepewnosc niz milczec.
-                const pasuje = r.list.filter(function (a){
-                    const ff = String(a.ff || '');
-                    return !ff || ff.indexOf(x.order) === 0;
-                });
-                x.obce = r.list.length - pasuje.length;
-                x.bezFf = pasuje.filter(function (a){ return !a.ff; }).length;
-                if (!pasuje.length){
-                    x.st = 'brak';
-                    x.msg = 'znalazłem ' + r.list.length + ' auftragów, ale żaden nie ma numeru zaczynającego się od ' + x.order;
-                    x.aufs = [];
-                    return;
+                // ===== v3.81: WYBOR WLASCIWEGO AUFTRAGU =====
+                // Odsiew po numerze fulfilmentu (v3.80) byl zly: numer brany byl jako
+                // pierwszy pasujacy ksztalt z CALEJ strony, a takich numerow jest tam
+                // wiecej — na 786 zamowieniach odsialo 86 dobrych i 56 zostawilo bez
+                // rozstrzygniecia. Zamiast zgadywac po tekscie, identyfikujemy auftrag
+                // po OPEN AMOUNT: przed zaksiegowaniem musi byc rowny kwocie zamowienia
+                // z rozliczenia. To jest kontrola, ktora albo trafia, albo uczciwie mowi
+                // „nie wiem" — a nie taka, ktora po cichu wybiera zle.
+                // Kaskada: jeden kandydat -> bierzemy; kilku -> po kwocie; gdy kwota nie
+                // rozstrzyga -> po numerze fulfilmentu, jesli udalo sie go odczytac;
+                // gdy i to nie -> NIE WYBIERAMY NIC i mowimy o tym wprost.
+                // Rozstrzyganie 1:1 z modulem „Ksiegowanie w auftragu": gdy jeden numer
+                // wskazuje kilka auftragow, czytamy open amount kazdego z nich — przed
+                // zaksiegowaniem tylko jeden jest rowny kwocie zamowienia z rozliczenia.
+                // DOKLADNIE JEDNO trafienie = wybor jednoznaczny. Zero albo wiecej niz
+                // jedno = nie zgadujemy, tylko pokazujemy wszystkich kandydatow.
+                const kwota = (p.ord || {})[x.order];
+                const opisK = function (a){ return a.number + ' → open ' + (a.open == null ? '?' : f2(a.open)); };
+                let pasuje = r.list;
+                if (r.list.length > 1){
+                    const hit = r.list.filter(function (a){
+                        return a.open != null && isFinite(kwota) && Math.abs(a.open - kwota) < 0.05;
+                    });
+                    if (hit.length === 1){
+                        pasuje = hit;
+                        x.wybor = 'numer wskazywał ' + r.list.length + ' auftragi — wybrany ' + hit[0].number
+                                + ', bo jego open amount zgadza się z kwotą ' + f2(kwota)
+                                + '; pozostałe: ' + r.list.filter(function (a){ return a.number !== hit[0].number; }).map(opisK).join(', ');
+                    } else {
+                        x.st = 'brak';
+                        x.aufs = [];
+                        x.kandydaci = r.list.slice();
+                        x.msg = (hit.length > 1)
+                            ? ('kilka auftragów ma taki sam open amount ' + f2(kwota) + ' — rozstrzygnij ręcznie: ' + r.list.map(opisK).join(', '))
+                            : ('żaden z ' + r.list.length + ' auftragów nie ma open amount = '
+                               + (isFinite(kwota) ? f2(kwota) : '?') + ': ' + r.list.map(opisK).join(', '));
+                        return;
+                    }
                 }
+                x.kandydatow = r.list.length;
                 // Adresy zapamietujemy — przy ponowieniu i przy nastepnym rozliczeniu tego
                 // samego zamowienia nie trzeba juz pytac wyszukiwarki. Zapisujemy TYLKO
                 // potwierdzone, zeby pamiec nie utrwalila cudzych.
@@ -25850,12 +26009,23 @@
         // „jest co ksiegowac" od „juz zrobione". Flage czytamy swiezo z dysku, bo
         // impRender bywa wolany z zamknieciem, ktore pamieta starszy stan zlecenia.
         const jbNow = jobsLoad()[job.ref] || job;
-        const canBook = ok.length > 0 && !jbNow.booked;
-        h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-          +  '<button id="mk-book"' + (canBook ? '' : ' disabled')
-          +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (canBook ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (canBook ? 'pointer' : 'default') + ';font-size:11px">'
-          +  (jbNow.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : ('▶ Zaksięguj OK (' + ok.length + ')')) + '</button>'
-          +  '<button id="mk-imp-re" style="padding:5px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">↻ Odśwież</button>'
+        // v3.82: przy Amazonie ksiegowanie jest ZABLOKOWANE, dopoki nie sprawdzisz typow
+        // klienta. Typ decyduje o koncie VAT, a po zaksiegowaniu jego poprawienie jest juz
+        // grzebaniem w zaksiegowanych pozycjach — dlatego kontrola stoi PRZED, a nie obok.
+        const jestAmz = !!(job.data && job.data.amz);
+        const typOk = !jestAmz || !!jbNow.typChecked;
+        const canBook = ok.length > 0 && !jbNow.booked && typOk;
+        h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
+        if (jestAmz && !jbNow.typChecked){
+            h += '<button id="mk-typ-run" style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź typy klientów</button>'
+              +  '<span style="font-size:11px;color:#92400e">księgowanie odblokuje się po sprawdzeniu</span>';
+        } else {
+            h += '<button id="mk-book"' + (canBook ? '' : ' disabled')
+              +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (canBook ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (canBook ? 'pointer' : 'default') + ';font-size:11px">'
+              +  (jbNow.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : ('▶ Zaksięguj OK (' + ok.length + ')')) + '</button>';
+            if (jestAmz) h += '<button id="mk-typ-run" style="padding:5px 10px;border:1px solid #7c3aed;border-radius:6px;background:#faf5ff;color:#5b21b6;cursor:pointer;font-size:11px">↻ Sprawdź typy jeszcze raz</button>';
+        }
+        h += '<button id="mk-imp-re" style="padding:5px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">↻ Odśwież</button>'
           +  '<span id="mk-book-msg" style="font-size:11px;color:#666"></span></div>';
         box.style.display = 'block';
         box.innerHTML = h;
@@ -25863,6 +26033,8 @@
 
         const re = box.querySelector('#mk-imp-re');
         if (re) re.onclick = function(){ impCheck(job.ref); };
+        const tr = box.querySelector('#mk-typ-run');
+        if (tr) tr.onclick = function(){ amzTypZPaczki(jobsLoad()[job.ref] || job, d, tr); };
         const ts = box.querySelector('#mk-tol-set');
         if (ts) ts.onclick = function(){
             const v = Number(String(box.querySelector('#mk-tol').value || '').replace(',', '.'));
