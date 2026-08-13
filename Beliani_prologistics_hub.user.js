@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.92
+// @version      3.94
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22273,9 +22273,17 @@
     // bo w prologistics zdarzaja sie poprawne warianty krajowe (decyzja z 13.08.2026):
     //   3253 „Erlöse AT" przy B2C — czasem tak ustawi sie konto przez state odbiorcy
     //        i jest to POPRAWNE, wiec nie zglaszamy tego jako bledu,
-    //   3218 „B2B intra 0% DKK" przy B2B — Amazon DE wysyla do Danii, zwykle na 0%.
+    //   3218 „B2B intra 0% DKK" przy B2B 0% — Amazon DE wysyla do Danii, zwykle na 0%.
+    //        v3.94: TYLKO przy B2B 0%. Wczesniej stalo przy B2B, bo tak odczytalem
+    //        opis „przy b2b moze pojawiac sie 3218"; dane pokazaly je przy B2B 0%
+    //        i tak tez zostalo potwierdzone — sama nazwa konta zreszta o tym mowi.
+    //
+    // CZEGO TU CELOWO NIE MA: kont w rodzaju 3242, ktore prologistics czasem POKAZUJE
+    // przy pozycji, chociaz zaksiegowane jest wlasciwe. Przyczyna nieznana, wiec takie
+    // wiersze maja sie ZGLASZAC (decyzja z 13.08.2026) — lepiej obejrzec kilka falszywych
+    // alarmow niz przegapic prawdziwy rozjazd konta.
     const MK_EXP_OK = {
-        de: { 'B2C': ['3252', '3253'], 'B2B': ['3283', '3218'], 'B2B 0%': ['3264'] }
+        de: { 'B2C': ['3252', '3253'], 'B2B': ['3283'], 'B2B 0%': ['3264', '3218'] }
     };
     // Stawka krajowa. Wszystko inne trafia na liste „do wgladu" — NIE jako blad:
     // 3252 to „Erlöse DE 0% Marketplace" i stawka nie ma tam znaczenia, bo VAT-u nie
@@ -22346,6 +22354,7 @@
         ex.forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
 
         const brakuje = [], zleKonto = [], zlaKwota = [], stawki = [], obce = [], brakZwrot = [];
+        const dopasowane = {};
         Object.keys(p.ord).forEach(function (id){
             const typ = p.typOrd[id] || '';
             const brutto = r2(p.ord[id]);
@@ -22367,6 +22376,7 @@
                                sku: p.skuOrd[id] || '', maZwrot: p.ref[id] != null });
                 return;
             }
+            dopasowane[id] = 1;
             // --- konto sprzedazy ---
             const dozw = okKonta[typ];
             w.forEach(function (r){
@@ -22418,23 +22428,89 @@
                          return (r.auf || '?') + (r.ff ? (' · ' + r.ff) : '');
                      }), ile: tr.length };
         });
-        // --- wiersze exportu spoza tego rozliczenia ---
+        // --- wiersze exportu bez odpowiednika w raporcie ---
         const znane = {};
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
         Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
-        const spoza = ex.filter(function (r){ return r.ff && !znane[r.ff]; });
-        const spozaFf = {};
-        spoza.forEach(function (r){ spozaFf[r.ff] = (spozaFf[r.ff] || 0) + 1; });
+        const wolne = ex.filter(function (r){ return !r.ff || !znane[r.ff]; });
+
+        // --- v3.93: SKLEJANIE PO KWOCIE ---
+        // Zamowienie, ktorego import nie dopasowal (NOT FOUND), trafia na liste dla
+        // marketingu, a potem ksieguje sie RECZNIE — pod auftragiem albo ticketem, ktorego
+        // numer fulfilmentu w exporcie jest juz INNY. Szukanie po samym numerze mowilo
+        // wtedy „nie zaksiegowane", chociaz pieniadze siedza w ksiegach.
+        // Sprawdzone na 27390327512: zamowienie 304-4647887-4582704 (299.99) nie ma wiersza
+        // pod swoim numerem, ale w exporcie stoi CREDIT 10339597 TICKET 608018 na te sama
+        // kwote i BEZ odpowiednika w raporcie — czyli dokladnie ta sama pozycja.
+        // Regula jest ostrozna: parujemy tylko wtedy, gdy dopasowanie jest OBUSTRONNIE
+        // JEDNOZNACZNE (jedna kwota, jeden wolny wiersz). Przy kilku kandydatach nie
+        // zgadujemy — pokazujemy ich liste i zostawiamy decyzje czlowiekowi.
+        const poKwocie = {};
+        wolne.forEach(function (r){
+            const k = Math.abs(r.kwota).toFixed(2);
+            (poKwocie[k] || (poKwocie[k] = [])).push(r);
+        });
+        const sklejone = [], niepewne = [], naprawdeBrak = [];
+        const uzyte = [];
+        brakuje.forEach(function (x){
+            const k = Math.abs(x.kwota).toFixed(2);
+            const kand = poKwocie[k] || [];
+            // Ile zamowien z braku ma DOKLADNIE te sama kwote — gdy wiecej niz jedno,
+            // para nie jest jednoznaczna nawet przy jednym wolnym wierszu.
+            const ileTakich = brakuje.filter(function (y){ return Math.abs(y.kwota).toFixed(2) === k; }).length;
+            if (kand.length === 1 && ileTakich === 1){
+                uzyte.push(kand[0]);
+                sklejone.push({ id: x.id, kwota: x.kwota, typ: x.typ, data: x.data, sku: x.sku,
+                                auf: kand[0].auf, ff: kand[0].ff, konto: kand[0].konto,
+                                zwrot: kand[0].zwrot, paid: kand[0].paid });
+            } else if (kand.length){
+                niepewne.push({ id: x.id, kwota: x.kwota, typ: x.typ, data: x.data, sku: x.sku,
+                                kand: kand.slice(0, 5).map(function (r){
+                                    return { auf: r.auf, ff: r.ff, kwota: r.kwota };
+                                }), ile: kand.length, ileTakich: ileTakich });
+            } else {
+                naprawdeBrak.push(x);
+            }
+        });
+        // Wolne wiersze, ktorych nie udalo sie z niczym skleic — to jest druga strona
+        // tego samego pytania: „co siedzi w exporcie, czego nie ma w rozliczeniu".
+        const zostalo = wolne.filter(function (r){ return uzyte.indexOf(r) < 0; });
 
         return {
             nOrd: Object.keys(p.ord).length, nExp: ex.length,
-            nDopasowanych: Object.keys(p.ord).filter(function (id){ return poFf[id]; }).length,
-            brakuje: brakuje.sort(function (a, b){ return b.kwota - a.kwota; }),
-            brakujeSuma: r2(brakuje.reduce(function (a, x){ return a + x.kwota; }, 0)),
+            nDopasowanych: Object.keys(dopasowane).length,
+            brakuje: naprawdeBrak.sort(function (a, b){ return b.kwota - a.kwota; }),
+            brakujeSuma: r2(naprawdeBrak.reduce(function (a, x){ return a + x.kwota; }, 0)),
+            sklejone: sklejone.sort(function (a, b){ return b.kwota - a.kwota; }),
+            niepewne: niepewne.sort(function (a, b){ return b.kwota - a.kwota; }),
             zleKonto: zleKonto, zlaKwota: zlaKwota, obce: obce, brakZwrot: brakZwrot,
             stawki: stawki.sort(function (a, b){ return a.st - b.st; }),
-            wyj: wyj, spoza: Object.keys(spozaFf).length, spozaLista: Object.keys(spozaFf).slice(0, 20)
+            wyj: wyj,
+            wolne: zostalo.sort(function (a, b){ return Math.abs(b.kwota) - Math.abs(a.kwota); }),
+            wolneSuma: r2(zostalo.reduce(function (a, r){ return a + Math.abs(r.kwota); }, 0))
         };
+    }
+    // v3.93: numer auftragu / ticketu jako ODNOSNIK. W exporcie stoja dwa ksztalty:
+    //   „15040035 / 3"                     -> auftrag
+    //   „CREDIT 10339597 TICKET 608018"    -> nota kredytowa z numerem ticketu
+    // Pierwszy prowadzi na auction.php, drugi na rma.php. Gdy ksztalt jest inny,
+    // zostawiamy sam tekst — zly odnosnik jest gorszy niz zaden.
+    function knLink(auf){
+        const t = String(auf == null ? '' : auf).trim();
+        if (!t) return '';
+        const bAuf = 'https://www.prologistics.info/auction.php?number=';
+        const bTic = 'https://www.prologistics.info/rma.php?rma_id=';
+        const a = t.match(/^(\d{5,})\s*(?:\/\s*\d+)?$/);
+        if (a) return '<a href="' + bAuf + a[1] + '" target="_blank" style="color:#5b21b6">' + esc(t) + '</a>';
+        const c = t.match(/TICKET\s+(\d{3,})/i);
+        if (c) return '<a href="' + bTic + c[1] + '" target="_blank" style="color:#5b21b6">' + esc(t) + '</a>';
+        return esc(t);
+    }
+    // Kilka numerow po przecinku — kazdy osobnym odnosnikiem.
+    function knLinki(s){
+        const t = String(s == null ? '' : s).trim();
+        if (!t) return '';
+        return t.split(',').map(function (x){ return knLink(x.trim()); }).filter(Boolean).join(', ');
     }
 
     // ================= SALDA: miesieczne zestawienie do xlsx =================
@@ -23092,7 +23168,7 @@
 
         if (k.brakuje.length){
             h += sek('❌ Nie zaksięgowane — ' + k.brakuje.length + ' zamówień na ' + f2(k.brakujeSuma) + ' ' + esc(p.cur), '#c00',
-                '<div style="font-size:10px;color:#666;margin-bottom:3px">Są w rozliczeniu Amazona, a w exporcie nie ma dla nich ani jednego wiersza.</div>'
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Są w rozliczeniu Amazona, w exporcie nie ma dla nich wiersza pod ich numerem <b>ani</b> płatności o tej samej kwocie.</div>'
                 + '<div style="' + mono + ';max-height:220px;overflow:auto">'
                 + k.brakuje.map(function (x){
                       return esc(x.id) + '  ' + f2(x.kwota) + '  ' + esc(x.typ || '?')
@@ -23101,13 +23177,40 @@
                            + (x.maZwrot ? '  <span style="color:#c47f00">(ma też zwrot)</span>' : '');
                   }).join('<br>') + '</div>');
         }
+        // v3.93: sklejone po kwocie — to NIE jest blad, tylko zamowienie zaksiegowane
+        // pod innym numerem (zwykle NOT FOUND z listy dla marketingu).
+        if (k.sklejone.length){
+            h += sek('✔ Zaksięgowane pod innym numerem — ' + k.sklejone.length, '#0a7a2f',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Nie ma ich w exporcie pod numerem zamówienia, ale jest płatność o dokładnie tej samej kwocie i bez odpowiednika w rozliczeniu. Tak wygląda pozycja NOT FOUND, którą ktoś zaksięgował ręcznie po podaniu auftraga/ticketu.</div>'
+                + '<div style="' + mono + '">'
+                + k.sklejone.map(function (x){
+                      return esc(x.id) + '  ' + f2(x.kwota) + '  ' + esc(x.typ || '?')
+                           + '  →  ' + knLink(x.auf)
+                           + (x.ff ? ('  <span style="color:#888">ff w exporcie: ' + esc(x.ff) + '</span>') : '')
+                           + (x.konto ? ('  konto ' + esc(x.konto)) : '')
+                           + (x.zwrot ? '  (korekta)' : '')
+                           + (x.paid && x.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(x.paid) + '</span>') : '');
+                  }).join('<br>') + '</div>');
+        }
+        if (k.niepewne.length){
+            h += sek('Kwota pasuje, ale do kilku pozycji — ' + k.niepewne.length, '#c47f00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Nie zgaduję: tej samej kwocie odpowiada więcej niż jedna płatność (albo więcej niż jedno brakujące zamówienie). Rozstrzygnij ręcznie.</div>'
+                + '<div style="' + mono + '">'
+                + k.niepewne.map(function (x){
+                      return esc(x.id) + '  ' + f2(x.kwota) + '  ' + esc(x.typ || '?')
+                           + '  → kandydaci: ' + x.kand.map(function (c){ return knLink(c.auf); }).join(', ')
+                           + (x.ile > x.kand.length ? (' … +' + (x.ile - x.kand.length)) : '')
+                           + (x.ileTakich > 1 ? ('  <span style="color:#c47f00">(zamówień o tej kwocie: ' + x.ileTakich + ')</span>') : '');
+                  }).join('<br>') + '</div>');
+        }
         if (k.zleKonto.length){
             h += sek('❌ Złe konto sprzedaży — ' + k.zleKonto.length, '#c00',
-                '<div style="' + mono + '">'
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Konto z exportu nie zgadza się z typem klienta wyliczonym z raportu. Uwaga: prologistics czasem <b>pokazuje</b> inne konto, niż jest faktycznie zaksięgowane — dlatego zanim poprawisz, otwórz auftrag i sprawdź na miejscu.</div>'
+                + '<div style="' + mono + '">'
                 + k.zleKonto.map(function (x){
                       return esc(x.id) + '  typ <b>' + esc(x.typ || '?') + '</b>  konto <b style="color:#c00">'
                            + esc(x.konto) + '</b> (oczekiwane ' + esc(x.ocz) + ')  ' + f2(x.kwota)
-                           + (x.auf ? ('  auftrag ' + esc(x.auf)) : '')
+                           + (x.auf ? ('  auftrag ' + knLinki(x.auf)) : '')
                            + (x.vat ? ('  VAT ' + esc(x.vat)) : '')
                            + (x.paid && x.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(x.paid) + '</span>') : '')
                            + (x.zwrot ? '  (korekta)' : '');
@@ -23119,7 +23222,7 @@
                 + k.zlaKwota.map(function (x){
                       return esc(x.id) + '  w exporcie ' + f2(x.wExporcie) + ', w raporcie ' + f2(x.wRaporcie)
                            + '  (różnica <b>' + f2(x.roznica) + '</b>)'
-                           + (x.auf ? ('  auftrag ' + esc(x.auf)) : '')
+                           + (x.auf ? ('  auftrag ' + knLinki(x.auf)) : '')
                            + (x.paid && x.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(x.paid) + '</span>') : '');
                   }).join('<br>') + '</div>');
         }
@@ -23142,7 +23245,11 @@
                 + k.wyj.map(function (x){
                       return esc(x.typ) + '  ' + f2(x.kwota) + (x.data ? ('  ' + esc(x.data)) : '')
                            + (x.id ? ('  id ' + esc(x.id)) : '')
-                           + (x.ile ? ('  → <span style="color:#0a7a2f">' + esc(x.trafienia.join(' | '))
+                           + (x.ile ? ('  → <span style="color:#0a7a2f">'
+                                       + x.trafienia.map(function (t){
+                                             const cz = String(t).split(' · ');
+                                             return knLink(cz[0]) + (cz[1] ? (' · ' + esc(cz[1])) : '');
+                                         }).join(' | ')
                                        + (x.ile > x.trafienia.length ? (' … +' + (x.ile - x.trafienia.length)) : '') + '</span>')
                                     : '  → <b style="color:#c47f00">NIE ZAKSIĘGOWANE</b>');
                   }).join('<br>') + '</div>');
@@ -23154,7 +23261,7 @@
                 + k.stawki.map(function (x){
                       return '<b>' + x.st + '%</b>  ' + esc(x.id) + '  ' + esc(x.typ || '?') + '  ' + f2(x.kwota)
                            + (x.konto ? ('  konto ' + esc(x.konto)) : '  <span style="color:#c00">brak w exporcie</span>')
-                           + (x.auf ? ('  auftrag ' + esc(x.auf)) : '')
+                           + (x.auf ? ('  auftrag ' + knLinki(x.auf)) : '')
                            + (x.sku ? ('  SKU ' + esc(x.sku)) : '');
                   }).join('<br>') + '</div>');
         }
@@ -23166,11 +23273,24 @@
                            + '  ' + esc(x.plik);
                   }).join('<br>') + (k.obce.length > 20 ? ('<br>… +' + (k.obce.length - 20)) : '') + '</div>');
         }
-        if (k.spoza)
-            h += sek('W exporcie, spoza tego rozliczenia — ' + k.spoza + ' numerów', '#9ca3af',
-                '<div style="font-size:10px;color:#666">To normalne, gdy export obejmuje szerszy zakres niż jedno rozliczenie.</div>'
-                + '<div style="' + mono + '">' + k.spozaLista.map(esc).join(', ')
-                + (k.spoza > k.spozaLista.length ? (' … +' + (k.spoza - k.spozaLista.length)) : '') + '</div>');
+        // v3.93: druga strona uzgodnienia — co siedzi w exporcie, a czego nie ma
+        // w rozliczeniu. Dotad byla to tylko liczba i lista numerow „spoza rozliczenia";
+        // teraz pokazujemy wiersze z kwota i auftragiem, bo to wlasnie wsrod nich szuka
+        // sie pary dla pozycji, ktorej import nie dopasowal.
+        if (k.wolne.length){
+            h += sek('W exporcie, a nie ma w rozliczeniu — ' + k.wolne.length
+                     + ' wierszy na ' + f2(k.wolneSuma) + ' ' + esc(p.cur), '#c47f00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Płatności, których numer fulfilmentu nie występuje w tym rozliczeniu Amazona. Częściowo to normalne (export obejmuje szerszy zakres), ale to także miejsce, gdzie siedzą pozycje zaksięgowane ręcznie pod innym numerem.</div>'
+                + '<div style="' + mono + ';max-height:200px;overflow:auto">'
+                + k.wolne.slice(0, 60).map(function (r){
+                      return f2(r.kwota) + '  ' + knLink(r.auf)
+                           + (r.ff ? ('  ' + esc(r.ff)) : '  <span style="color:#888">(bez numeru)</span>')
+                           + (r.konto ? ('  konto ' + esc(r.konto)) : '')
+                           + (r.zwrot ? '  (korekta)' : '')
+                           + (r.paid && r.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(r.paid) + '</span>') : '');
+                  }).join('<br>')
+                + (k.wolne.length > 60 ? ('<br>… +' + (k.wolne.length - 60)) : '') + '</div>');
+        }
 
         if (!k.brakuje.length && !k.zleKonto.length && !k.zlaKwota.length && !k.brakZwrot.length)
             h += sek('✔ Wszystko zaksięgowane i na właściwych kontach', '#0a7a2f',
@@ -23189,6 +23309,27 @@
             L.push(''); L.push('NIE ZAKSIĘGOWANE (' + k.brakuje.length + ' na ' + f2(k.brakujeSuma) + ' ' + p.cur + ')');
             k.brakuje.forEach(function (x){
                 L.push('\t' + x.id + '\t' + f2(x.kwota) + '\t' + (x.typ || '') + '\t' + (x.data || '') + '\t' + (x.sku || ''));
+            });
+        }
+        if (k.sklejone.length){
+            L.push(''); L.push('ZAKSIĘGOWANE POD INNYM NUMEREM (' + k.sklejone.length + ')');
+            k.sklejone.forEach(function (x){
+                L.push('\t' + x.id + '\t' + f2(x.kwota) + '\t' + (x.typ || '') + '\t' + (x.auf || '') + '\t' + (x.ff || ''));
+            });
+        }
+        if (k.niepewne.length){
+            L.push(''); L.push('KWOTA PASUJE DO KILKU (' + k.niepewne.length + ')');
+            k.niepewne.forEach(function (x){
+                L.push('\t' + x.id + '\t' + f2(x.kwota) + '\t'
+                       + x.kand.map(function (c){ return c.auf; }).join(' | '));
+            });
+        }
+        if (k.wolne.length){
+            L.push(''); L.push('W EXPORCIE, A NIE MA W ROZLICZENIU ('
+                   + k.wolne.length + ' na ' + f2(k.wolneSuma) + ' ' + p.cur + ')');
+            k.wolne.forEach(function (r){
+                L.push('\t' + f2(r.kwota) + '\t' + (r.auf || '') + '\t' + (r.ff || '')
+                       + '\t' + (r.konto || '') + '\t' + (r.zwrot ? 'korekta' : 'wpłata'));
             });
         }
         if (k.zleKonto.length){
@@ -31833,3 +31974,5 @@
     [500, 1500].forEach(function(ms){ setTimeout(buildLauncher, ms); });
 
 })();
+
+
