@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.88
+// @version      3.91
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -4013,29 +4013,30 @@
         // „nie potwierdzilo sie", chociaz zapis szedl. Jednolinijkowe „Please add solution"
         // trafialo zawsze i dlatego eskalacje wygladaly na sprawne, a opisy potracen nie.
         const szukany = normalizeSpaces(commentText).slice(0, 60);
-        const ileRazy = function (hay, needle) {
-            if (!needle) return 0;
-            let n = 0, od = 0, p;
-            while ((p = hay.indexOf(needle, od)) >= 0) { n++; od = p + needle.length; }
-            return n;
-        };
         for (let czekano = 0; czekano < KOM_MAX; czekano += KOM_KROK) {
             await sleep(KOM_KROK);
             const d2 = getFrameDoc(ctx);
             if (!d2) continue;
-            const ta = d2.querySelector('textarea#newcomment, textarea[name="newcomment"]');
-            // Strona przeladowala sie po dodaniu — textarea zniknela albo wrocila pusta.
-            if (!ta) return { ok: true, potwierdzone: 'przeładowanie strony' };
-            if (!String(ta.value || '').trim()) return { ok: true, potwierdzone: 'pole wyczyszczone' };
-            // Pole nadal trzyma nasz tekst, ale komentarz juz widnieje na liscie.
-            // ZLICZAMY wystapienia, a nie wycinamy: textContent strony zawiera tresc
-            // textarea DOKLADNIE raz, wiec drugie wystapienie moze pochodzic juz tylko
-            // z listy komentarzy. Wycinanie po wartosci pola kasowalo takze ten wpis
-            // na liscie i potwierdzenie nigdy nie przychodzilo.
+            // v3.90: JEDYNYM dowodem zapisu jest tekst komentarza WIDOCZNY na stronie.
+            // Dwie usterki naraz sie tu zbiegly:
+            //  1. Prog „widoczny na liscie" byl zawyzony o 1. Wpisujemy tekst przez
+            //     .value, a JS-owe .value NIE trafia do textContent — wiec swiezy
+            //     komentarz na liscie dawal 1 wystapienie przy progu ">1" i ta galaz
+            //     NIE STRZELALA NIGDY. Kazda pozycja odsiadywala przez to pelne 10 s
+            //     i dopiero przeladowanie (nizej) potwierdzalo zapis — stad minuty
+            //     ciszy przy dopisywaniu opisow.
+            //  2. „Textarea zniknela / wrocila pusta" to dowody czysto KLIENCKIE:
+            //     potrafily potwierdzic zapis, ktorego serwer jeszcze nie przyjal,
+            //     a najblizsze loadInFrame/destroyFrameCtx (przywracanie Closed,
+            //     sprzatanie ramki) ubijalo wiszacy XHR razem z komentarzem —
+            //     dokladnie awaria opisana wyzej przy KOM_MAX.
+            // Obecnosc prefiksu w body moze pochodzic wylacznie z listy komentarzy:
+            // duplikat-check w moscie odsial wczesniej tickety, ktore mialy ten tekst
+            // przed dopisaniem. Gdy strona przeladuje sie po zapisie, nastepna probka
+            // i tak zobaczy komentarz w body — osobne dowody z textarea sa zbedne.
             if (szukany){
                 const body = normalizeSpaces((d2.body && d2.body.textContent) || '');
-                const wPolu = (normalizeSpaces(ta.value).indexOf(szukany) >= 0) ? 1 : 0;
-                if (ileRazy(body, szukany) > wPolu) return { ok: true, potwierdzone: 'widoczny na liście' };
+                if (body.indexOf(szukany) >= 0) return { ok: true, potwierdzone: 'widoczny na liście' };
             }
         }
         // v3.66: ostatnie slowo ma STRONA, nie nasz podglad. Przeladowujemy ticket i
@@ -4147,6 +4148,35 @@
         if (r2 && r2.ok) return { ...r2, poPowtorzeniu: true };
         return { ok: false, href: (r2 && r2.href) || (r1 && r1.href) || '',
                  error: ((r1 && r1.error) || '?') + ' | po powtórzeniu: ' + ((r2 && r2.error) || '?') };
+    };
+    // v3.90: druga polowa mostu — SPRAWDZENIE, czy opis faktycznie stoi na tickecie.
+    // Dopisywanie ma swoje potwierdzenia, ale one orzekaja w chwili zapisu; to tutaj
+    // czyta ticket na swiezo i mowi, jak jest TERAZ. Moduł Marketplace dostaje przez to
+    // odpowiedz na jedyne pytanie, ktore naprawde pada po ksiegowaniu: „jest czy nie ma".
+    window.__TM_TICKET_COMMENT_CHECK = async function (ffNumber, text) {
+        const ff = String(ffNumber || '').trim();
+        const szukany = normalizeSpaces(String(text || '')).slice(0, 60);
+        if (!ff || !szukany) return { ok: false, error: 'brak numeru zamówienia albo treści' };
+        const ctx = createFrameCtx();
+        try {
+            let href = tmHrefKnown(ff);
+            if (!href){
+                const found = await findBestTicketForOrder(ff, ctx);
+                href = (found.ok && found.ticket && found.ticket.href)
+                     || (found.noSolutionTickets && found.noSolutionTickets[0] && found.noSolutionTickets[0].href) || '';
+                if (!href) return { ok: false, error: found.error || ('nie znalazłem ticketu dla ' + ff) };
+            }
+            await loadInFrame(href, 20000, ctx);
+            await sleep(500);
+            const d = getFrameDoc(ctx);
+            const body = normalizeSpaces((d && d.body && d.body.textContent) || '');
+            if (!body) return { ok: false, error: 'nie odczytałem strony ticketu', href: href };
+            return { ok: true, jest: body.indexOf(szukany) >= 0, href: href };
+        } catch (e) {
+            return { ok: false, error: (e && e.message) || String(e) };
+        } finally {
+            destroyFrameCtx(ctx);
+        }
     };
 
     async function reassignTicketToUser(ctx, ticketHref, openedByName) {
@@ -18506,7 +18536,8 @@
         // wtedy konto wchodzilo z podpowiedzi po nazwie. Tu jest wprost z tabeli kont.
         'Amazon · Amazon IT':          { bank: '',    booking: '9', acct: '1337' },
         'Amazon · Amazon FR':          { bank: '',    booking: '9', acct: '1285' },
-        'Amazon · Amazon NL':          { bank: '',    booking: '9', acct: '1452' }
+        'Amazon · Amazon NL':          { bank: '',    booking: '9', acct: '1452' },
+        'Amazon · Amazon PL':          { bank: '',    booking: '9', acct: '1082' }
     };
     function setLoad(){
         let d = null;
@@ -20182,7 +20213,7 @@
         'direct-payment-amount', 'other-amount'];
     const MK_AMZ_SHOP = { 'amazon.de': 'Amazon DE', 'amazon.co.uk': 'Amazon UK', 'amazon.uk': 'Amazon UK',
         'amazon.fr': 'Amazon FR', 'amazon.es': 'Amazon ES', 'amazon.it': 'Amazon IT',
-        'amazon.nl': 'Amazon NL' };
+        'amazon.nl': 'Amazon NL', 'amazon.pl': 'Amazon PL' };
     // Konta 1:1 z dzisiejsza aplikacja (get_accounts). Numer konta i konta VAT ida
     // DO PLIKU IMPORTU, kolumna po kolumnie — prologistics czyta je z wiersza, a nie
     // z bank_settingu, i na tym polega roznica wobec pozostalych marketplace'ow.
@@ -20199,7 +20230,14 @@
         // v3.85: Holandia. Wszystkie trzy numery podane wprost (12.08.2026). B2B tak samo
         // jak przy FR nie wystepuje — w 6 rozliczeniach NL (28.05–06.08.2026, 80 zamowien)
         // sa wylacznie B2C, wiec 3272 czeka na pierwsze zamowienie 0%.
-        nl: { acc: '1452', vat: { 'B2C': '3261', 'B2B 0%': '3272' } }
+        nl: { acc: '1452', vat: { 'B2C': '3261', 'B2B 0%': '3272' } },
+        // v3.89: Polska. Konta podane wprost (13.08.2026), komplet trzech typow.
+        // PIERWSZY KRAJ SPOZA STREFY EURO — rozliczenia przychodza w PLN. Waluta idzie
+        // ze srodka pliku (naglowek wyplaty), a nie z tabeli, wiec nie ma tu czego ustawiac;
+        // zapisano to jako uwage, bo przy 7 rozliczeniach PL sprawdzone bylo tylko PLN.
+        // W tych plikach z trzech typow wystapily dwa: B2C 61 zam. i B2B 0% jedno
+        // (403-8257787-0335553). B2B czeka na pierwsze zamowienie.
+        pl: { acc: '1082', vat: { 'B2C': '3292', 'B2B': '3209', 'B2B 0%': '3294' } }
     };
     // ===== v3.73: pozycje „do wyjaśnienia" =====
     // Czesc wierszy raportu nie ma jak trafic na auftrag: albo w ogole nie ma numeru
@@ -20258,6 +20296,7 @@
         if (c.indexOf('amazon.es') >= 0 || c === 'es') return 'es';
         if (c.indexOf('amazon.it') >= 0 || c === 'it') return 'it';
         if (c.indexOf('amazon.nl') >= 0 || c === 'nl') return 'nl';
+        if (c.indexOf('amazon.pl') >= 0 || c === 'pl') return 'pl';
         return '';
     }
     // Typ transakcji 1:1 z determine_type: bez PRINCIPAL nie ma typu, TAX + VAT pobrany
@@ -20312,6 +20351,7 @@
         let setId = '', payDate = '', total = null, cur = '';
         const ord = {}, ref = {}, refNote = {}, refSign = {}, ids = {};
         const ptOrd = {}, ptRef = {}, ctryO = {}, ctryR = {};
+        const prinOrd = {}, taxOrd = {}, skuOrd = {}, dataOrd = {};   // v3.91
         const gw = [], rekomp = {}, chgOrd = {}, mktCnt = {}, doWyj = [], nieznane = {};
         let gross = 0, refund = 0, nOrd = 0, nRef = 0, sumAll = 0, gwKolizja = 0, rekompN = 0;
         let eprN = 0, eprSum = 0, cofN = 0, cofSum = 0;   // v3.84
@@ -20396,6 +20436,18 @@
                     if (!ptOrd[on]) ptOrd[on] = {};
                     if (pt && pt !== 'NAN') ptOrd[on][pt] = 1;
                     if (kraj && kraj !== 'nan') ctryO[on] = kraj;
+                    // v3.91: Principal i Tax OSOBNO — z nich liczy sie stawka VAT zamowienia
+                    // (Tax/Principal). Kontrola ksiegowania wypisuje pozycje ze stawka inna
+                    // niz krajowa: 7% (Globus), 20% (AT), 25% (DK). SKU i data ida obok,
+                    // bo bez nich taka lista jest nie do sprawdzenia recznie.
+                    if (pt === 'PRINCIPAL') prinOrd[on] = r2((prinOrd[on] || 0) + y);
+                    if (pt === 'TAX') taxOrd[on] = r2((taxOrd[on] || 0) + y);
+                    if (!skuOrd[on]){
+                        const sk = String(r[C.sku] == null ? '' : r[C.sku]).trim();
+                        if (sk && sk.toLowerCase() !== 'nan') skuOrd[on] = sk;
+                    }
+                    const dOrd = String(r[C.post] == null ? '' : r[C.post]).slice(0, 10);
+                    if (dOrd && (!dataOrd[on] || dOrd < dataOrd[on])) dataOrd[on] = dOrd;
                 } else {
                     ref[on] = r2((ref[on] || 0) + v); refund = r2(refund + v); nRef++;
                     if (!ptRef[on]) ptRef[on] = {};
@@ -20547,13 +20599,16 @@
             // v3.83: DE i IT sa sprawdzone na zywych rozliczeniach (11 raportow DE,
             // 7 rozliczen IT). UK/FR/ES maja tabele kont przepisana z dzisiejszej
             // aplikacji, ale nie widzialem stamtad ani jednego pliku — stad ostrzezenie.
-            // v3.85: NL dolacza do sprawdzonych — konta sprzedazy przyszly wprost od Was,
-            // a wszystkie 6 rozliczen NL przeszlo kontrole sumy. UK/FR/ES nadal ostrzegaja.
-            tylkoDE: (['de', 'it', 'nl'].indexOf(amzKraj(dom)) >= 0),
+            // v3.89: PL dolacza do sprawdzonych na tej samej zasadzie co NL — konta przyszly
+            // wprost od Was, a wszystkie 7 rozliczen PL przeszlo kontrole sumy.
+            // UK/FR/ES nadal ostrzegaja: ich tabela pochodzi z poprzedniej aplikacji
+            // i nikt jej nie potwierdzil.
+            tylkoDE: (['de', 'it', 'nl', 'pl'].indexOf(amzKraj(dom)) >= 0),
             goodwill: gw.length, gwKolizja: gwKolizja,
             epr: eprN, eprSum: eprSum, cofN: cofN, cofSum: cofSum,
             brakVat: brakVat, brakAcc: brakAcc,
             doWyj: doWyj, nieznane: nieznane, typOrd: typOrd, vatOrd: vatOrd,
+            prinOrd: prinOrd, taxOrd: taxOrd, skuOrd: skuOrd, dataOrd: dataOrd,   // v3.91
             doWyjSum: doWyj.reduce(function (a, x){ return r2(a + x.kwota); }, 0),
             wOrd: wOrd,
             n: Object.keys(ord).length + Object.keys(ref).length
@@ -22197,6 +22252,197 @@
         return { list: all, total: total, full: full, pages: pages, how: how };
     }
 
+    // ============ KONTROLA KSIEGOWANIA: raport Amazona kontra Export payments ============
+    // v3.91. Pytanie, na ktore to odpowiada, brzmi: „czy WSZYSTKO z rozliczenia naprawde
+    // wpadlo do prologistics i na WLASCIWE konta". Import mowi tylko, ze plik poszedl —
+    // nie mowi, ile wierszy sie dopasowalo do auftragow ani co z nimi zrobil system.
+    //
+    // Zrodlo prawdy po stronie prologistics to „Export payments" (.xls). Czytamy go
+    // SheetJS-em, ktory skrypt i tak ma w @require. UWAGA: prologistics sklada ten plik
+    // sam i naglowek OLE bywa niespojny — dlatego czytamy z tolerancja na bledy.
+    //
+    // Uklad pliku (sprawdzone na 2026-07-10 · 1323, 710 wierszy): arkusz „Payments",
+    // 17 kolumn, z czego licza sie: Fulfillment number (= order-id Amazona), Auftrag
+    // number, Debit, Credit, Amount, Paid status, VAT Account, Invoice Number.
+    // KIERUNEK poznajemy po tym, po ktorej stronie stoi konto rozliczeniowe (1323):
+    //   1323 po stronie Debit  -> sprzedaz,
+    //   1323 po stronie Credit -> zwrot / korekta.
+    // Konto sprzedazy to zawsze to DRUGIE.
+    const MK_EXP_KOL = ['Fulfillment number', 'Auftrag number', 'Debit', 'Credit', 'Amount'];
+    // Konta sprzedazy dopuszczalne dla danego typu klienta — SZERSZE niz tabela importu,
+    // bo w prologistics zdarzaja sie poprawne warianty krajowe (decyzja z 13.08.2026):
+    //   3253 „Erlöse AT" przy B2C — czasem tak ustawi sie konto przez state odbiorcy
+    //        i jest to POPRAWNE, wiec nie zglaszamy tego jako bledu,
+    //   3218 „B2B intra 0% DKK" przy B2B — Amazon DE wysyla do Danii, zwykle na 0%.
+    const MK_EXP_OK = {
+        de: { 'B2C': ['3252', '3253'], 'B2B': ['3283', '3218'], 'B2B 0%': ['3264'] }
+    };
+    // Stawka krajowa. Wszystko inne trafia na liste „do wgladu" — NIE jako blad:
+    // 3252 to „Erlöse DE 0% Marketplace" i stawka nie ma tam znaczenia, bo VAT-u nie
+    // odprowadzamy my, tylko Amazon (decyzja z 13.08.2026). Lista ma jednak powstawac
+    // zawsze, takze dla stawek, ktorych jeszcze nie widzielismy.
+    const MK_EXP_STAWKA = { de: 19 };
+    function expNum(v){
+        if (typeof v === 'number') return v;
+        const s = String(v == null ? '' : v).trim().replace(/\s/g, '');
+        if (!s) return 0;
+        // W exporcie kwoty bywaja tekstem — raz z kropka, raz z przecinkiem.
+        const t = (s.indexOf(',') >= 0 && s.indexOf('.') < 0) ? s.replace(',', '.') : s.replace(/,/g, '');
+        const n = Number(t);
+        return isFinite(n) ? n : 0;
+    }
+    function expTxt(v){
+        if (v == null) return '';
+        // SheetJS oddaje liczby calkowite jako number — numer konta „1323" nie moze
+        // wyjsc jako „1323.0" ani jako „1.323".
+        if (typeof v === 'number') return (v === Math.floor(v)) ? String(Math.floor(v)) : String(v);
+        return String(v).trim();
+    }
+    // Czyta JEDEN plik Export payments. Zwraca { rows, err }.
+    function mkParseExport(u8, nazwa, kontoRozl){
+        if (typeof XLSX === 'undefined' || !XLSX.read)
+            return { err: 'biblioteka do czytania .xls się nie załadowała — odśwież stronę prologistics' };
+        let wb;
+        try { wb = XLSX.read(u8, { type: 'array' }); }
+        catch (e){ return { err: 'nie umiem otworzyć ' + nazwa + ': ' + ((e && e.message) || e) }; }
+        const nm = (wb.SheetNames || []).filter(function (x){ return /payment/i.test(x); })[0]
+                 || (wb.SheetNames || [])[0];
+        if (!nm) return { err: nazwa + ': plik nie ma żadnego arkusza' };
+        const aoa = XLSX.utils.sheet_to_json(wb.Sheets[nm], { header: 1, raw: true, defval: '' });
+        if (!aoa.length) return { err: nazwa + ': arkusz „' + nm + '” jest pusty' };
+        const hdr = (aoa[0] || []).map(function (c){ return expTxt(c); });
+        const ix = {};
+        hdr.forEach(function (c, i){ if (c) ix[c.toLowerCase()] = i; });
+        const brak = MK_EXP_KOL.filter(function (k){ return ix[k.toLowerCase()] == null; });
+        if (brak.length)
+            return { err: nazwa + ': to nie wygląda na „Export payments" — brak kolumn: ' + brak.join(', ')
+                        + '. Widziane kolumny: ' + hdr.filter(Boolean).slice(0, 12).join(', ') };
+        const K = { ff: ix['fulfillment number'], auf: ix['auftrag number'], deb: ix['debit'],
+                    cre: ix['credit'], kw: ix['amount'], paid: ix['paid status'],
+                    vat: ix['vat account'], inv: ix['invoice number'], dat: ix['payment date'] };
+        const rows = [];
+        for (let i = 1; i < aoa.length; i++){
+            const r = aoa[i] || [];
+            const ff = expTxt(r[K.ff]);
+            const deb = expTxt(r[K.deb]), cre = expTxt(r[K.cre]);
+            if (!ff && !deb && !cre) continue;
+            const sprzedaz = (deb === kontoRozl);
+            const zwrot = (cre === kontoRozl);
+            rows.push({
+                ff: ff, auf: expTxt(r[K.auf]), deb: deb, cre: cre,
+                kwota: r2(expNum(r[K.kw])),
+                paid: expTxt(K.paid == null ? '' : r[K.paid]),
+                vat: expTxt(K.vat == null ? '' : r[K.vat]),
+                inv: expTxt(K.inv == null ? '' : r[K.inv]),
+                data: expTxt(K.dat == null ? '' : r[K.dat]).slice(0, 10),
+                // Konto sprzedazy to to, ktore NIE jest kontem rozliczeniowym. Gdy zadne
+                // z dwoch nim nie jest, wiersz nie dotyczy tego rozliczenia — zapisujemy
+                // go jako „obce", zamiast zgadywac.
+                konto: sprzedaz ? cre : (zwrot ? deb : ''),
+                sprzedaz: sprzedaz, zwrot: zwrot, plik: nazwa
+            });
+        }
+        return { rows: rows, arkusz: nm };
+    }
+    // Wlasciwe porownanie. p — wynik mkParseAmz, ex — sklejone wiersze ze wszystkich
+    // wgranych plikow Export payments.
+    function mkKontrolaAmz(p, ex){
+        const okKonta = MK_EXP_OK.de, stKraj = MK_EXP_STAWKA.de;
+        const poFf = {};
+        ex.forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
+
+        const brakuje = [], zleKonto = [], zlaKwota = [], stawki = [], obce = [], brakZwrot = [];
+        Object.keys(p.ord).forEach(function (id){
+            const typ = p.typOrd[id] || '';
+            const brutto = r2(p.ord[id]);
+            const w = poFf[id] || [];
+            const sprz = w.filter(function (r){ return r.sprzedaz; });
+            // --- stawka VAT: liczymy z raportu, nie z prologistics ---
+            const pr = p.prinOrd[id] || 0, tx = p.taxOrd[id] || 0;
+            if (pr > 0 && tx > 0){
+                const st = Math.round(tx / pr * 100);
+                if (st !== stKraj){
+                    stawki.push({ id: id, st: st, typ: typ, kwota: brutto,
+                                  auf: w.map(function (r){ return r.auf; }).filter(Boolean).join(', '),
+                                  konto: w.map(function (r){ return r.konto; }).filter(Boolean).join(', '),
+                                  sku: p.skuOrd[id] || '', data: p.dataOrd[id] || '' });
+                }
+            }
+            if (!w.length){
+                brakuje.push({ id: id, kwota: brutto, typ: typ, data: p.dataOrd[id] || '',
+                               sku: p.skuOrd[id] || '', maZwrot: p.ref[id] != null });
+                return;
+            }
+            // --- konto sprzedazy ---
+            const dozw = okKonta[typ];
+            w.forEach(function (r){
+                if (!r.konto){
+                    obce.push({ id: id, auf: r.auf, deb: r.deb, cre: r.cre, kwota: r.kwota, plik: r.plik });
+                    return;
+                }
+                if (dozw && dozw.indexOf(r.konto) < 0){
+                    zleKonto.push({ id: id, typ: typ, konto: r.konto, ocz: dozw.join(' lub '),
+                                    auf: r.auf, kwota: r.kwota, vat: r.vat, paid: r.paid,
+                                    zwrot: r.zwrot, plik: r.plik });
+                }
+            });
+            // --- kwota: tylko gdy sa wiersze sprzedazy. Zamowienie, ktore w exporcie
+            // widnieje WYLACZNIE jako korekta, sprzedano w innym okresie i porownywanie
+            // go z brutto z tego raportu nie mialoby sensu.
+            if (sprz.length){
+                const suma = r2(sprz.reduce(function (a, r){ return a + r.kwota; }, 0));
+                if (Math.abs(suma - brutto) > 0.02)
+                    zlaKwota.push({ id: id, wExporcie: suma, wRaporcie: brutto,
+                                    roznica: r2(suma - brutto), typ: typ,
+                                    auf: sprz.map(function (r){ return r.auf; }).filter(Boolean).join(', '),
+                                    paid: sprz.map(function (r){ return r.paid; }).filter(Boolean).join(',') });
+            }
+        });
+        // --- zwroty z raportu: czy zostawily slad w exporcie ---
+        // UWAGA na kierunek: NIE kazdy zwrot ksieguje sie jako korekta. SAFE-T
+        // i REVERSAL_REIMBURSEMENT to pieniadze, ktore Amazon nam ODDAJE — w prologistics
+        // ida wtedy po stronie wplaty (1323 w Debit), dokladnie odwrotnie niz zwykly zwrot.
+        // Sprawdzone na 27390327512: wszystkie 8 pozycji SAFE-T siedzi po stronie wplaty
+        // i warunek „musi byc korekta" zglaszal je jako brak, chociaz sa zaksiegowane.
+        // Dlatego szukamy sladu w OBU kierunkach: albo wiersz korekty, albo wiersz
+        // o tej samej kwocie (bez wzgledu na strone).
+        Object.keys(p.ref || {}).forEach(function (id){
+            const w = poFf[id] || [];
+            if (w.some(function (r){ return r.zwrot; })) return;
+            const a = Math.abs(r2(p.ref[id]));
+            if (w.some(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
+            brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
+        });
+        // --- lista „do wyjasnienia": szukamy odpowiednika KWOTOWEGO ---
+        // Tak wlasnie rozstrzyga sie to recznie: marketing dopisuje auftrag/ticket, a wtedy
+        // pozycja jest juz zaksiegowana pod innym numerem i po numerze jej nie znajdziemy.
+        const wyj = (p.doWyj || []).map(function (d){
+            const a = Math.abs(d.kwota);
+            const tr = ex.filter(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.005; });
+            return { typ: d.typ, id: d.id, kwota: d.kwota, data: d.data,
+                     trafienia: tr.slice(0, 4).map(function (r){
+                         return (r.auf || '?') + (r.ff ? (' · ' + r.ff) : '');
+                     }), ile: tr.length };
+        });
+        // --- wiersze exportu spoza tego rozliczenia ---
+        const znane = {};
+        Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
+        Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
+        const spoza = ex.filter(function (r){ return r.ff && !znane[r.ff]; });
+        const spozaFf = {};
+        spoza.forEach(function (r){ spozaFf[r.ff] = (spozaFf[r.ff] || 0) + 1; });
+
+        return {
+            nOrd: Object.keys(p.ord).length, nExp: ex.length,
+            nDopasowanych: Object.keys(p.ord).filter(function (id){ return poFf[id]; }).length,
+            brakuje: brakuje.sort(function (a, b){ return b.kwota - a.kwota; }),
+            brakujeSuma: r2(brakuje.reduce(function (a, x){ return a + x.kwota; }, 0)),
+            zleKonto: zleKonto, zlaKwota: zlaKwota, obce: obce, brakZwrot: brakZwrot,
+            stawki: stawki.sort(function (a, b){ return a.st - b.st; }),
+            wyj: wyj, spoza: Object.keys(spozaFf).length, spozaLista: Object.keys(spozaFf).slice(0, 20)
+        };
+    }
+
     // ================= SALDA: miesieczne zestawienie do xlsx =================
     // Rreczne sciaganie i sklejanie trzydziestu dziennych raportow to praca, ktora
     // komputer robi lepiej. Uklad odtwarzamy z pliku „OBI DE.xlsx": naglowek raz na
@@ -22826,10 +23072,257 @@
               + '<input id="mk-sal-m" value="' + def + '" placeholder="MM/RRRR" style="width:80px;font-size:11px;text-align:center">'
               + '<button id="mk-sal-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Pokaż zestawienia</button>'
               + '<span id="mk-sal-msg" style="font-size:11px;color:#666"></span></div>'
-              + '<div id="mk-sal-out" style="margin-top:8px"></div>';
+              + '<div id="mk-sal-out" style="margin-top:8px"></div>'
+              // v3.91: druga, niezalezna czesc panelu Salda — kontrola ksiegowania Amazona.
+              // Stoi tu, bo odpowiada na to samo pytanie co salda: „czy to, co mialo wejsc,
+              // naprawde weszlo". Na razie WYLACZNIE Amazon DE — reszta krajow ma inne
+              // zaleznosci kontowe i dokladamy je osobno.
+              + '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ddd6fe">'
+              + '<div style="font-size:11px;color:#5b21b6;font-weight:700;margin-bottom:4px">Amazon DE — kontrola księgowania</div>'
+              + '<div style="font-size:10px;color:#666;margin-bottom:6px">Wgraj raport rozliczenia z Amazona (.txt) i export z prologistics '
+              + '(<b>Export payments</b>, .xls) — możesz wskazać kilka plików exportu naraz, jeśli bierzecie go per dzień. '
+              + 'Sprawdzę, czy każde zamówienie z rozliczenia ma płatność, czy siedzi na właściwym koncie sprzedaży '
+              + 'i czy pozycje z listy „do wyjaśnienia" zostały gdzieś zaksięgowane.</div>'
+              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+              + '<label style="font-size:11px;font-weight:700;color:#fff;background:#7c3aed;border-radius:6px;padding:4px 10px;cursor:pointer">📄 Raport Amazona'
+              + '<input type="file" id="mk-kn-amz" accept=".txt,text/plain" style="display:none"></label>'
+              + '<span id="mk-kn-amz-nm" style="font-size:11px;color:#666">—</span>'
+              + '<label style="font-size:11px;font-weight:700;color:#fff;background:#7c3aed;border-radius:6px;padding:4px 10px;cursor:pointer">📊 Export payments'
+              + '<input type="file" id="mk-kn-exp" accept=".xls,.xlsx,application/vnd.ms-excel" multiple style="display:none"></label>'
+              + '<span id="mk-kn-exp-nm" style="font-size:11px;color:#666">—</span>'
+              + '<button id="mk-kn-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź</button>'
+              + '<button id="mk-kn-cp" style="padding:5px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
+              + '<span id="mk-kn-msg" style="font-size:11px;color:#666"></span></div>'
+              + '<div id="mk-kn-out" style="margin-top:8px"></div></div>';
             box.querySelector('#mk-sal-go').onclick = function(){ saldaGo(this); };
+            knPodepnij(box);
         };
     })();
+
+    // ---------- Amazon DE: kontrola ksiegowania (panel) ----------
+    // Pliki trzymamy w domknieciu, a nie w input.files — input czyscimy po wskazaniu,
+    // zeby dalo sie wskazac ten sam plik drugi raz po poprawce.
+    let knAmzPlik = null, knExpPliki = [], knTekst = '';
+    function knPodepnij(box){
+        const iA = box.querySelector('#mk-kn-amz'), iE = box.querySelector('#mk-kn-exp');
+        const nA = box.querySelector('#mk-kn-amz-nm'), nE = box.querySelector('#mk-kn-exp-nm');
+        const cp = box.querySelector('#mk-kn-cp');
+        iA.onchange = function(){
+            knAmzPlik = (this.files && this.files[0]) || null;
+            nA.textContent = knAmzPlik ? knAmzPlik.name : '—';
+            try { this.value = ''; } catch (e){}
+        };
+        iE.onchange = function(){
+            knExpPliki = Array.prototype.slice.call(this.files || []);
+            nE.textContent = knExpPliki.length
+                ? (knExpPliki.length === 1 ? knExpPliki[0].name : (knExpPliki.length + ' plików'))
+                : '—';
+            try { this.value = ''; } catch (e){}
+        };
+        box.querySelector('#mk-kn-go').onclick = function(){ knSprawdz(this, box); };
+        cp.onclick = function(){
+            try { GM_setClipboard(knTekst, 'text'); say('Wynik kontroli skopiowany.', '#0a7a2f'); }
+            catch (e){ say('Nie udało się skopiować.', '#c00'); }
+        };
+    }
+    async function knSprawdz(btn, box){
+        const msg = box.querySelector('#mk-kn-msg'), out = box.querySelector('#mk-kn-out');
+        const cp = box.querySelector('#mk-kn-cp');
+        const pisz = function (t, kol){ msg.style.color = kol || '#666'; msg.textContent = t; };
+        if (!knAmzPlik){ pisz('Wskaż raport rozliczenia z Amazona (.txt).', '#c47f00'); return; }
+        if (!knExpPliki.length){ pisz('Wskaż co najmniej jeden plik „Export payments" (.xls).', '#c47f00'); return; }
+        btn.disabled = true; cp.style.display = 'none'; out.innerHTML = '';
+        try {
+            pisz('Czytam raport Amazona…');
+            const p = mkParseAmz(mkDecode(await readBuf(knAmzPlik)));
+            if (p.err){ pisz(p.err, '#c00'); return; }
+            // Kontrole kontowe sa na razie ULOZONE POD DE i tylko pod DE. Przy innym kraju
+            // wynik bylby mylacy, wiec zamiast liczyc cokolwiek — mowimy wprost.
+            if (p.shop !== 'Amazon DE'){
+                pisz('Na razie sprawdzam wyłącznie Amazon DE, a ten raport to ' + (p.shop || '?')
+                     + '. Reszta krajów ma inne zależności kontowe — dołożę je osobno.', '#c47f00');
+                return;
+            }
+            const kontoRozl = MK_AMZ_ACC.de.acc;
+            const ex = [], zle = [];
+            for (let i = 0; i < knExpPliki.length; i++){
+                const f = knExpPliki[i];
+                pisz('Czytam export ' + (i + 1) + '/' + knExpPliki.length + ' — ' + f.name + '…');
+                const r = mkParseExport(new Uint8Array(await readBuf(f)), f.name, kontoRozl);
+                if (r.err){ zle.push(r.err); continue; }
+                r.rows.forEach(function (x){ ex.push(x); });
+            }
+            if (!ex.length){
+                pisz('Nie wczytałem ani jednego wiersza z exportu. ' + zle.join(' · '), '#c00');
+                return;
+            }
+            pisz('Porównuję…');
+            const k = mkKontrolaAmz(p, ex);
+            knTekst = knTekstowo(p, k, zle);
+            out.innerHTML = knRender(p, k, zle);
+            cp.style.display = '';
+            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+            pisz(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
+                 blady ? '#c47f00' : '#0a7a2f');
+        } catch (e){
+            pisz('Błąd: ' + ((e && e.message) || e), '#c00');
+        } finally { btn.disabled = false; }
+    }
+
+    // Wynik kontroli na ekranie. Kolejnosc sekcji jest kolejnoscia WAZNOSCI:
+    // najpierw to, czego nie ma w ksiegach, potem to, co jest, ale nie tam gdzie trzeba,
+    // a listy czysto informacyjne na koncu.
+    function knRender(p, k, zle){
+        const sek = function (tytul, kol, tresc){
+            return '<div style="margin-top:8px;padding:6px 8px;background:#fff;border:1px solid '
+                 + kol + ';border-radius:6px"><div style="font-size:11px;font-weight:700;color:'
+                 + kol + ';margin-bottom:3px">' + tytul + '</div>' + tresc + '</div>';
+        };
+        const mono = 'font:10px/1.5 monospace;color:#374151';
+        let h = '<div style="font-size:11px;color:#374151">Rozliczenie <b>' + esc(p.setId) + '</b>'
+              + ' · wypłata ' + esc(p.payDate || '—') + ' · ' + f2(p.net) + ' ' + esc(p.cur)
+              + ' · zamówień w raporcie <b>' + k.nOrd + '</b>'
+              + ' · wierszy w exporcie <b>' + k.nExp + '</b>'
+              + ' · dopasowanych <b>' + k.nDopasowanych + '</b></div>';
+        if (zle.length)
+            h += sek('Plików nie przeczytałem: ' + zle.length, '#c00',
+                     '<div style="' + mono + '">' + zle.map(esc).join('<br>') + '</div>');
+
+        if (k.brakuje.length){
+            h += sek('❌ Nie zaksięgowane — ' + k.brakuje.length + ' zamówień na ' + f2(k.brakujeSuma) + ' ' + esc(p.cur), '#c00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Są w rozliczeniu Amazona, a w exporcie nie ma dla nich ani jednego wiersza.</div>'
+                + '<div style="' + mono + ';max-height:220px;overflow:auto">'
+                + k.brakuje.map(function (x){
+                      return esc(x.id) + '  ' + f2(x.kwota) + '  ' + esc(x.typ || '?')
+                           + (x.data ? ('  ' + esc(x.data)) : '')
+                           + (x.sku ? ('  SKU ' + esc(x.sku)) : '')
+                           + (x.maZwrot ? '  <span style="color:#c47f00">(ma też zwrot)</span>' : '');
+                  }).join('<br>') + '</div>');
+        }
+        if (k.zleKonto.length){
+            h += sek('❌ Złe konto sprzedaży — ' + k.zleKonto.length, '#c00',
+                '<div style="' + mono + '">'
+                + k.zleKonto.map(function (x){
+                      return esc(x.id) + '  typ <b>' + esc(x.typ || '?') + '</b>  konto <b style="color:#c00">'
+                           + esc(x.konto) + '</b> (oczekiwane ' + esc(x.ocz) + ')  ' + f2(x.kwota)
+                           + (x.auf ? ('  auftrag ' + esc(x.auf)) : '')
+                           + (x.vat ? ('  VAT ' + esc(x.vat)) : '')
+                           + (x.paid && x.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(x.paid) + '</span>') : '')
+                           + (x.zwrot ? '  (korekta)' : '');
+                  }).join('<br>') + '</div>');
+        }
+        if (k.zlaKwota.length){
+            h += sek('❌ Kwota się nie zgadza — ' + k.zlaKwota.length, '#c00',
+                '<div style="' + mono + '">'
+                + k.zlaKwota.map(function (x){
+                      return esc(x.id) + '  w exporcie ' + f2(x.wExporcie) + ', w raporcie ' + f2(x.wRaporcie)
+                           + '  (różnica <b>' + f2(x.roznica) + '</b>)'
+                           + (x.auf ? ('  auftrag ' + esc(x.auf)) : '')
+                           + (x.paid && x.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(x.paid) + '</span>') : '');
+                  }).join('<br>') + '</div>');
+        }
+        if (k.brakZwrot.length){
+            h += sek('❌ Zwrot bez korekty w exporcie — ' + k.brakZwrot.length, '#c00',
+                '<div style="' + mono + '">'
+                + k.brakZwrot.map(function (x){
+                      return esc(x.id) + '  ' + f2(x.kwota)
+                           + (x.wierszy ? ('  <span style="color:#666">(zamówienie ma ' + x.wierszy
+                                           + ' wierszy, ale żaden na tę kwotę)</span>')
+                                        : '  <span style="color:#666">(brak jakiegokolwiek wiersza)</span>');
+                  }).join('<br>') + '</div>');
+        }
+        if (k.wyj.length){
+            const bez = k.wyj.filter(function (x){ return !x.ile; });
+            h += sek('Lista „do wyjaśnienia" — ' + k.wyj.length + ' poz., bez śladu w księgach: ' + bez.length,
+                bez.length ? '#c47f00' : '#0a7a2f',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Pozycji bez numeru zamówienia nie znajdę po numerze — szukam więc płatności o TEJ SAMEJ kwocie. Trafienie znaczy, że ktoś już podał auftrag/ticket.</div>'
+                + '<div style="' + mono + '">'
+                + k.wyj.map(function (x){
+                      return esc(x.typ) + '  ' + f2(x.kwota) + (x.data ? ('  ' + esc(x.data)) : '')
+                           + (x.id ? ('  id ' + esc(x.id)) : '')
+                           + (x.ile ? ('  → <span style="color:#0a7a2f">' + esc(x.trafienia.join(' | '))
+                                       + (x.ile > x.trafienia.length ? (' … +' + (x.ile - x.trafienia.length)) : '') + '</span>')
+                                    : '  → <b style="color:#c47f00">NIE ZAKSIĘGOWANE</b>');
+                  }).join('<br>') + '</div>');
+        }
+        if (k.stawki.length){
+            h += sek('Stawka inna niż 19% — ' + k.stawki.length + ' zam. (do wglądu, nie błąd)', '#c47f00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Konto 3252 to „Erlöse DE 0% Marketplace" — VAT-u nie odprowadzamy my, więc stawka nie przesądza o koncie. Lista jest po to, żeby dało się je obejrzeć: 7% to Globus, 20% Austria, 25% Dania.</div>'
+                + '<div style="' + mono + '">'
+                + k.stawki.map(function (x){
+                      return '<b>' + x.st + '%</b>  ' + esc(x.id) + '  ' + esc(x.typ || '?') + '  ' + f2(x.kwota)
+                           + (x.konto ? ('  konto ' + esc(x.konto)) : '  <span style="color:#c00">brak w exporcie</span>')
+                           + (x.auf ? ('  auftrag ' + esc(x.auf)) : '')
+                           + (x.sku ? ('  SKU ' + esc(x.sku)) : '');
+                  }).join('<br>') + '</div>');
+        }
+        if (k.obce.length){
+            h += sek('Wiersze bez konta rozliczeniowego ' + esc(MK_AMZ_ACC.de.acc) + ' — ' + k.obce.length, '#c47f00',
+                '<div style="' + mono + '">'
+                + k.obce.slice(0, 20).map(function (x){
+                      return esc(x.id) + '  ' + esc(x.deb) + '/' + esc(x.cre) + '  ' + f2(x.kwota)
+                           + '  ' + esc(x.plik);
+                  }).join('<br>') + (k.obce.length > 20 ? ('<br>… +' + (k.obce.length - 20)) : '') + '</div>');
+        }
+        if (k.spoza)
+            h += sek('W exporcie, spoza tego rozliczenia — ' + k.spoza + ' numerów', '#9ca3af',
+                '<div style="font-size:10px;color:#666">To normalne, gdy export obejmuje szerszy zakres niż jedno rozliczenie.</div>'
+                + '<div style="' + mono + '">' + k.spozaLista.map(esc).join(', ')
+                + (k.spoza > k.spozaLista.length ? (' … +' + (k.spoza - k.spozaLista.length)) : '') + '</div>');
+
+        if (!k.brakuje.length && !k.zleKonto.length && !k.zlaKwota.length && !k.brakZwrot.length)
+            h += sek('✔ Wszystko zaksięgowane i na właściwych kontach', '#0a7a2f',
+                     '<div style="font-size:10px;color:#666">' + k.nDopasowanych + ' z ' + k.nOrd
+                     + ' zamówień ma płatność, konta zgodne z typem klienta, kwoty się zgadzają.</div>');
+        return h;
+    }
+    // Ta sama tresc plaskim tekstem — do wklejenia w mail albo do arkusza.
+    function knTekstowo(p, k, zle){
+        const L = [];
+        L.push('KONTROLA KSIĘGOWANIA — Amazon DE');
+        L.push('rozliczenie ' + p.setId + ' · wypłata ' + (p.payDate || '—') + ' · ' + f2(p.net) + ' ' + p.cur);
+        L.push('zamówień w raporcie ' + k.nOrd + ', wierszy w exporcie ' + k.nExp + ', dopasowanych ' + k.nDopasowanych);
+        if (zle.length){ L.push(''); L.push('NIE PRZECZYTAŁEM: ' + zle.join(' | ')); }
+        if (k.brakuje.length){
+            L.push(''); L.push('NIE ZAKSIĘGOWANE (' + k.brakuje.length + ' na ' + f2(k.brakujeSuma) + ' ' + p.cur + ')');
+            k.brakuje.forEach(function (x){
+                L.push('\t' + x.id + '\t' + f2(x.kwota) + '\t' + (x.typ || '') + '\t' + (x.data || '') + '\t' + (x.sku || ''));
+            });
+        }
+        if (k.zleKonto.length){
+            L.push(''); L.push('ZŁE KONTO SPRZEDAŻY (' + k.zleKonto.length + ')');
+            k.zleKonto.forEach(function (x){
+                L.push('\t' + x.id + '\t' + (x.typ || '') + '\tjest ' + x.konto + '\tma być ' + x.ocz
+                       + '\t' + f2(x.kwota) + '\t' + (x.auf || ''));
+            });
+        }
+        if (k.zlaKwota.length){
+            L.push(''); L.push('KWOTA SIĘ NIE ZGADZA (' + k.zlaKwota.length + ')');
+            k.zlaKwota.forEach(function (x){
+                L.push('\t' + x.id + '\texport ' + f2(x.wExporcie) + '\traport ' + f2(x.wRaporcie)
+                       + '\tróżnica ' + f2(x.roznica) + '\t' + (x.auf || ''));
+            });
+        }
+        if (k.brakZwrot.length){
+            L.push(''); L.push('ZWROT BEZ KOREKTY W EXPORCIE (' + k.brakZwrot.length + ')');
+            k.brakZwrot.forEach(function (x){ L.push('\t' + x.id + '\t' + f2(x.kwota)); });
+        }
+        if (k.wyj.length){
+            L.push(''); L.push('LISTA „DO WYJAŚNIENIA" (' + k.wyj.length + ')');
+            k.wyj.forEach(function (x){
+                L.push('\t' + x.typ + '\t' + f2(x.kwota) + '\t' + (x.data || '') + '\t' + (x.id || '')
+                       + '\t' + (x.ile ? ('znalezione: ' + x.trafienia.join(' | ')) : 'NIE ZAKSIĘGOWANE'));
+            });
+        }
+        if (k.stawki.length){
+            L.push(''); L.push('STAWKA INNA NIŻ 19% — do wglądu (' + k.stawki.length + ')');
+            k.stawki.forEach(function (x){
+                L.push('\t' + x.st + '%\t' + x.id + '\t' + (x.typ || '') + '\t' + f2(x.kwota)
+                       + '\t' + (x.auf || 'brak w exporcie') + '\t' + (x.sku || ''));
+            });
+        }
+        return L.join('\n');
+    }
 
     // Zestawienia z ostatniego wyszukania — zeby zaznaczanie i skladanie pliku
     // nie musialy pobierac tego samego drugi raz.
@@ -23169,7 +23662,7 @@
         _rcCache = o;
         try { GM_setValue(MK_RCOM, JSON.stringify(o)); } catch (e){}
     }
-    function rcMark(id, ok, powod){
+    function rcMark(id, ok, powod, naOko){
         if (!id) return;
         const all = rcLoad();
         const prev = all[String(id)];
@@ -23177,7 +23670,10 @@
         // trafia juz do „want" (nie ma jej w done tego przebiegu) i bez tego zastrzezenia
         // jej ✔ zamienialoby sie w ✖ „zwrot sie nie zaksiegowal" — chociaz komentarz od
         // dawna siedzi w tickecie i nikt go stamtad nie usunal.
-        if (prev && prev.ok && !ok) return;
+        // v3.90: WYJATEK — „naOko" pochodzi ze sprawdzenia ticketu na swiezo
+        // (__TM_TICKET_COMMENT_CHECK). To jest odczyt stanu faktycznego, wiec wolno mu
+        // takze COFNAC sukces: skoro na tickecie opisu nie ma, ✔ klamal.
+        if (prev && prev.ok && !ok && !naOko) return;
         all[String(id)] = { at: new Date().toISOString().slice(0, 16).replace('T', ' '),
                             ok: !!ok, powod: String(powod || '') };
         rcSave(all);
@@ -23252,8 +23748,10 @@
         let h = '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ede9fe">'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">'
               + '<b style="font-size:11px;color:#5b21b6">Zwroty</b>'
-              + '<button id="mk-ref-all"' + (withAcc ? '' : ' disabled')
-              + ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (withAcc ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (withAcc ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj wszystkie zwroty (' + withAcc + ')</button></div>'
+              + '<button id="mk-ref-all"' + (withAcc && !refBusy ? '' : ' disabled')
+              + ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (withAcc && !refBusy ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (withAcc && !refBusy ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj wszystkie zwroty (' + withAcc + ')</button>'
+              + (refBusy ? '<span style="font-size:11px;color:#c47f00;font-weight:700">⏳ trwa księgowanie / dopisywanie opisów — stan niżej rośnie na bieżąco</span>' : '')
+              + '</div>'
               + '<div style="font-size:10px;color:#888;margin-bottom:6px">Zebrane ze wszystkich zestawień, pogrupowane po dacie i koncie — moduł ticketa księguje na jedno konto naraz. Księguje go ten moduł, nic nie trzeba przeklejać.</div>';
         keys.forEach(function (k, i){
             const x = g[k];
@@ -23291,16 +23789,26 @@
                     return '<span style="font-size:11px;color:#c47f00;font-weight:700">opisy: ' + c.ok + ' z ' + c.n
                         + (c.zle ? (', bez komentarza ' + c.zle) : '') + '</span>';
                  })()
-              +  '<button class="mk-rt" data-g="' + i + '"' + (x.acct ? '' : ' disabled') + ' style="padding:3px 10px;border:none;border-radius:6px;background:'
-              +  (x.acct ? ((st[k] && !st[k].left.length) ? '#9ca3af' : '#5b21b6') : '#c7c7c7')
-              +  ';color:#fff;font-weight:700;cursor:' + (x.acct ? 'pointer' : 'default') + ';font-size:11px">'
+              +  '<button class="mk-rt" data-g="' + i + '"' + (x.acct && !refBusy ? '' : ' disabled') + ' style="padding:3px 10px;border:none;border-radius:6px;background:'
+              +  (x.acct && !refBusy ? ((st[k] && !st[k].left.length) ? '#9ca3af' : '#5b21b6') : '#c7c7c7')
+              +  ';color:#fff;font-weight:700;cursor:' + (x.acct && !refBusy ? 'pointer' : 'default') + ';font-size:11px">'
               +  ((st[k] && !st[k].left.length) ? '↻ Zaksięguj ponownie' : '▶ Zaksięguj') + '</button>'
+              // v3.90: kontrola stanu faktycznego — czyta kazdy ticket na swiezo i mowi,
+              // czy opis TAM JEST. Odpowiedz na „zaksiegowalo i nie ma": zamiast wierzyc
+              // zapisowi sprzed minut, pytamy sam ticket.
+              +  (x.rows.some(function (r){ return r.note; })
+                    ? '<button class="mk-rv" data-g="' + i + '"' + (refBusy ? ' disabled' : '')
+                      + ' style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:'
+                      + (refBusy ? 'default' : 'pointer') + ';font-size:11px">🔍 Sprawdź opisy w ticketach</button>'
+                    : '')
               // v3.88: kiedy zwroty poszly INNA droga niz tym guzikiem (np. wklejone wprost
               // w module ticketa dawno temu, gdy jego zapis dotyczyl juz czegos innego),
               // modul nie ma jak sie o tym dowiedziec. Zamiast zostawiac grupe na zawsze
               // „do zrobienia" — pozwalamy odhaczyc ja recznie, z widoczna adnotacja i z
               // mozliwoscia cofniecia.
-              +  '<button class="mk-rok" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">'
+              +  '<button class="mk-rok" data-g="' + i + '"' + (refBusy ? ' disabled' : '')
+              +  ' style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:'
+              +  (refBusy ? 'default' : 'pointer') + ';font-size:11px">'
               +  (zrobiona ? '↺ Cofnij oznaczenie' : '✓ Oznacz jako zrobione') + '</button>'
               +  '<button class="mk-rc" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj</button>'
               +  (x.rows.some(function (r){ return r.note; })
@@ -23350,6 +23858,35 @@
             // o arkuszu kasowal komunikat o komentarzach) — tylko pietro wyzej.
             // Skutek byl taki, ze „opisy potracen dopisane do 0 z 1. BEZ KOMENTARZA: …"
             // nie mialo jak dotrzec i modul wygladal, jakby komentarzy w ogole nie robil.
+        }; });
+        box.querySelectorAll('.mk-rv').forEach(function (b){ b.onclick = async function(){
+            const k = keys[+b.getAttribute('data-g')], x = g[k];
+            const zOpisem = x.rows.filter(function (r){ return r.note; });
+            if (!zOpisem.length) return;
+            if (typeof window.__TM_TICKET_COMMENT_CHECK !== 'function'){
+                say('Moduł „Księgowanie w tickecie" jest wyłączony — nie mam czym czytać ticketów.', '#c47f00');
+                return;
+            }
+            b.disabled = true; refBusy = true;
+            let jest = 0; const brak = [], nieud = [];
+            try {
+                for (let i = 0; i < zOpisem.length; i++){
+                    const r = zOpisem[i];
+                    say('Sprawdzam opis na tickecie ' + (i + 1) + '/' + zOpisem.length + ' — ' + r.id + '…');
+                    try {
+                        const w = await window.__TM_TICKET_COMMENT_CHECK(r.id, r.note);
+                        if (w && w.ok && w.jest){ jest++; rcMark(r.id, true, 'sprawdzone na tickecie — jest', true); }
+                        else if (w && w.ok){ brak.push(r.id); rcMark(r.id, false, 'sprawdzone na tickecie — BRAK opisu', true); }
+                        else nieud.push(r.id + ': ' + ((w && w.error) || '?'));
+                    } catch (e){ nieud.push(r.id + ': ' + ((e && e.message) || e)); }
+                    try { renderRef(); } catch (e){}
+                }
+            } finally { refBusy = false; }
+            renderRef();
+            say('Opisy na ticketach: jest ' + jest + ' z ' + zOpisem.length
+                + (brak.length ? (' · BRAK: ' + brak.join(', ')) : '')
+                + (nieud.length ? (' · nie sprawdziłem: ' + nieud.join('; ')) : ''),
+                (brak.length || nieud.length) ? '#c47f00' : '#0a7a2f');
         }; });
         box.querySelectorAll('.mk-rok').forEach(function (b){ b.onclick = function(){
             const k = keys[+b.getAttribute('data-g')], x = g[k];
@@ -23855,7 +24392,12 @@
         }
         let ok = 0; const bad = [];
         for (let i = 0; i < want.length; i++){
-            say('Dopisuję opis potrącenia do ticketu ' + (i + 1) + '/' + want.length + ' — ' + want[i].id + '…');
+            // v3.90: licznik z dotychczasowym wynikiem. Jedna pozycja potrafi trwac
+            // 10-30 s (zaladowanie ticketu, otwarcie zamknietego, zapis, potwierdzenie,
+            // zamkniecie z powrotem) — bez biezacego ✔/✖ cala ta praca wygladala jak cisza.
+            say('Dopisuję opis potrącenia ' + (i + 1) + '/' + want.length
+                + (ok || bad.length ? (' (✔ ' + ok + (bad.length ? (' · ✖ ' + bad.length) : '') + ')') : '')
+                + ' — ' + want[i].id + '… (10-30 s na pozycję)');
             try {
                 const r = await window.__TM_TICKET_COMMENT(want[i].id, want[i].note);
                 if (r && r.ok){
@@ -23872,6 +24414,13 @@
                 bad.push(want[i].id + ': ' + p);
                 rcMark(want[i].id, false, p);
             }
+            // v3.90: lista zwrotow przerysowuje sie PO KAZDEJ pozycji, nie dopiero na
+            // koncu. Dotad przez kilka minut wisialo „opisy: jeszcze nie dopisywane",
+            // ktos zagladal do ticketu w polowie, nie widzial komentarza i slusznie
+            // meldowal „nie dziala" — a pociag jeszcze jechal. renderRef czyta stan
+            // z rcMark, wiec ✔/✖ pojawiaja sie na biezaco; refBusy gasi guziki na czas
+            // przebiegu, zeby przerysowana lista nie zapraszala do drugiego startu.
+            try { renderRef(); } catch (e){}
         }
         zOpisem.forEach(function (r){ if (want.indexOf(r) < 0) pominietePowod(r); });
         const pominiete = zOpisem.length - want.length;
@@ -23886,9 +24435,18 @@
             col: (bad.length || pominiete) ? '#c47f00' : '#0a7a2f'
         };
     }
+    // v3.90: na czas przebiegu (ksiegowanie + opisy) lista zwrotow rysuje sie z
+    // wygaszonymi guzikami — przerysowujemy ja teraz W TRAKCIE, wiec bez tej flagi
+    // kazde przerysowanie stawialoby swieze, klikalne „▶ Zaksięguj".
+    let refBusy = false;
     async function bookRefunds(x){
         const err = ksFill(x);
         if (err){ say(err, '#c47f00'); return err; }
+        refBusy = true;
+        try { return await bookRefundsWlasciwe(x); }
+        finally { refBusy = false; try { renderRef(); } catch (e){} }
+    }
+    async function bookRefundsWlasciwe(x){
         say('Księguję zwroty: ' + x.rows.length + ' poz. na ' + f2(x.sum) + ', konto ' + x.acct + '…');
         ksMirror(x.date + ' · konto ' + x.acct + (x.accNm ? (' — ' + x.accNm) : ''), x.rows.length);
         ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
@@ -23983,16 +24541,21 @@
             (bad.length || komZle) ? '#c47f00' : '#0a7a2f');
     }
 
+    // v3.91: readBuf stalo w domknieciu „if (onProlo)", a od tej wersji potrzebuje go
+    // takze panel Salda (kontrola ksiegowania Amazona), ktory jest pietro wyzej.
+    // Przenosimy je na poziom modulu zamiast pisac drugie takie samo — deklaracja funkcji
+    // i tak sie wynosi, wiec kod w srodku „if (onProlo)" widzi je bez zmian.
+    function readBuf(f){
+        return new Promise(function (resolve, reject){
+            const rd = new FileReader();
+            rd.onload = function(){ resolve(rd.result); };
+            rd.onerror = function(){ reject(new Error('nie mogę odczytać pliku')); };
+            rd.readAsArrayBuffer(f);     // kodowanie rozpoznajemy sami — bywa UTF-16
+        });
+    }
+
     // ---------- prologistics: wczytanie wyciagu ----------
     if (onProlo){
-        function readBuf(f){
-            return new Promise(function (resolve, reject){
-                const rd = new FileReader();
-                rd.onload = function(){ resolve(rd.result); };
-                rd.onerror = function(){ reject(new Error('nie mogę odczytać pliku')); };
-                rd.readAsArrayBuffer(f);     // kodowanie rozpoznajemy sami — bywa UTF-16
-            });
-        }
         // Jeden miesiac to czasem WIECEJ NIZ JEDEN wyciag: Vente BE i NL wplywaja na inne
         // konto (Postbank) niz reszta (UBS). Pliki DOPISUJA sie do wspolnej listy zlecen,
         // wiec mozna wskazac kilka naraz albo dokladac je pojedynczo, w dowolnej kolejnosci.
