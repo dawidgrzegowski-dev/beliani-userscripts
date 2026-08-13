@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.94
+// @version      3.96
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20591,6 +20591,7 @@
         const netOk = Math.abs(sumAll - total) < 0.01;
         return {
             setId: setId, payDate: payDate, cur: cur || 'EUR', shop: shop,
+            kraj: amzKraj(dom),                                   // v3.96: 'de' / 'pl' / …
             net: total, sumAll: r2(sumAll), netOk: netOk,
             ord: ord, ref: ref, refNote: refNote, refSign: refSign, ids: ids,
             gross: gross, refund: refund, nOrd: nOrd, nRef: nRef,
@@ -22282,14 +22283,35 @@
     // przy pozycji, chociaz zaksiegowane jest wlasciwe. Przyczyna nieznana, wiec takie
     // wiersze maja sie ZGLASZAC (decyzja z 13.08.2026) — lepiej obejrzec kilka falszywych
     // alarmow niz przegapic prawdziwy rozjazd konta.
-    const MK_EXP_OK = {
-        de: { 'B2C': ['3252', '3253'], 'B2B': ['3283'], 'B2B 0%': ['3264', '3218'] }
-    };
+    //
+    // v3.96: reguly dla WSZYSTKICH rynkow. Nie przepisujemy ich drugi raz — sklada je
+    // MK_AMZ_ACC, ta sama tabela, ktora buduje plik importu. Dzieki temu dopisanie kraju
+    // w jednym miejscu wystarcza, a kontrola nie ma prawa rozjechac sie z importem.
+    // Wyjatki dopisujemy TYLKO tam, gdzie rzeczywistosc jest szersza niz tabela — dzis
+    // wylacznie DE (decyzja z 13.08.2026); pozostale rynki nie maja takich zaleznosci.
+    const MK_EXP_EXTRA = { de: { 'B2C': ['3253'], 'B2B 0%': ['3218'] } };
+    function mkExpOk(kraj){
+        const k = String(kraj || '').toLowerCase();
+        const baza = MK_AMZ_ACC[k];
+        if (!baza) return null;
+        const extra = MK_EXP_EXTRA[k] || {};
+        const out = {};
+        Object.keys(baza.vat).forEach(function (typ){
+            out[typ] = [baza.vat[typ]].concat(extra[typ] || []);
+        });
+        // Wyjatek dla typu, ktorego w tabeli w ogole nie ma (np. DE nie ma osobnego
+        // wpisu, ale gdyby kiedys byl) — zeby dopisek nie przepadl.
+        Object.keys(extra).forEach(function (typ){ if (!out[typ]) out[typ] = extra[typ].slice(); });
+        return out;
+    }
     // Stawka krajowa. Wszystko inne trafia na liste „do wgladu" — NIE jako blad:
-    // 3252 to „Erlöse DE 0% Marketplace" i stawka nie ma tam znaczenia, bo VAT-u nie
-    // odprowadzamy my, tylko Amazon (decyzja z 13.08.2026). Lista ma jednak powstawac
-    // zawsze, takze dla stawek, ktorych jeszcze nie widzielismy.
-    const MK_EXP_STAWKA = { de: 19 };
+    // konto sprzedazy to „Erlöse … 0% Marketplace" i stawka nie ma tam znaczenia, bo
+    // VAT-u nie odprowadzamy my, tylko Amazon (decyzja z 13.08.2026). Lista ma jednak
+    // powstawac zawsze, takze dla stawek, ktorych jeszcze nie widzielismy.
+    // v3.96: stawki krajowe pozostalych rynkow (decyzja z 13.08.2026). Sprawdzone
+    // z danymi: PL 23% i NL 21% wychodza czysto, FR ma obok 20% takze 21%, IT obok
+    // 22% takze 19% — to sprzedaz transgraniczna i wlasnie ona ma byc widoczna.
+    const MK_EXP_STAWKA = { de: 19, fr: 20, it: 22, es: 21, nl: 21, pl: 23, uk: 20 };
     function expNum(v){
         if (typeof v === 'number') return v;
         const s = String(v == null ? '' : v).trim().replace(/\s/g, '');
@@ -22349,11 +22371,15 @@
     // Wlasciwe porownanie. p — wynik mkParseAmz, ex — sklejone wiersze ze wszystkich
     // wgranych plikow Export payments.
     function mkKontrolaAmz(p, ex){
-        const okKonta = MK_EXP_OK.de, stKraj = MK_EXP_STAWKA.de;
+        // v3.96: kraj bierzemy Z RAPORTU, a nie zakladamy DE. Reguly kontowe i stawka
+        // krajowa ida za nim.
+        const kraj = String(p.kraj || 'de').toLowerCase();
+        const okKonta = mkExpOk(kraj) || {}, stKraj = MK_EXP_STAWKA[kraj];
         const poFf = {};
         ex.forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
 
         const brakuje = [], zleKonto = [], zlaKwota = [], stawki = [], obce = [], brakZwrot = [];
+        const bezKonta = [];                                  // v3.96
         const dopasowane = {};
         Object.keys(p.ord).forEach(function (id){
             const typ = p.typOrd[id] || '';
@@ -22362,7 +22388,7 @@
             const sprz = w.filter(function (r){ return r.sprzedaz; });
             // --- stawka VAT: liczymy z raportu, nie z prologistics ---
             const pr = p.prinOrd[id] || 0, tx = p.taxOrd[id] || 0;
-            if (pr > 0 && tx > 0){
+            if (pr > 0 && tx > 0 && stKraj != null){
                 const st = Math.round(tx / pr * 100);
                 if (st !== stKraj){
                     stawki.push({ id: id, st: st, typ: typ, kwota: brutto,
@@ -22379,6 +22405,14 @@
             dopasowane[id] = 1;
             // --- konto sprzedazy ---
             const dozw = okKonta[typ];
+            // v3.96: typ, dla ktorego tabela kont NIE MA wpisu (dzis: FR/NL B2B, UK B2B 0%).
+            // Dotad taki wiersz przechodzil po cichu, bo nie bylo z czym porownac —
+            // a to jest dokladnie sytuacja, ktora trzeba zobaczyc (decyzja z 13.08.2026).
+            if (typ && !dozw && w.length){
+                bezKonta.push({ id: id, typ: typ, kwota: brutto,
+                                konta: w.map(function (r){ return r.konto; }).filter(Boolean).join(', '),
+                                auf: w.map(function (r){ return r.auf; }).filter(Boolean).join(', ') });
+            }
             w.forEach(function (r){
                 if (!r.konto){
                     obce.push({ id: id, auf: r.auf, deb: r.deb, cre: r.cre, kwota: r.kwota, plik: r.plik });
@@ -22417,22 +22451,28 @@
             if (w.some(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
             brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
         });
-        // --- lista „do wyjasnienia": szukamy odpowiednika KWOTOWEGO ---
-        // Tak wlasnie rozstrzyga sie to recznie: marketing dopisuje auftrag/ticket, a wtedy
-        // pozycja jest juz zaksiegowana pod innym numerem i po numerze jej nie znajdziemy.
-        const wyj = (p.doWyj || []).map(function (d){
-            const a = Math.abs(d.kwota);
-            const tr = ex.filter(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.005; });
-            return { typ: d.typ, id: d.id, kwota: d.kwota, data: d.data,
-                     trafienia: tr.slice(0, 4).map(function (r){
-                         return (r.auf || '?') + (r.ff ? (' · ' + r.ff) : '');
-                     }), ile: tr.length };
-        });
         // --- wiersze exportu bez odpowiednika w raporcie ---
         const znane = {};
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
         Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
         const wolne = ex.filter(function (r){ return !r.ff || !znane[r.ff]; });
+        const zuzyte = [];          // wiersze, ktore juz cos wyjasnily — nie pokazujemy ich drugi raz
+
+        // --- lista „do wyjasnienia": szukamy odpowiednika KWOTOWEGO ---
+        // Tak wlasnie rozstrzyga sie to recznie: marketing dopisuje auftrag/ticket, a wtedy
+        // pozycja jest juz zaksiegowana pod innym numerem i po numerze jej nie znajdziemy.
+        // v3.95: wiersz, ktory wyjasnil taka pozycje, ZNIKA z listy „w exporcie, a nie ma
+        // w rozliczeniu". Wczesniej ta sama para pokazywala sie w dwoch sekcjach naraz
+        // i wygladala jak dwa osobne znaleziska.
+        const wyj = (p.doWyj || []).map(function (d){
+            const a = Math.abs(d.kwota);
+            const tr = ex.filter(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.005; });
+            tr.forEach(function (r){ if (wolne.indexOf(r) >= 0 && zuzyte.indexOf(r) < 0) zuzyte.push(r); });
+            return { typ: d.typ, id: d.id, kwota: d.kwota, data: d.data,
+                     trafienia: tr.slice(0, 4).map(function (r){
+                         return (r.auf || '?') + (r.ff ? (' · ' + r.ff) : '');
+                     }), ile: tr.length };
+        });
 
         // --- v3.93: SKLEJANIE PO KWOCIE ---
         // Zamowienie, ktorego import nie dopasowal (NOT FOUND), trafia na liste dla
@@ -22445,8 +22485,10 @@
         // Regula jest ostrozna: parujemy tylko wtedy, gdy dopasowanie jest OBUSTRONNIE
         // JEDNOZNACZNE (jedna kwota, jeden wolny wiersz). Przy kilku kandydatach nie
         // zgadujemy — pokazujemy ich liste i zostawiamy decyzje czlowiekowi.
+        // Do sklejania idzie tylko to, czego nie zuzyla juz lista „do wyjasnienia".
         const poKwocie = {};
         wolne.forEach(function (r){
+            if (zuzyte.indexOf(r) >= 0) return;
             const k = Math.abs(r.kwota).toFixed(2);
             (poKwocie[k] || (poKwocie[k] = [])).push(r);
         });
@@ -22474,11 +22516,15 @@
         });
         // Wolne wiersze, ktorych nie udalo sie z niczym skleic — to jest druga strona
         // tego samego pytania: „co siedzi w exporcie, czego nie ma w rozliczeniu".
-        const zostalo = wolne.filter(function (r){ return uzyte.indexOf(r) < 0; });
+        const zostalo = wolne.filter(function (r){
+            return uzyte.indexOf(r) < 0 && zuzyte.indexOf(r) < 0;
+        });
 
         return {
+            kraj: kraj, stKraj: stKraj,
             nOrd: Object.keys(p.ord).length, nExp: ex.length,
             nDopasowanych: Object.keys(dopasowane).length,
+            bezKonta: bezKonta,
             brakuje: naprawdeBrak.sort(function (a, b){ return b.kwota - a.kwota; }),
             brakujeSuma: r2(naprawdeBrak.reduce(function (a, x){ return a + x.kwota; }, 0)),
             sklejone: sklejone.sort(function (a, b){ return b.kwota - a.kwota; }),
@@ -22486,6 +22532,7 @@
             zleKonto: zleKonto, zlaKwota: zlaKwota, obce: obce, brakZwrot: brakZwrot,
             stawki: stawki.sort(function (a, b){ return a.st - b.st; }),
             wyj: wyj,
+            wyjBez: wyj.filter(function (x){ return !x.ile; }),      // v3.95: tylko te bez sladu
             wolne: zostalo.sort(function (a, b){ return Math.abs(b.kwota) - Math.abs(a.kwota); }),
             wolneSuma: r2(zostalo.reduce(function (a, r){ return a + Math.abs(r.kwota); }, 0))
         };
@@ -22498,10 +22545,16 @@
     function knLink(auf){
         const t = String(auf == null ? '' : auf).trim();
         if (!t) return '';
-        const bAuf = 'https://www.prologistics.info/auction.php?number=';
         const bTic = 'https://www.prologistics.info/rma.php?rma_id=';
-        const a = t.match(/^(\d{5,})\s*(?:\/\s*\d+)?$/);
-        if (a) return '<a href="' + bAuf + a[1] + '" target="_blank" style="color:#5b21b6">' + esc(t) + '</a>';
+        // v3.95: SAM numer nie wystarczy — auction.php bez „&txnid" nie otwiera auftragu.
+        // Czesc po ukosniku w exporcie („15040035 / 3") to wlasnie txnid; tak samo sklada
+        // ten adres impAuction przy paczce importu. Gdy sufiksu nie ma, bierzemy 3 —
+        // to wartosc, ktora prologistics uzywa dla zwyklego auftragu sprzedazy.
+        const a = t.match(/^(\d{5,})\s*(?:\/\s*(\d+))?$/);
+        if (a){
+            const u = 'https://www.prologistics.info/auction.php?number=' + a[1] + '&txnid=' + (a[2] || '3');
+            return '<a href="' + u + '" target="_blank" style="color:#5b21b6">' + esc(t) + '</a>';
+        }
         const c = t.match(/TICKET\s+(\d{3,})/i);
         if (c) return '<a href="' + bTic + c[1] + '" target="_blank" style="color:#5b21b6">' + esc(t) + '</a>';
         return esc(t);
@@ -23226,6 +23279,17 @@
                            + (x.paid && x.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(x.paid) + '</span>') : '');
                   }).join('<br>') + '</div>');
         }
+        if (k.bezKonta.length){
+            h += sek('❌ Nie mam konta dla tego typu — ' + k.bezKonta.length, '#c00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Tabela kont dla '
+                + esc(String(k.kraj).toUpperCase()) + ' nie ma wpisu dla tego typu klienta, więc nie mam z czym porównać konta z exportu. Uzupełnij tabelę, a przy okazji sprawdź, czy ta płatność siedzi tam, gdzie powinna.</div>'
+                + '<div style="' + mono + '">'
+                + k.bezKonta.map(function (x){
+                      return esc(x.id) + '  typ <b>' + esc(x.typ) + '</b>  ' + f2(x.kwota)
+                           + (x.konta ? ('  w exporcie konto ' + esc(x.konta)) : '')
+                           + (x.auf ? ('  auftrag ' + knLinki(x.auf)) : '');
+                  }).join('<br>') + '</div>');
+        }
         if (k.brakZwrot.length){
             h += sek('❌ Zwrot bez korekty w exporcie — ' + k.brakZwrot.length, '#c00',
                 '<div style="' + mono + '">'
@@ -23236,27 +23300,22 @@
                                         : '  <span style="color:#666">(brak jakiegokolwiek wiersza)</span>');
                   }).join('<br>') + '</div>');
         }
-        if (k.wyj.length){
-            const bez = k.wyj.filter(function (x){ return !x.ile; });
-            h += sek('Lista „do wyjaśnienia" — ' + k.wyj.length + ' poz., bez śladu w księgach: ' + bez.length,
-                bez.length ? '#c47f00' : '#0a7a2f',
-                '<div style="font-size:10px;color:#666;margin-bottom:3px">Pozycji bez numeru zamówienia nie znajdę po numerze — szukam więc płatności o TEJ SAMEJ kwocie. Trafienie znaczy, że ktoś już podał auftrag/ticket.</div>'
+        // v3.95: pokazujemy WYLACZNIE pozycje z listy dla marketingu, ktorych naprawde
+        // nie ma w ksiegach. Te, ktore maja odpowiednik kwotowy, sa zalatwione — a ich
+        // wypisywanie dublowalo sekcje „w exporcie, a nie ma w rozliczeniu".
+        if (k.wyjBez.length){
+            h += sek('❌ Z listy dla marketingu — ' + k.wyjBez.length + ' poz. bez śladu w księgach', '#c00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Pozycji bez numeru zamówienia nie znajdę po numerze, więc szukam płatności o tej samej kwocie. Tych nie znalazłem — nikt ich jeszcze nie zaksięgował.</div>'
                 + '<div style="' + mono + '">'
-                + k.wyj.map(function (x){
+                + k.wyjBez.map(function (x){
                       return esc(x.typ) + '  ' + f2(x.kwota) + (x.data ? ('  ' + esc(x.data)) : '')
-                           + (x.id ? ('  id ' + esc(x.id)) : '')
-                           + (x.ile ? ('  → <span style="color:#0a7a2f">'
-                                       + x.trafienia.map(function (t){
-                                             const cz = String(t).split(' · ');
-                                             return knLink(cz[0]) + (cz[1] ? (' · ' + esc(cz[1])) : '');
-                                         }).join(' | ')
-                                       + (x.ile > x.trafienia.length ? (' … +' + (x.ile - x.trafienia.length)) : '') + '</span>')
-                                    : '  → <b style="color:#c47f00">NIE ZAKSIĘGOWANE</b>');
+                           + (x.id ? ('  id ' + esc(x.id)) : '');
                   }).join('<br>') + '</div>');
         }
         if (k.stawki.length){
-            h += sek('Stawka inna niż 19% — ' + k.stawki.length + ' zam. (do wglądu, nie błąd)', '#c47f00',
-                '<div style="font-size:10px;color:#666;margin-bottom:3px">Konto 3252 to „Erlöse DE 0% Marketplace" — VAT-u nie odprowadzamy my, więc stawka nie przesądza o koncie. Lista jest po to, żeby dało się je obejrzeć: 7% to Globus, 20% Austria, 25% Dania.</div>'
+            h += sek('Stawka inna niż ' + k.stKraj + '% — ' + k.stawki.length + ' zam. (do wglądu, nie błąd)', '#c47f00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Konto sprzedaży to „Erlöse … 0% Marketplace" — VAT-u nie odprowadzamy my, więc stawka nie przesądza o dekretacji. Lista jest po to, żeby dało się je obejrzeć.'
+                + (k.kraj === 'de' ? ' Przy DE: 7% to Globus, 20% Austria, 25% Dania.' : ' Zwykle to sprzedaż transgraniczna.') + '</div>'
                 + '<div style="' + mono + '">'
                 + k.stawki.map(function (x){
                       return '<b>' + x.st + '%</b>  ' + esc(x.id) + '  ' + esc(x.typ || '?') + '  ' + f2(x.kwota)
@@ -23292,10 +23351,13 @@
                 + (k.wolne.length > 60 ? ('<br>… +' + (k.wolne.length - 60)) : '') + '</div>');
         }
 
-        if (!k.brakuje.length && !k.zleKonto.length && !k.zlaKwota.length && !k.brakZwrot.length)
+        if (!k.brakuje.length && !k.zleKonto.length && !k.zlaKwota.length && !k.brakZwrot.length
+            && !k.wyjBez.length && !k.bezKonta.length)
             h += sek('✔ Wszystko zaksięgowane i na właściwych kontach', '#0a7a2f',
                      '<div style="font-size:10px;color:#666">' + k.nDopasowanych + ' z ' + k.nOrd
-                     + ' zamówień ma płatność, konta zgodne z typem klienta, kwoty się zgadzają.</div>');
+                     + ' zamówień ma płatność, konta zgodne z typem klienta, kwoty się zgadzają'
+                     + (k.wyj.length ? (' · lista dla marketingu (' + k.wyj.length + ' poz.) też ma pokrycie w księgach') : '')
+                     + '.</div>');
         return h;
     }
     // Ta sama tresc plaskim tekstem — do wklejenia w mail albo do arkusza.
@@ -23350,15 +23412,21 @@
             L.push(''); L.push('ZWROT BEZ KOREKTY W EXPORCIE (' + k.brakZwrot.length + ')');
             k.brakZwrot.forEach(function (x){ L.push('\t' + x.id + '\t' + f2(x.kwota)); });
         }
-        if (k.wyj.length){
-            L.push(''); L.push('LISTA „DO WYJAŚNIENIA" (' + k.wyj.length + ')');
-            k.wyj.forEach(function (x){
-                L.push('\t' + x.typ + '\t' + f2(x.kwota) + '\t' + (x.data || '') + '\t' + (x.id || '')
-                       + '\t' + (x.ile ? ('znalezione: ' + x.trafienia.join(' | ')) : 'NIE ZAKSIĘGOWANE'));
+        if (k.wyjBez.length){
+            L.push(''); L.push('Z LISTY DLA MARKETINGU — BEZ ŚLADU W KSIĘGACH (' + k.wyjBez.length
+                   + ' z ' + k.wyj.length + ')');
+            k.wyjBez.forEach(function (x){
+                L.push('\t' + x.typ + '\t' + f2(x.kwota) + '\t' + (x.data || '') + '\t' + (x.id || ''));
+            });
+        }
+        if (k.bezKonta.length){
+            L.push(''); L.push('NIE MAM KONTA DLA TEGO TYPU (' + k.bezKonta.length + ')');
+            k.bezKonta.forEach(function (x){
+                L.push('\t' + x.id + '\t' + x.typ + '\t' + f2(x.kwota) + '\t' + (x.konta || '') + '\t' + (x.auf || ''));
             });
         }
         if (k.stawki.length){
-            L.push(''); L.push('STAWKA INNA NIŻ 19% — do wglądu (' + k.stawki.length + ')');
+            L.push(''); L.push('STAWKA INNA NIŻ ' + k.stKraj + '% — do wglądu (' + k.stawki.length + ')');
             k.stawki.forEach(function (x){
                 L.push('\t' + x.st + '%\t' + x.id + '\t' + (x.typ || '') + '\t' + f2(x.kwota)
                        + '\t' + (x.auf || 'brak w exporcie') + '\t' + (x.sku || ''));
@@ -23382,8 +23450,17 @@
             const k = MK_AMZ_ACC[String(kraj || 'de').toLowerCase()];
             return k ? k.acc : '';
         },
-        // Ktore kraje maja komplet regul kontowych. Na razie tylko DE.
-        obsluga: Object.keys(MK_EXP_OK)
+        // v3.96: lista rynkow do wyboru konta w Saldach — jedno zrodlo prawdy z tabela
+        // importu, wiec dopisanie kraju tam wystarcza, zeby pojawil sie w wyborze.
+        konta: function (){
+            return Object.keys(MK_AMZ_ACC).map(function (k){
+                return { kraj: k, acc: MK_AMZ_ACC[k].acc,
+                         nazwa: MK_AMZ_SHOP['amazon.' + (k === 'uk' ? 'co.uk' : k)] || ('Amazon ' + k.toUpperCase()) };
+            }).filter(function (x){ return x.acc; })
+              .sort(function (a, b){ return a.nazwa.localeCompare(b.nazwa); });
+        },
+        // Ktore rynki maja komplet regul kontowych — dzis wszystkie z tabeli.
+        obsluga: Object.keys(MK_AMZ_ACC)
     };
 
     // Zestawienia z ostatniego wyszukania — zeby zaznaczanie i skladanie pliku
@@ -30271,7 +30348,7 @@
         // platnosci, tylko rozliczenie marketplace'u, i sprawdzamy nie tylko CZY cos jest
         // w ksiedze, ale takze NA JAKIM koncie. Reszta mechaniki jest ta sama: zestawienie
         // dociagamy z prologistics tym samym mostem co PayPal.
-        { id: 'amazon', nazwa: 'Amazon DE ↔ Export payments',
+        { id: 'amazon', nazwa: 'Amazon ↔ Export payments',
           opis: 'rozliczenie Amazona kontra zestawienie z prologistics · sprawdza też konta sprzedaży', gotowe: true },
         { id: 'saferpay', nazwa: 'Saferpay ↔ Export payments', opis: 'jeszcze nie zrobione', gotowe: false }
     ];
@@ -30395,9 +30472,13 @@
     async function salRysujAmz(){
         const p = salPanel(), u = salUst();
         const most = salAmzMost();
-        const kontoDom = most ? (most.kontoRozl('de') || '1323') : '1323';
+        // v3.96: wybor rynku z listy, dokladnie jak konta PayPala. Etykiety bierzemy
+        // z zywego export.php — gdy nazwa konta zmieni sie w prologistics, widac to tu
+        // od razu, a nie dopiero po poprawieniu skryptu.
+        const rynki = most ? most.konta() : [];
+        const et = await salEtykiety(), akt = salAktywne();
         p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
-            + '<div style="font-weight:700;color:#750000">Salda · Amazon DE ↔ Export payments</div>'
+            + '<div style="font-weight:700;color:#750000">Salda · Amazon ↔ Export payments</div>'
             + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
             + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
 
@@ -30411,9 +30492,23 @@
             + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
             + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.od) + '" style="font-size:12px;width:130px"></label>'
             + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.do) + '" style="font-size:12px;width:130px"></label>'
-            + '<label>konto <input id="sal-akonto" value="' + salEsc(kontoDom) + '" style="font-size:12px;width:70px;text-align:center"></label>'
             + '<button id="sal-apobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
             + '</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Rynek <span style="font-weight:400;color:#888;font-size:11px">'
+            + '— jedno rozliczenie to jeden rynek i jedno konto rozliczeniowe; po wskazaniu raportu ustawiam go sam</span></div>'
+            + '<select id="sal-akonto" style="width:100%;font-size:12px;padding:4px;'
+            + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
+            + (rynki.length
+                ? rynki.map(function (r){
+                      const stan = (r.acc in akt) ? (akt[r.acc] ? '' : '  · nieaktywne') : '';
+                      return '<option value="' + salEsc(r.acc) + '" data-kraj="' + salEsc(r.kraj) + '"'
+                          + (r.kraj === 'de' ? ' selected' : '') + '>'
+                          + salEsc(r.nazwa) + ' — ' + salEsc(et[r.acc] || r.acc) + salEsc(stan) + '</option>';
+                  }).join('')
+                : '<option value="">— moduł marketplace\'ów wyłączony —</option>')
+            + '</select></div>'
             + '<div id="sal-aexpinfo" style="font-size:11px;color:#888;margin-bottom:8px">Zestawienie: jeszcze nie pobrane.</div>'
 
             + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
@@ -30471,8 +30566,19 @@
             const p = most.raport(txt);
             if (p.err){ SAL_AMZ = null; salSay(p.err, '#c00'); salAmzInfo(); return; }
             SAL_AMZ = p;
+            // v3.96: rynek ustawiamy SAMI, wprost z raportu — pomylka „raport PL, konto DE"
+            // dawalaby wynik, ktory wyglada wiarygodnie i jest w calosci bez sensu.
+            let dopasowane = '';
+            const sel = salPanel().querySelector('#sal-akonto');
+            if (sel && p.kraj){
+                const opt = Array.prototype.slice.call(sel.options).filter(function (o){
+                    return o.getAttribute('data-kraj') === p.kraj;
+                })[0];
+                if (opt){ sel.value = opt.value; dopasowane = ' · rynek ustawiony na ' + opt.textContent.split(' — ')[0]; }
+                else dopasowane = ' · UWAGA: nie mam konta rozliczeniowego dla ' + p.kraj.toUpperCase();
+            }
             salSay('Wczytane: ' + p.shop + ', rozliczenie ' + p.setId + ', wypłata ' + (p.payDate || '—')
-                 + ' ' + (p.cur || ''), '#0a7a2f');
+                 + ' ' + (p.cur || '') + dopasowane, dopasowane.indexOf('UWAGA') >= 0 ? '#c47f00' : '#0a7a2f');
         } catch (e){
             SAL_AMZ = null;
             salSay('„' + files[0].name + '": ' + ((e && e.message) || e), '#c00');
@@ -30532,11 +30638,19 @@
         if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
         if (!SAL_AMZ){ salSay('Wskaż plik rozliczenia z Amazona.', '#c47f00'); return; }
         if (!SAL_AEXP || !SAL_AEXP.rows.length){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
-        // Reguly kontowe sa ulozone pod DE i tylko pod DE — przy innym kraju wynik bylby
-        // mylacy, wiec mowimy to wprost zamiast liczyc cokolwiek.
-        if ((most.obsluga || []).indexOf('de') < 0 || SAL_AMZ.shop !== 'Amazon DE'){
-            salSay('Na razie sprawdzam wyłącznie Amazon DE, a ten raport to ' + (SAL_AMZ.shop || '?')
-                 + '. Reszta krajów ma inne zależności kontowe.', '#c47f00');
+        // v3.96: sprawdzamy KAZDY rynek z tabeli kont. Zostaje jeden warunek: raport
+        // musi dotyczyc rynku, ktory w tej tabeli jest — inaczej nie ma z czym porownac.
+        if ((most.obsluga || []).indexOf(String(SAL_AMZ.kraj || '')) < 0){
+            salSay('Nie mam tabeli kont dla „' + (SAL_AMZ.shop || '?') + '" — dopisz ten rynek '
+                 + 'w MK_AMZ_ACC, wtedy go sprawdzę.', '#c47f00');
+            return;
+        }
+        // Raport i pobrane zestawienie musza dotyczyc TEGO SAMEGO konta rozliczeniowego.
+        const kontoSel = String(p.querySelector('#sal-akonto').value || '').trim();
+        const kontoRap = most.kontoRozl(SAL_AMZ.kraj);
+        if (kontoRap && kontoSel && kontoRap !== kontoSel){
+            salSay('Raport dotyczy ' + SAL_AMZ.shop + ' (konto ' + kontoRap + '), a zestawienie pobrałeś '
+                 + 'dla konta ' + kontoSel + '. Ustaw właściwy rynek i pobierz jeszcze raz.', '#c00');
             return;
         }
         b.disabled = true;
@@ -31974,5 +32088,7 @@
     [500, 1500].forEach(function(ms){ setTimeout(buildLauncher, ms); });
 
 })();
+
+
 
 
