@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.86
+// @version      3.88
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18724,6 +18724,14 @@
              + (zmieniona ? ('<div style="font-size:9px;color:#7c3aed">poprawiona · z raportu ' + esc(zrodlo) + '</div>')
                           : (zrodlo ? '<div style="font-size:9px;color:#9ca3af">data wypłaty z raportu</div>' : ''));
     }
+    // v3.88: „paczka N — jeszcze NIEZAKSIĘGOWANA" powstaje w chwili IMPORTU i zostawala
+    // w opisie takze po zaksiegowaniu. Wiersz mowil wtedy dwie sprzeczne rzeczy naraz:
+    // ✓ zaksiegowane w kroku obok i „jeszcze NIEZAKSIĘGOWANA" w opisie. Poprawiamy tekst
+    // przy ksiegowaniu, a przy rysowaniu jeszcze raz — zeby zlecenia zaksiegowane
+    // WCZESNIEJSZA wersja tez przestaly klamac, bez potrzeby ksiegowania ich od nowa.
+    function impMsgPoKsieg(msg){
+        return String(msg == null ? '' : msg).replace(/—\s*jeszcze NIEZAKSIĘGOWANA/g, '— zaksięgowana');
+    }
     function mkShort(j){
         const shop = (j.data && j.data.shop) || j.shop || '';
         const cc = String(shop).match(/\b([A-Z]{2})\s*$/);
@@ -20729,6 +20737,14 @@
         //               nie importujemy (bo prosba brzmiala: zadnych minusow), ale nikt go
         //               nie zaksieguje, wiec musi byc widoczny z nazwiska.
         let nPom = 0, pomNet = 0, nUjInne = 0, ujInneNet = 0, impSum = 0;
+        // Co dokladnie zostawalo na wyjetym wierszu OBOK samej kwoty zwrotu — bo lista
+        // zwrotow bierze z niego tylko zwrot. Rozbijamy to na dwie rozne rzeczy:
+        //   pomRabat   — odwrocona Preisreduzierung (prowizja, ktora CHECK24 oddaje).
+        //                Tego nie ksieguje nikt inny, wiec o tym ostrzegamy.
+        //   pomKorekta — Korrekturbuchungen na wierszu zwrotu calosciowego, w praktyce
+        //                koszt etykiety zwrotnej. Ksieguja to inne osoby (decyzja
+        //                z 13.08.2026), wiec pokazujemy dla porzadku, ale bez alarmu.
+        let pomRabat = 0, pomKorekta = 0;
         const ujInneLista = [];
         for (let i = 1; i < rows.length; i++){
             const r = rows[i];
@@ -20754,6 +20770,10 @@
                 nZwr++;
                 nPom++;
                 pomNet = r2(pomNet + netto);
+                // Przy zwrocie calosciowym zwrotem jest H, wiec reszta wiersza (J, L, N)
+                // zostaje. Przy czesciowym zwrotem jest samo N — wtedy N nie jest „reszta".
+                pomRabat = r2(pomRabat + J + L);
+                if (H < -0.005) pomKorekta = r2(pomKorekta + N);
                 const opis = [String(r[C24_TXT] || '').trim() || (H < 0 ? 'zwrot całościowy' : 'zwrot częściowy'),
                               String(r[17] || '').trim(), z.toFixed(2) + ' EUR']
                              .filter(Boolean).join(' · ');
@@ -20800,6 +20820,7 @@
             // zwrotow bierze z niego TYLKO kwote zwrotu. Liczymy ja tak, jak sie ja widzi
             // w ksiegach: Gesamt Brutto minus (to, co pojdzie importem, minus to, co pojdzie zwrotami).
             nPom: nPom, pomNet: pomNet, impSum: impSum,
+            pomRabat: pomRabat, pomKorekta: pomKorekta,
             nUjInne: nUjInne, ujInneNet: ujInneNet, ujInneLista: ujInneLista,
             resztka: r2(brutto - (impSum - zwrot)),
             wiersze: doImportu, naglowekWiersz: rows[0],
@@ -20853,14 +20874,18 @@
                + ' — są na liście zwrotów, w imporcie księgowałyby się drugi raz'
                + ' · do importu idzie ' + f2(csv.impSum) + ' EUR';
         }
-        // Rozjazd pokazujemy ZAWSZE, gdy jest — to jest cena tej zmiany i nie ma sensu,
-        // zeby ktos ja odkrywal dopiero przy zamknieciu miesiaca.
-        if (Math.abs(csv.resztka || 0) > 0.005){
-            s += ' · UWAGA: import minus zwroty daje ' + f2(csv.impSum - csv.refund)
-               + ', a Gesamt Brutto to ' + f2(csv.brutto) + ' — różnica ' + f2(csv.resztka)
-               + ' to kwoty, które siedziały na wyjętych wierszach OBOK samego zwrotu'
-               + ' (odwrócone rabaty Preisreduzierung, koszty etykiet zwrotnych)'
-               + ' i po tej zmianie nie księgują się nigdzie';
+        // Koszty etykiet zwrotnych ksieguja inne osoby — pokazujemy je dla porzadku,
+        // ale to nie jest problem i nie ma po co tego oznaczac jako UWAGA.
+        if (Math.abs(csv.pomKorekta || 0) > 0.005){
+            s += ' · koszty etykiet zwrotnych z wyjętych wierszy ' + f2(csv.pomKorekta)
+               + ' — księgowane osobno, poza tym modułem';
+        }
+        // A to zostaje naprawde nieksiegowane i dlatego pokazujemy to ZAWSZE, gdy jest.
+        if (Math.abs(csv.pomRabat || 0) > 0.005){
+            s += ' · UWAGA: odwrócone rabaty Preisreduzierung ' + f2(csv.pomRabat)
+               + ' siedziały na wierszach zwrotów i po ich wyjęciu nie księgują się nigdzie'
+               + ' (import minus zwroty ' + f2(csv.impSum - csv.refund)
+               + ' wobec Gesamt Brutto ' + f2(csv.brutto) + ')';
         }
         if (csv.nUjInne){
             s += ' · UWAGA: ' + csv.nUjInne + ' wierszy na minus (' + f2(csv.ujInneNet) + ') NIE ma na liście'
@@ -22556,7 +22581,7 @@
                    + stepDone(!!j.booked, 'zaksięgowane')
                    + '</div>')
                 : '';
-            let det = linkify(j.msg || '');
+            let det = linkify(j.booked ? impMsgPoKsieg(j.msg) : (j.msg || ''));
             if (!j.data) det += manorBox(j);
             if (j.data){
                 const n = Object.keys(j.data.ord || {}).length, nr = Object.keys(j.data.ref || {}).length;
@@ -22641,8 +22666,17 @@
                   +  '</td></tr>';
             }
             if (onProlo && st === 'done' && j.impId){
+                // v3.88: po zaksiegowaniu guzik gasnie i zmienia napis. Dotad wygladal
+                // identycznie przed i po — wiersz mial juz trzy ptaszki („zaimportowane,
+                // sprawdzone, zaksiegowane"), a obok stalo zapraszajace fioletowe
+                // „Sprawdz paczke i zaksieguj". Klikalny zostaje, bo powtorne sprawdzenie
+                // nic nie psuje i czasem chce sie zobaczyc stan prosto z systemu.
+                const zrob = !!j.booked;
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
-                  +  '<button class="mk-chk" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź paczkę ' + esc(j.impId) + ' i zaksięguj</button>'
+                  +  '<button class="mk-chk" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:'
+                  +  (zrob ? '#9ca3af' : '#5b21b6') + ';color:#fff;font-weight:700;cursor:pointer;font-size:11px">'
+                  +  (zrob ? ('✔ Paczka ' + esc(j.impId) + ' zaksięgowana — sprawdź ponownie')
+                           : ('🔍 Sprawdź paczkę ' + esc(j.impId) + ' i zaksięguj')) + '</button>'
                   +  ' <a href="/react/settings_page/import_payments/' + esc(j.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
                   +  '</td></tr>';
             }
@@ -23048,20 +23082,64 @@
         Object.keys(o).forEach(function (k){ if (String(k).slice(0, 10) < cut) delete o[k]; });
         try { GM_setValue(MK_RDONE, JSON.stringify(o)); } catch (e){}
     }
-    function rdMark(key, ids, sure){
+    function rdMark(key, ids, sure, reczne){
         if (!key || !ids || !ids.length) return;
         const all = rdLoad(), prev = all[key] || { ids: [] };
         const list = (prev.ids || []).slice();
         ids.forEach(function (id){ if (list.indexOf(id) < 0) list.push(id); });
         all[key] = { at: new Date().toISOString().slice(0, 16).replace('T', ' '), ids: list,
-                     sure: (prev.sure === false ? false : !!sure) };
+                     sure: (prev.sure === false ? false : !!sure),
+                     reczne: !!reczne || !!(prev && prev.reczne) };   // v3.88
         rdSave(all);
+    }
+    // v3.88: cofniecie recznego oznaczenia. Bez tego pomylkowe kliknięcie „oznacz jako
+    // zrobione" byloby nie do odkrecenia inaczej niz czyszczeniem calego magazynu.
+    function rdUnmark(key){
+        const all = rdLoad();
+        if (!all[key]) return false;
+        delete all[key];
+        rdSave(all);
+        return true;
+    }
+    // v3.88: DRUGIE zrodlo prawdy o zaksiegowanych zwrotach — wlasny zapis modulu
+    // „Ksiegowanie w tickecie" (localStorage, ten sam origin co prologistics).
+    // Po co: zwroty zaksiegowane TAM, a nie tym guzikiem, nie zostawialy tu zadnego
+    // sladu i grupa wygladala dokladnie tak, jakby nikt jej nie tknal. Zapis trzyma
+    // OSTATNI przebieg, wiec to uzupelnienie rdMark, a nie jego zamiennik.
+    // Porownujemy numer ORAZ kwote — sam numer zamowienia potrafi wystapic w tym module
+    // takze przy czyms innym niz ten zwrot.
+    const MK_TPROG = 'tm_t_progress_v1';
+    function ksZapis(){
+        let p = null;
+        try { p = JSON.parse(localStorage.getItem(MK_TPROG) || 'null'); } catch (e){ p = null; }
+        const o = {};
+        if (p && Array.isArray(p.rows)){
+            p.rows.forEach(function (r){
+                if (!r || (!r.booked && !r.alreadyBooked)) return;
+                const id = String(r.orderNumber == null ? '' : r.orderNumber).trim();
+                if (!id) return;
+                const kw = Math.abs(Number(String(r.amount == null ? '' : r.amount).replace(',', '.')) || 0);
+                o[id + '|' + kw.toFixed(2)] = 1;
+            });
+        }
+        return o;
     }
     function rdState(key, x){
         const d = rdLoad()[key];
-        if (!d || !d.ids || !d.ids.length) return null;
-        const left = x.rows.filter(function (r){ return d.ids.indexOf(r.id) < 0; });
-        return { at: d.at, sure: d.sure !== false, done: x.rows.length - left.length, left: left };
+        const zap = ksZapis();
+        const zLogu = [];
+        (x.rows || []).forEach(function (r){
+            if (zap[r.id + '|' + Math.abs(r.amt).toFixed(2)] && zLogu.indexOf(r.id) < 0) zLogu.push(r.id);
+        });
+        const ids = ((d && d.ids) || []).slice();
+        zLogu.forEach(function (id){ if (ids.indexOf(id) < 0) ids.push(id); });
+        if (!ids.length) return null;
+        const left = x.rows.filter(function (r){ return ids.indexOf(r.id) < 0; });
+        return { at: (d && d.at) || 'wg zapisu modułu ticketa',
+                 sure: d ? (d.sure !== false) : true,
+                 reczne: !!(d && d.reczne),
+                 zLogu: zLogu.length,
+                 done: x.rows.length - left.length, left: left };
     }
 
     // ---------- slad po dopisanych opisach potracen ----------
@@ -23181,7 +23259,12 @@
             const x = g[k];
             const dup = {}, dupList = [];
             x.rows.forEach(function (r){ if (dup[r.id]) { if (dupList.indexOf(r.id) < 0) dupList.push(r.id); } dup[r.id] = 1; });
-            h += '<div style="margin:6px 0;padding:6px 8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:6px">'
+            // v3.88: cala grupa gasnie, gdy nic w niej nie zostalo. Sam napis „✔ zaksięgowane"
+            // gubil sie miedzy pozostalymi, a guzik obok nadal wygladal na do zrobienia.
+            const zrobiona = !!(st[k] && !st[k].left.length);
+            h += '<div style="margin:6px 0;padding:6px 8px;background:' + (zrobiona ? '#f4f4f5' : '#faf9ff')
+              +  ';border:1px solid ' + (zrobiona ? '#e4e4e7' : '#ede9fe') + ';border-radius:6px'
+              +  (zrobiona ? ';opacity:.72' : '') + '">'
               +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               +  '<b style="font-size:11px">' + esc(x.date) + '</b>'
               +  '<span style="font-size:11px;color:#374151">' + (x.acct ? esc(x.acct + (x.accNm ? (' — ' + x.accNm) : '')) : '<span style="color:#c47f00">konto nieustawione (' + esc(Object.keys(x.shops).join(', ')) + ')</span>') + '</span>'
@@ -23190,6 +23273,10 @@
                     const s = st[k];
                     if (!s) return '';
                     if (!s.left.length) return '<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ zaksięgowane ' + esc(s.at)
+                        // v3.88: skad wiemy, ze zrobione — z wlasnego sladu, z zapisu modulu
+                        // ticketa, czy z recznego oznaczenia. To trzy rozne stopnie pewnosci.
+                        + (s.reczne ? ' <span style="font-weight:400;color:#c47f00">(oznaczone ręcznie)</span>'
+                           : (s.zLogu ? ' <span style="font-weight:400;color:#666">(wg zapisu modułu ticketa)</span>' : ''))
                         + (s.sure ? '' : ' <span style="font-weight:400;color:#c47f00">(bez potwierdzenia z logu)</span>') + '</span>';
                     return '<span style="font-size:11px;color:#c47f00;font-weight:700">częściowo: ' + s.done + ' z ' + x.rows.length
                         + ', zostało ' + s.left.length + '</span>';
@@ -23208,6 +23295,13 @@
               +  (x.acct ? ((st[k] && !st[k].left.length) ? '#9ca3af' : '#5b21b6') : '#c7c7c7')
               +  ';color:#fff;font-weight:700;cursor:' + (x.acct ? 'pointer' : 'default') + ';font-size:11px">'
               +  ((st[k] && !st[k].left.length) ? '↻ Zaksięguj ponownie' : '▶ Zaksięguj') + '</button>'
+              // v3.88: kiedy zwroty poszly INNA droga niz tym guzikiem (np. wklejone wprost
+              // w module ticketa dawno temu, gdy jego zapis dotyczyl juz czegos innego),
+              // modul nie ma jak sie o tym dowiedziec. Zamiast zostawiac grupe na zawsze
+              // „do zrobienia" — pozwalamy odhaczyc ja recznie, z widoczna adnotacja i z
+              // mozliwoscia cofniecia.
+              +  '<button class="mk-rok" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">'
+              +  (zrobiona ? '↺ Cofnij oznaczenie' : '✓ Oznacz jako zrobione') + '</button>'
               +  '<button class="mk-rc" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj</button>'
               +  (x.rows.some(function (r){ return r.note; })
                     ? '<button class="mk-rd" data-g="' + i + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj z opisami</button>'
@@ -23256,6 +23350,26 @@
             // o arkuszu kasowal komunikat o komentarzach) — tylko pietro wyzej.
             // Skutek byl taki, ze „opisy potracen dopisane do 0 z 1. BEZ KOMENTARZA: …"
             // nie mialo jak dotrzec i modul wygladal, jakby komentarzy w ogole nie robil.
+        }; });
+        box.querySelectorAll('.mk-rok').forEach(function (b){ b.onclick = function(){
+            const k = keys[+b.getAttribute('data-g')], x = g[k];
+            const s = rdState(k, x);
+            if (s && !s.left.length){
+                if (!rdUnmark(k)){
+                    say('Ta grupa jest odhaczona nie ręcznie, tylko na podstawie zapisu modułu '
+                        + '„Księgowanie w tickecie" — tego nie cofam stąd.', '#c47f00');
+                    return;
+                }
+                say('Cofnięte — grupa wróciła na listę do zrobienia.', '#c47f00');
+            } else {
+                const zostalo = s ? s.left.length : x.rows.length;
+                if (!confirm('Oznaczyć ' + zostalo + ' pozycji z ' + x.date + ' (konto ' + (x.acct || '?')
+                    + ') jako już zaksięgowane?\n\nModuł ich NIE zaksięguje — tylko zapamięta, że są zrobione.'
+                    + '\nUżyj tego, gdy zwroty poszły inną drogą niż tym guzikiem.')) return;
+                rdMark(k, x.rows.map(function (r){ return r.id; }), false, true);
+                say('Oznaczone jako zrobione (ręcznie).', '#0a7a2f');
+            }
+            renderRef();
         }; });
         box.querySelectorAll('.mk-rc').forEach(function (b){ b.onclick = function(){
             const x = g[keys[+b.getAttribute('data-g')]];
@@ -23909,10 +24023,17 @@
                 } catch (e){ errs.push(f.name + ': ' + ((e && e.message) || e)); }
             }
             render();
+            // v3.87: samo wgranie wyciagu NICZEGO nie pobiera — zaklada wylacznie zlecenia.
+            // Bez tego zdania latwo bylo uznac, ze modul juz probowal i nic nie znalazl,
+            // podczas gdy on jeszcze w ogole nie ruszyl po zestawienia.
+            const jz = jobsLoad();
+            const czeka = Object.keys(jz).filter(function (k){ return mkTodo(jz[k]) && jz[k].ref; }).length;
             say((fs.length > 1 ? ('Wczytane pliki: ' + fs.length + ' · ') : 'Wczytano: ')
                 + 'rozpoznanych obsługiwanych ' + knownT + ' (nowych zleceń ' + addT + ')'
                 + (fs.length > 1 ? (' — ' + per.join(', ')) : '')
                 + (otherT ? (', pozostałych marketplace’ów ' + otherT + ' — na razie poza zakresem') : '') + '.'
+                + (czeka ? (' Zestawień jeszcze nie pobierałem — kliknij „⬇ Pobierz zestawienia" (czeka '
+                            + czeka + ').') : '')
                 + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
                 errs.length ? '#c47f00' : '#0a7a2f');
         }
@@ -24087,7 +24208,7 @@
             // v3.86: informacja o wierszach wyjetych z importu leci od razu przy wczytaniu,
             // a nie dopiero w adnotacji zlecenia — to jest moment, w ktorym czlowiek patrzy.
             const minus = csv ? c24NotaMinus(csv) : '';
-            const alarm = !!(csv && (csv.nUjInne || Math.abs(csv.resztka || 0) > 0.005));
+            const alarm = !!(csv && (csv.nUjInne || Math.abs(csv.pomRabat || 0) > 0.005));
             say('CHECK24 ' + (p.nr || klucz) + ' — wczytany ' + (jestPdf ? 'PDF' : 'CSV')
                 + (csv ? (' · zakupów ' + Object.keys(csv.ord).length + ' na ' + f2(csv.zakup)
                           + ' · zwrotów ' + Object.keys(csv.ref).length + ' na ' + f2(csv.refund)) : '')
@@ -25234,6 +25355,33 @@
             if (n){ jobsSave(jobs); render(); }
             return n;
         }
+        // v3.87: to samo co mkPowod, ale dla JEDNEJ instancji Mirakla.
+        // Mirakli jest kilka (Vente, Home24, Manor) i blad jednego nie ma prawa opisac
+        // zlecen drugiego — mkPowod('mirakl', …) rozsmarowalby go po wszystkich.
+        function mkPowodHost(host, tekst, jakoBlad, tylkoBezOpisu){
+            const jobs = jobsLoad();
+            let n = 0;
+            mkCzekajace(jobs, 'mirakl').forEach(function (k){
+                const j = jobs[k];
+                if (String(j.host || '') !== String(host || '')) return;
+                if (tylkoBezOpisu && j.msg) return;
+                j.msg = tekst;
+                if (jakoBlad) j.status = 'err';
+                n++;
+            });
+            if (n){ jobsSave(jobs); render(); }
+            return n;
+        }
+        // Dowolne czekajace zlecenie z tej instancji — withLogin potrzebuje marki
+        // („Vente Unique", „Manor"), zeby wyciagnac wlasciwy adres z MK_LOGIN. Bez tego
+        // zostaje golo „https://host/", co przy Miraklu tez dziala, ale jest mniej celne.
+        function mkWzorHost(host){
+            const jobs = jobsLoad();
+            const k = mkCzekajace(jobs, 'mirakl').filter(function (x){
+                return String(jobs[x].host || '') === String(host || '');
+            })[0];
+            return k ? jobs[k] : { host: host };
+        }
         // etykieta — nazwa platformy do komunikatu; kind — rodzaj zlecen; host — do linku
         // logowania; fn — wlasciwy przelot. Zwraca liczbe pobranych rozliczen.
         async function mkPrzelot(etykieta, kind, host, marka, fn){
@@ -25363,7 +25511,12 @@
                         // Petla po sklepach nizej robi to samo w kazdej iteracji (22203).
                         jobs = jobsLoad();
                         ok += await mkPass(jobs, await mkShopName(), host);
-                        if (mkLeft(jobsLoad(), host)) problem.push(host + ': zostały rozliczenia na innych sklepach — wejdź tam raz na stronę Mirakla, moduł zapamięta ich listę');
+                        if (mkLeft(jobsLoad(), host)){
+                            const t = host + ': zostały rozliczenia na innych sklepach — wejdź tam raz na '
+                                    + mkPanelUrl(host) + ', moduł zapamięta ich listę';
+                            mkPowodHost(host, t, false, true);
+                            problem.push(t);
+                        }
                         continue;
                     }
                     for (let i = 0; i < ids.length; i++){
@@ -25375,7 +25528,24 @@
                         const nm = await mkShopName();
                         ok += await mkPass(jobs, nm, host);
                     }
-                } catch (e){ problem.push(host + ': ' + ((e && e.message) || e)); }
+                    // v3.87: przelot przeszedl bez wyjatku, a zlecenia dalej czekaja i nie maja
+                    // wlasnego opisu. Dotad zostawalo przy nich gole „czeka na dane" i nic nie
+                    // mowilo, gdzie szukac — dokladnie tak, jak to od dawna robi mkPrzelot
+                    // przy Galaxusie, Wayfairze, eBayu i CHECK24.
+                    mkPowodHost(host, host + ': przelot przeszedł, ale nie znalazł tego rozliczenia. '
+                        + 'Sprawdź, czy jesteś zalogowany na ' + mkPanelUrl(host)
+                        + ' i czy wypłata jest już widoczna w panelu.', false, true);
+                } catch (e){
+                    // v3.87: powod ląduje PRZY ZLECENIU i z klikalnym adresem — tak samo jak
+                    // przy pozostalych platformach. Dotad szedl wylacznie do zbiorczego
+                    // „Problemy: …" na pasku stanu, ktory znika przy nastepnym komunikacie,
+                    // a przy zleceniu zostawalo gole „czeka na dane" bez slowa o sesji.
+                    const tresc = (e && e.message) || String(e);
+                    let txt;
+                    try { txt = withLogin(mkWzorHost(host), tresc); } catch (e2){ txt = tresc; }
+                    mkPowodHost(host, host + ': ' + txt, true, false);
+                    problem.push(host + ': ' + txt);
+                }
                 finally {
                     // Powrot na sklep wyjsciowy takze po bledzie — inaczej zostawilbym
                     // sesje na przypadkowym sklepie, a strona pokazywalaby stary.
@@ -26243,7 +26413,11 @@
             try {
                 await impBook(job.impId, ok.map(function (x){ return x.id; }));
                 const jobs = jobsLoad();
-                if (jobs[job.ref]){ jobs[job.ref].booked = true; jobs[job.ref].checked = true; jobsSave(jobs); }
+                if (jobs[job.ref]){
+                    jobs[job.ref].booked = true; jobs[job.ref].checked = true;
+                    jobs[job.ref].msg = impMsgPoKsieg(jobs[job.ref].msg);   // v3.88
+                    jobsSave(jobs);
+                }
                 await shAfterBook(jobs, job.ref);
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję wynik…';
                 render();
@@ -26322,7 +26496,7 @@
                 if (jobs[p.j.ref]){
                     jobs[p.j.ref].booked = true;
                     jobs[p.j.ref].checked = true;
-                    jobs[p.j.ref].msg = String(jobs[p.j.ref].msg || '') + ' · zaksięgowane ' + p.ok.length + ' poz.';
+                    jobs[p.j.ref].msg = impMsgPoKsieg(jobs[p.j.ref].msg) + ' · zaksięgowane ' + p.ok.length + ' poz.';
                     jobsSave(jobs);
                     await shAfterBook(jobs, p.j.ref);
                 }
