@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.97
+// @version      3.99
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -9,6 +9,7 @@
 // @match        https://salescenter.allegro.com/*
 // @match        https://*.mirakl.net/*
 // @match        https://*.myvtex.com/*
+// @match        https://toolbox.manomano.com/*
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
 // @connect      fxds-public-exchange-rates-api.oanda.com
 // @connect      oanda.com
@@ -30,6 +31,8 @@
 // @connect      ebay.de
 // @connect      check24.de
 // @connect      mc.moebel.check24.de
+// @connect      browserapi.manomano.com
+// @connect      manomano.com
 // @connect      core-api.moebel.check24.de
 // @connect      www.ebay.de
 // @connect      storage.googleapis.com
@@ -71,6 +74,8 @@
     // OBI stoi na VTEX-ie. Modul musi tam wchodzic, bo ciasteczko sesji nie jedzie
     // w zapytaniu miedzydomenowym i z prologistics dostajemy 404.
     const onVtex    = () => /(^|\.)myvtex\.com$/i.test(H);
+    // Panel ManoMano — wchodzimy tam WYLACZNIE po to, zeby podejrzec token sesji.
+    const onMano    = () => /(^|\.)toolbox\.manomano\.com$/i.test(H);
 
     const HUB = 'beliani_hub_';
     const isOn = (id) => { try { return GM_getValue(HUB + id, true); } catch (e) { return true; } };
@@ -17190,6 +17195,17 @@
         { mp: 'Manor',          ok: true,  payer: /MANOR\s*AG/i,
           ref:  /\/ROC\/(\d+)/,
           brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH' },
+        // ManoMano placi przez Mangopay, tak samo jak inne Mirakle, wiec sam platnik nie
+        // wystarczy — rozstrzyga referencja „MANOMANO-<RYNEK>-<data>-<kontrakt>". Ta regula
+        // MUSI stac przed ogolna regula Mangopay, bo mkDetect bierze pierwsze trafienie.
+        // Wyciag UCINA referencje do trzech pierwszych cyfr numeru kontraktu (FR 639081 ->
+        // „…-639"), bo pole SEPA lamie sie co 35 znakow — dlatego wzorzec konczy sie na
+        // \d{3,}, a dopasowanie do pliku idzie po PREFIKSIE i potwierdza je kwota.
+        // Trzycyfrowe koncowki sa miedzy rynkami unikalne: 639 FR, 722 DE, 738 IT, 743 ES,
+        // 230 UK, 561 MMF FR — wiec prefiks nie ma jak trafic w cudzy rynek.
+        { mp: 'ManoMano',       ok: true,  payer: /MANGOPAY|MANO\s?MANO/i,
+          ref: /(MANOMANO-[A-Z]{2}-\d{8}-\d{3,})/i,
+          brand: 'ManoMano', short: 'ManoMano', host: MK_MM_HOST, kind: 'mano', shop: 'ManoMano' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -17223,6 +17239,13 @@
                 const m = raw.match(r.ref) || raw.replace(/\s+/g, '').match(r.ref);
                 if (!m) continue;
                 base.ref = m[1];
+                // ManoMano: rynek stoi wprost w referencji, wiec sklep da sie nazwac od razu,
+                // bez czekania na plik rozliczeniowy — inaczej wszystkie cztery wplaty
+                // wygladalyby na liscie identycznie.
+                if (base.kind === 'mano'){
+                    const mmk = String(base.ref || '').toUpperCase().match(/^MANOMANO-([A-Z]{2})-/);
+                    if (mmk) base.shop = 'ManoMano ' + mmk[1];
+                }
                 // Manor: jeden przelew reguluje kilka dokumentow naraz. Zbieramy komplet
                 // z obu wariantow tekstu — surowego i sklejonego — bo wyciag lamie dlugi
                 // opis i numer potrafi sie rozpasc na dwa wiersze.
@@ -18648,6 +18671,487 @@
         return cz.join(' · ') + ' — uzupełnij tabelę kont MK_AMZ_ACC w skrypcie, pliku nie generuję';
     }
 
+    // ================= MANOMANO =================
+    // Zrodlo jest JEDNO: plik rozliczeniowy CSV („MANOMANO-<RYNEK>-<data>-<kontrakt>.csv"),
+    // sredniki, 23 kolumny, kropka dziesietna. Kontrola wewnetrzna jest twarda i wystarczy
+    // sama za caly sprawdzian: SUMA KOLUMNY NET_AMOUNT po CALYM pliku rowna sie kwocie
+    // wyplaty z wyciagu. Sprawdzone na czterech wyplatach z 08.08.2026 co do grosza —
+    // FR 36 597,77 / DE 7 728,34 / IT 10 643,49 / ES 2 412,02.
+    //
+    // WIERSZE. TYPE przyjmuje: ORDER, REFUND, VAT_ADJUSTMENT, DEDUCTIONS_FROM_COMMISSIONS,
+    // SUBSCRIPTION, ADJUSTMENT. Do importu ida WYLACZNIE wiersze ORDER, kwota brutto
+    // (AMOUNT_VAT_INCL) — czyli to, co zaplacil klient; prowizja ManoMano jest ksiegowana
+    // osobno, tak samo jak przy Amazonie. Zwroty ida na liste zwrotow, bo ksieguje sie je
+    // na auftragu. Potracenia i abonament nie ida nigdzie: to koszty, ktore ksieguje kto
+    // inny — modul je tylko wypisuje, zeby bylo widac, z czego sklada sie roznica do wyplaty.
+    //
+    // TYP KLIENTA. ManoMano nie podaje go wprost, wiec wyprowadzamy go z VAT-u:
+    //   FR/ES/IT: VAT_ON_PRODUCT = 0 znaczy B2B 0% (wewnatrzwspolnotowe), a kazda wartosc
+    //             znaczy B2C. Jednoznaczne — B2B 19% na tych rynkach u nas nie wystepuje.
+    //   DE:       VAT stoi PRZY KAZDYM zamowieniu, wiec z niego nic nie wynika. Rozstrzyga
+    //             korekta: przy B2C ManoMano zabiera VAT wierszem VAT_ADJUSTMENT rownym
+    //             -(VAT), przy B2B zostawia go sprzedawcy i korekty nie ma wcale.
+    //
+    // DZIURA W TEJ REGULE — i dlaczego jest zamknieta tak, a nie inaczej. Zamowienie
+    // ZWROCONE w tym samym rozliczeniu albo nie dostaje korekty w ogole, albo dostaje pare
+    // +/-, ktora sie znosi. W obu ukladach wyglada DOKLADNIE tak jak B2B. Sprawdzone na
+    // 308 zamowieniach FR/ES/IT, gdzie prawde znamy niezaleznie z kolumny VAT: wszystkie
+    // 25 takich przypadkow to byly zwroty, ani jeden nie byl prawdziwym B2B. Dlatego numer
+    // majacy wiersz REFUND NIE JEST klasyfikowany — idzie na osobna liste do recznego
+    // rozstrzygniecia. Bez tego zabezpieczenia regula wskazalaby 9 zamowien B2C jako B2B
+    // (FR 6, IT 2, ES 1) i tyle samo pozycji poszloby na zle konto VAT.
+    //
+    // Korekty SUMUJEMY, a nie porownujemy pojedynczo: zamowienie bywa wielopozycyjne
+    // (16 przypadkow w danych, do 3 pozycji) i kazda pozycja dostaje wlasna korekte.
+    // Porownanie „jedna korekta == caly VAT" mylilo takie zamowienia z B2B.
+    //
+    // Po zamknieciu dziury regula na 280 znanych zamowieniach B2C nie dala ANI JEDNEGO
+    // falszywego B2B. Na szesciu rozliczeniach DE (III-VIII 2026) wychodzi z niej
+    // 140 B2C, 5 B2B 19% i 13 do rozstrzygniecia recznego.
+    const MK_MM_ACC = {
+        fr: { acc: '1258', vat: { 'B2C': '3223', 'B2B 0%': '3230' } },
+        es: { acc: '1263', vat: { 'B2C': '3257', 'B2B 0%': '3268' } },
+        it: { acc: '1261', vat: { 'B2C': '3258', 'B2B 0%': '3269' } },
+        // DE jako jedyny ma B2B ze stawka (19%) i jako jedyny nie ma B2B 0%.
+        de: { acc: '1266', vat: { 'B2C': '3252', 'B2B': '3283' } }
+    };
+    const MK_MM_HOST = 'toolbox.manomano.com';
+    function mmKonta(kraj, typ){
+        const k = MK_MM_ACC[String(kraj || '').toLowerCase()];
+        if (!k) return { acc: '', vat: '' };
+        return { acc: k.acc, vat: (k.vat[typ] || '') };
+    }
+    // Kwoty sa w formacie angielskim: kropka dziesietna, BEZ separatora tysiecy (sprawdzone
+    // na wartosciach czterocyfrowych). Pusta komorka to zero — w wierszach VAT_ADJUSTMENT
+    // wiekszosc kolumn jest pusta i to jest normalne, a nie uszkodzony plik.
+    function mmNum(v){
+        const s = String(v == null ? '' : v).trim();
+        if (!s) return 0;
+        const n = Number(s.replace(/\s/g, ''));
+        return isFinite(n) ? n : 0;
+    }
+    // Rynek bierzemy z PAYOUT_REFERENCE („MANOMANO-DE-20260808-722497"), a nie z nazwy
+    // pliku — nazwe da sie zmienic przy zapisie, tresci nie.
+    function mmKraj(payRef){
+        const m = String(payRef || '').toUpperCase().match(/^MANOMANO-([A-Z]{2})-/);
+        return m ? m[1].toLowerCase() : '';
+    }
+    function mmRow(numer, kwota, typ, kraj){
+        const c = new Array(35).fill('');
+        const kk = mmKonta(kraj, typ);
+        c[6] = 'Order'; c[7] = numer;
+        c[24] = f2(kwota);
+        c[25] = typ || ''; c[26] = kk.acc; c[27] = kk.vat;
+        return c;
+    }
+    function mkParseMano(text){
+        const rows = mkCsvRows(String(text == null ? '' : text));
+        if (!rows.length || !rows[0]) return { err: 'pusty plik' };
+        const hdr = rows[0].map(function (h){ return String(h || '').trim().toUpperCase(); });
+        // Warunek wejscia musi byc ostry, bo mkTypPliku pyta parsery po kolei i pierwszy,
+        // ktory nie odmowi, dostaje plik. „TYPE" w pierwszej kolumnie plus komplet nazw
+        // ponizej nie wystepuje w zadnym innym rozliczeniu, ktore ten modul obsluguje.
+        if (hdr[0] !== 'TYPE')
+            return { err: 'to nie wygląda na rozliczenie ManoMano — pierwsza kolumna to nie „TYPE"' };
+        const ix = {};
+        hdr.forEach(function (h, i){ if (h && ix[h] == null) ix[h] = i; });
+        const need = ['TYPE', 'REFERENCE', 'CURRENCY', 'AMOUNT_VAT_INCL', 'COMMISSION_VAT_INCL',
+                      'NET_AMOUNT', 'VAT_ON_PRODUCT', 'VAT_ON_SHIPPING', 'PAYOUT_REFERENCE', 'PAYOUT_DATE'];
+        const brakK = need.filter(function (k){ return ix[k] == null; });
+        if (brakK.length)
+            return { err: 'rozliczenie ManoMano bez kolumn: ' + brakK.join(', ') };
+
+        const C = { t: ix['TYPE'], id: ix['REFERENCE'], dat: ix['OPERATION_DATE'], cur: ix['CURRENCY'],
+                    br: ix['AMOUNT_VAT_INCL'], prow: ix['COMMISSION_VAT_INCL'], net: ix['NET_AMOUNT'],
+                    vp: ix['VAT_ON_PRODUCT'], vs: ix['VAT_ON_SHIPPING'],
+                    pref: ix['PAYOUT_REFERENCE'], pdat: ix['PAYOUT_DATE'] };
+
+        const ordBr = {}, ordVat = {}, ordN = {}, kor = {}, zwrot = {}, zwrotNote = {};
+        const potr = [];
+        let suma = 0, prowSum = 0, korSum = 0, potrSum = 0, zwrotSum = 0, brutto = 0;
+        let payRef = '', payDate = '', cur = '', nWierszy = 0;
+        const waluty = {};
+
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || !r.join('').trim()) continue;
+            const typ = String(r[C.t] || '').trim().toUpperCase();
+            if (!typ) continue;
+            const id = String(r[C.id] || '').trim();
+            const netto = mmNum(r[C.net]);
+            nWierszy++;
+            suma = r2(suma + netto);
+            if (!payRef && r[C.pref]) payRef = String(r[C.pref]).trim();
+            if (!payDate && r[C.pdat]) payDate = String(r[C.pdat]).trim();
+            const w = String(r[C.cur] || '').trim().toUpperCase();
+            if (w){ waluty[w] = (waluty[w] || 0) + 1; if (!cur) cur = w; }
+
+            if (typ === 'ORDER'){
+                if (!id) continue;
+                ordBr[id] = r2((ordBr[id] || 0) + mmNum(r[C.br]));
+                ordVat[id] = r2((ordVat[id] || 0) + mmNum(r[C.vp]) + mmNum(r[C.vs]));
+                ordN[id] = (ordN[id] || 0) + 1;
+                brutto = r2(brutto + mmNum(r[C.br]));
+                prowSum = r2(prowSum + mmNum(r[C.prow]));
+            } else if (typ === 'VAT_ADJUSTMENT'){
+                if (!id) continue;
+                kor[id] = r2((kor[id] || 0) + netto);
+                korSum = r2(korSum + netto);
+            } else if (typ === 'REFUND'){
+                if (!id) continue;
+                // Na liste zwrotow idzie kwota BRUTTO ze znakiem dodatnim — tak samo jak
+                // przy Check24 i Wayfairze, bo zwrot ksieguje sie na auftragu jako kwota.
+                const kw = Math.abs(mmNum(r[C.br]));
+                zwrot[id] = r2((zwrot[id] || 0) + kw);
+                zwrotSum = r2(zwrotSum + kw);
+                const opis = ['zwrot', String(r[C.dat] || '').slice(0, 10), f2(kw) + ' ' + (w || 'EUR')]
+                             .filter(Boolean).join(' · ');
+                zwrotNote[id] = zwrotNote[id] ? (zwrotNote[id] + '\n\n' + opis) : opis;
+            } else {
+                // SUBSCRIPTION, DEDUCTIONS_FROM_COMMISSIONS, ADJUSTMENT i cokolwiek nowego.
+                // Nie ksiegujemy ich, ale POKAZUJEMY — inaczej roznica miedzy suma zamowien
+                // a wyplata bylaby nie do wytlumaczenia bez zagladania do pliku.
+                potr.push({ typ: typ, kwota: netto, id: id });
+                potrSum = r2(potrSum + netto);
+            }
+        }
+        if (!payRef) return { err: 'w pliku nie ma kolumny PAYOUT_REFERENCE z numerem wypłaty' };
+        const kraj = mmKraj(payRef);
+        if (!kraj) return { err: 'nie rozpoznaję rynku z „' + payRef + '" — spodziewam się MANOMANO-XX-…' };
+        if (!Object.keys(ordBr).length && !Object.keys(zwrot).length)
+            return { err: 'rozliczenie ' + payRef + ' nie ma ani jednego wiersza ORDER ani REFUND' };
+
+        // ----- klasyfikacja typu klienta -----
+        const typOrd = {}, wOrd = [], niepewne = [];
+        const brakVat = {}, brakAcc = {};
+        const licz = { 'B2C': 0, 'B2B': 0, 'B2B 0%': 0 };
+        Object.keys(ordBr).forEach(function (id){
+            const vat = r2(ordVat[id] || 0);
+            const kk = r2(kor[id] || 0);
+            let typ = '', powod = '';
+            if (Math.abs(vat) < 0.005){
+                typ = 'B2B 0%';
+            } else if (zwrot[id] != null){
+                // Zwrot w tym samym rozliczeniu — patrz komentarz nad tabela kont.
+                powod = 'zwrócone w tym samym rozliczeniu, korekta VAT nic nie mówi';
+            } else if (eq(kk, -vat)){
+                typ = 'B2C';
+            } else if (Math.abs(kk) < 0.005){
+                typ = 'B2B';
+            } else {
+                powod = 'korekta VAT ' + f2(kk) + ' nie pasuje ani do 0, ani do −' + f2(vat);
+            }
+            if (!typ){
+                niepewne.push({ id: id, brutto: ordBr[id], vat: vat, korekta: kk, powod: powod });
+                return;
+            }
+            typOrd[id] = typ;
+            licz[typ] = (licz[typ] || 0) + 1;
+            const kn = mmKonta(kraj, typ);
+            if (!kn.acc) brakAcc[kraj.toUpperCase()] = (brakAcc[kraj.toUpperCase()] || 0) + 1;
+            if (!kn.vat){
+                const kl = kraj.toUpperCase() + ' ' + typ;
+                brakVat[kl] = (brakVat[kl] || 0) + 1;
+            }
+            wOrd.push({ r: mmRow(id, ordBr[id], typ, kraj), t: typ, id: id });
+        });
+        wOrd.sort(function (a, b){
+            const d = amzSortKey(a.t) - amzSortKey(b.t);
+            return d || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0));
+        });
+        niepewne.sort(function (a, b){ return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0); });
+
+        return {
+            kraj: kraj, payRef: payRef, payDate: payDate, cur: cur || 'EUR',
+            waluty: Object.keys(waluty),
+            suma: suma, brutto: brutto, prowizja: prowSum, korekty: korSum,
+            potracenia: potr, potrSum: potrSum,
+            ord: ordBr, typOrd: typOrd, wOrd: wOrd, licz: licz,
+            ref: zwrot, refNote: zwrotNote, zwrotSum: zwrotSum,
+            niepewne: niepewne,
+            brakVat: brakVat, brakAcc: brakAcc,
+            nOrd: Object.keys(ordBr).length, nZwr: Object.keys(zwrot).length,
+            nImport: wOrd.length, nWierszy: nWierszy
+        };
+    }
+    // ---------- ManoMano: pobieranie zestawien z panelu ----------
+    // Adres pobrania ustalony ze zrzutu HAR z 13.08.2026: TEN SAM endpoint, ktory wyglada
+    // na „szczegoly dokumentu", oddaje SAM PLIK — content-type application/octet-stream,
+    // a nazwa wyplaty siedzi w naglowku content-disposition:
+    //   GET /api/finance/v3/sellers/722497/documents/29d7bcbf-…
+    //   → filename="MANOMANO-DE-20260808-722497.csv", 19 577 B
+    // Zadnych podpisanych linkow ani przekierowan, inaczej niz u Wayfaira.
+    const MK_MM_API = 'https://browserapi.manomano.com';
+    const MK_MM_KONTRAKT = { fr: '639081', de: '722497', it: '738383', es: '743659' };
+    const MM_TOK_KEY = 'tm_mm_token_v1';
+    function mmTokCzytaj(){
+        let s = '';
+        try { s = GM_getValue(MM_TOK_KEY, '') || ''; } catch (e){ return null; }
+        if (!s) return null;
+        let o; try { o = JSON.parse(s); } catch (e){ return null; }
+        if (!o || !o.tok) return null;
+        // Zapas 60 s: token, ktoremu zostala minuta, nie przezyje przelotu przez 4 rynki.
+        if (o.exp && o.exp < Date.now() + 60000) return { przeterminowany: true, exp: o.exp };
+        return o;
+    }
+    function mmBrakTokena(){
+        const t = mmTokCzytaj();
+        if (t && !t.przeterminowany) return '';
+        return 'nie mam ważnej sesji ManoMano — otwórz ' + mkPanelUrl(MK_MM_HOST)
+             + ', poczekaj aż panel się załaduje, i wróć tutaj'
+             + (t && t.exp ? (' (poprzednia wygasła ' + new Date(t.exp).toLocaleString('pl-PL') + ')') : '');
+    }
+    function mmGet(url, binarnie){
+        const t = mmTokCzytaj();
+        if (!t || t.przeterminowany) return Promise.reject(new Error(mmBrakTokena()));
+        return new Promise(function (resolve, reject){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ reject(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 90000,
+                responseType: binarnie ? 'arraybuffer' : undefined,
+                headers: {
+                    'Authorization': t.tok,
+                    'Accept': binarnie ? '*/*' : 'application/json, text/plain, */*',
+                    // Panel wysyla ten naglowek przy KAZDYM zapytaniu do API. Nie wiadomo,
+                    // czy brama go wymaga — wysylamy go tak samo, zeby nie sprawdzac tego
+                    // na produkcji cudzym kosztem.
+                    'x-mm-user-agent': 'toolbox/0.0.1'
+                },
+                onload: function (r){ resolve(r); },
+                onerror: function (){ reject(new Error('nie mogę połączyć się z browserapi.manomano.com'
+                    + ' — jeśli to nowy adres, dopisz go do @connect w nagłówku skryptu')); },
+                ontimeout: function (){ reject(new Error('browserapi.manomano.com nie odpowiedział na czas')); }
+            });
+        });
+    }
+    function mmSprawdzOdpowiedz(r){
+        if (r.status === 401 || r.status === 403)
+            throw new Error('ManoMano odrzucił sesję (HTTP ' + r.status + ') — ' + mmBrakTokena());
+        if (r.status < 200 || r.status >= 300)
+            throw new Error('HTTP ' + r.status + ' z browserapi.manomano.com');
+    }
+    // Nazw pol w liscie dokumentow NIE ZNAM — wersja „sanitized" zrzutu HAR nie niesie
+    // tresci odpowiedzi. Zamiast zgadywac nazwy, przechodzimy strukture i zbieramy
+    // obiekty, w ktorych stoja OBOK SIEBIE identyfikator UUID i referencja wyplaty
+    // („MANOMANO-DE-20260808-722497"). Ten drugi ksztalt jest na tyle sztywny, ze nie ma
+    // jak trafic przypadkiem, a interesuja nas wylacznie wyplaty — faktury i reszta
+    // dokumentow takiej referencji nie niosa, wiec same wypadaja.
+    // Trafienie potwierdzamy potem TRZY RAZY, kazdym razem z innego zrodla: nazwa pliku
+    // z naglowka content-disposition, referencja ze srodka CSV i suma kontrolna do wyciagu.
+    const MM_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const MM_REF  = /MANOMANO-[A-Z]{2}-\d{8}-\d+/i;
+    // Parujemy w PODDRZEWIE, a nie w pojedynczym obiekcie. Uklad
+    //   [{ id: "<uuid>", attributes: { reference: "MANOMANO-DE-…" } }]
+    // trzyma identyfikator i referencje na roznych poziomach i porownanie „oba pola w tym
+    // samym obiekcie" by go przegapilo. Zamiast tego dla kazdego wezla liczymy, co siedzi
+    // w calym jego poddrzewie, i uznajemy za wyplate ten wezel, ktory zawiera DOKLADNIE
+    // JEDNA referencje — bo wtedy na pewno opisuje jeden dokument, a nie cala liste.
+    // Z kilku takich wezlow dla tej samej referencji bierzemy NAJWEZSZY, czyli ten
+    // z najmniejsza liczba identyfikatorow: on jest najblizej samego dokumentu.
+    function mmZnajdzPayouty(dane){
+        const kand = {};
+        (function chodz(x){
+            if (!x || typeof x !== 'object') return { u: [], r: [] };
+            const u = [], r = [];
+            Object.keys(x).forEach(function (k){
+                const v = x[k];
+                if (typeof v === 'string'){
+                    const t = v.trim();
+                    if (MM_UUID.test(t) && u.indexOf(t) < 0) u.push(t);
+                    const m = t.match(MM_REF);
+                    if (m && r.indexOf(m[0].toUpperCase()) < 0) r.push(m[0].toUpperCase());
+                } else if (v && typeof v === 'object'){
+                    const d = chodz(v);
+                    d.u.forEach(function (z){ if (u.indexOf(z) < 0) u.push(z); });
+                    d.r.forEach(function (z){ if (r.indexOf(z) < 0) r.push(z); });
+                }
+            });
+            if (r.length === 1 && u.length){
+                const ref = r[0], stary = kand[ref];
+                if (!stary || u.length < stary.ile) kand[ref] = { uuid: u[0], ref: ref, ile: u.length };
+            }
+            return { u: u, r: r };
+        })(dane);
+        return Object.keys(kand).sort().reverse().map(function (k){
+            return { uuid: kand[k].uuid, ref: kand[k].ref };
+        });
+    }
+    async function mmLista(kontrakt){
+        // 60 zamiast 15 — panel pokazuje po 15, ale nas interesuje kilka ostatnich wyplat,
+        // a jedno wieksze zapytanie jest tansze niz stronicowanie.
+        const r = await mmGet(MK_MM_API + '/api/finance/v3/sellers/' + encodeURIComponent(kontrakt)
+                            + '/documents?limit=60&page=1');
+        mmSprawdzOdpowiedz(r);
+        let d;
+        try { d = JSON.parse(String(r.responseText || '')); }
+        catch (e){ throw new Error('lista dokumentów ManoMano przyszła jako nie-JSON — najpewniej sesja wygasła'); }
+        const p = mmZnajdzPayouty(d);
+        if (!p.length) throw new Error('w liście dokumentów kontraktu ' + kontrakt
+            + ' nie ma ani jednej pozycji z referencją wypłaty (sprawdzonych pozycji: '
+            + String(r.responseText || '').length + ' B odpowiedzi)');
+        return p;
+    }
+    async function mmPlik(kontrakt, uuid){
+        const r = await mmGet(MK_MM_API + '/api/finance/v3/sellers/' + encodeURIComponent(kontrakt)
+                            + '/documents/' + encodeURIComponent(uuid), true);
+        mmSprawdzOdpowiedz(r);
+        // Nazwa pliku z naglowka to PIERWSZE z trzech niezaleznych potwierdzen, ze pobralismy
+        // to, o co prosilismy. Serwer wystawia content-disposition przez access-control-
+        // expose-headers, wiec jest widoczna takze miedzydomenowo.
+        let nazwa = '';
+        const h = String(r.responseHeaders || '');
+        const m = h.match(/filename\s*=\s*"?([^";\r\n]+)"?/i);
+        if (m) nazwa = m[1].trim();
+        const buf = r.response;
+        if (!buf || !buf.byteLength) throw new Error('ManoMano oddał pusty plik dla ' + uuid);
+        return { text: mkDecode(buf), nazwa: nazwa, bajtow: buf.byteLength };
+    }
+    function manoLeft(jobs){
+        const j = jobs || jobsLoad();
+        return Object.keys(j).filter(function (k){
+            return j[k].kind === 'mano' && mkTodo(j[k]);
+        }).length;
+    }
+    // Jedno przejscie po czekajacych zleceniach ManoMano. Liste dokumentow pobieramy RAZ
+    // NA KONTRAKT i dopasowujemy do niej wszystkie zlecenia z tego rynku — inaczej przy
+    // czterech wyplatach z jednego rynku poszlyby cztery takie same zapytania.
+    async function manoPass(jobs){
+        const todo = Object.keys(jobs).filter(function (k){
+            return jobs[k].kind === 'mano' && mkTodo(jobs[k]);
+        });
+        if (!todo.length) return 0;
+        const blok = mmBrakTokena();
+        if (blok){
+            todo.forEach(function (k){ jobs[k].status = 'err'; jobs[k].msg = mkLink(blok); });
+            jobsSave(jobs); render();
+            say('ManoMano: ' + blok, '#c47f00');
+            return 0;
+        }
+        const listy = {};
+        let ok = 0;
+        for (let i = 0; i < todo.length; i++){
+            const j = jobs[todo[i]];
+            try {
+                const kraj = mmKraj(j.ref);
+                const kontrakt = MK_MM_KONTRAKT[kraj];
+                if (!kontrakt) throw new Error('nie znam numeru kontraktu dla rynku „' + (kraj || '?')
+                    + '" — uzupełnij MK_MM_KONTRAKT w skrypcie');
+                say('ManoMano ' + kraj.toUpperCase() + ' — szukam ' + j.ref + '…');
+                if (!listy[kontrakt]) listy[kontrakt] = await mmLista(kontrakt);
+                // Referencja z wyciagu jest UCIETA do trzech cyfr numeru kontraktu, wiec
+                // dopasowanie idzie po prefiksie — tak samo jak przy wgrywanym pliku.
+                const kand = listy[kontrakt].filter(function (d){ return d.ref.indexOf(String(j.ref).toUpperCase()) === 0; });
+                if (!kand.length) throw new Error('w panelu nie ma wypłaty zaczynającej się od ' + j.ref
+                    + ' (widzę ' + listy[kontrakt].length + ' wypłat, najnowsze: '
+                    + listy[kontrakt].slice(0, 3).map(function (d){ return d.ref; }).join(', ') + ')');
+                if (kand.length > 1) throw new Error('do ' + j.ref + ' pasuje ' + kand.length
+                    + ' wypłat: ' + kand.map(function (d){ return d.ref; }).join(', ')
+                    + ' — nie zgaduję, którą wziąć');
+                const plik = await mmPlik(kontrakt, kand[0].uuid);
+                // Potwierdzenie drugie: nazwa pliku z naglowka.
+                if (plik.nazwa && plik.nazwa.toUpperCase().indexOf(kand[0].ref) < 0)
+                    throw new Error('pobrany plik nazywa się „' + plik.nazwa + '", a prosiłem o ' + kand[0].ref);
+                const p = mkParseMano(plik.text);
+                if (p.err) throw new Error(p.err);
+                // Potwierdzenie trzecie: referencja ZE SRODKA pliku.
+                if (String(j.ref).toUpperCase().length && p.payRef.toUpperCase().indexOf(String(j.ref).toUpperCase()) !== 0)
+                    throw new Error('w pobranym pliku stoi ' + p.payRef + ', a przelew mówi ' + j.ref);
+                // Czwarte potwierdzenie — suma kontrolna do wyciagu — robi manoZastosuj.
+                manoZastosuj(j, p, 'panel ManoMano');
+                ok++;
+            } catch (e){
+                j.status = 'err';
+                j.msg = mkLink(withLogin(j, (e && e.message) || String(e)));
+            }
+            jobsSave(jobs); render();
+        }
+        return ok;
+    }
+    // Jedno miejsce, w ktorym rozliczenie ManoMano wchodzi do zlecenia — obojetnie, czy
+    // przyszlo z dysku, czy z panelu. Wczesniej ta logika stala tylko w manoWczytaj i przy
+    // dokladaniu pobierania trzeba by ja bylo przepisac drugi raz; jedna kopia to jedna
+    // prawda o tym, kiedy zlecenie jest gotowe do ksiegowania.
+    function manoZastosuj(j, p, skad){
+        j.ref = p.payRef;
+        j.shop = 'ManoMano ' + p.kraj.toUpperCase();
+        if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
+        const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
+        j.data = { mano: p, shop: j.shop, gross: p.brutto, refund: p.zwrotSum,
+                   net: p.suma, netOk: (j.amount == null) ? true : eq(p.suma, j.amount),
+                   ord: p.ord, ref: p.ref, refNote: p.refNote,
+                   unknown: {}, skipped: {}, full: true, both: both,
+                   pays: 1, split: false, rows: p.nWierszy, total: p.nWierszy,
+                   pages: 1, how: skad };
+        // Kontrola, ktora ma prawo wstrzymac ksiegowanie: suma NET_AMOUNT z pliku kontra
+        // kwota z wyciagu. Na czterech wyplatach z 08.08.2026 zgadzala sie co do grosza,
+        // wiec kazdy rozjazd znaczy, ze to nie ta sama wyplata albo ze plik jest niepelny.
+        const bad = [];
+        if (j.amount != null && !eq(p.suma, j.amount))
+            bad.push('suma z rozliczenia ' + f2(p.suma) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+        const blokK = manoBrakKont(j);
+        if (blokK) bad.push(blokK);
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join('; ');
+        j.note = manoNota(p) + (p.niepewne.length
+            ? (' · ' + p.niepewne.length + ' zam. bez rozstrzygnięcia typu — NIE ma ich w imporcie')
+            : '');
+        return bad;
+    }
+    function manoKomunikat(p, j){
+        const t = p.licz;
+        return 'ManoMano ' + p.kraj.toUpperCase() + ' ' + p.payRef + ' — '
+            + ((j.data && j.data.how) || 'wczytane') + ' · '
+            + 'do importu ' + p.nImport + ' zam. na ' + f2(p.brutto) + ' ' + p.cur
+            + ' (B2C ' + (t['B2C'] || 0)
+            + (p.kraj === 'de' ? (', B2B 19% ' + (t['B2B'] || 0)) : (', B2B 0% ' + (t['B2B 0%'] || 0))) + ')'
+            + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum)) : '')
+            + (p.niepewne.length ? (' · ⚠ ' + p.niepewne.length + ' bez rozstrzygnięcia typu: '
+                + p.niepewne.slice(0, 3).map(function (x){ return x.id; }).join(', ')
+                + (p.niepewne.length > 3 ? ' i ' + (p.niepewne.length - 3) + ' więcej' : '')
+                + ' — te zamówienia NIE trafiły do pliku importu, zaksięguj je ręcznie') : '')
+            + (j.msg ? ('. ' + j.msg) : '.');
+    }
+    function mkCsvMano(p){
+        const linie = ((p && p.wOrd) || []).map(function (x){
+            return (x.r || []).map(function (c){ return (c == null) ? '' : String(c); }).join(';');
+        });
+        return '﻿' + linie.join('\r\n') + '\r\n';
+    }
+    // Bramka przed wygenerowaniem pliku — ta sama zasada co przy Amazonie: lepiej nie dac
+    // pliku wcale niz dac go z pusta kolumna konta. Doszedl trzeci powod: zamowienia,
+    // ktorych nie umiemy sklasyfikowac. Ich brak w pliku importu jest zamierzony, ale
+    // czlowiek MUSI o nich wiedziec, zanim wysle import.
+    function manoBrakKont(j){
+        const p = j && j.data && j.data.mano;
+        if (!p) return '';
+        const b = p.brakVat || {}, a = p.brakAcc || {};
+        const kb = Object.keys(b), ka = Object.keys(a);
+        const cz = [];
+        if (ka.length) cz.push('brak konta rozliczeniowego dla: '
+            + ka.map(function (x){ return x + ' (' + a[x] + ' zam.)'; }).join(', '));
+        if (kb.length) cz.push('brak konta VAT dla: '
+            + kb.map(function (x){ return x + ' (' + b[x] + ' zam.)'; }).join(', '));
+        if (!cz.length) return '';
+        return cz.join(' · ') + ' — uzupełnij tabelę MK_MM_ACC w skrypcie, pliku nie generuję';
+    }
+    // Zdanie podsumowujace, wspolne dla komunikatu przy wczytaniu i dla adnotacji zlecenia.
+    function manoNota(p){
+        const cz = [];
+        cz.push('brutto ' + f2(p.brutto) + ' − prowizja ' + f2(p.prowizja));
+        if (Math.abs(p.korekty) > 0.005) cz.push('korekty VAT ' + f2(p.korekty));
+        if (Math.abs(p.zwrotSum) > 0.005) cz.push('zwroty ' + p.nZwr + ' na ' + f2(p.zwrotSum)
+            + ' — idą na listę zwrotów');
+        if (p.potracenia.length){
+            const wg = {};
+            p.potracenia.forEach(function (x){ wg[x.typ] = r2((wg[x.typ] || 0) + x.kwota); });
+            cz.push('potrącenia: ' + Object.keys(wg).map(function (k){
+                return k.toLowerCase().replace(/_/g, ' ') + ' ' + f2(wg[k]);
+            }).join(', ') + ' — tego nie księguję');
+        }
+        cz.push('do wypłaty ' + f2(p.suma) + ' ' + p.cur);
+        return cz.join(' · ');
+    }
+
     // ================= CHECK24 =================
     // Zrodla sa DWA i oba sa potrzebne:
     //   „Details" (CSV)   — pozycje: zakupy, zwroty, korekty. Z niego robimy plik importu
@@ -19613,6 +20117,7 @@
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
         if (j.kind === 'ebay' && j.data && j.data.ebay) return mkCsvEbay(j.data.ebay);
         if (j.kind === 'amz'  && j.data && j.data.amz)  return mkCsvAmz(j.data.amz);
+        if (j.kind === 'mano' && j.data && j.data.mano) return mkCsvMano(j.data.mano);
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         return mkCsvText(pairsOf(j));
     }
@@ -22766,6 +23271,9 @@
             try { if (!mkParseEbay(txt).err) return 'ebay'; } catch (e){}
             try { if (!mkParseGalx(txt, 'Galaxus CH').err) return 'galx'; } catch (e){}
             try { if (!mkParseWayf(txt).err) return 'wayf'; } catch (e){}
+            // ManoMano: pierwsza kolumna naglowka to doslownie „TYPE" plus komplet
+            // nazw kolumn kwotowych — zaden inny obslugiwany plik tak nie wyglada.
+            try { if (!mkParseMano(txt).err) return 'mano'; } catch (e){}
             try { if (!mkParseCheck24(txt, '').err) return 'c24'; } catch (e){}
             return '';
         }
@@ -22775,7 +23283,7 @@
             try { this.value = ''; } catch (e){}
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
-            const kubelki = { bank: [], amz: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [] }, nieznane = [];
+            const kubelki = { bank: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -22796,6 +23304,7 @@
             if (kubelki.bank.length) await mkWczytajWyciagi(kubelki.bank);
             // Raporty pojedynczo: kazdy dotyczy jednej wyplaty i kazdy ma wlasny komunikat.
             kubelki.amz.forEach(function (f){ amzWczytaj(f); });
+            kubelki.mano.forEach(function (f){ manoWczytaj(f); });
             kubelki.ebay.forEach(function (f){ ebayWczytaj(f); });
             kubelki.galx.forEach(function (f){ galxWczytaj(f); });
             kubelki.wayf.forEach(function (f){ wayfWczytaj(f); });
@@ -22989,27 +23498,83 @@
                 if (j.status === 'done'){ say('Ta wypłata jest już zaksięgowana.', '#c47f00'); return; }
                 if (!j.shop) j.shop = p.shop;
                 if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
-                const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
-                j.data = { ebay: p, shop: p.shop, gross: p.gross, refund: p.refund,
-                           net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
-                           refNote: p.refNote, unknown: {}, skipped: {}, full: true, both: both,
-                           pays: 1, split: false, rows: p.nPos + p.nZwr, total: p.nPos + p.nZwr,
-                           pages: 1, how: 'plik ' + f.name };
-                j.status = j.data.netOk ? 'ready' : 'partial';
-                j.msg = j.data.netOk ? '' : ('wypłata z pliku ' + f2(p.net) + ' ' + p.cur
-                        + ' nie zgadza się z kwotą zlecenia ' + f2(j.amount) + ' ' + (j.cur || ''));
-                // Kwoty zamowien sa w walucie TRANSAKCJI, a wyplata w walucie konta —
-                // bez tej adnotacji rozjazd miedzy suma pozycji a wplata wyglada na blad.
-                j.note = 'kwoty zamówień w ' + (p.curTx || '—') + ', wypłata w ' + (p.cur || '—')
-                       + ' · prowizje i etykiety zwrotne są już potrącone w wypłacie i nie wchodzą na zamówienia';
+                manoZastosuj(j, p, 'plik ' + f.name);
                 jobsSave(jobs); render();
-                say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
-                    + ': ' + p.shop + ' · wypłata nr ' + (p.payNo || '—') + ' z ' + (p.payDate || '—')
-                    + ' na ' + f2(p.net) + ' ' + p.cur
-                    + ' · zamówień ' + Object.keys(p.ord).length + ' na ' + f2(p.gross) + ' ' + p.curTx
-                    + (p.nZwr ? (' · zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund) + ' ' + p.curTx
-                                 + ' — idą na listę zwrotów') : ''),
-                    '#0a7a2f');
+                say(manoKomunikat(p, j), (j.status !== 'ready' || p.niepewne.length) ? '#c47f00' : '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
+        }
+        // Rozliczenie ManoMano. Zlecenie zakladamy z samego pliku — kluczem jest
+        // PAYOUT_REFERENCE ZE SRODKA, a nie nazwa pliku: ten sam plik pobrany drugi raz
+        // przychodzi jako „… (1).csv" i po nazwie zrobilby drugie zlecenie na te sama kwote.
+        function manoWczytaj(f){
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                let p;
+                try { p = mkParseMano(mkDecode(rd.result)); }
+                catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); return; }
+                if (p.err){ say(p.err, '#c00'); return; }
+                const jobs = jobsLoad();
+                // Wplata z wyciagu ma referencje UCIETA („MANOMANO-DE-20260808-722"), a plik
+                // pelna („…-722497"). Zlecenia z banku szukamy wiec po PREFIKSIE — inaczej
+                // plik zalozylby drugie zlecenie obok tego, ktore juz czeka z wyciagu.
+                let k = Object.keys(jobs).filter(function (x){
+                    const j0 = jobs[x];
+                    if (j0.kind !== 'mano') return false;
+                    const r0 = String(j0.ref || '');
+                    return !!r0 && (r0 === p.payRef || p.payRef.indexOf(r0) === 0);
+                })[0];
+                if (!k){
+                    k = p.payRef;
+                    jobs[k] = { ref: p.payRef, date: p.payDate, dateSrc: p.payDate,
+                                amount: null, cur: p.cur,
+                                mp: 'ManoMano', brand: 'ManoMano', short: 'ManoMano',
+                                host: MK_MM_HOST, kind: 'mano', shop: 'ManoMano ' + p.kraj.toUpperCase(),
+                                docs: null, payer: '', txId: '', status: 'new', msg: '' };
+                }
+                const j = jobs[k];
+                if (j.status === 'done'){ say('To rozliczenie jest już zaksięgowane.', '#c47f00'); return; }
+                // Referencje podmieniamy na PELNA z pliku — od tej chwili zlecenie zna swoj
+                // numer kontraktu, a nie ucieta koncowke z wyciagu.
+                j.ref = p.payRef;
+                j.shop = 'ManoMano ' + p.kraj.toUpperCase();
+                if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
+                const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
+                j.data = { mano: p, shop: j.shop, gross: p.brutto, refund: p.zwrotSum,
+                           net: p.suma, netOk: (j.amount == null) ? true : eq(p.suma, j.amount),
+                           ord: p.ord, ref: p.ref, refNote: p.refNote,
+                           unknown: {}, skipped: {}, full: true, both: both,
+                           pays: 1, split: false, rows: p.nWierszy, total: p.nWierszy,
+                           pages: 1, how: 'plik ' + f.name };
+                // Kontrola, ktora ma prawo wstrzymac ksiegowanie: suma NET_AMOUNT z pliku
+                // kontra kwota z wyciagu. Na czterech wyplatach z 08.08.2026 zgadzala sie
+                // co do grosza, wiec kazdy rozjazd znaczy, ze plik i wplata to nie ta sama
+                // wyplata — albo ze plik jest niekompletny.
+                const bad = [];
+                if (j.amount != null && !eq(p.suma, j.amount))
+                    bad.push('suma z rozliczenia ' + f2(p.suma) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+                const blokK = manoBrakKont(j);
+                if (blokK) bad.push(blokK);
+                j.status = bad.length ? 'partial' : 'ready';
+                j.msg = bad.join('; ');
+                j.note = manoNota(p) + (p.niepewne.length
+                    ? (' · ' + p.niepewne.length + ' zam. bez rozstrzygnięcia typu — NIE ma ich w imporcie')
+                    : '');
+                jobsSave(jobs); render();
+                const t = p.licz;
+                say('ManoMano ' + p.kraj.toUpperCase() + ' ' + p.payRef + ' — wczytany · '
+                    + 'do importu ' + p.nImport + ' zam. na ' + f2(p.brutto) + ' ' + p.cur
+                    + ' (B2C ' + (t['B2C'] || 0)
+                    + (p.kraj === 'de' ? (', B2B 19% ' + (t['B2B'] || 0)) : (', B2B 0% ' + (t['B2B 0%'] || 0)))
+                    + ')'
+                    + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum)) : '')
+                    + (p.niepewne.length ? (' · ⚠ ' + p.niepewne.length + ' bez rozstrzygnięcia typu: '
+                        + p.niepewne.slice(0, 3).map(function (x){ return x.id; }).join(', ')
+                        + (p.niepewne.length > 3 ? ' i ' + (p.niepewne.length - 3) + ' więcej' : '')
+                        + ' — te zamówienia NIE trafiły do pliku importu, zaksięguj je ręcznie') : '')
+                    + (bad.length ? ('. ' + bad.join('; ')) : '.'),
+                    (bad.length || p.niepewne.length) ? '#c47f00' : '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -24153,9 +24718,9 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs);
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs);
             // CHECK24 doliczamy do komunikatu, ale NIE do przelotu — nie ma czym go pobrac.
-            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -24167,15 +24732,18 @@
             const wayf = (onMirakl || onVtex) ? 0 : nWayf;
             const ebay = (onMirakl || onVtex) ? 0 : nEbay;
             const c24p = (onMirakl || onVtex) ? 0 : nC24;
-            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const mano = (onMirakl || onVtex) ? 0 : nMano;
+            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : [])
-                              .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+                              .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : [])
+                              .concat(mano ? [MK_MM_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
                     .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
                     .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : [])
                     .concat(ebay ? ['  • ' + MK_EBAY_HOST + ' — ' + ebay + ' szt. (rozpoznanie wypłaty)'] : [])
-                    .concat(c24p ? ['  • ' + MK_C24_HOST + ' — ' + c24p + ' szt. (Details + Abrechnung)'] : []).join('\n')
+                    .concat(c24p ? ['  • ' + MK_C24_HOST + ' — ' + c24p + ' szt. (Details + Abrechnung)'] : [])
+                    .concat(mano ? ['  • ' + MK_MM_HOST + ' — ' + mano + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -24199,6 +24767,11 @@
                 seen++;
                 try { ok += await mkPrzelot('CHECK24', 'c24', MK_C24_HOST, 'CHECK24', c24Pass); }
                 catch (e){ problem.push(MK_C24_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (mano){
+                seen++;
+                try { ok += await mkPrzelot('ManoMano', 'mano', MK_MM_HOST, 'ManoMano', manoPass); }
+                catch (e){ problem.push(MK_MM_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
@@ -24320,7 +24893,7 @@
     }
     function doCsv(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
-        const blok = (j.kind === 'amz') ? amzBrakKont(j) : '';
+        const blok = (j.kind === 'amz') ? amzBrakKont(j) : ((j.kind === 'mano') ? manoBrakKont(j) : '');
         if (blok){ say(blok, '#c00'); return; }
         const blob = csvBlob(j);
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
@@ -29515,8 +30088,111 @@
 })();
     }
 
+    // ===== ManoMano: przechwycenie sesji panelu =====
+    // Panel toolbox.manomano.com trzyma token OIDC WYLACZNIE w pamieci JS — sprawdzone
+    // 13.08.2026: w localStorage sa tylko toolbox:lang, toolbox:session.user.email
+    // i toolbox:session.contract_id, w sessionStorage nic. Keycloak nie zapisuje go nigdzie,
+    // wiec ODCZYTAC go nie ma skad. Zamiast tego podgladamy wlasny ruch panelu: kazde jego
+    // zapytanie do browserapi.manomano.com niesie naglowek Authorization i wystarczy
+    // zapamietac jego wartosc.
+    //
+    // Ten modul NICZEGO NIE WYSYLA i niczego nie klika — tylko sluchа. Token zapisujemy
+    // przez GM_setValue, ktore jest wspolne dla wszystkich domen skryptu, wiec polowka
+    // na prologistics go widzi.
+    //
+    // Token zyje 12 godzin (exp - iat = 43 199 s), wiec jedno wejscie na panel starcza
+    // na caly dzien pracy.
+    //
+    // UWAGA na @run-at: skrypt startuje w document-idle, wiec pierwsze zapytania aplikacji
+    // moga juz byc za nami. Nie szkodzi — panel odpytuje powiadomienia cyklicznie, wiec
+    // token wpada w ciagu kilkunastu sekund. Zeby nie trzymac czlowieka w niepewnosci,
+    // pokazujemy maly znacznik w rogu, ktory mowi wprost, czy juz jest.
+    function init_mmtok(){
+        const KLUCZ = 'tm_mm_token_v1';
+        let mam = false;
+        function zapisz(v){
+            const t = String(v || '');
+            if (!/^Bearer\s+[\w-]+\.[\w-]+\.[\w-]+$/.test(t)) return;
+            let exp = 0;
+            try {
+                const cz = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                exp = (JSON.parse(atob(cz + '==='.slice((cz.length + 3) % 4))).exp || 0) * 1000;
+            } catch (e){ exp = 0; }
+            if (exp && exp < Date.now()) return;                  // przeterminowanego nie zapisujemy
+            try { GM_setValue(KLUCZ, JSON.stringify({ tok: t, exp: exp, kiedy: Date.now() })); }
+            catch (e){ return; }
+            if (!mam){ mam = true; znacznik(exp); }
+        }
+        function znacznik(exp){
+            let d = document.getElementById('mm-tok-badge');
+            if (!d){
+                d = document.createElement('div');
+                d.id = 'mm-tok-badge';
+                d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;'
+                    + 'background:#0a7a2f;color:#fff;font:600 12px/1.4 system-ui,sans-serif;'
+                    + 'padding:7px 11px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);'
+                    + 'cursor:pointer;max-width:280px';
+                d.onclick = function(){ d.remove(); };
+                document.body.appendChild(d);
+                setTimeout(function(){ if (d.parentNode) d.remove(); }, 12000);
+            }
+            d.textContent = '✓ HUB ma sesję ManoMano'
+                + (exp ? (' — ważna do ' + new Date(exp).toLocaleTimeString('pl-PL').slice(0, 5)) : '')
+                + '. Możesz wrócić do prologistics.';
+        }
+        // Hookujemy OBIE drogi, bo panel uzywa i fetch (customFetch), i XHR (axios).
+        // Zapytania ida potem przez service workera batching.js, ale naglowek jest
+        // ustawiany PRZED nim, na poziomie strony — wiec tutaj go widzimy.
+        const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+        try {
+            const staryFetch = W.fetch;
+            if (typeof staryFetch === 'function'){
+                W.fetch = function (wej, opc){
+                    try {
+                        let a = '';
+                        if (opc && opc.headers){
+                            const h = opc.headers;
+                            a = (typeof h.get === 'function') ? (h.get('authorization') || h.get('Authorization') || '')
+                                                              : (h.Authorization || h.authorization || '');
+                        } else if (wej && typeof wej === 'object' && wej.headers
+                                   && typeof wej.headers.get === 'function'){
+                            a = wej.headers.get('authorization') || '';
+                        }
+                        if (a) zapisz(a);
+                    } catch (e){}
+                    return staryFetch.apply(this, arguments);
+                };
+            }
+        } catch (e){}
+        try {
+            const staryHdr = W.XMLHttpRequest && W.XMLHttpRequest.prototype
+                             && W.XMLHttpRequest.prototype.setRequestHeader;
+            if (typeof staryHdr === 'function'){
+                W.XMLHttpRequest.prototype.setRequestHeader = function (n, v){
+                    try { if (String(n).toLowerCase() === 'authorization') zapisz(v); } catch (e){}
+                    return staryHdr.apply(this, arguments);
+                };
+            }
+        } catch (e){}
+        // Gdy po 20 s nic nie wpadlo, mowimy co zrobic — cisza jest tu najgorsza.
+        setTimeout(function(){
+            if (mam) return;
+            let d = document.createElement('div');
+            d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;'
+                + 'background:#c47f00;color:#fff;font:600 12px/1.4 system-ui,sans-serif;'
+                + 'padding:7px 11px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);'
+                + 'cursor:pointer;max-width:280px';
+            d.textContent = 'HUB jeszcze nie widzi sesji ManoMano — kliknij cokolwiek w panelu '
+                + '(np. Finance), to wystarczy.';
+            d.onclick = function(){ d.remove(); };
+            document.body.appendChild(d);
+            setTimeout(function(){ if (d.parentNode) d.remove(); }, 15000);
+        }, 20000);
+    }
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
+        { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
