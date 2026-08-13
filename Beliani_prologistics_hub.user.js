@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.84
+// @version      3.86
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20718,20 +20718,30 @@
                         + c24Podglad(text) };
 
         const ord = {}, ref = {}, refNote = {}, ids = {};
-        // Wiersze do pliku importu. Plik idzie do prologistics BEZ ZMIAN — poza wierszami
-        // w calosci zerowymi, ktorych nie ma po co ksiegowac.
+        // Wiersze do pliku importu. Uklad zrodlowy zostaje bez zmian, ale NIE wszystkie
+        // wiersze tam ida — patrz nizej.
         const doImportu = [];
         let brutto = 0, zakup = 0, zwrot = 0, nZak = 0, nZwr = 0, nZero = 0;
+        // v3.86: wiersze na minus wypadaja z importu.
+        // nPom/pomNet — wiersze zwrotow: sa juz na liscie zwrotow i ksiegowane w tickecie,
+        //               wiec w imporcie ksiegowalyby sie DRUGI RAZ.
+        // nUjInne     — wiersz na minus, ktorego modul NIE rozpoznal jako zwrotu. Tez go
+        //               nie importujemy (bo prosba brzmiala: zadnych minusow), ale nikt go
+        //               nie zaksieguje, wiec musi byc widoczny z nazwiska.
+        let nPom = 0, pomNet = 0, nUjInne = 0, ujInneNet = 0, impSum = 0;
+        const ujInneLista = [];
         for (let i = 1; i < rows.length; i++){
             const r = rows[i];
             const ff = String(r[C24_FF] || '').trim();
             if (!C24_FF_RE.test(ff)) continue;
             const H = c24Num(r[C24_H]), J = c24Num(r[C24_J]), L = c24Num(r[C24_L]), N = c24Num(r[C24_N]);
+            const netto = r2(H + J + L + N);
+            // Brutto liczymy z KAZDEGO wiersza, takze wyrzuconych — to jest „Gesamt Brutto"
+            // porownywane z PDF-em i ta liczba nie ma prawa sie zmienic przez zmiane importu.
             brutto = r2(brutto + H + J + L + N);
             ids[ff] = 1;
             // Wiersz calkowicie zerowy nie niesie zadnej kwoty — pomijamy go w imporcie.
             if (!H && !J && !L && !N){ nZero++; continue; }
-            doImportu.push(r);
             // Zwroty — regula wprost z modulu „Ksiegowanie w tickecie", zeby obie drogi
             // liczyly to samo. Calosciowy: H<0 (J na tym wierszu celowo pomijamy).
             // Czesciowy: H=0 i N<0.
@@ -20742,12 +20752,22 @@
                 ref[ff] = r2((ref[ff] || 0) + z);
                 zwrot = r2(zwrot + z);
                 nZwr++;
+                nPom++;
+                pomNet = r2(pomNet + netto);
                 const opis = [String(r[C24_TXT] || '').trim() || (H < 0 ? 'zwrot całościowy' : 'zwrot częściowy'),
                               String(r[17] || '').trim(), z.toFixed(2) + ' EUR']
                              .filter(Boolean).join(' · ');
                 refNote[ff] = refNote[ff] ? (refNote[ff] + '\n\n' + opis) : opis;
-                continue;
+                continue;                                   // <- do importu NIE trafia
             }
+            if (netto < -0.005){
+                nUjInne++;
+                ujInneNet = r2(ujInneNet + netto);
+                if (ujInneLista.indexOf(ff) < 0) ujInneLista.push(ff);
+                continue;                                   // <- do importu NIE trafia
+            }
+            doImportu.push(r);
+            impSum = r2(impSum + netto);
             if (H > 0.005){
                 ord[ff] = r2((ord[ff] || 0) + H);
                 zakup = r2(zakup + H);
@@ -20774,6 +20794,14 @@
             ord: ord, ref: ref, refNote: refNote, ids: ids,
             brutto: brutto, zakup: zakup, refund: zwrot,
             nZak: nZak, nZwr: nZwr, nZero: nZero,
+            // v3.86. „resztka" to jedyna liczba, ktora przez te zmiane przestaje byc gdziekolwiek
+            // zaksiegowana: wiersz zwrotu niosl obok samego zwrotu takze odwrocony rabat
+            // (Preisreduzierung WE) i koszt etykiety zwrotnej (Korrekturbuchungen), a lista
+            // zwrotow bierze z niego TYLKO kwote zwrotu. Liczymy ja tak, jak sie ja widzi
+            // w ksiegach: Gesamt Brutto minus (to, co pojdzie importem, minus to, co pojdzie zwrotami).
+            nPom: nPom, pomNet: pomNet, impSum: impSum,
+            nUjInne: nUjInne, ujInneNet: ujInneNet, ujInneLista: ujInneLista,
+            resztka: r2(brutto - (impSum - zwrot)),
             wiersze: doImportu, naglowekWiersz: rows[0],
             n: Object.keys(ord).length + Object.keys(ref).length
         };
@@ -20814,6 +20842,33 @@
             } catch (e){}
         }
         return lib;
+    }
+    // v3.86: co wypadlo z importu i co z tego wynika. Osobna funkcja, bo ten sam tekst
+    // ma sie pokazac i w adnotacji zlecenia, i w komunikacie po wczytaniu pliku.
+    function c24NotaMinus(csv){
+        if (!csv) return '';
+        let s = '';
+        if (csv.nPom){
+            s += ' · z importu wyjęte ' + csv.nPom + ' wierszy zwrotów na ' + f2(csv.pomNet)
+               + ' — są na liście zwrotów, w imporcie księgowałyby się drugi raz'
+               + ' · do importu idzie ' + f2(csv.impSum) + ' EUR';
+        }
+        // Rozjazd pokazujemy ZAWSZE, gdy jest — to jest cena tej zmiany i nie ma sensu,
+        // zeby ktos ja odkrywal dopiero przy zamknieciu miesiaca.
+        if (Math.abs(csv.resztka || 0) > 0.005){
+            s += ' · UWAGA: import minus zwroty daje ' + f2(csv.impSum - csv.refund)
+               + ', a Gesamt Brutto to ' + f2(csv.brutto) + ' — różnica ' + f2(csv.resztka)
+               + ' to kwoty, które siedziały na wyjętych wierszach OBOK samego zwrotu'
+               + ' (odwrócone rabaty Preisreduzierung, koszty etykiet zwrotnych)'
+               + ' i po tej zmianie nie księgują się nigdzie';
+        }
+        if (csv.nUjInne){
+            s += ' · UWAGA: ' + csv.nUjInne + ' wierszy na minus (' + f2(csv.ujInneNet) + ') NIE ma na liście'
+               + ' zwrotów — wyjąłem je z importu, ale nikt ich nie zaksięguje: '
+               + csv.ujInneLista.slice(0, 12).join(', ')
+               + (csv.ujInneLista.length > 12 ? (' … +' + (csv.ujInneLista.length - 12)) : '');
+        }
+        return s;
     }
     // Zlozenie zlecenia CHECK24 z tego, co juz o nim wiadomo.
     // ZASIEG: musi byc w zasiegu MODULU, bo wolaja ja dwie rozne drogi z DWOCH
@@ -20859,7 +20914,8 @@
                    + ' · kaucja na zwroty: zwolniona ' + f2(pdf.zwolniona) + ', nowa ' + f2(pdf.nowa)
                    + ' → wypłata ' + f2(pdf.wyplata) + ' EUR'
                    + (pdf.okres ? (' · okres ' + pdf.okres) : '')
-                   + (csv.nZero ? (' · pominięto ' + csv.nZero + ' wierszy zerowych') : '');
+                   + (csv.nZero ? (' · pominięto ' + csv.nZero + ' wierszy zerowych') : '')
+                   + c24NotaMinus(csv);
         }
         return { csv: csv, pdf: pdf, brak: brak };
     }
@@ -24028,12 +24084,17 @@
             const z = c24Zloz(j, 'plik ' + f.name);
             const csv = z.csv, pdf = z.pdf, brak = z.brak;
             jobsSave(jobs); render();
+            // v3.86: informacja o wierszach wyjetych z importu leci od razu przy wczytaniu,
+            // a nie dopiero w adnotacji zlecenia — to jest moment, w ktorym czlowiek patrzy.
+            const minus = csv ? c24NotaMinus(csv) : '';
+            const alarm = !!(csv && (csv.nUjInne || Math.abs(csv.resztka || 0) > 0.005));
             say('CHECK24 ' + (p.nr || klucz) + ' — wczytany ' + (jestPdf ? 'PDF' : 'CSV')
                 + (csv ? (' · zakupów ' + Object.keys(csv.ord).length + ' na ' + f2(csv.zakup)
                           + ' · zwrotów ' + Object.keys(csv.ref).length + ' na ' + f2(csv.refund)) : '')
                 + (pdf ? (' · wypłata ' + f2(pdf.wyplata) + ' EUR') : '')
+                + minus
                 + (brak.length ? ('. Brakuje jeszcze: ' + brak.join('; ')) : '.'),
-                brak.length ? '#c47f00' : '#0a7a2f');
+                (brak.length || alarm) ? '#c47f00' : '#0a7a2f');
         }
 
         // Raport transakcji eBaya. Inaczej niz przy Galaxusie i Wayfairze plik jest
