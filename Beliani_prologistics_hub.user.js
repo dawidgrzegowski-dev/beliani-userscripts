@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.04
+// @version      4.05
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18832,7 +18832,7 @@
             return { err: 'rozliczenie ' + payRef + ' nie ma ani jednego wiersza ORDER ani REFUND' };
 
         // ----- klasyfikacja typu klienta -----
-        const typOrd = {}, wOrd = [], niepewne = [];
+        const typOrd = {}, vatOrd = {}, wOrd = [], niepewne = [];
         const brakVat = {}, brakAcc = {};
         const licz = { 'B2C': 0, 'B2B': 0, 'B2B 0%': 0 };
         Object.keys(ordBr).forEach(function (id){
@@ -18858,6 +18858,7 @@
             typOrd[id] = typ;
             licz[typ] = (licz[typ] || 0) + 1;
             const kn = mmKonta(kraj, typ);
+            vatOrd[id] = kn.vat;
             if (!kn.acc) brakAcc[kraj.toUpperCase()] = (brakAcc[kraj.toUpperCase()] || 0) + 1;
             if (!kn.vat){
                 const kl = kraj.toUpperCase() + ' ' + typ;
@@ -18884,19 +18885,65 @@
         // ORDER policzonych przez parser. Rozjazd = nie generujemy pliku.
         const eol = zrodlo.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
         const linie = zrodlo.split(/\r?\n/);
-        const doImportu = [linie[0]];
+        // Wiersze ORDER grupujemy PO NUMERZE ZAMOWIENIA. Zamowienie o JEDNEJ pozycji idzie
+        // do importu DOSLOWNIE takie, jakie przyszlo — bez skladania od nowa, wiec zapis
+        // liczb i puste pola zostaja nietkniete. Zamowienie WIELOPOZYCYJNE (16 przypadkow
+        // w dziewieciu rozliczeniach, do 3 pozycji) skladamy: kolumny KWOTOWE sumujemy,
+        // pozostale bierzemy z pierwszego wiersza grupy — w tym SELLER_SKU, ktory wtedy
+        // opisuje tylko pierwsza pozycje. Numerem, po ktorym prologistics laczy wplate
+        // z auftragiem, jest REFERENCE, a ten jest dla calej grupy ten sam.
+        // Zwrotow TU NIE POTRACAMY — ida osobno, na liste zwrotow do ksiegowania na ticketach.
+        const KWOTOWE = ['AMOUNT_VAT_INCL', 'COMMISSION_VAT_INCL', 'SELLER_COUPON_VAT_INCL',
+            'NET_AMOUNT', 'PRODUCT_PRICE_VAT_EXCL', 'VAT_ON_PRODUCT', 'SHIPPING_PRICE_VAT_EXCL',
+            'VAT_ON_SHIPPING', 'AMOUNT_VAT_EXCL', 'COMMISSION_VAT_EXCL', 'VAT_ON_COMMISSION',
+            'SELLER_COUPON_VAT_EXCL', 'VAT_ON_SELLER_COUPON'];
+        const grupy = {}, kolejnosc = [];
+        let nSurowych = 0;
         for (let i = 1; i < linie.length; i++){
-            if (/^ORDER;/.test(linie[i])) doImportu.push(linie[i]);
+            if (!/^ORDER;/.test(linie[i])) continue;
+            nSurowych++;
+            const pola = linie[i].split(';');
+            const nr = String(pola[C.id] || '').trim();
+            if (!grupy[nr]){ grupy[nr] = []; kolejnosc.push(nr); }
+            grupy[nr].push({ tekst: linie[i], pola: pola });
         }
-        const impOk = (doImportu.length - 1) === nOrdW;
+        const doImportu = [linie[0]];
+        let nScalonych = 0;
+        kolejnosc.forEach(function (nr){
+            const g = grupy[nr];
+            if (g.length === 1){ doImportu.push(g[0].tekst); return; }
+            nScalonych++;
+            const pola = g[0].pola.slice();
+            KWOTOWE.forEach(function (nazwa){
+                const k = ix[nazwa];
+                if (k == null) return;
+                let suma = 0;
+                g.forEach(function (w){ suma = r2(suma + mmNum(w.pola[k])); });
+                pola[k] = suma.toFixed(2);
+            });
+            if (ix['QUANTITY'] != null){
+                let q = 0;
+                g.forEach(function (w){ q += Math.round(mmNum(w.pola[ix['QUANTITY']])); });
+                pola[ix['QUANTITY']] = String(q);
+            }
+            doImportu.push(pola.join(';'));
+        });
+        // Kontrola: kazdy wiersz ORDER ze zrodla musi trafic do jakiejs grupy, a liczba
+        // wierszy w pliku musi rownac sie liczbie ROZNYCH numerow zamowien.
+        const impOk = (nSurowych === nOrdW) && ((doImportu.length - 1) === kolejnosc.length);
         return {
             kraj: kraj, payRef: payRef, payDate: payDate, cur: cur || 'EUR',
             csvImport: impOk ? (doImportu.join(eol) + eol) : '',
             impOk: impOk, nOrdW: nOrdW, impNet: impNet,
+            nImpWierszy: doImportu.length - 1, nScalonych: nScalonych,
             waluty: Object.keys(waluty),
             suma: suma, brutto: brutto, prowizja: prowSum, korekty: korSum,
             potracenia: potr, potrSum: potrSum,
-            ord: ordBr, typOrd: typOrd, wOrd: wOrd, licz: licz,
+            ord: ordBr, typOrd: typOrd, vatOrd: vatOrd, wOrd: wOrd, licz: licz,
+            // Numery zamowien ManoMano maja ksztalt „M" + 12 cyfr. Kontrola typu klienta
+            // szuka numeru w wierszach paczki po TYM wzorcu — tak samo jak przy Amazonie
+            // szuka po jego „304-1234567-1234567".
+            wzorNr: '\\b(M\\d{12})\\b',
             ref: zwrot, refNote: zwrotNote, zwrotSum: zwrotSum,
             niepewne: niepewne,
             brakVat: brakVat, brakAcc: brakAcc,
@@ -25194,9 +25241,16 @@
     // nalezy do ktorego zamowienia. Jedno zapytanie na auftrag i tyle.
     // To zamyka historie bledow z 3.79–3.81: nadmiarowych auftragow, odsiewu po numerze
     // fulfilmentu i „sprawdz wzrokowo 56 pozycji".
+    // Wspolne dla Amazona i ManoMano. Oba dostarczaja to samo: typ klienta per zamowienie
+    // (typOrd), oczekiwane konto sprzedazy (vatOrd) i wzorzec numeru zamowienia. Reszta —
+    // odczyt auftragu, porownanie, poprawianie — jest identyczna, wiec stoi w jednym miejscu.
+    function typDane(job){
+        const d = job && job.data;
+        return (d && (d.amz || d.mano)) || null;
+    }
     async function amzTypZPaczki(job, d, btn){
-        const p = job && job.data && job.data.amz;
-        if (!p){ say('To zlecenie nie ma danych z raportu Amazona.', '#c47f00'); return; }
+        const p = typDane(job);
+        if (!p){ say('To zlecenie nie ma danych z raportu marketplace’u.', '#c47f00'); return; }
         if (!window.__TM_CUSTOMER_TYPE || typeof window.__TM_CUSTOMER_TYPE.readAll !== 'function'){
             say('Nie widzę odczytu typu klienta — odśwież stronę prologistics i spróbuj ponownie.', '#c47f00');
             return;
@@ -25208,9 +25262,10 @@
             // Numer zamowienia szukamy po KSZTALCIE we wszystkich polach wiersza, a nie po
             // nazwie pola — nazwy tej odpowiedzi znam tylko z podgladu.
             let ord = '';
+            const wz = new RegExp(p.wzorNr || '\\b(\\d{3}-\\d{7}-\\d{7})\\b');
             Object.keys(x).forEach(function (k){
                 if (ord) return;
-                const m = String(x[k] == null ? '' : x[k]).match(/\b(\d{3}-\d{7}-\d{7})\b/);
+                const m = String(x[k] == null ? '' : x[k]).match(wz);
                 if (m) ord = m[1];
             });
             if (!ord) return;
@@ -25275,8 +25330,8 @@
     // tylkoTe — gdy podane, sprawdzamy WYLACZNIE te numery i doklejamy wynik do
     // poprzedniego przebiegu. Sluzy ponowieniu pozycji, ktore padly na sieci.
     async function amzTypCheck(ref, btn, tylkoTe){
-        const j = jobsLoad()[ref], p = j && j.data && j.data.amz;
-        if (!p){ say('To zlecenie nie ma danych z raportu Amazona.', '#c47f00'); return; }
+        const j = jobsLoad()[ref], p = typDane(j);
+        if (!p){ say('To zlecenie nie ma danych z raportu marketplace’u.', '#c47f00'); return; }
         if (typeof window.__TM_CUSTOMER_TYPE !== 'object' || !window.__TM_CUSTOMER_TYPE){
             say('Nie widzę odczytu typu klienta — odśwież stronę prologistics i spróbuj ponownie.', '#c47f00');
             return;
@@ -25693,7 +25748,9 @@
         // v3.82: przy Amazonie ksiegowanie jest ZABLOKOWANE, dopoki nie sprawdzisz typow
         // klienta. Typ decyduje o koncie VAT, a po zaksiegowaniu jego poprawienie jest juz
         // grzebaniem w zaksiegowanych pozycjach — dlatego kontrola stoi PRZED, a nie obok.
-        const jestAmz = !!(job.data && job.data.amz);
+        // Bramka obejmuje teraz takze ManoMano: typ decyduje o koncie VAT, a po
+        // zaksiegowaniu jego poprawienie to juz grzebanie w zaksiegowanych pozycjach.
+        const jestAmz = !!(job.data && (job.data.amz || job.data.mano));
         const typOk = !jestAmz || !!jbNow.typChecked;
         const canBook = ok.length > 0 && !jbNow.booked && typOk;
         h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
