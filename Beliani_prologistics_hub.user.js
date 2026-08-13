@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.00
+// @version      4.01
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17203,9 +17203,15 @@
         // \d{3,}, a dopasowanie do pliku idzie po PREFIKSIE i potwierdza je kwota.
         // Trzycyfrowe koncowki sa miedzy rynkami unikalne: 639 FR, 722 DE, 738 IT, 743 ES,
         // 230 UK, 561 MMF FR — wiec prefiks nie ma jak trafic w cudzy rynek.
+        // Adres wpisany WPROST, a nie przez stala MK_MM_HOST. MK_RULES jest wyliczana przy
+        // starcie modulu, a MK_MM_HOST deklarowany jest tysiac linii nizej — „const" jest
+        // wtedy podniesiony, ale jeszcze niezainicjowany (martwa strefa czasowa) i odwolanie
+        // do niego rzuca ReferenceError. Launcher lapie wyjatek modulu do console.error,
+        // wiec objawem jest BRAK GUZIKA bez zadnego widocznego bledu. Tak samo, i z tego
+        // samego powodu, adres Check24 stoi tu wprost zamiast MK_C24_HOST.
         { mp: 'ManoMano',       ok: true,  payer: /MANGOPAY|MANO\s?MANO/i,
           ref: /(MANOMANO-[A-Z]{2}-\d{8}-\d{3,})/i,
-          brand: 'ManoMano', short: 'ManoMano', host: MK_MM_HOST, kind: 'mano', shop: 'ManoMano' },
+          brand: 'ManoMano', short: 'ManoMano', host: 'toolbox.manomano.com', kind: 'mano', shop: 'ManoMano' },
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
