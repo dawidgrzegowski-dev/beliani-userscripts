@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.91
+// @version      3.92
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22298,18 +22298,12 @@
         if (typeof v === 'number') return (v === Math.floor(v)) ? String(Math.floor(v)) : String(v);
         return String(v).trim();
     }
-    // Czyta JEDEN plik Export payments. Zwraca { rows, err }.
-    function mkParseExport(u8, nazwa, kontoRozl){
-        if (typeof XLSX === 'undefined' || !XLSX.read)
-            return { err: 'biblioteka do czytania .xls się nie załadowała — odśwież stronę prologistics' };
-        let wb;
-        try { wb = XLSX.read(u8, { type: 'array' }); }
-        catch (e){ return { err: 'nie umiem otworzyć ' + nazwa + ': ' + ((e && e.message) || e) }; }
-        const nm = (wb.SheetNames || []).filter(function (x){ return /payment/i.test(x); })[0]
-                 || (wb.SheetNames || [])[0];
-        if (!nm) return { err: nazwa + ': plik nie ma żadnego arkusza' };
-        const aoa = XLSX.utils.sheet_to_json(wb.Sheets[nm], { header: 1, raw: true, defval: '' });
-        if (!aoa.length) return { err: nazwa + ': arkusz „' + nm + '” jest pusty' };
+    // Czyta zestawienie „Export payments" podane jako TABLICA WIERSZY (array of arrays).
+    // Bajtow nie tykamy: plik rozkodowuje modul Salda swoim slXls-em, ktory radzi sobie
+    // z uszkodzonym kontenerem OLE2 tych plikow. Tutaj zostaje sama znajomosc UKLADU
+    // kolumn i regula kierunku ksiegowania — czyli wiedza o Amazonie, a nie o formacie.
+    function mkExpZAoa(aoa, nazwa, kontoRozl){
+        if (!Array.isArray(aoa) || !aoa.length) return { err: nazwa + ': puste zestawienie' };
         const hdr = (aoa[0] || []).map(function (c){ return expTxt(c); });
         const ix = {};
         hdr.forEach(function (c, i){ if (c) ix[c.toLowerCase()] = i; });
@@ -22342,7 +22336,7 @@
                 sprzedaz: sprzedaz, zwrot: zwrot, plik: nazwa
             });
         }
-        return { rows: rows, arkusz: nm };
+        return { rows: rows };
     }
     // Wlasciwe porownanie. p — wynik mkParseAmz, ex — sklejone wiersze ze wszystkich
     // wgranych plikow Export payments.
@@ -23072,102 +23066,10 @@
               + '<input id="mk-sal-m" value="' + def + '" placeholder="MM/RRRR" style="width:80px;font-size:11px;text-align:center">'
               + '<button id="mk-sal-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Pokaż zestawienia</button>'
               + '<span id="mk-sal-msg" style="font-size:11px;color:#666"></span></div>'
-              + '<div id="mk-sal-out" style="margin-top:8px"></div>'
-              // v3.91: druga, niezalezna czesc panelu Salda — kontrola ksiegowania Amazona.
-              // Stoi tu, bo odpowiada na to samo pytanie co salda: „czy to, co mialo wejsc,
-              // naprawde weszlo". Na razie WYLACZNIE Amazon DE — reszta krajow ma inne
-              // zaleznosci kontowe i dokladamy je osobno.
-              + '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ddd6fe">'
-              + '<div style="font-size:11px;color:#5b21b6;font-weight:700;margin-bottom:4px">Amazon DE — kontrola księgowania</div>'
-              + '<div style="font-size:10px;color:#666;margin-bottom:6px">Wgraj raport rozliczenia z Amazona (.txt) i export z prologistics '
-              + '(<b>Export payments</b>, .xls) — możesz wskazać kilka plików exportu naraz, jeśli bierzecie go per dzień. '
-              + 'Sprawdzę, czy każde zamówienie z rozliczenia ma płatność, czy siedzi na właściwym koncie sprzedaży '
-              + 'i czy pozycje z listy „do wyjaśnienia" zostały gdzieś zaksięgowane.</div>'
-              + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-              + '<label style="font-size:11px;font-weight:700;color:#fff;background:#7c3aed;border-radius:6px;padding:4px 10px;cursor:pointer">📄 Raport Amazona'
-              + '<input type="file" id="mk-kn-amz" accept=".txt,text/plain" style="display:none"></label>'
-              + '<span id="mk-kn-amz-nm" style="font-size:11px;color:#666">—</span>'
-              + '<label style="font-size:11px;font-weight:700;color:#fff;background:#7c3aed;border-radius:6px;padding:4px 10px;cursor:pointer">📊 Export payments'
-              + '<input type="file" id="mk-kn-exp" accept=".xls,.xlsx,application/vnd.ms-excel" multiple style="display:none"></label>'
-              + '<span id="mk-kn-exp-nm" style="font-size:11px;color:#666">—</span>'
-              + '<button id="mk-kn-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź</button>'
-              + '<button id="mk-kn-cp" style="padding:5px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
-              + '<span id="mk-kn-msg" style="font-size:11px;color:#666"></span></div>'
-              + '<div id="mk-kn-out" style="margin-top:8px"></div></div>';
+              + '<div id="mk-sal-out" style="margin-top:8px"></div>';
             box.querySelector('#mk-sal-go').onclick = function(){ saldaGo(this); };
-            knPodepnij(box);
         };
     })();
-
-    // ---------- Amazon DE: kontrola ksiegowania (panel) ----------
-    // Pliki trzymamy w domknieciu, a nie w input.files — input czyscimy po wskazaniu,
-    // zeby dalo sie wskazac ten sam plik drugi raz po poprawce.
-    let knAmzPlik = null, knExpPliki = [], knTekst = '';
-    function knPodepnij(box){
-        const iA = box.querySelector('#mk-kn-amz'), iE = box.querySelector('#mk-kn-exp');
-        const nA = box.querySelector('#mk-kn-amz-nm'), nE = box.querySelector('#mk-kn-exp-nm');
-        const cp = box.querySelector('#mk-kn-cp');
-        iA.onchange = function(){
-            knAmzPlik = (this.files && this.files[0]) || null;
-            nA.textContent = knAmzPlik ? knAmzPlik.name : '—';
-            try { this.value = ''; } catch (e){}
-        };
-        iE.onchange = function(){
-            knExpPliki = Array.prototype.slice.call(this.files || []);
-            nE.textContent = knExpPliki.length
-                ? (knExpPliki.length === 1 ? knExpPliki[0].name : (knExpPliki.length + ' plików'))
-                : '—';
-            try { this.value = ''; } catch (e){}
-        };
-        box.querySelector('#mk-kn-go').onclick = function(){ knSprawdz(this, box); };
-        cp.onclick = function(){
-            try { GM_setClipboard(knTekst, 'text'); say('Wynik kontroli skopiowany.', '#0a7a2f'); }
-            catch (e){ say('Nie udało się skopiować.', '#c00'); }
-        };
-    }
-    async function knSprawdz(btn, box){
-        const msg = box.querySelector('#mk-kn-msg'), out = box.querySelector('#mk-kn-out');
-        const cp = box.querySelector('#mk-kn-cp');
-        const pisz = function (t, kol){ msg.style.color = kol || '#666'; msg.textContent = t; };
-        if (!knAmzPlik){ pisz('Wskaż raport rozliczenia z Amazona (.txt).', '#c47f00'); return; }
-        if (!knExpPliki.length){ pisz('Wskaż co najmniej jeden plik „Export payments" (.xls).', '#c47f00'); return; }
-        btn.disabled = true; cp.style.display = 'none'; out.innerHTML = '';
-        try {
-            pisz('Czytam raport Amazona…');
-            const p = mkParseAmz(mkDecode(await readBuf(knAmzPlik)));
-            if (p.err){ pisz(p.err, '#c00'); return; }
-            // Kontrole kontowe sa na razie ULOZONE POD DE i tylko pod DE. Przy innym kraju
-            // wynik bylby mylacy, wiec zamiast liczyc cokolwiek — mowimy wprost.
-            if (p.shop !== 'Amazon DE'){
-                pisz('Na razie sprawdzam wyłącznie Amazon DE, a ten raport to ' + (p.shop || '?')
-                     + '. Reszta krajów ma inne zależności kontowe — dołożę je osobno.', '#c47f00');
-                return;
-            }
-            const kontoRozl = MK_AMZ_ACC.de.acc;
-            const ex = [], zle = [];
-            for (let i = 0; i < knExpPliki.length; i++){
-                const f = knExpPliki[i];
-                pisz('Czytam export ' + (i + 1) + '/' + knExpPliki.length + ' — ' + f.name + '…');
-                const r = mkParseExport(new Uint8Array(await readBuf(f)), f.name, kontoRozl);
-                if (r.err){ zle.push(r.err); continue; }
-                r.rows.forEach(function (x){ ex.push(x); });
-            }
-            if (!ex.length){
-                pisz('Nie wczytałem ani jednego wiersza z exportu. ' + zle.join(' · '), '#c00');
-                return;
-            }
-            pisz('Porównuję…');
-            const k = mkKontrolaAmz(p, ex);
-            knTekst = knTekstowo(p, k, zle);
-            out.innerHTML = knRender(p, k, zle);
-            cp.style.display = '';
-            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
-            pisz(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
-                 blady ? '#c47f00' : '#0a7a2f');
-        } catch (e){
-            pisz('Błąd: ' + ((e && e.message) || e), '#c00');
-        } finally { btn.disabled = false; }
-    }
 
     // Wynik kontroli na ekranie. Kolejnosc sekcji jest kolejnoscia WAZNOSCI:
     // najpierw to, czego nie ma w ksiegach, potem to, co jest, ale nie tam gdzie trzeba,
@@ -23323,6 +23225,25 @@
         }
         return L.join('\n');
     }
+
+    // v3.92: most do modulu Salda. Kontrola ksiegowania siedzi TAM, bo tam mieszkaja
+    // wszystkie uzgodnienia (PayPal, wyciag bankowy) i tam jest juz gotowe pobieranie
+    // zestawien z prologistics. Tutaj zostaje sama wiedza o Amazonie: jak czytac raport,
+    // jakie konta sa poprawne i co z czym porownac. Bajtow pliku .xls ten modul nie widzi.
+    window.__TM_AMZ_KONTROLA = {
+        raport: function (tekst){ return mkParseAmz(tekst); },
+        wiersze: mkExpZAoa,
+        sprawdz: mkKontrolaAmz,
+        render: knRender,
+        tekst: knTekstowo,
+        // Konto rozliczeniowe kraju — modul Salda podstawia je jako domyslne w wyborze.
+        kontoRozl: function (kraj){
+            const k = MK_AMZ_ACC[String(kraj || 'de').toLowerCase()];
+            return k ? k.acc : '';
+        },
+        // Ktore kraje maja komplet regul kontowych. Na razie tylko DE.
+        obsluga: Object.keys(MK_EXP_OK)
+    };
 
     // Zestawienia z ostatniego wyszukania — zeby zaznaczanie i skladanie pliku
     // nie musialy pobierac tego samego drugi raz.
@@ -30205,6 +30126,12 @@
         { id: 'paypal', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
         { id: 'bank', nazwa: 'Wyciąg bankowy ↔ Export payments',
           opis: 'wyciąg z banku kontra zestawienie z prologistics · parowanie po numerze auftraga', gotowe: true },
+        // v3.92: Amazon jest inny niz PayPal i bank — po jednej stronie nie stoi operator
+        // platnosci, tylko rozliczenie marketplace'u, i sprawdzamy nie tylko CZY cos jest
+        // w ksiedze, ale takze NA JAKIM koncie. Reszta mechaniki jest ta sama: zestawienie
+        // dociagamy z prologistics tym samym mostem co PayPal.
+        { id: 'amazon', nazwa: 'Amazon DE ↔ Export payments',
+          opis: 'rozliczenie Amazona kontra zestawienie z prologistics · sprawdza też konta sprzedaży', gotowe: true },
         { id: 'saferpay', nazwa: 'Saferpay ↔ Export payments', opis: 'jeszcze nie zrobione', gotowe: false }
     ];
     // Konta PayPal, ktore uzgadniamy. Numery sa stale, ale ETYKIETY czytamy z zywego
@@ -30308,8 +30235,181 @@
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
         p.querySelectorAll('.sal-poz').forEach(function (d){
             const x = SAL_LISTA.filter(function (y){ return y.id === d.getAttribute('data-id'); })[0];
-            if (x && x.gotowe) d.onclick = function (){ (x.id === 'bank' ? salRysujBank : salRysujPP)(); };
+            if (x && x.gotowe) d.onclick = function (){
+                (x.id === 'bank' ? salRysujBank : (x.id === 'amazon' ? salRysujAmz : salRysujPP))();
+            };
         });
+    }
+
+    // ---------- Amazon DE ↔ Export payments ----------
+    // Rozliczenie Amazona wgrywasz plikiem — z tej strony nie ma czego pobierac, bo to
+    // raport z Seller Central. Zestawienie z prologistics dociaga sie samo, dokladnie tym
+    // samym mostem co przy PayPalu.
+    let SAL_AMZ = null;        // sparsowany raport Amazona
+    let SAL_AEXP = null;       // { rows, zrodla, zle } z Export payments
+    let SAL_AWYNIK = '';       // wynik tekstowy do schowka
+    function salAmzMost(){
+        return (typeof window.__TM_AMZ_KONTROLA === 'object' && window.__TM_AMZ_KONTROLA) || null;
+    }
+    async function salRysujAmz(){
+        const p = salPanel(), u = salUst();
+        const most = salAmzMost();
+        const kontoDom = most ? (most.kontoRozl('de') || '1323') : '1323';
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · Amazon DE ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+
+            + (most ? '' : '<div style="border:1px solid #f5c2c7;background:#fff5f5;border-radius:8px;padding:8px;margin-bottom:8px;color:#c00">'
+                + 'Moduł „Księgowanie Marketplace\'s" jest wyłączony w launcherze — bez niego nie odczytam raportu Amazona.</div>')
+
+            + '<div style="color:#555;margin-bottom:8px;font-size:11px">Sprawdzam, czy każde zamówienie z rozliczenia ma płatność w prologistics, '
+            + 'czy siedzi na właściwym koncie sprzedaży i czy pozycje z listy „do wyjaśnienia" gdzieś się zaksięgowały. '
+            + 'Zakres dat ustaw tak, żeby objął dzień wypłaty — zestawienie pobiorę sam.</div>'
+
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.do) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>konto <input id="sal-akonto" value="' + salEsc(kontoDom) + '" style="font-size:12px;width:70px;text-align:center"></label>'
+            + '<button id="sal-apobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
+            + '</div>'
+            + '<div id="sal-aexpinfo" style="font-size:11px;color:#888;margin-bottom:8px">Zestawienie: jeszcze nie pobrane.</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Rozliczenie z Amazona</div>'
+            + '<label style="font-size:11px;display:block">plik „Settlement Report V2" (.txt) '
+            + '<input type="file" id="sal-famz" accept=".txt,text/plain" style="font-size:11px"></label>'
+            + '<div id="sal-amzinfo" style="font-size:11px;color:#888;margin-top:4px">Plik: nie wskazany.</div>'
+            + '</div>'
+
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<button id="sal-aporownaj" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
+            + '<button id="sal-akopiuj" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
+            + '</div>'
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
+            + '<div id="sal-awynik"></div>';
+
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-apobierz').onclick = function (){ salPobierzAmzExp(this); };
+        p.querySelector('#sal-famz').onchange = function (){ salWczytajAmz(this.files); };
+        p.querySelector('#sal-aporownaj').onclick = function (){ salPorownajAmz(this); };
+        p.querySelector('#sal-akopiuj').onclick = function (){
+            try { GM_setClipboard(SAL_AWYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
+            catch (e){ salSay('Nie udało się skopiować.', '#c00'); }
+        };
+        salAmzInfo();
+    }
+    function salAmzInfo(){
+        const p = salPanel();
+        const a = p.querySelector('#sal-amzinfo'), e = p.querySelector('#sal-aexpinfo');
+        if (a) a.textContent = SAL_AMZ
+            ? ('Rozliczenie ' + SAL_AMZ.setId + ' · wypłata ' + (SAL_AMZ.payDate || '—')
+               + ' · ' + SAL_AMZ.shop + ' · zamówień ' + Object.keys(SAL_AMZ.ord).length
+               + ', zwrotów ' + Object.keys(SAL_AMZ.ref || {}).length)
+            : 'Plik: nie wskazany.';
+        if (e) e.textContent = SAL_AEXP
+            ? ('Zestawienie: ' + SAL_AEXP.rows.length + ' wierszy'
+               + (SAL_AEXP.zrodla.length ? (' · ' + SAL_AEXP.zrodla.join(', ')) : '')
+               + (SAL_AEXP.zle.length ? (' · problemy: ' + SAL_AEXP.zle.join('; ')) : ''))
+            : 'Zestawienie: jeszcze nie pobrane.';
+    }
+    async function salWczytajAmz(files){
+        const most = salAmzMost();
+        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!files || !files.length) return;
+        try {
+            const buf = await files[0].arrayBuffer();
+            // Raport Amazona bywa w UTF-8 i w UTF-16 — rozpoznajemy po znaku kolejnosci
+            // bajtow, tak samo jak robi to mkDecode po stronie modulu marketplace'ow.
+            const u8 = new Uint8Array(buf);
+            let txt;
+            if (u8.length > 1 && u8[0] === 0xFF && u8[1] === 0xFE) txt = new TextDecoder('utf-16le').decode(u8);
+            else if (u8.length > 1 && u8[0] === 0xFE && u8[1] === 0xFF) txt = new TextDecoder('utf-16be').decode(u8);
+            else txt = new TextDecoder('utf-8').decode(u8);
+            const p = most.raport(txt);
+            if (p.err){ SAL_AMZ = null; salSay(p.err, '#c00'); salAmzInfo(); return; }
+            SAL_AMZ = p;
+            salSay('Wczytane: ' + p.shop + ', rozliczenie ' + p.setId + ', wypłata ' + (p.payDate || '—')
+                 + ' ' + (p.cur || ''), '#0a7a2f');
+        } catch (e){
+            SAL_AMZ = null;
+            salSay('„' + files[0].name + '": ' + ((e && e.message) || e), '#c00');
+        }
+        salAmzInfo();
+    }
+    async function salPobierzAmzExp(b){
+        const p = salPanel();
+        const konto = String(p.querySelector('#sal-akonto').value || '').trim();
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!konto){ salSay('Podaj numer konta rozliczeniowego.', '#c47f00'); return; }
+        if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salSay('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        if (typeof window.__TM_EXPORT_FETCH !== 'function'){
+            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawienia.', '#c00');
+            return;
+        }
+        const most = salAmzMost();
+        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        b.disabled = true;
+        const t0 = Date.now();
+        let ostatni = 'Pobieram…';
+        const zegar = setInterval(function (){
+            salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+        }, 1000);
+        try {
+            const wynik = await window.__TM_EXPORT_FETCH([konto], od, doo, 'excel', function (i, n, nazwa, etap){
+                ostatni = 'Pobieram ' + nazwa + (etap ? (' · ' + etap) : '');
+                salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+            });
+            const rows = [], zrodla = [], zle = [];
+            wynik.forEach(function (x){
+                if (x.blad){ zle.push(x.nazwa + ': ' + x.blad); return; }
+                if (!x.buf){ zle.push(x.nazwa + ': brak ruchu w tym zakresie'); return; }
+                // slXls rozkodowuje BIFF omijajac uszkodzony kontener OLE2 — ta sama
+                // droga, ktora czyta zestawienia dla PayPala i wyciagu bankowego.
+                const r = most.wiersze(slXls(x.buf), x.nazwa || konto, konto);
+                if (r.err){ zle.push(r.err); return; }
+                r.rows.forEach(function (y){ rows.push(y); });
+                zrodla.push((x.nazwa || konto) + ' (' + r.rows.length + ')');
+            });
+            SAL_AEXP = { rows: rows, zrodla: zrodla, zle: zle };
+            clearInterval(zegar);
+            salAmzInfo();
+            salSay(rows.length
+                ? ('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: ' + rows.length + ' wierszy.'
+                   + (zle.length ? (' Problemy: ' + zle.join('; ')) : ''))
+                : ('Nie wczytałem ani jednego wiersza. ' + zle.join('; ')),
+                rows.length ? (zle.length ? '#c47f00' : '#0a7a2f') : '#c00');
+        } catch (e){
+            salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        } finally { clearInterval(zegar); b.disabled = false; }
+    }
+    function salPorownajAmz(b){
+        const p = salPanel(), most = salAmzMost();
+        const out = p.querySelector('#sal-awynik'), kop = p.querySelector('#sal-akopiuj');
+        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!SAL_AMZ){ salSay('Wskaż plik rozliczenia z Amazona.', '#c47f00'); return; }
+        if (!SAL_AEXP || !SAL_AEXP.rows.length){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
+        // Reguly kontowe sa ulozone pod DE i tylko pod DE — przy innym kraju wynik bylby
+        // mylacy, wiec mowimy to wprost zamiast liczyc cokolwiek.
+        if ((most.obsluga || []).indexOf('de') < 0 || SAL_AMZ.shop !== 'Amazon DE'){
+            salSay('Na razie sprawdzam wyłącznie Amazon DE, a ten raport to ' + (SAL_AMZ.shop || '?')
+                 + '. Reszta krajów ma inne zależności kontowe.', '#c47f00');
+            return;
+        }
+        b.disabled = true;
+        try {
+            const k = most.sprawdz(SAL_AMZ, SAL_AEXP.rows);
+            SAL_AWYNIK = most.tekst(SAL_AMZ, k, SAL_AEXP.zle);
+            out.innerHTML = most.render(SAL_AMZ, k, SAL_AEXP.zle);
+            kop.style.display = '';
+            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+            salSay(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
+                   blady ? '#c47f00' : '#0a7a2f');
+        } catch (e){
+            salSay('Błąd porównania: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
     }
 
     async function salRysujPP(){
