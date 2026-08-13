@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.01
+// @version      4.02
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23272,6 +23272,13 @@
         // miec naglowek UBS/Postbank/PostFinance, Galaxus komplet czterech kolumn,
         // Wayfair naglowek „Invoice #", eBay kolumny z VAT-em pobranym przez eBaya.
         // Kolejnosc od najostrzejszego. Parsery sa czyste — nic nie zapisuja.
+        // Jedna lista typow plikow dla calego modulu. Wczesniej nazwy byly wpisane
+        // w miejscu uzycia i dolozenie ManoMano do rozpoznawania NIE dolozylo go do
+        // podsumowania — wgrany plik nie pojawial sie w komunikacie.
+        const MK_TYPY_ETYK = { bank: 'wyciąg', amz: 'raport Amazon', mano: 'rozliczenie ManoMano',
+            ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair',
+            c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung' };
+        const MK_TYPY_NAZWY = Object.keys(MK_TYPY_ETYK);
         function mkTypPliku(txt){
             try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
             // Amazon pyta sie WCZESNIE, bo jego warunek wejscia jest najostrzejszy z calej
@@ -23305,6 +23312,14 @@
                 } catch (e){ typ = ''; }
                 if (typ) kubelki[typ].push(f); else nieznane.push(f);
             }
+            // Komunikat postepu MUSI isc PRZED wczytywaniem. Wczesniej stal na samym koncu
+            // i nadpisywal komunikat z wynikiem — po zakonczonej pracy na pasku zostawalo
+            // „wczytuję…" i wygladalo to na zawieszenie, chociaz wszystko bylo juz zrobione.
+            const rozpoznaneWstepnie = MK_TYPY_NAZWY
+                .filter(function (t){ return kubelki[t].length; })
+                .map(function (t){ return kubelki[t].length + '× ' + MK_TYPY_ETYK[t]; });
+            if (rozpoznaneWstepnie.length)
+                say('Rozpoznałem: ' + rozpoznaneWstepnie.join(', ') + ' — wczytuję…', '#666');
             // Wyciagi ida razem — ich obsluga sama zlicza i podsumowuje kilka plikow naraz.
             // Obsluge wolamy WPROST. Wczesniej szlo to przez podrzucenie pliku ukrytemu
             // wejsciu (input.files = DataTransfer.files) — w piaskownicy ScriptCata takie
@@ -23322,10 +23337,9 @@
             // wrzucaniu nie — obie drogi dopisuja sie do tego samego zlecenia po numerze.
             for (let i = 0; i < kubelki.c24.length; i++) await c24Wczytaj(kubelki.c24[i], false);
             for (let i = 0; i < kubelki.c24pdf.length; i++) await c24Wczytaj(kubelki.c24pdf[i], true);
-            const rozpoznane = ['bank', 'amz', 'ebay', 'galx', 'wayf', 'c24', 'c24pdf']
+            const rozpoznane = MK_TYPY_NAZWY
                 .filter(function (t){ return kubelki[t].length; })
-                .map(function (t){ return kubelki[t].length + '× ' + ({ bank: 'wyciąg', amz: 'raport Amazon', ebay: 'raport eBay', galx: 'raport Galaxus',
-                    wayf: 'raport Wayfair', c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung' })[t]; });
+                .map(function (t){ return kubelki[t].length + '× ' + MK_TYPY_ETYK[t]; });
             // Plik, ktorego nie przypisalismy, NIE moze skonczyc w prozni. Oddajemy go
             // obsludze wyciagu: to najczestszy przypadek, a jej komunikat bledu jest
             // najbardziej konkretny („nie rozpoznaje naglowka — obsluguje UBS…").
@@ -23336,9 +23350,9 @@
                 say('Nie rozpoznałem po zawartości: ' + nieznane.map(function (f){ return f.name; }).join(', ')
                     + ' — próbuję jako wyciąg bankowy.'
                     + (rozpoznane.length ? (' Pozostałe: ' + rozpoznane.join(', ') + '.') : ''), '#c47f00');
-            } else if (rozpoznane.length){
-                say('Rozpoznałem: ' + rozpoznane.join(', ') + ' — wczytuję…', '#666');
             }
+            // Gdy wszystko sie rozpoznalo, NIC tu nie mowimy: na pasku ma zostac komunikat
+            // z WYNIKIEM, ktory wypisala obsluga ostatniego pliku.
         };
 
         // Reczne dodanie wplaty. Data NIE ma wartosci domyslnej: podpowiedziana „dzisiaj"
@@ -30172,6 +30186,595 @@
         }, 20000);
     }
 
+    // ===== Kalkulator VAT (PL + UE + UK/CH) =====
+    // Zrodlo: osobny userscript „Kalkulator VAT (payments)" 1.0.0, wciagniety do HUB-a
+    // w v4.02. Wnetrze bez zmian merytorycznych — poprawione tylko rzeczy wynikajace
+    // z tego, ze teraz dziali obok dziewieciu innych modulow: prefiks kluczy ustawien,
+    // guzik w zwyklym drzewie dokumentu (launcher go potrzebuje) i bezpiecznik na ramki.
+    // Panel zostaje w shadow DOM — dzieki temu jego style nie mieszaja sie z reszta.
+    function init_vatcalc() {
+(function () {
+  "use strict";
+  // Te same dwa bezpieczniki co w pozostalych modulach: panel osadzony w ramce robil
+  // drugi komplet guzikow, a powtorne wywolanie init — trzeci.
+  if (window.top !== window.self) return;
+  if (document.getElementById("vatcalc-btn")) return;
+
+  /* ---------------- dane ---------------- */
+  // Waluty urzedowe 2026 (Bulgaria: EUR od 1.01.2026)
+  const COUNTRIES = [
+    { code: "PL", name: "Polska", flag: "🇵🇱", cur: "PLN", rates: [23, 8, 5, 0] },
+    { code: "AT", name: "Austria", flag: "🇦🇹", cur: "EUR", rates: [20, 13, 10, 0] },
+    { code: "BE", name: "Belgia", flag: "🇧🇪", cur: "EUR", rates: [21, 12, 6, 0] },
+    { code: "BG", name: "Bułgaria", flag: "🇧🇬", cur: "EUR", rates: [20, 9, 0] },
+    { code: "HR", name: "Chorwacja", flag: "🇭🇷", cur: "EUR", rates: [25, 13, 5, 0] },
+    { code: "CY", name: "Cypr", flag: "🇨🇾", cur: "EUR", rates: [19, 9, 5, 0] },
+    { code: "CZ", name: "Czechy", flag: "🇨🇿", cur: "CZK", rates: [21, 12, 0] },
+    { code: "DK", name: "Dania", flag: "🇩🇰", cur: "DKK", rates: [25, 0] },
+    { code: "EE", name: "Estonia", flag: "🇪🇪", cur: "EUR", rates: [24, 9, 0] },
+    { code: "FI", name: "Finlandia", flag: "🇫🇮", cur: "EUR", rates: [25.5, 14, 13.5, 0] },
+    { code: "FR", name: "Francja", flag: "🇫🇷", cur: "EUR", rates: [20, 10, 5.5, 2.1, 0] },
+    { code: "DE", name: "Niemcy", flag: "🇩🇪", cur: "EUR", rates: [19, 7, 0] },
+    { code: "GR", name: "Grecja", flag: "🇬🇷", cur: "EUR", rates: [24, 13, 6, 0] },
+    { code: "HU", name: "Węgry", flag: "🇭🇺", cur: "HUF", rates: [27, 18, 5, 0] },
+    { code: "IE", name: "Irlandia", flag: "🇮🇪", cur: "EUR", rates: [23, 13.5, 9, 4.8, 0] },
+    { code: "IT", name: "Włochy", flag: "🇮🇹", cur: "EUR", rates: [22, 10, 5, 4, 0] },
+    { code: "LV", name: "Łotwa", flag: "🇱🇻", cur: "EUR", rates: [21, 12, 5, 0] },
+    { code: "LT", name: "Litwa", flag: "🇱🇹", cur: "EUR", rates: [21, 12, 9, 5, 0] },
+    { code: "LU", name: "Luksemburg", flag: "🇱🇺", cur: "EUR", rates: [16, 13, 7, 3, 0] },
+    { code: "MT", name: "Malta", flag: "🇲🇹", cur: "EUR", rates: [18, 7, 5, 0] },
+    { code: "NL", name: "Holandia", flag: "🇳🇱", cur: "EUR", rates: [21, 9, 0] },
+    { code: "PT", name: "Portugalia", flag: "🇵🇹", cur: "EUR", rates: [23, 13, 6, 0] },
+    { code: "RO", name: "Rumunia", flag: "🇷🇴", cur: "RON", rates: [21, 11, 0] },
+    { code: "SK", name: "Słowacja", flag: "🇸🇰", cur: "EUR", rates: [23, 19, 5, 0] },
+    { code: "SI", name: "Słowenia", flag: "🇸🇮", cur: "EUR", rates: [22, 9.5, 5, 0] },
+    { code: "ES", name: "Hiszpania", flag: "🇪🇸", cur: "EUR", rates: [21, 10, 4, 0] },
+    { code: "SE", name: "Szwecja", flag: "🇸🇪", cur: "SEK", rates: [25, 12, 6, 0] },
+    { code: "GB", name: "Wielka Brytania", flag: "🇬🇧", cur: "GBP", rates: [20, 5, 0] },
+    { code: "CH", name: "Szwajcaria", flag: "🇨🇭", cur: "CHF", rates: [8.1, 2.6, 0] },
+  ];
+  const CURRENCIES = [
+    { code: "PLN", sym: "zł" }, { code: "EUR", sym: "€" }, { code: "GBP", sym: "£" },
+    { code: "CHF", sym: "₣" }, { code: "CZK", sym: "Kč" }, { code: "DKK", sym: "kr" },
+    { code: "SEK", sym: "kr" }, { code: "NOK", sym: "kr" }, { code: "HUF", sym: "Ft" },
+    { code: "RON", sym: "lei" }, { code: "USD", sym: "$" },
+  ];
+
+  /* ---------------- pamiec ustawien ---------------- */
+  const mem = {};
+  // v4.02: klucze prefiksowane. GM_setValue jest WSPOLNE dla calego HUB-a, a kalkulator
+  // zapisywal ustawienia pod nazwami „mode", „pos", „rate", „base", „cur" — na tyle
+  // ogolnymi, ze predzej czy pozniej zderzylyby sie z innym modulem.
+  const PFX = "vatcalc_";
+  const store = {
+    get(k, d) {
+      k = PFX + k;
+      try { if (typeof GM_getValue === "function") return GM_getValue(k, d); } catch (e) {}
+      return k in mem ? mem[k] : d;
+    },
+    set(k, v) {
+      k = PFX + k;
+      mem[k] = v;
+      try { if (typeof GM_setValue === "function") GM_setValue(k, v); } catch (e) {}
+    },
+  };
+
+  /* ---------------- pomocnicze ---------------- */
+  const C = (c) => COUNTRIES.find((x) => x.code === c) || COUNTRIES[0];
+  const r2 = (s) => String(s).replace(".", ",");
+  const fmt = (n, p = 2) =>
+    isFinite(n)
+      ? n.toLocaleString("pl-PL", { minimumFractionDigits: p, maximumFractionDigits: p })
+      : (0).toFixed(p).replace(".", ",");
+  const parseAmt = (s) => {
+    const v = parseFloat(String(s).replace(/\s/g, "").replace(",", "."));
+    return isNaN(v) ? 0 : v;
+  };
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+  function sanitizeAmount(v) {
+    v = String(v).replace(/\./g, ",").replace(/[^\d,]/g, "");
+    const i = v.indexOf(",");
+    if (i >= 0) v = v.slice(0, i + 1) + v.slice(i + 1).replace(/,/g, "");
+    return v.slice(0, 18);
+  }
+  function sanitizeExpr(v) {
+    return String(v)
+      .replace(/\*/g, "×").replace(/x/gi, "×").replace(/\//g, "÷")
+      .replace(/-/g, "−").replace(/\./g, ",")
+      .replace(/[^\d,+−×÷]/g, "").slice(0, 40);
+  }
+
+  const OPS = { "+": 1, "-": 1, "*": 2, "/": 2 };
+  function evaluate(disp) {
+    const s = String(disp).replace(/,/g, ".").replace(/×/g, "*").replace(/÷/g, "/").replace(/−/g, "-");
+    const tk = []; let num = "";
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (/[0-9.]/.test(ch)) num += ch;
+      else if ("+-*/".includes(ch)) {
+        if (num !== "") { tk.push(num); num = ""; }
+        const last = tk[tk.length - 1];
+        if (ch === "-" && (tk.length === 0 || OPS[last] !== undefined)) num = "-";
+        else tk.push(ch);
+      }
+    }
+    if (num !== "" && num !== "-") tk.push(num);
+    const out = [], ops = [];
+    for (const t of tk) {
+      if (OPS[t] !== undefined) {
+        while (ops.length && OPS[ops[ops.length - 1]] >= OPS[t]) out.push(ops.pop());
+        ops.push(t);
+      } else { const n = parseFloat(t); if (!isNaN(n)) out.push(n); }
+    }
+    while (ops.length) out.push(ops.pop());
+    const st = [];
+    for (const t of out) {
+      if (typeof t === "number") st.push(t);
+      else {
+        const b = st.pop(), a = st.pop();
+        if (a === undefined || b === undefined) return null;
+        st.push(t === "+" ? a + b : t === "-" ? a - b : t === "*" ? a * b : a / b);
+      }
+    }
+    return st.length === 1 && isFinite(st[0]) ? st[0] : null;
+  }
+  const trimNum = (n) => String(Math.round(n * 1000) / 1000).replace(".", ",");
+
+  /* ---------------- stan ---------------- */
+  const S = {
+    open: false,
+    mode: store.get("mode", "convert"),
+    amount: "", expr: "",
+    countryCode: store.get("countryCode", "PL"),
+    dir: store.get("dir", "g2n"),
+    rate: store.get("rate", 23),
+    base: store.get("base", "net"),
+    fromCountry: store.get("fromCountry", "PL"),
+    toCountry: store.get("toCountry", "DE"),
+    fromRate: store.get("fromRate", 23),
+    toRate: store.get("toRate", 19),
+    cur: store.get("cur", "PLN"),
+    caret: null, focusField: false,
+  };
+  const persist = () => {
+    ["mode", "countryCode", "dir", "rate", "base", "fromCountry", "toCountry", "fromRate", "toRate", "cur"]
+      .forEach((k) => store.set(k, S[k]));
+  };
+
+  /* ---------------- style (shadow DOM) ---------------- */
+  const CSS = `
+  :host{position:fixed;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box;}
+  .fab{width:48px;height:48px;border-radius:50%;border:none;cursor:pointer;
+    background:linear-gradient(145deg,#10b981,#059669);color:#fff;font-size:22px;font-weight:700;
+    box-shadow:0 10px 24px -8px rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;}
+  .fab{display:none;}   /* v4.02: rolę przycisku przejął #vatcalc-btn dla launchera */
+  .fab:hover{filter:brightness(1.08);}
+  .panel{display:none;width:400px;max-height:88vh;overflow:auto;color:#e2e8f0;
+    background:rgba(15,23,42,.97);backdrop-filter:blur(8px);border-radius:22px;
+    border:1px solid rgba(255,255,255,.1);box-shadow:0 30px 60px -15px rgba(0,0,0,.75);}
+  .panel::-webkit-scrollbar{width:8px;} .panel::-webkit-scrollbar-thumb{background:#334155;border-radius:8px;}
+  :host(.open) .panel{display:block;} :host(.open) .fab{display:none;}
+  .pad{padding:0 18px;} .mt{margin-top:12px;}
+  .head{padding:14px 16px 10px;display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:move;user-select:none;}
+  .head h1{font-size:16px;font-weight:700;margin:0;color:#fff;}
+  .hact{display:flex;align-items:center;gap:6px;}
+  .badge{font-size:10px;color:#94a3b8;background:rgba(51,65,85,.6);padding:3px 7px;border-radius:999px;}
+  select{width:100%;appearance:none;background:rgba(51,65,85,.65);color:#fff;border:none;border-radius:11px;
+    padding:9px 11px;font-size:13px;font-weight:500;cursor:pointer;outline:none;font-family:inherit;}
+  select:focus{box-shadow:0 0 0 2px #10b981;}
+  .currow{display:flex;gap:8px;align-items:center;}
+  .cursel{width:auto;min-width:100px;flex:0 0 auto;color:#34d399;font-weight:700;text-align:center;}
+  .tabs{display:flex;gap:4px;background:rgba(2,6,23,.6);padding:4px;border-radius:12px;margin:12px 18px 0;}
+  .tab{flex:1;border:none;background:rgba(51,65,85,.55);color:#cbd5e1;font-size:12.5px;font-weight:600;
+    padding:9px 4px;border-radius:9px;cursor:pointer;font-family:inherit;}
+  .tab:hover{background:rgba(71,85,105,.85);color:#fff;}
+  .tab.on{background:#10b981;color:#fff;}
+  .disp{background:rgba(2,6,23,.75);border-radius:16px;padding:12px 14px 14px;}
+  .disp.focus{box-shadow:0 0 0 2px rgba(16,185,129,.55);}
+  .dhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;}
+  .lbl{font-size:10.5px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;}
+  .acts{display:flex;gap:6px;flex:0 0 auto;}
+  .mini{border:none;background:rgba(51,65,85,.75);color:#cbd5e1;font-size:11px;font-weight:600;
+    padding:4px 8px;border-radius:7px;cursor:pointer;font-family:inherit;}
+  .mini:hover{background:rgba(71,85,105,.95);color:#fff;}
+  .mini.x{color:#fb7185;}
+  .valrow{display:flex;align-items:baseline;gap:6px;}
+  .valin{flex:1;min-width:0;background:transparent;border:none;outline:none;padding:0;margin:0;color:#fff;
+    font-family:inherit;font-size:34px;font-weight:300;text-align:right;min-height:40px;font-variant-numeric:tabular-nums;}
+  .valin.sm{font-size:21px;min-height:28px;}
+  .valin::placeholder{color:#475569;}
+  .valin::selection{background:rgba(16,185,129,.45);color:#fff;}
+  .cur{color:#64748b;font-size:21px;flex:0 0 auto;}
+  .res{text-align:right;color:#34d399;font-size:27px;font-weight:600;margin-top:6px;}
+  .seg{display:flex;gap:4px;background:rgba(2,6,23,.6);padding:4px;border-radius:11px;font-size:13px;}
+  .seg button{flex:1;border:none;background:none;color:#64748b;font-weight:500;padding:6px;border-radius:8px;cursor:pointer;font-family:inherit;}
+  .seg button.on{background:#334155;color:#fff;}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;}
+  .chip{border:none;background:rgba(51,65,85,.65);color:#cbd5e1;font-size:13px;font-weight:600;
+    padding:7px 11px;border-radius:9px;cursor:pointer;font-family:inherit;}
+  .chip.on{background:#10b981;color:#fff;}
+  .chip .std{opacity:.6;font-size:9.5px;margin-right:3px;}
+  .box{background:rgba(2,6,23,.45);border-radius:11px;padding:11px;margin-bottom:8px;}
+  .boxlbl{font-size:10.5px;color:#34d399;font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;}
+  .arrow{text-align:center;color:#34d399;font-size:17px;margin:2px 0;}
+  .presets{display:flex;flex-wrap:wrap;gap:6px;}
+  .preset{border:none;background:rgba(51,65,85,.45);color:#cbd5e1;font-size:11.5px;font-weight:500;
+    padding:5px 9px;border-radius:8px;cursor:pointer;font-family:inherit;}
+  .warn{margin-top:10px;font-size:10.5px;line-height:1.45;color:#fde68a;background:rgba(251,191,36,.09);
+    border:1px solid rgba(251,191,36,.28);border-radius:10px;padding:8px 10px;}
+  .results{background:rgba(2,6,23,.5);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:9px;}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+  .row .l{font-size:13px;color:#64748b;} .row .l.b{color:#fff;font-weight:600;}
+  .row .sub{display:block;font-size:10.5px;color:#64748b;}
+  .row .r{font-variant-numeric:tabular-nums;color:#cbd5e1;font-size:13.5px;}
+  .row .r.b{color:#fff;font-size:18px;font-weight:700;}
+  .row .r.acc{color:#34d399;font-weight:600;}
+  .row .r .c{font-size:11px;color:#64748b;margin-left:2px;}
+  .hr{height:1px;background:rgba(51,65,85,.6);}
+  .refund{margin-top:4px;border-radius:11px;background:rgba(16,185,129,.11);border:1px solid rgba(16,185,129,.3);
+    padding:11px;display:flex;align-items:center;justify-content:space-between;gap:8px;}
+  .refund .t{font-size:13px;color:#34d399;font-weight:600;}
+  .refund .s{display:block;font-size:10.5px;color:#64748b;}
+  .refund .v{font-variant-numeric:tabular-nums;color:#34d399;font-size:22px;font-weight:700;}
+  .hint{text-align:center;font-size:10.5px;color:#64748b;margin:10px 0 0;line-height:1.5;padding-bottom:16px;}
+  .neg{color:#fb7185 !important;}
+  `;
+
+  /* ---------------- montaz ---------------- */
+  const host = document.createElement("div");
+  host.id = "vatcalc-host";
+  const shadow = host.attachShadow({ mode: "open" });
+
+  try {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(CSS);
+    shadow.adoptedStyleSheets = [sheet];
+  } catch (e) {
+    const st = document.createElement("style");
+    st.textContent = CSS;
+    shadow.appendChild(st);
+  }
+
+  const fab = document.createElement("button");
+  fab.className = "fab";
+  fab.textContent = "%";
+  fab.title = "Kalkulator VAT (Alt+V)";
+  // Guzik widoczny dla launchera — musi stac w ZWYKLYM drzewie dokumentu, bo launcher
+  // szuka go przez document.querySelector('#vatcalc-btn') i otwiera panel wywolujac
+  // na nim .click(). Przycisk w shadow DOM byl dla niego niewidoczny.
+  // Wyglad jak u pozostalych modulow; launcher go schowa i bedzie klikal ukryty.
+  const lightBtn = document.createElement("button");
+  lightBtn.id = "vatcalc-btn";
+  lightBtn.textContent = "% Kalkulator VAT";
+  lightBtn.style.cssText = "position:fixed;top:560px;right:12px;z-index:2147483000;padding:9px 14px;"
+    + "border:none;border-radius:8px;background:#059669;color:#fff;font:bold 13px Arial,sans-serif;"
+    + "cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)";
+  lightBtn.addEventListener("click", function(){ toggle(); });
+  (document.body || document.documentElement).appendChild(lightBtn);
+
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  const appEl = document.createElement("div");
+  panel.appendChild(appEl);
+
+  shadow.appendChild(fab);
+  shadow.appendChild(panel);
+  (document.body || document.documentElement).appendChild(host);
+
+  /* pozycja */
+  const pos = store.get("pos", null);
+  function place(x, y) {
+    const w = host.getBoundingClientRect().width || 60;
+    const h = host.getBoundingClientRect().height || 60;
+    const nx = Math.max(8, Math.min(x, window.innerWidth - w - 8));
+    const ny = Math.max(8, Math.min(y, window.innerHeight - h - 8));
+    host.style.left = nx + "px";
+    host.style.top = ny + "px";
+    host.style.right = "auto";
+    host.style.bottom = "auto";
+  }
+  if (pos && typeof pos.x === "number") place(pos.x, pos.y);
+  else place(window.innerWidth - 76, window.innerHeight - 76);
+  const savePos = () => {
+    const r = host.getBoundingClientRect();
+    store.set("pos", { x: r.left, y: r.top });
+  };
+
+  /* ---------------- render ---------------- */
+  const countryOpts = (sel) => COUNTRIES.map((c) =>
+    `<option value="${c.code}" ${c.code === sel ? "selected" : ""}>${c.flag} ${c.name} (${c.code}) · std ${r2(c.rates[0])}%</option>`).join("");
+  const curOpts = (sel) => CURRENCIES.map((c) =>
+    `<option value="${c.code}" ${c.code === sel ? "selected" : ""}>${c.sym} ${c.code}</option>`).join("");
+  const chips = (rates, active, act, ctry) => rates.map((r) =>
+    `<button class="chip ${r === active ? "on" : ""}" data-act="${act}" data-val="${r}">${r === ctry.rates[0] ? '<span class="std">std</span>' : ""}${r2(r)}%</button>`).join("");
+  const row = (l, v, o = {}) => {
+    const av = Math.abs(v), p = o.prec || 2;
+    const sign = o.signed ? (v > 0 ? "+" : v < 0 ? "−" : "") : "";
+    const cls = (o.bold ? "b" : o.acc ? "acc" : "") + (o.signed && v < 0 ? " neg" : "") + (o.signed && v > 0 ? " acc" : "");
+    return `<div class="row"><div><span class="l ${o.bold ? "b" : ""}">${l}</span>${o.sub ? `<span class="sub">${o.sub}</span>` : ""}</div>
+      <span class="r ${cls}">${sign}${fmt(av, p)} <span class="c">${S.cur}</span></span></div>`;
+  };
+
+  function render() {
+    const ae = shadow.activeElement;
+    const wasFld = !!(ae && ae.id === "fld");
+    const ss = wasFld ? ae.selectionStart : null;
+    const se = wasFld ? ae.selectionEnd : null;
+
+    const amt = parseAmt(S.amount);
+    const co = C(S.countryCode), fc = C(S.fromCountry), tc = C(S.toCountry);
+    let html = "";
+
+    html += `<div class="head"><h1>Kalkulator VAT</h1><span class="hact">
+      <span class="badge">2026</span>
+      <button class="mini x" data-act="close" title="Zamknij (Alt+V)">✕</button></span></div>`;
+
+    html += `<div class="pad currow">`;
+    if (S.mode === "convert") html += `<select data-act="country" style="flex:1">${countryOpts(S.countryCode)}</select>`;
+    html += `<select class="cursel" data-act="cur" title="Waluta wyświetlania">${curOpts(S.cur)}</select></div>`;
+
+    html += `<div class="tabs">
+      <button class="tab ${S.mode === "convert" ? "on" : ""}" data-act="tab" data-val="convert">Przelicz</button>
+      <button class="tab ${S.mode === "reclass" ? "on" : ""}" data-act="tab" data-val="reclass">Zmiana stawki</button>
+      <button class="tab ${S.mode === "calc" ? "on" : ""}" data-act="tab" data-val="calc">Kalkulator</button></div>`;
+
+    html += `<div class="pad mt">`;
+    if (S.mode === "calc") {
+      const res = evaluate(S.expr);
+      html += `<div class="disp" id="disp">
+        <div class="dhead"><span class="lbl">Działanie</span><span class="acts">
+          <button class="mini" data-act="key" data-val="=" title="Zwiń wynik">=</button>
+          <button class="mini" data-act="copyfield">Kopiuj</button>
+          <button class="mini x" data-act="clearfield" title="Wyczyść pole">✕</button></span></div>
+        <input id="fld" class="valin sm" type="text" autocomplete="off" spellcheck="false" placeholder="0" value="${esc(S.expr)}">
+        <div class="res">= ${res == null ? "—" : fmt(res, 3)}</div></div>`;
+    } else {
+      const lbl = S.mode === "convert"
+        ? (S.dir === "g2n" ? "Kwota brutto" : "Kwota netto")
+        : (S.base === "net" ? "Kwota netto" : `Kwota brutto (${S.fromCountry} ${r2(S.fromRate)}%)`);
+      html += `<div class="disp" id="disp">
+        <div class="dhead"><span class="lbl">${lbl}</span><span class="acts">
+          <button class="mini" data-act="copyfield">Kopiuj</button>
+          <button class="mini x" data-act="clearfield" title="Wyczyść pole">✕</button></span></div>
+        <div class="valrow">
+          <input id="fld" class="valin" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="0" value="${esc(S.amount)}">
+          <span class="cur">${S.cur}</span></div></div>`;
+    }
+    html += `</div>`;
+
+    html += `<div class="pad mt">`;
+    if (S.mode === "convert") {
+      html += `<div class="seg" style="margin-bottom:12px">
+        <button class="${S.dir === "g2n" ? "on" : ""}" data-act="dir" data-val="g2n">Brutto → Netto</button>
+        <button class="${S.dir === "n2g" ? "on" : ""}" data-act="dir" data-val="n2g">Netto → Brutto</button></div>
+        <div class="chips">${chips(co.rates, S.rate, "rate", co)}</div>`;
+    } else if (S.mode === "reclass") {
+      html += `<div class="seg" style="margin-bottom:12px">
+        <button class="${S.base === "net" ? "on" : ""}" data-act="base" data-val="net">Podstawa: netto</button>
+        <button class="${S.base === "gross" ? "on" : ""}" data-act="base" data-val="gross">Podstawa: brutto</button></div>
+        <div class="box"><div class="boxlbl">Ze stawki</div>
+          <select data-act="fromcountry">${countryOpts(S.fromCountry)}</select>
+          <div class="chips" style="margin-top:8px">${chips(fc.rates, S.fromRate, "fromrate", fc)}</div></div>
+        <div class="arrow">→</div>
+        <div class="box"><div class="boxlbl">Na stawkę</div>
+          <select data-act="tocountry">${countryOpts(S.toCountry)}</select>
+          <div class="chips" style="margin-top:8px">${chips(tc.rates, S.toRate, "torate", tc)}</div></div>
+        <div class="presets">
+          <button class="preset" data-act="preset" data-val="PL,23,DE,19">PL 23 → DE 19</button>
+          <button class="preset" data-act="preset" data-val="PL,23,PL,0">PL 23 → 0</button>
+          <button class="preset" data-act="preset" data-val="PL,23,PL,8">PL 23 → 8</button>
+          <button class="preset" data-act="preset" data-val="PL,23,PL,5">PL 23 → 5</button></div>`;
+      if (fc.cur !== tc.cur) {
+        html += `<div class="warn">Uwaga: ${S.fromCountry} rozlicza się w ${fc.cur}, a ${S.toCountry} w ${tc.cur}.
+          Kalkulator nie przelicza kursów walut — kwoty pokazuje w wybranej walucie (${S.cur}).</div>`;
+      }
+    }
+    html += `</div>`;
+
+    if (S.mode === "convert") {
+      const r = S.rate / 100;
+      let net, vat, gross;
+      if (S.dir === "g2n") { net = amt / (1 + r); vat = amt - net; gross = amt; }
+      else { net = amt; vat = amt * r; gross = amt * (1 + r); }
+      html += `<div class="pad mt"><div class="results">
+        ${row("Netto", net)}${row(`VAT ${r2(S.rate)}%`, vat, { acc: true })}
+        <div class="hr"></div>${row("Brutto", gross, { bold: true })}</div></div>`;
+    } else if (S.mode === "reclass") {
+      const rf = S.fromRate / 100, rt = S.toRate / 100;
+      const net = S.base === "net" ? amt : amt / (1 + rf);
+      const vf = net * rf, vt = net * rt, gf = net + vf, gt = net + vt, refund = gf - gt;
+      html += `<div class="pad mt"><div class="results">
+        ${row("Netto (podstawa)", net)}<div class="hr"></div>
+        ${row(`${fc.flag} ${S.fromCountry} ${r2(S.fromRate)}% — brutto`, gf, { sub: `VAT ${fmt(vf)} ${S.cur}` })}
+        ${row(`${tc.flag} ${S.toCountry} ${r2(S.toRate)}% — brutto`, gt, { bold: true, sub: `VAT ${fmt(vt)} ${S.cur}` })}
+        <div class="hr"></div>${row("Różnica VAT", vf - vt, { signed: true })}
+        <div class="refund"><div><span class="t">${refund >= 0 ? "Do zwrotu klientowi" : "Dopłata od klienta"}</span>
+          <span class="s">różnica brutto ${r2(S.fromRate)}% → ${r2(S.toRate)}%</span></div>
+          <span class="v">${fmt(Math.abs(refund), 3)}<span class="c" style="font-size:11px;color:#64748b"> ${S.cur}</span></span></div>
+        </div></div>`;
+    }
+
+    html += `<div class="pad"><p class="hint">Kwotę wpisujesz z klawiatury · Ctrl+A zaznacza · Ctrl+C kopiuje · Ctrl+V wkleja<br>
+      ${S.mode === "calc"
+        ? "Działania: + − × ÷ (klawisze * i / też działają) · Enter = wynik"
+        : "Backspace kasuje znak · Esc czyści pole"} · Alt+V zamyka</p></div>`;
+
+    appEl.innerHTML = html;
+
+    const f = shadow.getElementById("fld");
+    if (f && (wasFld || S.focusField)) {
+      f.focus();
+      const len = f.value.length;
+      let a, b;
+      if (S.caret != null) { a = b = Math.min(S.caret, len); }
+      else if (wasFld && ss != null) { a = Math.min(ss, len); b = Math.min(se, len); }
+      else { a = b = len; }
+      try { f.setSelectionRange(a, b); } catch (err) {}
+      const d = shadow.getElementById("disp"); if (d) d.classList.add("focus");
+    }
+    S.caret = null; S.focusField = false;
+  }
+
+  /* ---------------- otwieranie / zamykanie ---------------- */
+  function clampIntoView() {
+    const r = host.getBoundingClientRect();
+    place(r.left, r.top);
+  }
+  function open() {
+    S.open = true;
+    host.classList.add("open");
+    render();
+    requestAnimationFrame(() => {
+      clampIntoView();
+      const f = shadow.getElementById("fld");
+      if (f) f.focus();
+    });
+  }
+  function close() {
+    S.open = false;
+    host.classList.remove("open");
+    persist();
+    clampIntoView();
+  }
+  const toggle = () => (S.open ? close() : open());
+
+  fab.addEventListener("click", open);
+  // Wpis w menu Tampermonkeya rejestruje juz launcher (MODULES) — drugi bylby duplikatem.
+
+  /* ---------------- interakcje ---------------- */
+  shadow.addEventListener("input", (e) => {
+    const t = e.target;
+    if (!t || t.id !== "fld") return;
+    const posn = t.selectionStart, raw = t.value;
+    const val = S.mode === "calc" ? sanitizeExpr(raw) : sanitizeAmount(raw);
+    S.caret = Math.max(0, posn + (val.length - raw.length));
+    if (S.mode === "calc") S.expr = val; else S.amount = val;
+    render();
+  });
+
+  shadow.addEventListener("focusin", (e) => {
+    if (e.target && e.target.id === "fld") {
+      const d = shadow.getElementById("disp"); if (d) d.classList.add("focus");
+    }
+  });
+  shadow.addEventListener("focusout", (e) => {
+    if (e.target && e.target.id === "fld") {
+      const d = shadow.getElementById("disp"); if (d) d.classList.remove("focus");
+    }
+  });
+
+  shadow.addEventListener("click", (e) => {
+    const t = e.target.closest && e.target.closest("[data-act]");
+    if (!t) return;
+    const a = t.dataset.act, v = t.dataset.val;
+
+    if (a === "close") { close(); return; }
+    if (a === "copyfield") {
+      const f = shadow.getElementById("fld"); if (!f) return;
+      const done = () => {
+        t.textContent = "Skopiowano";
+        setTimeout(() => {
+          const b = shadow.querySelector('[data-act="copyfield"]');
+          if (b) b.textContent = "Kopiuj";
+        }, 1200);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(f.value).then(done).catch(() => { f.select(); try { document.execCommand("copy"); } catch (err) {} done(); });
+      } else { f.select(); try { document.execCommand("copy"); } catch (err) {} done(); }
+      return;
+    }
+    if (a === "clearfield") { if (S.mode === "calc") S.expr = ""; else S.amount = ""; S.focusField = true; }
+    else if (a === "tab") S.mode = v;
+    else if (a === "dir") S.dir = v;
+    else if (a === "base") S.base = v;
+    else if (a === "rate") S.rate = parseFloat(v);
+    else if (a === "fromrate") S.fromRate = parseFloat(v);
+    else if (a === "torate") S.toRate = parseFloat(v);
+    else if (a === "preset") {
+      const p = v.split(",");
+      S.fromCountry = p[0]; S.fromRate = +p[1]; S.toCountry = p[2]; S.toRate = +p[3];
+      S.cur = C(p[0]).cur;
+    }
+    else if (a === "key") {
+      if (S.mode === "calc" && v === "=") {
+        const r = evaluate(S.expr);
+        if (r != null) S.expr = trimNum(r);
+        S.focusField = true;
+      }
+    }
+    else return;
+    persist();
+    render();
+  });
+
+  shadow.addEventListener("change", (e) => {
+    const t = e.target.closest && e.target.closest("[data-act]");
+    if (!t) return;
+    const a = t.dataset.act;
+    if (a === "country") { S.countryCode = t.value; S.rate = C(t.value).rates[0]; S.cur = C(t.value).cur; }
+    else if (a === "fromcountry") { S.fromCountry = t.value; S.fromRate = C(t.value).rates[0]; S.cur = C(t.value).cur; }
+    else if (a === "tocountry") { S.toCountry = t.value; S.toRate = C(t.value).rates[0]; }
+    else if (a === "cur") { S.cur = t.value; }
+    else return;
+    persist();
+    render();
+  });
+
+  // klawisze wewnatrz panelu — nie przepuszczamy ich do strony
+  ["keydown", "keyup", "keypress"].forEach((ev) => {
+    shadow.addEventListener(ev, (e) => {
+      e.stopPropagation();
+      if (ev !== "keydown") return;
+      const inField = e.target && e.target.id === "fld";
+      if (!inField) return;
+      if (e.key === "Enter" && S.mode === "calc") {
+        e.preventDefault();
+        const r = evaluate(S.expr);
+        if (r != null) S.expr = trimNum(r);
+        S.focusField = true; render();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        const empty = S.mode === "calc" ? S.expr === "" : S.amount === "";
+        if (empty) { close(); return; }
+        if (S.mode === "calc") S.expr = ""; else S.amount = "";
+        S.focusField = true; render();
+      }
+    });
+  });
+
+  /* przeciaganie panelu za naglowek */
+  let drag = null;
+  shadow.addEventListener("pointerdown", (e) => {
+    const h = e.target.closest && e.target.closest(".head");
+    if (!h || (e.target.closest && e.target.closest("button"))) return;
+    const r = host.getBoundingClientRect();
+    drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    try { h.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  shadow.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    place(e.clientX - drag.dx, e.clientY - drag.dy);
+  });
+  shadow.addEventListener("pointerup", () => {
+    if (!drag) return;
+    drag = null; savePos();
+  });
+
+  /* skrot Alt+V */
+  window.addEventListener("keydown", (e) => {
+    if (e.altKey && !e.ctrlKey && !e.metaKey && (e.code === "KeyV" || String(e.key).toLowerCase() === "v")) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggle();
+    }
+  }, true);
+
+  window.addEventListener("resize", () => { if (S.open) clampIntoView(); });
+})();
+    }
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
@@ -30179,6 +30782,7 @@
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
         { id: 'refund',   name: 'Refund Checker',            test: onProlo,   init: init_refund },
+        { id: 'vatcalc',  name: 'Kalkulator VAT',            test: onProlo,   init: init_vatcalc },
         { id: 'sepa',     name: 'SEPA Walidator IBAN',       test: onProlo,   init: init_sepa },
         { id: 'issuelog', name: 'Issue Log - Faktury',       test: onProlo,   init: init_issuelog },
         { id: 'allegro',  name: 'Allegro CZ/HU/SK',          test: onAllegro, init: init_allegro },
@@ -30401,6 +31005,7 @@
             { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
             { id:'vies',     icon:svgIco('<path d="M17.2 7a6 7 0 1 0 0 10"/><path d="M4 10h9"/><path d="M4 14h9"/>'), label:'Kurs walut', sel:'#oandaKursBtn' },
             { id:'vies',     icon:svgIco('<path d="M11.46 20.85a12 12 0 0 1 -7.96 -14.85a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3a12 12 0 0 1 -.09 7.06"/><path d="M15 19l2 2l4 -4"/>'), label:'VIES / KRS / GUS', sel:'#viesBtn' },
+            { id:'vatcalc',  icon:svgIco('<path d="M19 5a2 2 0 0 0 -2 -2h-10a2 2 0 0 0 -2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2z"/><path d="M8 7h8"/><path d="M8 11h.01"/><path d="M12 11h.01"/><path d="M16 11h.01"/><path d="M8 15h.01"/><path d="M12 15h.01"/><path d="M16 15h.01"/>'), label:'Kalkulator VAT', sel:'#vatcalc-btn' },
             { id:'sepa',     icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M9 13h6"/><path d="M9 17h6"/>'), label:'Walidator SEPA', sel:'#sepa-btn' },
             { id:'export',   icon:svgIco('<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M12 11v6"/><path d="M9.5 14.5l2.5 2.5l2.5 -2.5"/>'), label:'Export payments', sel:'#exp-btn' },
             { id:'salda',    icon:svgIco('<path d="M3 12m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v7a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z"/><path d="M9 8m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v11a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z"/><path d="M15 4m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v15a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z"/><path d="M4 20h14"/>'), label:'Salda', sel:'#sal-btn' },
