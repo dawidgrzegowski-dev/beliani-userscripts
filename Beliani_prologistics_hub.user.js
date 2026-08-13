@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.02
+// @version      4.03
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19081,7 +19081,15 @@
     // dokladaniu pobierania trzeba by ja bylo przepisac drugi raz; jedna kopia to jedna
     // prawda o tym, kiedy zlecenie jest gotowe do ksiegowania.
     function manoZastosuj(j, p, skad){
-        j.ref = p.payRef;
+        // NIE WOLNO tu ruszac j.ref. Zlecenia z wyciagu leza w pamieci pod kluczem ROWNYM
+        // referencji (mkWczytajWyciagi: „const k = r.ref …; jobs[k] = { ref: r.ref, … }"),
+        // a sendImport odnajduje zlecenie przez jobs[j.ref]. Podmiana referencji z urwanej
+        // przez bank („MANOMANO-DE-20260808-722") na pelna z pliku („…-722497") rozjezdzala
+        // klucz z polem — jobs[j.ref] robilo sie undefined i sendImport melodwal
+        // „już zaksięgowane", chociaz NIC nie zostalo zaksiegowane i paczka nie powstala.
+        // Pelna referencje trzymamy obok, do pokazania czlowiekowi.
+        if (!j.ref) j.ref = p.payRef;
+        j.pelnaRef = p.payRef;
         j.shop = 'ManoMano ' + p.kraj.toUpperCase();
         if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
         const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
@@ -19101,7 +19109,7 @@
         if (blokK) bad.push(blokK);
         j.status = bad.length ? 'partial' : 'ready';
         j.msg = bad.join('; ');
-        j.note = manoNota(p) + (p.niepewne.length
+        j.note = 'rozliczenie ' + p.payRef + ' · ' + manoNota(p) + (p.niepewne.length
             ? (' · ' + p.niepewne.length + ' zam. bez rozstrzygnięcia typu — NIE ma ich w imporcie')
             : '');
         return bad;
@@ -25894,8 +25902,25 @@
     // Wspolna wysylka — uzywana i przez pojedynczy import, i przez zbiorczy.
     // Zwraca true albo tresc bledu.
     async function sendImport(j, c){
-        const jobs = jobsLoad(), cur = jobs[j.ref];
-        if (!cur || cur.status === 'done') return 'już zaksięgowane';
+        const jobs = jobsLoad();
+        let cur = jobs[j.ref];
+        // Zlecenie trzymane jest pod kluczem rownym referencji, ale wpisy dodane recznie
+        // maja klucz „MAN_…" i pusta referencje, a kazda przyszla obsluga marketplace'u
+        // moze ten zwiazek naruszyc. Samo „nie znalazlem po kluczu" NIE ZNACZY „juz
+        // zaksiegowane" — to byl mylacy komunikat, przez ktory wygladalo, ze praca zostala
+        // wykonana, choc nic sie nie stalo. Szukamy wiec zapasowo po tozsamosci zlecenia.
+        if (!cur){
+            const k2 = Object.keys(jobs).filter(function (x){
+                const o = jobs[x];
+                return o && o.kind === j.kind && o.status !== 'done'
+                    && String(o.shop || '') === String(j.shop || '')
+                    && o.amount != null && j.amount != null && Math.abs(o.amount - j.amount) < 0.005;
+            })[0];
+            if (k2) cur = jobs[k2];
+        }
+        if (!cur) return 'nie znajduję tego zlecenia w pamięci modułu (klucz „' + (j.ref || '—')
+                       + '") — odśwież stronę i wgraj wyciąg jeszcze raz';
+        if (cur.status === 'done') return 'już zaksięgowane';
         const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
         if (!d) return 'nie umiem odczytać daty wypłaty';
         if (j.kind === 'amz'){ const blok = amzBrakKont(j); if (blok) return blok; }
