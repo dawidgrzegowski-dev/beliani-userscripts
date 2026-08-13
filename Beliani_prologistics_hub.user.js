@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.03
+// @version      4.04
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18751,7 +18751,10 @@
         return c;
     }
     function mkParseMano(text){
-        const rows = mkCsvRows(String(text == null ? '' : text));
+        // Tresc zrodlowa zostaje NIETKNIETA — to ona idzie potem do prologistics.
+        // Zadnego obcinania, sortowania ani przepisywania kolumn.
+        const zrodlo = String(text == null ? '' : text);
+        const rows = mkCsvRows(zrodlo);
         if (!rows.length || !rows[0]) return { err: 'pusty plik' };
         const hdr = rows[0].map(function (h){ return String(h || '').trim().toUpperCase(); });
         // Warunek wejscia musi byc ostry, bo mkTypPliku pyta parsery po kolei i pierwszy,
@@ -18775,7 +18778,7 @@
         const ordBr = {}, ordVat = {}, ordN = {}, kor = {}, zwrot = {}, zwrotNote = {};
         const potr = [];
         let suma = 0, prowSum = 0, korSum = 0, potrSum = 0, zwrotSum = 0, brutto = 0;
-        let payRef = '', payDate = '', cur = '', nWierszy = 0;
+        let payRef = '', payDate = '', cur = '', nWierszy = 0, nOrdW = 0, impNet = 0;
         const waluty = {};
 
         for (let i = 1; i < rows.length; i++){
@@ -18794,6 +18797,7 @@
 
             if (typ === 'ORDER'){
                 if (!id) continue;
+                nOrdW++; impNet = r2(impNet + netto);
                 ordBr[id] = r2((ordBr[id] || 0) + mmNum(r[C.br]));
                 ordVat[id] = r2((ordVat[id] || 0) + mmNum(r[C.vp]) + mmNum(r[C.vs]));
                 ordN[id] = (ordN[id] || 0) + 1;
@@ -18867,8 +18871,28 @@
         });
         niepewne.sort(function (a, b){ return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0); });
 
+        // Do importu ida WYLACZNIE wiersze ORDER. Zwroty ksiegujesz na ticketach (ida na
+        // liste zwrotow), a korekty VAT, abonament i potracenia ksieguje kto inny — tak samo
+        // jak przy Check24. Uklad kolumn zostaje ZRODLOWY, wiec wiersza NIE skladamy od nowa
+        // z odczytanych wartosci, tylko bierzemy jego oryginalny tekst: inaczej zmienilby sie
+        // zapis liczb, puste pola albo koncowki linii.
+        //
+        // Podzial po liniach jest tu bezpieczny, bo w tych plikach nie ma ANI JEDNEGO
+        // cudzyslowu (sprawdzone na 1026 wierszach z 9 rozliczen), wiec zaden rekord nie
+        // lamie sie na dwie linie. Zeby to zalozenie nie zostalo ciche, ponizej stoi
+        // kontrola: liczba wierszy wybranych po tekscie musi zgadzac sie z liczba wierszy
+        // ORDER policzonych przez parser. Rozjazd = nie generujemy pliku.
+        const eol = zrodlo.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+        const linie = zrodlo.split(/\r?\n/);
+        const doImportu = [linie[0]];
+        for (let i = 1; i < linie.length; i++){
+            if (/^ORDER;/.test(linie[i])) doImportu.push(linie[i]);
+        }
+        const impOk = (doImportu.length - 1) === nOrdW;
         return {
             kraj: kraj, payRef: payRef, payDate: payDate, cur: cur || 'EUR',
+            csvImport: impOk ? (doImportu.join(eol) + eol) : '',
+            impOk: impOk, nOrdW: nOrdW, impNet: impNet,
             waluty: Object.keys(waluty),
             suma: suma, brutto: brutto, prowizja: prowSum, korekty: korSum,
             potracenia: potr, potrSum: potrSum,
@@ -18877,7 +18901,8 @@
             niepewne: niepewne,
             brakVat: brakVat, brakAcc: brakAcc,
             nOrd: Object.keys(ordBr).length, nZwr: Object.keys(zwrot).length,
-            nImport: wOrd.length, nWierszy: nWierszy
+            nImport: wOrd.length, nWierszy: nWierszy,
+            zrodlo: zrodlo
         };
     }
     // ---------- ManoMano: pobieranie zestawien z panelu ----------
@@ -19105,12 +19130,12 @@
         const bad = [];
         if (j.amount != null && !eq(p.suma, j.amount))
             bad.push('suma z rozliczenia ' + f2(p.suma) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
-        const blokK = manoBrakKont(j);
-        if (blokK) bad.push(blokK);
+        // Brak konta w tabeli NIE wstrzymuje ksiegowania — plik i tak idzie bez zmian.
+        // Zostaje w adnotacji, zeby bylo widac, ze podglad jest niepelny.
         j.status = bad.length ? 'partial' : 'ready';
         j.msg = bad.join('; ');
         j.note = 'rozliczenie ' + p.payRef + ' · ' + manoNota(p) + (p.niepewne.length
-            ? (' · ' + p.niepewne.length + ' zam. bez rozstrzygnięcia typu — NIE ma ich w imporcie')
+            ? (' · ' + p.niepewne.length + ' zam. bez rozstrzygnięcia typu — sprawdź im konto')
             : '');
         return bad;
     }
@@ -19118,21 +19143,27 @@
         const t = p.licz;
         return 'ManoMano ' + p.kraj.toUpperCase() + ' ' + p.payRef + ' — '
             + ((j.data && j.data.how) || 'wczytane') + ' · '
-            + 'do importu ' + p.nImport + ' zam. na ' + f2(p.brutto) + ' ' + p.cur
-            + ' (B2C ' + (t['B2C'] || 0)
-            + (p.kraj === 'de' ? (', B2B 19% ' + (t['B2B'] || 0)) : (', B2B 0% ' + (t['B2B 0%'] || 0))) + ')'
+            + 'plik idzie bez zmian (' + p.nWierszy + ' wierszy, ' + p.nOrd + ' zam. brutto '
+            + f2(p.brutto) + ' ' + p.cur + ') · rozpoznane typy: '
+            + 'B2C ' + (t['B2C'] || 0)
+            + (p.kraj === 'de' ? (', B2B 19% ' + (t['B2B'] || 0)) : (', B2B 0% ' + (t['B2B 0%'] || 0)))
             + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum)) : '')
             + (p.niepewne.length ? (' · ⚠ ' + p.niepewne.length + ' bez rozstrzygnięcia typu: '
                 + p.niepewne.slice(0, 3).map(function (x){ return x.id; }).join(', ')
                 + (p.niepewne.length > 3 ? ' i ' + (p.niepewne.length - 3) + ' więcej' : '')
-                + ' — te zamówienia NIE trafiły do pliku importu, zaksięguj je ręcznie') : '')
+                + ' — sprawdź im konto po zaksięgowaniu') : '')
             + (j.msg ? ('. ' + j.msg) : '.');
     }
+    // Do prologistics idzie plik ManoMano DOKLADNIE TAKI, JAKI PRZYSZEDL — te same
+    // 23 kolumny, te same wiersze, ta sama kolejnosc, bez BOM-u i bez zmiany koncow linii.
+    // Prologistics ma wlasny parser tego formatu (osobny booking_setting), wiec kazde
+    // przepisanie pliku psuloby import. Wczesniejsza wersja budowala uklad prologistics
+    // jak przy Amazonie — to bylo bledne zalozenie i stad ta zmiana.
+    //
+    // Klasyfikacja B2B/B2C NIE ZNIKA: zostaje jako raport w panelu (ktore zamowienia sa
+    // B2B 19%, ktorych nie umiem rozstrzygnac), ale nie dotyka juz tresci pliku.
     function mkCsvMano(p){
-        const linie = ((p && p.wOrd) || []).map(function (x){
-            return (x.r || []).map(function (c){ return (c == null) ? '' : String(c); }).join(';');
-        });
-        return '﻿' + linie.join('\r\n') + '\r\n';
+        return (p && p.csvImport) || '';
     }
     // Bramka przed wygenerowaniem pliku — ta sama zasada co przy Amazonie: lepiej nie dac
     // pliku wcale niz dac go z pusta kolumna konta. Doszedl trzeci powod: zamowienia,
@@ -19149,11 +19180,18 @@
         if (kb.length) cz.push('brak konta VAT dla: '
             + kb.map(function (x){ return x + ' (' + b[x] + ' zam.)'; }).join(', '));
         if (!cz.length) return '';
-        return cz.join(' · ') + ' — uzupełnij tabelę MK_MM_ACC w skrypcie, pliku nie generuję';
+        // v4.04: to jest juz tylko UWAGA DO RAPORTU, a nie zapora. Konta nie ida do pliku
+        // importu — plik jest przepuszczany bez zmian, a konta przypisuje prologistics.
+        // Brak wpisu w MK_MM_ACC psuje wiec wylacznie podglad, nie ksiegowanie.
+        return cz.join(' · ') + ' — uzupełnij tabelę MK_MM_ACC w skrypcie (dotyczy tylko podglądu)';
     }
     // Zdanie podsumowujace, wspolne dla komunikatu przy wczytaniu i dla adnotacji zlecenia.
     function manoNota(p){
         const cz = [];
+        // Suma w pliku importu NIE rowna sie wyplacie i tak ma byc: do importu ida same
+        // wiersze ORDER, a wyplate obniżaja jeszcze zwroty, korekty VAT, abonament
+        // i potracenia. Rozpisujemy to, zeby roznica nie wygladala na blad.
+        cz.push('do importu ' + p.nOrdW + ' wierszy ORDER na ' + f2(p.impNet) + ' netto');
         cz.push('brutto ' + f2(p.brutto) + ' − prowizja ' + f2(p.prowizja));
         if (Math.abs(p.korekty) > 0.005) cz.push('korekty VAT ' + f2(p.korekty));
         if (Math.abs(p.zwrotSum) > 0.005) cz.push('zwroty ' + p.nZwr + ' na ' + f2(p.zwrotSum)
@@ -24910,7 +24948,10 @@
     }
     function doCsv(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
-        const blok = (j.kind === 'amz') ? amzBrakKont(j) : ((j.kind === 'mano') ? manoBrakKont(j) : '');
+        const blok = (j.kind === 'amz') ? amzBrakKont(j)
+                   : ((j.kind === 'mano' && j.data && j.data.mano && !j.data.mano.impOk)
+                        ? 'w pliku ManoMano nie zgadza się liczba wierszy ORDER — nie generuję pliku'
+                        : '');
         if (blok){ say(blok, '#c00'); return; }
         const blob = csvBlob(j);
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
