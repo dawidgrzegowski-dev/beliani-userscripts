@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      3.99
+// @version      4.00
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -18945,9 +18945,10 @@
     // trzyma identyfikator i referencje na roznych poziomach i porownanie „oba pola w tym
     // samym obiekcie" by go przegapilo. Zamiast tego dla kazdego wezla liczymy, co siedzi
     // w calym jego poddrzewie, i uznajemy za wyplate ten wezel, ktory zawiera DOKLADNIE
-    // JEDNA referencje — bo wtedy na pewno opisuje jeden dokument, a nie cala liste.
-    // Z kilku takich wezlow dla tej samej referencji bierzemy NAJWEZSZY, czyli ten
-    // z najmniejsza liczba identyfikatorow: on jest najblizej samego dokumentu.
+    // JEDNA referencje — bo wtedy opisuje jeden dokument, a nie cala liste. Z kilku takich
+    // wezlow dla tej samej referencji bierzemy NAJWEZSZY, czyli ten z najmniejsza liczba
+    // identyfikatorow: on jest najblizej samego dokumentu.
+    // Sprawdzone na siedmiu ukladach odpowiedzi, jakie takie API zwykle zwraca.
     function mmZnajdzPayouty(dane){
         const kand = {};
         (function chodz(x){
@@ -18972,6 +18973,8 @@
             }
             return { u: u, r: r };
         })(dane);
+        // Najnowsza wyplata pierwsza — referencja zawiera date, wiec sortowanie malejaco
+        // po napisie daje porzadek chronologiczny.
         return Object.keys(kand).sort().reverse().map(function (k){
             return { uuid: kand[k].uuid, ref: kand[k].ref };
         });
@@ -19022,7 +19025,7 @@
         if (!todo.length) return 0;
         const blok = mmBrakTokena();
         if (blok){
-            todo.forEach(function (k){ jobs[k].status = 'err'; jobs[k].msg = mkLink(blok); });
+            todo.forEach(function (k){ jobs[k].status = 'err'; jobs[k].msg = blok; });
             jobsSave(jobs); render();
             say('ManoMano: ' + blok, '#c47f00');
             return 0;
@@ -19061,7 +19064,7 @@
                 ok++;
             } catch (e){
                 j.status = 'err';
-                j.msg = mkLink(withLogin(j, (e && e.message) || String(e)));
+                j.msg = withLogin(j, (e && e.message) || String(e));
             }
             jobsSave(jobs); render();
         }
@@ -23498,9 +23501,27 @@
                 if (j.status === 'done'){ say('Ta wypłata jest już zaksięgowana.', '#c47f00'); return; }
                 if (!j.shop) j.shop = p.shop;
                 if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
-                manoZastosuj(j, p, 'plik ' + f.name);
+                const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
+                j.data = { ebay: p, shop: p.shop, gross: p.gross, refund: p.refund,
+                           net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
+                           refNote: p.refNote, unknown: {}, skipped: {}, full: true, both: both,
+                           pays: 1, split: false, rows: p.nPos + p.nZwr, total: p.nPos + p.nZwr,
+                           pages: 1, how: 'plik ' + f.name };
+                j.status = j.data.netOk ? 'ready' : 'partial';
+                j.msg = j.data.netOk ? '' : ('wypłata z pliku ' + f2(p.net) + ' ' + p.cur
+                        + ' nie zgadza się z kwotą zlecenia ' + f2(j.amount) + ' ' + (j.cur || ''));
+                // Kwoty zamowien sa w walucie TRANSAKCJI, a wyplata w walucie konta —
+                // bez tej adnotacji rozjazd miedzy suma pozycji a wplata wyglada na blad.
+                j.note = 'kwoty zamówień w ' + (p.curTx || '—') + ', wypłata w ' + (p.cur || '—')
+                       + ' · prowizje i etykiety zwrotne są już potrącone w wypłacie i nie wchodzą na zamówienia';
                 jobsSave(jobs); render();
-                say(manoKomunikat(p, j), (j.status !== 'ready' || p.niepewne.length) ? '#c47f00' : '#0a7a2f');
+                say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
+                    + ': ' + p.shop + ' · wypłata nr ' + (p.payNo || '—') + ' z ' + (p.payDate || '—')
+                    + ' na ' + f2(p.net) + ' ' + p.cur
+                    + ' · zamówień ' + Object.keys(p.ord).length + ' na ' + f2(p.gross) + ' ' + p.curTx
+                    + (p.nZwr ? (' · zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund) + ' ' + p.curTx
+                                 + ' — idą na listę zwrotów') : ''),
+                    '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -23540,41 +23561,9 @@
                 j.ref = p.payRef;
                 j.shop = 'ManoMano ' + p.kraj.toUpperCase();
                 if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
-                const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
-                j.data = { mano: p, shop: j.shop, gross: p.brutto, refund: p.zwrotSum,
-                           net: p.suma, netOk: (j.amount == null) ? true : eq(p.suma, j.amount),
-                           ord: p.ord, ref: p.ref, refNote: p.refNote,
-                           unknown: {}, skipped: {}, full: true, both: both,
-                           pays: 1, split: false, rows: p.nWierszy, total: p.nWierszy,
-                           pages: 1, how: 'plik ' + f.name };
-                // Kontrola, ktora ma prawo wstrzymac ksiegowanie: suma NET_AMOUNT z pliku
-                // kontra kwota z wyciagu. Na czterech wyplatach z 08.08.2026 zgadzala sie
-                // co do grosza, wiec kazdy rozjazd znaczy, ze plik i wplata to nie ta sama
-                // wyplata — albo ze plik jest niekompletny.
-                const bad = [];
-                if (j.amount != null && !eq(p.suma, j.amount))
-                    bad.push('suma z rozliczenia ' + f2(p.suma) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
-                const blokK = manoBrakKont(j);
-                if (blokK) bad.push(blokK);
-                j.status = bad.length ? 'partial' : 'ready';
-                j.msg = bad.join('; ');
-                j.note = manoNota(p) + (p.niepewne.length
-                    ? (' · ' + p.niepewne.length + ' zam. bez rozstrzygnięcia typu — NIE ma ich w imporcie')
-                    : '');
+                manoZastosuj(j, p, 'plik ' + f.name);
                 jobsSave(jobs); render();
-                const t = p.licz;
-                say('ManoMano ' + p.kraj.toUpperCase() + ' ' + p.payRef + ' — wczytany · '
-                    + 'do importu ' + p.nImport + ' zam. na ' + f2(p.brutto) + ' ' + p.cur
-                    + ' (B2C ' + (t['B2C'] || 0)
-                    + (p.kraj === 'de' ? (', B2B 19% ' + (t['B2B'] || 0)) : (', B2B 0% ' + (t['B2B 0%'] || 0)))
-                    + ')'
-                    + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum)) : '')
-                    + (p.niepewne.length ? (' · ⚠ ' + p.niepewne.length + ' bez rozstrzygnięcia typu: '
-                        + p.niepewne.slice(0, 3).map(function (x){ return x.id; }).join(', ')
-                        + (p.niepewne.length > 3 ? ' i ' + (p.niepewne.length - 3) + ' więcej' : '')
-                        + ' — te zamówienia NIE trafiły do pliku importu, zaksięguj je ręcznie') : '')
-                    + (bad.length ? ('. ' + bad.join('; ')) : '.'),
-                    (bad.length || p.niepewne.length) ? '#c47f00' : '#0a7a2f');
+                say(manoKomunikat(p, j), (j.status !== 'ready' || p.niepewne.length) ? '#c47f00' : '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -30096,53 +30085,48 @@
     // zapytanie do browserapi.manomano.com niesie naglowek Authorization i wystarczy
     // zapamietac jego wartosc.
     //
-    // Ten modul NICZEGO NIE WYSYLA i niczego nie klika — tylko sluchа. Token zapisujemy
-    // przez GM_setValue, ktore jest wspolne dla wszystkich domen skryptu, wiec polowka
-    // na prologistics go widzi.
-    //
-    // Token zyje 12 godzin (exp - iat = 43 199 s), wiec jedno wejscie na panel starcza
-    // na caly dzien pracy.
+    // Ten modul NICZEGO NIE WYSYLA i niczego nie klika — tylko slucha. Token zapisujemy
+    // przez GM_setValue, wspolne dla wszystkich domen skryptu, wiec polowka na prologistics
+    // go widzi. Token zyje 12 godzin (exp - iat = 43 199 s), wiec jedno wejscie na panel
+    // starcza na caly dzien pracy.
     //
     // UWAGA na @run-at: skrypt startuje w document-idle, wiec pierwsze zapytania aplikacji
     // moga juz byc za nami. Nie szkodzi — panel odpytuje powiadomienia cyklicznie, wiec
     // token wpada w ciagu kilkunastu sekund. Zeby nie trzymac czlowieka w niepewnosci,
-    // pokazujemy maly znacznik w rogu, ktory mowi wprost, czy juz jest.
+    // pokazujemy w rogu maly znacznik, ktory mowi wprost, czy juz jest.
     function init_mmtok(){
         const KLUCZ = 'tm_mm_token_v1';
         let mam = false;
+        function chmurka(tekst, kolor, ile){
+            const d = document.createElement('div');
+            d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;background:'
+                + kolor + ';color:#fff;font:600 12px/1.4 system-ui,sans-serif;padding:7px 11px;'
+                + 'border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);cursor:pointer;max-width:280px';
+            d.textContent = tekst;
+            d.onclick = function(){ d.remove(); };
+            if (document.body) document.body.appendChild(d);
+            setTimeout(function(){ if (d.parentNode) d.remove(); }, ile);
+        }
         function zapisz(v){
-            const t = String(v || '');
+            const t = String(v || '').trim();
             if (!/^Bearer\s+[\w-]+\.[\w-]+\.[\w-]+$/.test(t)) return;
             let exp = 0;
             try {
                 const cz = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
                 exp = (JSON.parse(atob(cz + '==='.slice((cz.length + 3) % 4))).exp || 0) * 1000;
             } catch (e){ exp = 0; }
-            if (exp && exp < Date.now()) return;                  // przeterminowanego nie zapisujemy
+            if (exp && exp < Date.now()) return;              // przeterminowanego nie zapisujemy
             try { GM_setValue(KLUCZ, JSON.stringify({ tok: t, exp: exp, kiedy: Date.now() })); }
             catch (e){ return; }
-            if (!mam){ mam = true; znacznik(exp); }
-        }
-        function znacznik(exp){
-            let d = document.getElementById('mm-tok-badge');
-            if (!d){
-                d = document.createElement('div');
-                d.id = 'mm-tok-badge';
-                d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;'
-                    + 'background:#0a7a2f;color:#fff;font:600 12px/1.4 system-ui,sans-serif;'
-                    + 'padding:7px 11px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);'
-                    + 'cursor:pointer;max-width:280px';
-                d.onclick = function(){ d.remove(); };
-                document.body.appendChild(d);
-                setTimeout(function(){ if (d.parentNode) d.remove(); }, 12000);
-            }
-            d.textContent = '✓ HUB ma sesję ManoMano'
+            if (mam) return;
+            mam = true;
+            chmurka('✓ HUB ma sesję ManoMano'
                 + (exp ? (' — ważna do ' + new Date(exp).toLocaleTimeString('pl-PL').slice(0, 5)) : '')
-                + '. Możesz wrócić do prologistics.';
+                + '. Możesz wrócić do prologistics.', '#0a7a2f', 12000);
         }
         // Hookujemy OBIE drogi, bo panel uzywa i fetch (customFetch), i XHR (axios).
-        // Zapytania ida potem przez service workera batching.js, ale naglowek jest
-        // ustawiany PRZED nim, na poziomie strony — wiec tutaj go widzimy.
+        // Zapytania ida potem przez service workera batching.js, ale naglowek ustawiany jest
+        // PRZED nim, na poziomie strony — wiec tutaj go widac.
         const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
         try {
             const staryFetch = W.fetch;
@@ -30152,12 +30136,12 @@
                         let a = '';
                         if (opc && opc.headers){
                             const h = opc.headers;
-                            a = (typeof h.get === 'function') ? (h.get('authorization') || h.get('Authorization') || '')
-                                                              : (h.Authorization || h.authorization || '');
-                        } else if (wej && typeof wej === 'object' && wej.headers
-                                   && typeof wej.headers.get === 'function'){
-                            a = wej.headers.get('authorization') || '';
+                            a = (typeof h.get === 'function')
+                                ? (h.get('authorization') || h.get('Authorization') || '')
+                                : (h.Authorization || h.authorization || '');
                         }
+                        if (!a && wej && typeof wej === 'object' && wej.headers
+                            && typeof wej.headers.get === 'function') a = wej.headers.get('authorization') || '';
                         if (a) zapisz(a);
                     } catch (e){}
                     return staryFetch.apply(this, arguments);
@@ -30165,28 +30149,20 @@
             }
         } catch (e){}
         try {
-            const staryHdr = W.XMLHttpRequest && W.XMLHttpRequest.prototype
-                             && W.XMLHttpRequest.prototype.setRequestHeader;
+            const proto = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
+            const staryHdr = proto && proto.setRequestHeader;
             if (typeof staryHdr === 'function'){
-                W.XMLHttpRequest.prototype.setRequestHeader = function (n, v){
+                proto.setRequestHeader = function (n, v){
                     try { if (String(n).toLowerCase() === 'authorization') zapisz(v); } catch (e){}
                     return staryHdr.apply(this, arguments);
                 };
             }
         } catch (e){}
-        // Gdy po 20 s nic nie wpadlo, mowimy co zrobic — cisza jest tu najgorsza.
+        // Cisza jest tu najgorsza — po 20 s bez trafienia mowimy wprost, co zrobic.
         setTimeout(function(){
             if (mam) return;
-            let d = document.createElement('div');
-            d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;'
-                + 'background:#c47f00;color:#fff;font:600 12px/1.4 system-ui,sans-serif;'
-                + 'padding:7px 11px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);'
-                + 'cursor:pointer;max-width:280px';
-            d.textContent = 'HUB jeszcze nie widzi sesji ManoMano — kliknij cokolwiek w panelu '
-                + '(np. Finance), to wystarczy.';
-            d.onclick = function(){ d.remove(); };
-            document.body.appendChild(d);
-            setTimeout(function(){ if (d.parentNode) d.remove(); }, 15000);
+            chmurka('HUB jeszcze nie widzi sesji ManoMano — kliknij cokolwiek w panelu '
+                + '(np. Finance), to wystarczy.', '#c47f00', 15000);
         }, 20000);
     }
 
