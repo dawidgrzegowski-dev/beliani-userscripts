@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.05
+// @version      4.06
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25134,6 +25134,8 @@
         await Promise.all(robot);
     }
     function amzTypBox(){ return $('#mk-typ-box'); }
+    // Wynik ostatniego poprawiania, per zlecenie — pokazywany na tabelce typow.
+    const mkTypMsg = {};
     function amzTypRender(ref){
         const box = amzTypBox(); if (!box) return;
         const lista = mkTyp[ref] || [];
@@ -25148,12 +25150,19 @@
         const ok = poAuf('ok').length;
         const reczne = poAuf('reczne');
         const konta = poAuf('konta');
-        const bad = poAuf('blad').concat(lista.filter(function (x){ return x.st === 'brak'; })
+        const bad = poAuf('blad').concat(poAuf('nieznane'))
+                                 .concat(lista.filter(function (x){ return x.st === 'brak'; })
                                               .map(function (x){ return { x: x, w: { msg: x.msg } }; }));
         const wielo = lista.filter(function (x){ return (x.aufs || []).length > 1; });
         box.style.display = 'block';
+        const km = mkTypMsg[ref];
         let h = '<div style="font-size:11px;font-weight:700;color:#92400e;margin-bottom:4px">'
               + 'Typ klienta — rozliczenie ' + esc(ref) + '</div>'
+              + (km ? ('<div style="font-size:11px;margin:0 0 6px;padding:6px 9px;border-radius:6px;'
+                    + 'background:' + (km.zle ? '#fffbeb' : '#f0fdf4') + ';border:1px solid '
+                    + (km.zle ? '#fcd34d' : '#86efac') + ';color:' + (km.zle ? '#92400e' : '#166534') + '">'
+                    + (km.zle ? '⚠ ' : '✔ ') + esc(km.tekst) + ' <span style="color:#888">('
+                    + esc(km.kiedy) + ')</span></div>') : '')
               + '<div style="font-size:11px;margin-bottom:6px">zamówień <b>' + lista.length + '</b>'
               + ' · auftragów <b>' + (ok + zle.length + reczne.length + konta.length + poAuf('blad').length) + '</b>'
               + ' · zgodnych <b style="color:#0a7a2f">' + ok + '</b>'
@@ -25450,7 +25459,7 @@
                 });
                 // Status zamowienia = najgorszy ze statusow jego auftragow. Kolejnosc wagi:
                 // cokolwiek do poprawy przebija wszystko inne.
-                const waga = { zle: 4, blad: 3, konta: 2, reczne: 1, ok: 0 };
+                const waga = { zle: 4, blad: 3, nieznane: 3, konta: 2, reczne: 1, ok: 0 };
                 x.st = x.aufs.reduce(function (a, w){ return (waga[w.st] > waga[a]) ? w.st : a; }, 'ok');
                 x.jest = x.aufs.map(function (w){ return w.jest || '?'; }).join(' / ');
                 x.selling = x.aufs.map(function (w){ return w.selling || '?'; }).join(' / ');
@@ -25492,7 +25501,7 @@
             + (wybrane.length > 10 ? ('\n  … i ' + (wybrane.length - 10) + ' więcej') : '')
             + '\n\nTego się nie cofa jednym kliknięciem.')) return;
         btn.disabled = true;
-        let ok = 0, zleN = 0, i = 0;
+        let ok = 0, zleN = 0, nieznane = 0, i = 0;
         for (const p of wybrane){
             i++;
             const etyk = p.w.ff || p.x.order;
@@ -25503,18 +25512,46 @@
                 // wtedy, gdy nic nie zmienil. Czytamy PONOWNIE CALA liste i szukamy TEGO
                 // auftragu po numerze: przy zamowieniu rozbitym na wysylki odczyt „pierwszego
                 // z brzegu" potwierdzalby cudza zmiane.
-                const po = await window.__TM_CUSTOMER_TYPE.readAll(p.x.order);
-                const ten = (po && po.ok && po.list) ? po.list.filter(function (a){ return a.number === p.w.number; })[0] : null;
+                //
+                // v4.06: odczyt idzie TA SAMA DROGA co sprawdzanie, czyli po ADRESIE auftragu.
+                // Wczesniej potwierdzenie wolalo readAll bez adresu i szlo przez wyszukiwarke.
+                // Przy Amazonie to dziala, bo wyszukiwarka zna jego numery zamowien. Numeru
+                // ManoMano („M260792298058") nie znajduje — lista wracala pusta, dopasowanie
+                // po numerze auftragu nie mialo na czym zadzialac i UDANA zmiana byla
+                // meldowana jako nieudana. Adres mamy w zleceniu od poczatku, wiec go uzywamy.
+                const gdzie = p.x.url ? [location.origin + p.x.url]
+                            : (p.w.auctionUrl ? [p.w.auctionUrl] : null);
+                const po = await window.__TM_CUSTOMER_TYPE.readAll(p.x.order, gdzie);
+                const lst = (po && po.ok && po.list) ? po.list : [];
+                // Dopasowanie po numerze auftragu; gdy odczyt oddal DOKLADNIE JEDEN auftrag,
+                // to jest ten, o ktory prosilismy adresem — wtedy numer nie musi sie zgadzac
+                // co do znaku (paczka i strona auftragu potrafia go zapisac inaczej).
+                let ten = lst.filter(function (a){ return a.number === p.w.number; })[0];
+                if (!ten && lst.length === 1) ten = lst[0];
                 const udane = !!(ten && String(ten.current || '').toUpperCase() === p.x.chce.toUpperCase());
                 if (udane){ p.w.st = 'ok'; p.w.jest = ten.current; ok++; }
-                else { p.w.msg = 'po zmianie nadal ' + ((ten && ten.current) || '?'); zleN++; }
+                else if (!lst.length){
+                    // Rozroznienie, ktorego brakowalo: „nie umiem sprawdzic" to nie to samo
+                    // co „zmiana nie przeszla". Pierwsze wymaga zajrzenia, drugie poprawki.
+                    p.w.st = 'nieznane';
+                    p.w.msg = 'zmiana wysłana, ale nie odczytałem auftragu z powrotem — sprawdź go wzrokowo';
+                    nieznane++;
+                } else { p.w.msg = 'po zmianie nadal ' + ((ten && ten.current) || '?'); zleN++; }
             } catch (e){ p.w.msg = (e && e.message) || String(e); zleN++; }
         }
         btn.disabled = false;
+        // Wynik zostaje PRZY TABELCE, a nie tylko na pasku stanu pod panelem. Pasek jest
+        // jeden na caly modul i nadpisuje go pierwsza nastepna czynnosc — a to jest
+        // informacja, do ktorej wraca sie po chwili, patrzac wlasnie na te tabelke.
+        const cz = ['Poprawione: ' + ok + ' z ' + wybrane.length];
+        if (zleN) cz.push('nie przeszło: ' + zleN);
+        if (nieznane) cz.push('wysłane, ale niepotwierdzone: ' + nieznane);
+        mkTypMsg[ref] = { tekst: cz.join(' · ') + '.',
+                          zle: !!(zleN || nieznane),
+                          kiedy: new Date().toLocaleTimeString('pl-PL').slice(0, 5) };
         amzTypRender(ref);
-        say('Typ klienta poprawiony na ' + ok + ' z ' + wybrane.length + ' auftragach'
-            + (zleN ? ('. Nie udało się: ' + zleN + ' — sprawdź je ręcznie') : '') + '.',
-            zleN ? '#c47f00' : '#0a7a2f');
+        say(mkTypMsg[ref].tekst + (zleN || nieznane ? ' Szczegóły w tabelce typów.' : ''),
+            (zleN || nieznane) ? '#c47f00' : '#0a7a2f');
     }
     function doCopyRef(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
