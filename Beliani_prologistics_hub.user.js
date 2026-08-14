@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.14
+// @version      4.22
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -1066,6 +1066,11 @@
 
     const BASE = 'https://www.prologistics.info';
     const SEARCH_URL = `${BASE}/search.php?express`;
+    // Wersja HUB-A, nie wlasny numerek modulu. Dotad w naglowku stalo wpisane na sztywno
+    // „v3.62" — nie zmieniane od wersji do wersji, wiec mowilo nieprawde o tym, co jest
+    // wgrane, i przy zglaszaniu bledow mylilo. Trzy inne moduly czytaja to tak samo.
+    const TM_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+                 ? GM_info.script.version : '?';
 
     let previewRows = [];
     let tmIsBusy = false;
@@ -2074,7 +2079,7 @@
     `;
 
     panel.innerHTML = `
-        <div style="font-weight:bold;margin-bottom:8px;color:#111;font-size:15px;">🎫 Księgowanie Money back w tickecie <span style="font-weight:normal;font-size:11px;color:#750000;">v3.62</span></div>
+        <div style="font-weight:bold;margin-bottom:8px;color:#111;font-size:15px;">🎫 Księgowanie Money back w tickecie <span style="font-weight:normal;font-size:11px;color:#750000;">HUB v${TM_VER}</span></div>
         <div style="font-size:11px;color:#666;margin-bottom:8px;">
             Obsługiwane formaty: stary E/O, nowy H/J, nagłówki Order Number + Sum of Y + AG, duże przerwy kolumnowe, Goodwill przed kwotą. Kwoty 0 są pomijane.
         </div>
@@ -2102,6 +2107,7 @@
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
             <button id="tm-t-check-btn" style="flex:1;min-width:180px;padding:9px;background:#332524;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">🔍 Sprawdź ordery</button>
             <button id="tm-t-clear-btn" style="width:120px;padding:9px;background:#750000;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">🧹 Wyczyść</button>
+            <button id="tm-t-log-btn" title="Zapisuje plik .txt z przebiegiem: każde wczytanie strony (fetch czy ramka, ile ms), każdy krok workerów i podsumowanie. Do wklejenia w rozmowie z Claude." style="width:110px;padding:9px;background:#fff;color:#750000;border:1px solid #750000;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">📄 Log</button>
         </div>
         <div style="margin-top:8px;padding:8px;background:#F6E7E6;border:1px solid #FFCCB7;border-radius:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
             <span style="font-size:12px;color:#750000;font-weight:bold;">⚙️ Księgowanie równoległe:</span>
@@ -2109,6 +2115,7 @@
             <input id="tm-t-parallel-workers" type="number" min="1" max="10" value="5" style="width:55px;padding:4px 6px;border:1px solid #750000;border-radius:4px;font-size:12px;text-align:center;">
             <label style="font-size:11px;color:#750000;white-space:nowrap;" title="Mnożnik wszystkich timeoutów na ładowanie/akcje. 1 = standard (20s). 3 = 60s. Zwiększ gdy serwer jest wolny / dużo workerów.">×&nbsp;timeout:</label>
             <input id="tm-t-timeout-mult" type="number" min="1" max="10" step="0.5" value="3" style="width:55px;padding:4px 6px;border:1px solid #750000;border-radius:4px;font-size:12px;text-align:center;" title="Mnożnik timeoutów: 1=20s, 2=40s, 3=60s. Zwiększ przy wielu workerach.">
+            <label style="font-size:11px;color:#750000;white-space:nowrap;cursor:pointer;" title="Strony, z ktorych tylko CZYTAMY, pobieraj przez fetch zamiast ladowac je do ramki. Ramka wykonuje JavaScript strony i dociaga ~8 MB danych, ktorych nie potrzebujemy — pomiar z 14.08: 38 s na jedna strone ticketu. fetch pobiera sam HTML, ~2 s. Zapisy i tak ida stara droga. Odznacz, jesli cokolwiek zacznie sie dziwnie zachowywac."><input type="checkbox" id="tm-t-fetch-read" checked style="vertical-align:middle;"> szybki&nbsp;odczyt</label>
             <button id="tm-t-check-and-book-parallel-btn" style="flex:1;min-width:240px;padding:7px;background:#FF2F00;color:white;border:none;border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold;">🚀 Sprawdź i zaksięguj RÓWNOLEGLE</button>
             <span style="font-size:10px;color:#750000;font-style:italic;width:100%;">Uwaga: kilka requestów do serwera jednocześnie. Zacznij od 2-3 workerów; jeśli stabilnie, zwiększ. Przy 6-10 workerach ustaw ×&nbsp;timeout na 2-3 (serwer wolniej odpowiada pod obciążeniem).</span>
         </div>
@@ -2173,10 +2180,21 @@
     const iframe = defaultFrameCtx.iframe; // alias dla wstecznej zgodności
 
     function getFrameDoc(ctx = defaultFrameCtx) {
+        // Strona pobrana fetch-em zyje w dokumencie odlaczonym — oddajemy wlasnie ja.
+        if (ctx._doc) return ctx._doc;
         return ctx.iframe.contentDocument || ctx.iframe.contentWindow.document;
     }
 
     function getFrameWin(ctx = defaultFrameCtx) {
+        // ZABEZPIECZENIE. Okno ramki sluzy wylacznie do ZAPISU (klikniecia, zmiany pol).
+        // Gdy biezaca strona pochodzi z fetch-a, zyje w dokumencie odlaczonym od ramki —
+        // pisanie przez to okno trafialoby w zupelnie inna strone. Zamiast zrobic to po
+        // cichu, przerywamy z jasnym komunikatem: znaczy on, ze ktorys odczyt zostal
+        // przelaczony na fetch, choc po nim NASTEPUJE zapis, i trzeba go z tego wylaczyc.
+        if (ctx._doc) {
+            throw new Error('Zapis do strony wczytanej fetch-em — ten odczyt musi zostać na ramce '
+                          + '(odznacz „szybki odczyt", żeby pracować dalej)');
+        }
         return ctx.iframe.contentWindow;
     }
 
@@ -2230,7 +2248,160 @@
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // ====================== LOG PRZEBIEGU (v4.16) ======================
+    // Ten sam pomysl co w module marketplace, ale wlasny — bo ten modul da sie
+    // uruchomic BEZ tamtego (wklejka wprost do panelu) i wtedy tamten log nie powstaje.
+    // Najwazniejsza czesc to czasy wczytywania stron: przy kazdym zapisujemy, ktora
+    // droga poszlo (fetch czy ramka) i ile trwalo. Na tym opiera sie ocena etapu 1.
+    const KS_LOG_MAX = 5000;
+    const ksLogi = [];
+    function ksLog(faza, tekst){
+        ksLogi.push({ t: Date.now(), faza: String(faza || ''), tekst: String(tekst == null ? '' : tekst) });
+        if (ksLogi.length > KS_LOG_MAX) ksLogi.splice(0, ksLogi.length - KS_LOG_MAX);
+    }
+    // Z dlugiego adresu zostawiamy to, co cokolwiek mowi: plik i identyfikator.
+    function ksUrlKrotko(u){
+        const t = String(u || '');
+        const m = t.match(/\/([a-z_]+\.php)(?:\?([^#]*))?/i);
+        if (!m) return t.slice(0, 80);
+        const q = (m[2] || '').split('&').filter(function (p){
+            return /^(rma_id|number|ff_number|what|txnid)=/.test(p) && !/=$/.test(p);
+        }).join('&');
+        return m[1] + (q ? ('?' + q) : '');
+    }
+    function ksLogCzas(ms){
+        const d = new Date(ms);
+        const p = function (n, w){ let x = String(n); while (x.length < (w || 2)) x = '0' + x; return x; };
+        return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+    }
+    function ksLogTekst(){
+        if (!ksLogi.length) return 'Log jest pusty — w tej karcie nic jeszcze nie ksiegowano.\n';
+        const L = [], t0 = ksLogi[0].t, tN = ksLogi[ksLogi.length - 1].t;
+        L.push('HUB — log modulu „Ksiegowanie w tickecie"');
+        L.push('wersja HUB : ' + (typeof GM_info !== 'undefined' && GM_info.script ? GM_info.script.version : '?'));
+        L.push('zapisany   : ' + new Date().toISOString());
+        L.push('wpisow     : ' + ksLogi.length + (ksLogi.length >= KS_LOG_MAX ? '  (bufor pelny)' : ''));
+        L.push('caly przebieg: ' + ((tN - t0) / 1000).toFixed(1) + ' s');
+        // Podsumowanie tego, po co ten log powstal: ile stron poszlo ktora droga.
+        let nF = 0, nR = 0, msF = 0, msR = 0;
+        ksLogi.forEach(function (e){
+            const m = e.tekst.match(/^(fetch|ramka)\s+(\d+) ms/);
+            if (!m) return;
+            if (m[1] === 'fetch'){ nF++; msF += +m[2]; } else { nR++; msR += +m[2]; }
+        });
+        if (nF || nR){
+            L.push('');
+            L.push('wczytania stron:');
+            if (nF) L.push('   fetch : ' + nF + ' szt., srednio ' + Math.round(msF / nF) + ' ms, razem ' + (msF / 1000).toFixed(1) + ' s');
+            if (nR) L.push('   ramka : ' + nR + ' szt., srednio ' + Math.round(msR / nR) + ' ms, razem ' + (msR / 1000).toFixed(1) + ' s');
+        }
+        L.push('');
+        L.push('Kolumny: [godzina] +sekundy_od_startu  FAZA  tresc');
+        L.push('==============================================================================');
+        let poprz = t0;
+        ksLogi.forEach(function (e){
+            const luka = e.t - poprz;
+            if (luka > 5000) L.push('        … cisza ' + (luka / 1000).toFixed(1) + ' s …');
+            poprz = e.t;
+            let sek = '+' + ((e.t - t0) / 1000).toFixed(1);
+            while (sek.length < 9) sek = ' ' + sek;
+            let fz = String(e.faza);
+            while (fz.length < 8) fz = fz + ' ';
+            L.push('[' + ksLogCzas(e.t) + '] ' + sek + '  ' + fz + '  ' + e.tekst);
+        });
+        L.push('==============================================================================');
+        return L.join('\n') + '\n';
+    }
+    function ksLogZapisz(){
+        const d = new Date(), p = function (n){ return String(n).length < 2 ? ('0' + n) : String(n); };
+        const nazwa = 'HUB-log-ticket-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate())
+                    + '-' + p(d.getHours()) + p(d.getMinutes()) + '.txt';
+        const blob = new Blob([ksLogTekst()], { type: 'text/plain;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob); a.download = nazwa;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+    }
+    // Kroki modulu. Wiersze sa nie tylko DOPISYWANE, ale i NADPISYWANE w miejscu
+    // (jeden wiersz na workera zmienia sie kilka razy), wiec sledzimy TRESC kazdego
+    // wiersza po indeksie — dokladnie tak, jak w module marketplace.
+    // Uchwyt na funkcje czytajaca trzymamy w osobnej zmiennej. setInterval oddaje
+    // LICZBE, a ten modul pracuje w 'use strict' — dopisanie do niej wlasnosci rzuca
+    // TypeError. W 4.16 wywracalo to caly przebieg tuz po starcie.
+    let _ksProbIv = null, _ksProbCzytaj = null;
+    function ksProbStart(){
+        if (_ksProbIv) return;
+        const ostTekst = [];
+        const czytaj = function (){
+            const list = document.getElementById('tm-t-progress-list');
+            if (!list) return;
+            const ds = list.querySelectorAll('div');
+            if (ds.length < ostTekst.length) ostTekst.length = ds.length;
+            for (let i = 0; i < ds.length; i++){
+                const t = String(ds[i].textContent || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length > 300 || ostTekst[i] === t) continue;
+                ostTekst[i] = t;
+                ksLog('krok', t);
+            }
+        };
+        _ksProbCzytaj = czytaj;
+        _ksProbIv = setInterval(czytaj, 400);
+    }
+    function ksProbStop(){
+        if (!_ksProbIv) return;
+        try { if (_ksProbCzytaj) _ksProbCzytaj(); } catch (e){}
+        clearInterval(_ksProbIv); _ksProbIv = null; _ksProbCzytaj = null;
+    }
+
+    // ================== ODCZYT STRONY BEZ RENDEROWANIA (v4.15) ==================
+    // Ramka wczytuje strone tak, jak zrobilby to czlowiek: wykonuje jej JavaScript,
+    // a ten dociaga swoje ~8 MB JSON-a i renderuje calosc. Pomiar z 14.08 na rma.php:
+    // DOMContentLoaded po 36,8 s, load po 38,4 s — JEDNA strona, w zwyklej karcie.
+    // Przy pieciu workerach w ramkach dawalo to 107-167 s na pozycje i timeouty.
+    //
+    // fetch pobiera SAM TEKST (1,3 MB), a DOMParser buduje z niego dokument ODLACZONY
+    // od strony: nie wykonuje skryptow, nie odpala zdarzen, nie zamawia niczego wiecej.
+    // Dla czytajacego kodu to zwykly Document — reszta modulu nie widzi roznicy.
+    //
+    // Uzywamy tego WYLACZNIE tam, gdzie po wczytaniu nic nie jest zapisywane. Zapisy
+    // dzialaja na ZYWYM dokumencie ramki i musza zostac na starej drodze.
+    function ksFetchOn(){
+        const el = document.getElementById('tm-t-fetch-read');
+        return el ? !!el.checked : true;
+    }
+    // Zwraca true, gdy strone udalo sie pobrac fetch-em (wtedy nie trzeba czekac na
+    // skrypty), false gdy trzeba bylo wrocic do ramki.
+    async function loadForRead(url, ms = 20000, ctx = defaultFrameCtx) {
+        if (!ksFetchOn()){ await loadInFrame(url, ms, ctx); return false; }
+        const t0 = performance.now();
+        const limit = Math.round((ms || 20000) * tmTimeoutMultiplier);
+        const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const tm = setTimeout(function (){ if (ctrl) try { ctrl.abort(); } catch (e){} }, limit);
+        try {
+            const res = await fetch(url, { credentials: 'same-origin',
+                                           signal: ctrl ? ctrl.signal : undefined });
+            if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
+            const txt = await res.text();
+            ctx._doc = new DOMParser().parseFromString(txt, 'text/html');
+            const ms = performance.now() - t0;
+            recordServerTiming('loadForRead', ms);
+            try { ksLog('odczyt', 'fetch ' + Math.round(ms) + ' ms  ' + ksUrlKrotko(url)); } catch (e){}
+            return true;
+        } catch (e) {
+            // Nie udalo sie — wracamy na ramke. Szybka droga nigdy nie moze zablokowac
+            // ksiegowania; najgorsze, co wolno jej zrobic, to byc rownie wolna jak stara.
+            ctx._doc = null;
+            try { ksLog('odczyt', 'fetch NIEUDANY (' + ((e && e.message) || e) + ') → wracam na ramkę  ' + ksUrlKrotko(url)); } catch (e2){}
+            await loadInFrame(url, ms, ctx);
+            return false;
+        } finally { clearTimeout(tm); }
+    }
+
     function loadInFrame(url, ms = 20000, ctx = defaultFrameCtx) {
+        // Prawdziwe wczytanie uniewaznia dokument pobrany fetch-em. To jest zawias calego
+        // zabezpieczenia: kazda sciezka zapisu zaczyna sie od loadInFrame, wiec po niej
+        // getFrameDoc znow oddaje ZYWY dokument ramki.
+        ctx._doc = null;
         const effectiveMs = Math.round(ms * tmTimeoutMultiplier);
         const t0 = performance.now();
         return new Promise((resolve, reject) => {
@@ -2238,6 +2409,7 @@
             const t = setTimeout(() => {
                 if (!done) {
                     done = true;
+                    try { ksLog('odczyt', 'ramka TIMEOUT po ' + effectiveMs + ' ms  ' + ksUrlKrotko(url)); } catch (e){}
                     reject(new Error('Timeout: ' + url));
                 }
             }, effectiveMs);
@@ -2245,7 +2417,9 @@
                 if (!done) {
                     done = true;
                     clearTimeout(t);
-                    recordServerTiming('loadInFrame', performance.now() - t0);
+                    const ms = performance.now() - t0;
+                    recordServerTiming('loadInFrame', ms);
+                    try { ksLog('odczyt', 'ramka ' + Math.round(ms) + ' ms  ' + ksUrlKrotko(url)); } catch (e){}
                     resolve();
                 }
             };
@@ -2434,7 +2608,66 @@
         return new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`).getTime() || 0;
     }
 
+    // Szukanie auftragu po numerze fulfilmentu ZWYKLYM GET-em. Wyszukiwarka niczego
+    // nie zmienia po stronie serwera — wypelnianie i wysylanie formularza w ramce bylo
+    // wylacznie sposobem dojscia do adresu, ktory da sie zlozyc samemu. Ta sama droga
+    // chodzi od dawna w module marketplace (crFind) przy potraceniach Wayfaira.
+    //
+    // Oszczedza DWA wczytania do ramki na pozycje: strone wyszukiwarki i nawigacje po
+    // submicie. W logu z 14.08 samo search.php to bylo 6 wczytan po srednio 7,5 s.
+    //
+    // Gdy GET nie da odpowiedzi (blad sieci, brak trafien, nieoczekiwana tresc),
+    // ZWRACAMY null i wracamy na formularz. „Nie znalazlem" z tej drogi nie jest
+    // wiarygodne na tyle, zeby na jego podstawie odpuscic pozycje.
+    // Kazdy odczyt auftragu w HUB-ie pyta z „txnid=3" — tak robi crRead w module
+    // marketplace, tak robi readAuftrag w module auftragu i taki adres oddawala dawna
+    // wyszukiwarka przez ramke. BEZ txnid strona auftragu pokazuje INNY widok, w ktorym
+    // nie ma sekcji ticketow. W 4.20 wycinalem z adresu sam numer i gubilem txnid —
+    // skutek: „nie znajduje ticketow, mimo ze sa".
+    function zTxnid(u) {
+        const t = String(u || '');
+        if (!t) return t;
+        if (/[?&]txnid=/i.test(t)) return t;
+        return t + (t.indexOf('?') >= 0 ? '&' : '?') + 'txnid=3';
+    }
+
+    async function searchByGet(ffNumber) {
+        const url = `${BASE}/search.php?what=ff_number&ff_number=` + encodeURIComponent(ffNumber);
+        const res = await fetch(url, { credentials: 'same-origin' });
+        if (!res || !res.ok) return null;
+        const html = await res.text();
+        // Przy jednym trafieniu serwer przekierowuje prosto na auftrag — widac to po res.url.
+        // Adres bierzemy CALY. Wycinanie z niego samego „auction.php?number=N" gubilo
+        // „&txnid=3" i psulo szukanie ticketow (4.20).
+        const finalUrl = String((res && res.url) || '');
+        if (/auction[.]php[?]/i.test(finalUrl) && !/shipping_auction/i.test(finalUrl)) {
+            return { ok: true, urls: [zTxnid(absoluteUrl(finalUrl))], count: 1 };
+        }
+        const d = new DOMParser().parseFromString(html, 'text/html');
+        const links = [...d.querySelectorAll('a[href*="auction.php?number="]')]
+            .map(a => zTxnid(absoluteUrl(a.getAttribute('href') || '')))
+            .filter(href => /auction[.]php[?]number=/i.test(href) && !/shipping_auction[.]php/i.test(href));
+        const uniq = [...new Set(links)];
+        if (!uniq.length) return null;                 // niepewne — niech sprawdzi formularz
+        return { ok: true, urls: uniq, count: uniq.length };
+    }
+
     async function searchAuctionUrls(ffNumber, ctx = defaultFrameCtx) {
+        if (ksFetchOn()) {
+            const t0 = performance.now();
+            try {
+                const r = await searchByGet(ffNumber);
+                if (r) {
+                    const ms = performance.now() - t0;
+                    recordServerTiming('searchByGet', ms);
+                    try { ksLog('odczyt', 'fetch ' + Math.round(ms) + ' ms  search.php?ff_number=' + ffNumber); } catch (e){}
+                    return r;
+                }
+                try { ksLog('odczyt', 'szukanie GET-em bez trafienia → formularz  ' + ffNumber); } catch (e){}
+            } catch (e) {
+                try { ksLog('odczyt', 'szukanie GET-em nieudane (' + ((e && e.message) || e) + ') → formularz'); } catch (e2){}
+            }
+        }
         await loadInFrame(SEARCH_URL, 20000, ctx);
         const doc = getFrameDoc(ctx);
         const win = getFrameWin(ctx);
@@ -2497,6 +2730,25 @@
     }
 
     function getTicketStatus(doc) {
+        // v4.17. NAJPIERW pytamy NATYWNY <select> o wybrana opcje — to jedyne zrodlo
+        // prawdziwe niezaleznie od tego, czy strone ktos wyrenderowal:
+        //   * w przegladarce Select2 trzyma natywny select w zgodzie ze soba (i to jego
+        //     zmienia setTicketStatus, wiec czytamy i piszemy przez TEN SAM element),
+        //   * na stronie pobranej fetch-em (v4.15) kontenery Select2 w ogole nie istnieja,
+        //     bo tworzy je JavaScript.
+        // Bez tego odczyt spadal do tekstu body, a tam NIEWYRENDEROWANY select oddaje
+        // wszystkie swoje opcje naraz („Status: OpenClosed…") — wzorzec lapal wiec zawsze
+        // pierwsza z brzegu i KAZDY ticket wygladal na „Open", takze zamkniety.
+        const sel = findTicketStatusSelect(doc);
+        if (sel && sel.options && sel.options.length) {
+            // selectedIndex dziala tez w dokumencie z DOMParsera, o ile serwer oznaczyl
+            // opcje atrybutem „selected"; gdyby nie oznaczyl, szukamy atrybutu wprost.
+            const wybrana = sel.options[sel.selectedIndex]
+                         || [...sel.options].find(o => o.hasAttribute('selected'));
+            const t = wybrana ? String(wybrana.textContent || '').trim() : '';
+            if (/closed/i.test(t)) return 'Closed';
+            if (/open/i.test(t)) return 'Open';
+        }
         const rendered = doc.querySelector('[id^="select2-ticket_status"][id$="-container"]') ||
             [...doc.querySelectorAll('.select2-selection__rendered')].find(x => /open|closed/i.test(x.getAttribute('title') || x.textContent || ''));
         const txt = rendered ? String(rendered.getAttribute('title') || rendered.textContent || '').trim() : '';
@@ -2783,8 +3035,11 @@
     }
 
     async function inspectTicketCandidate(ticket, auctionUrl, ctx = defaultFrameCtx) {
-        await loadInFrame(ticket.href, 20000, ctx);
-        await sleep(700);
+        // CZYSTY ODCZYT — nizej tylko czytamy dokument. To jest goraca sciezka: w logu
+        // z 14.08 „szukam ticketu…" trwalo 107-167 s na pozycje i to wlasnie te strony.
+        // Przy fetchu nie ma tez po co czekac na skrypty — nie ma ich kto uruchomic.
+        const zFetch = await loadForRead(ticket.href, 20000, ctx);
+        if (!zFetch) await sleep(700);
         const doc = getFrameDoc(ctx);
         const hasMoneBack = !!findSolutionSelect(doc);
         const creditNoteItems = getBrokenItemsWithCreditNote(doc);
@@ -2918,8 +3173,10 @@
         const ticketsByAuction = {}; // v3.33: linki ticketów z tego samego wejścia co Payments
         let anyDeleted = false;
         for (const auctionUrl of search.urls) {
-            await loadInFrame(auctionUrl, 20000, ctx);
-            await sleep(500);
+            // CZYSTY ODCZYT — nizej tylko sprawdzamy status auftragu, zbieramy linki
+            // ticketow i parsujemy tabele platnosci. Zadnego zapisu.
+            // Pomiar z 4.18: te trzy wczytania to bylo 28,9 s z 91,5 s calego przebiegu.
+            if (!await loadForRead(auctionUrl, 20000, ctx)) await sleep(500);
             if (isAuctionDeleted(getFrameDoc(ctx))) { anyDeleted = true; continue; } // Deleted -> nie księgujemy
             ticketsByAuction[auctionUrl] = getTicketLinks(ctx);
             const payments = parsePaymentsTable(getFrameDoc(ctx));
@@ -2993,8 +3250,8 @@
                     info8100: { amount: remSigned, booked: false, overTolerance: false },
                     error8100: r2.error, log, message: `VAT refund OK, reszta na 8100 NIE: ${r2.error}` };
             }
-            await loadInFrame(auctionUrl, 20000, ctx);
-            await sleep(700);
+            // CZYSTY ODCZYT — potwierdzenie po zaksiegowaniu reszty na 8100.
+            if (!await loadForRead(auctionUrl, 20000, ctx)) await sleep(700);
             payments = parsePaymentsTable(getFrameDoc(ctx));
             const remBooked = payments.rows.some(r => r.account === '8100' && Math.abs(Math.abs(r.amountNum) - Math.abs(remainder)) < 0.005) || payments.rows.length > rowsBefore2;
             info8100 = { amount: remSigned, booked: remBooked, overTolerance: false };
@@ -3045,8 +3302,8 @@
             if (preTickets && preTickets[auctionUrl]) {
                 tickets = preTickets[auctionUrl];
             } else {
-                await loadInFrame(auctionUrl, 20000, ctx);
-                await sleep(600);
+                // CZYSTY ODCZYT — zbieramy same linki ticketow z auftragu.
+                if (!await loadForRead(auctionUrl, 20000, ctx)) await sleep(600);
                 tickets = getTicketLinks(ctx);
             }
             for (const t of tickets) allTickets.push({ ...t, auctionUrl });
@@ -5375,6 +5632,16 @@
         checkBtn.disabled = true;
         tmIsBusy = true;
         resetServerTimings(); // v3.22: nowe metryki serwera dla tego batcha
+        // Log jest OBSERWATOREM. Cokolwiek w nim padnie, nie ma prawa zatrzymac
+        // ksiegowania — dlatego caly blok stoi w try/catch. Ta lekcja kosztowala 4.16:
+        // jedna linijka logu przewrocila przebieg, zanim ruszyl.
+        try {
+            ksLog('start', '=== przebieg równoległy: ' + previewRows.length + ' poz. · '
+                  + workersCount + ' workerów · × timeout ' + timeoutMult
+                  + ' · szybki odczyt: ' + (ksFetchOn() ? 'WŁĄCZONY' : 'wyłączony')
+                  + ' · konto ' + accountNum + ' · data ' + bookingDate + ' ===');
+            ksProbStart();
+        } catch (e){ try { console.error('[Beliani hub] log ticketa:', e); } catch (e2){} }
 
         const progressList = document.getElementById('tm-t-progress-list');
         let ok = 0, fail = 0, already = 0, escalated = 0;
@@ -5570,6 +5837,14 @@
             }
             try { updateIssueReport(); } catch (e3) {}
         } finally {
+            try {
+                ksProbStop();
+                const st = computeServerStats();
+                if (st) ksLog('koniec', 'roundtripów ' + st.n + ' · min ' + st.min + ' ms · mediana '
+                              + (st.p50 != null ? st.p50 : '?') + ' ms · max ' + st.max + ' ms');
+                ksLog('koniec', '=== zaksięgowane ' + ok + ' · błędy ' + fail + ' · już były ' + already
+                      + ' · eskalacje ' + escalated + ' ===');
+            } catch (e){ try { console.error('[Beliani hub] log ticketa:', e); } catch (e2){} }
             tmIsBusy = false;
             parallelBtn.disabled = false;
             parallelBtn.textContent = '🚀 Sprawdź i zaksięguj RÓWNOLEGLE';
@@ -5577,6 +5852,7 @@
         }
     };
 
+    panel.querySelector('#tm-t-log-btn').onclick = () => { ksLogZapisz(); };
     panel.querySelector('#tm-t-clear-btn').onclick = () => {
         // Jak wyzej: dopoki workery chodza, previewRows musi zostac na miejscu.
         if (tmIsBusy) {
@@ -6865,7 +7141,7 @@
           <div id="sepa-panel">
             <div class="sepa-head">
               <h2>€ Walidator SEPA (pain.001)</h2>
-              <span style="font-size:11px;color:#64748b">v1.5</span>
+              <span style="font-size:11px;color:#64748b">HUB v${(typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?'}</span>
               <button class="sepa-x" title="Zamknij">×</button>
             </div>
             <div class="sepa-body">
