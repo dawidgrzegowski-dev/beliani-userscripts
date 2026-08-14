@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.09
+// @version      4.10
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23289,6 +23289,36 @@
             }, 400);
         });
     }
+    // Modul ticketa pisze swoje kroki do #tm-t-progress-list. Probkujemy te liste i
+    // przepisujemy KAZDA NOWA linie do naszego logu razem z czasem od poprzedniej.
+    // Bez tego caly jego przebieg jest w logu jedna cisza — w pierwszym pomiarze
+    // (12.08, ManoMano IT, 7 pozycji) bylo to 188,8 s z 194,7 s calosci i nie dalo sie
+    // powiedziec, czy stoi jedna pozycja, czy wszystkie siedem po rowno.
+    //
+    // Liczymy po INDEKSIE, nie po tresci: dwie pozycje potrafia dac identyczna linie
+    // („Szukam auftragu…") i dedup po tekscie zjadlby te druga. Gdy lista sie skurczy,
+    // znaczy ze tamten modul przerysowal ja od zera — wtedy cofamy licznik, bo powtorka
+    // kilku linii szkodzi mniej niz luka w miejscu, ktorego wlasnie szukamy.
+    function ksProbki(){
+        let widziano = 0, ost = Date.now();
+        const czytaj = function (){
+            const list = document.getElementById('tm-t-progress-list');
+            if (!list) return;
+            const ds = list.querySelectorAll('div');
+            if (ds.length < widziano) widziano = 0;
+            for (let i = widziano; i < ds.length; i++){
+                const t = String(ds[i].textContent || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length > 300) continue;
+                const teraz = Date.now();
+                mkLog('ticket', '  · ' + t + '   (+' + ((teraz - ost) / 1000).toFixed(1) + ' s)');
+                ost = teraz;
+            }
+            widziano = ds.length;
+        };
+        const iv = setInterval(czytaj, 400);
+        // Zwracamy funkcje konczaca: dociaga ostatnie linie i gasi probkowanie.
+        return function (){ try { czytaj(); } catch (e){} clearInterval(iv); };
+    }
     function ksFill(x){
         const ta = document.getElementById('tm-t-input');
         const dt = document.getElementById('tm-t-date');
@@ -23474,10 +23504,13 @@
         ksMirror(x.date + ' · konto ' + x.acct + (x.accNm ? (' — ' + x.accNm) : ''), x.rows.length);
         const tKs = Date.now();
         mkLog('ticket', '▶ oddaje sterowanie modulowi „Ksiegowanie w tickecie"');
+        const stopProbek = ksProbki();
         ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
         const r = await ksWait(ksBtn());
+        stopProbek();
         mkLog('ticket', (r === 'ok' ? '✔' : '✖') + ' modul ticketa skonczyl: ' + r
-              + ' — ' + mkLogSek(tKs));
+              + ' — ' + mkLogSek(tKs) + ' (' + (x.rows.length
+                ? ((Date.now() - tKs) / 1000 / x.rows.length).toFixed(1) : '?') + ' s na pozycje)');
         ksMirror(null);
         if (r !== 'ok'){
             // Wyjscie w tym miejscu bylo ciche, a wywolujacy pokazuje komunikat tylko
@@ -23489,11 +23522,26 @@
         // a przebieg sie zakonczyl, oznaczamy calosc, ale z adnotacja — lepiej pokazac
         // niepewnosc niz udawac, ze wiemy.
         const done = ksDone(x);
+        // Same liczby nie wystarczaja. Przy „potwierdzil 5 z 7" trzeba wiedziec, KTORE
+        // dwie zostaly — inaczej jedyna droga to przeklikanie wszystkich siedmiu.
+        const brakP = x.rows.map(function (rr){ return rr.id; })
+                            .filter(function (id){ return done.indexOf(id) < 0; });
         mkLog('ticket', 'log ticketa potwierdzil ' + done.length + ' z ' + x.rows.length + ' poz.'
               + (done.length ? '' : ' — oznaczam calosc BEZ potwierdzenia'));
+        if (done.length)  mkLog('ticket', '    potwierdzone:      ' + done.join(', '));
+        if (brakP.length) mkLog('ticket', '    BEZ potwierdzenia: ' + brakP.join(', '));
         try {
             const bl = ksBledy(x);
-            Object.keys(bl).forEach(function (id){ mkLog('ticket', '    ' + id + ': ' + bl[id]); });
+            const powody = Object.keys(bl);
+            powody.forEach(function (id){ mkLog('ticket', '    ' + id + ': ' + bl[id]); });
+            // Brak powodu to NIE jest to samo co brak problemu. Gdy pozycji brakuje
+            // w potwierdzeniach, a log ticketa milczy, mowimy o tym wprost — inaczej
+            // cisza wyglada na porzadek.
+            if (!powody.length && brakP.length){
+                mkLog('ticket', '    log ticketa NIE podal powodu dla tych ' + brakP.length
+                      + ' — nie wiadomo, czy nie przeszly, czy tylko nie zostawily sladu. '
+                      + 'Sprawdz te auftragi wzrokowo.');
+            }
         } catch (e){ mkLog('ticket', '    (nie odczytalem powodow z logu: ' + ((e && e.message) || e) + ')'); }
         if (done.length) rdMark(x.key, done, true);
         else rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
@@ -23516,7 +23564,13 @@
         // Jeden komunikat na koncu. Dotad komunikat o arkuszu wchodzil PO komunikacie
         // o komentarzach i go zamazywal — informacja, ze komentarz nie poszedl, ginela
         // po ulamku sekundy i nie bylo jak sie o niej dowiedziec.
-        const czesci = ['Zwroty zaksięgowane'];
+        // „Zwroty zaksiegowane" przy 5 z 7 bylo prawda tylko czesciowa i brzmialo jak
+        // pelny sukces. Liczba wchodzi do pierwszego czlonu, zeby nie trzeba bylo jej
+        // szukac nizej w liscie grup.
+        const czesci = [done.length && done.length < x.rows.length
+                        ? ('Zwroty: potwierdzone ' + done.length + ' z ' + x.rows.length
+                           + ', zostało ' + (x.rows.length - done.length))
+                        : 'Zwroty zaksięgowane'];
         if (kom.msg) czesci.push(kom.msg);
         if (ark) czesci.push(ark);
         say(czesci.join(' · '), (kom.col === '#c47f00') ? '#c47f00' : '#0a7a2f');
