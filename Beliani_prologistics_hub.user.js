@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.10
+// @version      4.12
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17646,11 +17646,25 @@
         'Transaction Number','Quantity','Category Label','Offer SKU','Description','Type','Payment status',
         'Payment reference','Amount','Debit','Credit','Balance','Currency','Customer order reference',
         'Shop order reference','Billing cycle date','Shop ID','Order line ID','Refund ID','Sales channel','Billing Cycle ID'];
-    function mkCsvText(pairs){
-        const lines = [MK_HDR.join(';')];
+    // W ukladzie Mirakla kwota stoi w kolumnie O (indeks 14, naglowek „Amount"), a N
+    // (indeks 13, „Payment reference") jest pusta. Manor jest wyjatkiem: jego ustawienie
+    // importu po stronie prologistics czyta kwote z N. Plik rozni sie WYLACZNIE tym
+    // jednym miejscem, wiec zamiast osobnego budowniczego trzymamy numer kolumny w tabeli
+    // — dolozenie kolejnego marketplace'u to jedna linijka, a nie kopia funkcji.
+    // UWAGA: reszta Mirakla czyta z O i nie wolno jej ruszyc przy okazji.
+    const MK_KOL_KWOTA = { 'Manor': 13 };
+    function mkCsvText(pairs, mp){
+        const kol = MK_KOL_KWOTA[String(mp == null ? '' : mp)];
+        const kwotaIx = (kol == null) ? 14 : kol;
+        // Kolumny zamieniamy MIEJSCAMI razem z naglowkiem. Samo przestawienie wartosci
+        // dawaloby plik, w ktorym kwoty stoja pod napisem „Payment reference" — dla
+        // importu bez znaczenia (czyta po pozycji), dla czlowieka mylace.
+        const hdr = MK_HDR.slice();
+        if (kwotaIx !== 14){ const t = hdr[kwotaIx]; hdr[kwotaIx] = hdr[14]; hdr[14] = t; }
+        const lines = [hdr.join(';')];
         pairs.forEach(function (p){
             const c = new Array(MK_HDR.length).fill('');
-            c[4] = p.id; c[14] = f2(p.amt);
+            c[4] = p.id; c[kwotaIx] = f2(p.amt);
             lines.push(c.join(';'));
         });
         return '﻿' + lines.join('\n') + '\n';
@@ -20346,7 +20360,7 @@
         if (j.kind === 'amz'  && j.data && j.data.amz)  return mkCsvAmz(j.data.amz);
         if (j.kind === 'mano' && j.data && j.data.mano) return mkCsvMano(j.data.mano);
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
-        return mkCsvText(pairsOf(j));
+        return mkCsvText(pairsOf(j), j.mp);
     }
 
     // ================= ROZMOWA Z MIRAKLEM =================
@@ -22578,6 +22592,24 @@
                      reczne: !!reczne || !!(prev && prev.reczne) };   // v3.88
         rdSave(all);
     }
+    // Auftrag ze statusem Deleted nigdy sie nie zaksieguje — modul ticketa go pomija
+    // („Auftrag jest Deleted — pomijam (nic nie ksieguje)"). Trzymamy takie pozycje
+    // OSOBNO od zaksiegowanych: maja zamykac grupe, zeby nie wisiala w nieskonczonosc
+    // jako niedokonczona, ale policzenie ich jako zaksiegowane byloby nieprawda —
+    // nie poszedl na nie ani jeden grosz.
+    function rdMarkDel(key, ids){
+        if (!key || !ids || !ids.length) return;
+        const all = rdLoad(), prev = all[key] || {};
+        const list = (prev.del || []).slice();
+        ids.forEach(function (id){ if (list.indexOf(id) < 0) list.push(id); });
+        all[key] = {
+            at: prev.at || new Date().toISOString().slice(0, 16).replace('T', ' '),
+            ids: prev.ids || [], del: list,
+            sure: (prev.sure === false) ? false : true,
+            reczne: !!prev.reczne
+        };
+        rdSave(all);
+    }
     // v3.88: cofniecie recznego oznaczenia. Bez tego pomylkowe kliknięcie „oznacz jako
     // zrobione" byloby nie do odkrecenia inaczej niz czyszczeniem calego magazynu.
     function rdUnmark(key){
@@ -22619,12 +22651,18 @@
         });
         const ids = ((d && d.ids) || []).slice();
         zLogu.forEach(function (id){ if (ids.indexOf(id) < 0) ids.push(id); });
-        if (!ids.length) return null;
-        const left = x.rows.filter(function (r){ return ids.indexOf(r.id) < 0; });
+        // Pozycje z auftragiem Deleted zamykaja grupe, ale nie wchodza do zaksiegowanych.
+        // „done" zostaje ZALATWIONYMI (na tym opiera sie „zostalo" i wygaszanie grupy),
+        // a „zaks" mowi, ile naprawde poszlo — te dwie liczby wolno rozjechac.
+        const del = ((d && d.del) || []).filter(function (id){ return ids.indexOf(id) < 0; });
+        if (!ids.length && !del.length) return null;
+        const zalatwione = ids.concat(del);
+        const left = x.rows.filter(function (r){ return zalatwione.indexOf(r.id) < 0; });
         return { at: (d && d.at) || 'wg zapisu modułu ticketa',
                  sure: d ? (d.sure !== false) : true,
                  reczne: !!(d && d.reczne),
                  zLogu: zLogu.length,
+                 zaks: ids.length, pominiete: del.length,
                  done: x.rows.length - left.length, left: left };
     }
 
@@ -22701,6 +22739,22 @@
         });
         return ok;
     }
+    // Pozycje pominiete z powodu statusu Deleted. Czytamy ten sam log co ksDone —
+    // rozdzielenie ich od „nie wiadomo, co sie stalo" jest cala roznica miedzy
+    // spokojnym „tak mialo byc" a niepokojacym „sprawdz to recznie".
+    function ksUsuniete(x){
+        const list = document.getElementById('tm-t-progress-list');
+        if (!list) return [];
+        const txt = Array.prototype.slice.call(list.querySelectorAll('*'))
+            .map(function (e){ return String(e.textContent || ''); })
+            .filter(function (t){ return t && t.length < 400; });
+        const out = [];
+        x.rows.forEach(function (r){
+            const hit = txt.some(function (t){ return t.indexOf(r.id) >= 0 && /deleted/i.test(t); });
+            if (hit && out.indexOf(r.id) < 0) out.push(r.id);
+        });
+        return out;
+    }
     // Czemu pozycja nie przeszla. ksDone czyta z logu ticketa potwierdzenia; tu czytamy
     // z tego samego logu POWODY niepowodzenia, zeby nie trzeba bylo szukac ich wzrokiem
     // w kilkudziesieciu liniach. Rozpoznajemy trzy najczestsze: przekroczony czas,
@@ -22716,6 +22770,9 @@
             for (let i = 0; i < txt.length; i++){
                 const t = txt[i];
                 if (t.indexOf(r.id) < 0) continue;
+                // Deleted sprawdzamy PIERWSZY: to nie jest blad, tylko swiadome pominiecie,
+                // i nie chcemy, zeby zlapal go ktorykolwiek z ogolniejszych wzorcow nizej.
+                if (/deleted/i.test(t)) { out[r.id] = 'auftrag Deleted — pominięty, nic nie zaksięgowano'; return; }
                 if (/timeout/i.test(t)) { out[r.id] = 'przekroczony czas'; return; }
                 if (/brak\s+ticketu/i.test(t)) { out[r.id] = 'brak ticketu'; return; }
                 if (/BŁĄD|blad|błąd/i.test(t)) { out[r.id] = 'błąd'; return; }
@@ -22770,8 +22827,13 @@
                         // ticketa, czy z recznego oznaczenia. To trzy rozne stopnie pewnosci.
                         + (s.reczne ? ' <span style="font-weight:400;color:#c47f00">(oznaczone ręcznie)</span>'
                            : (s.zLogu ? ' <span style="font-weight:400;color:#666">(wg zapisu modułu ticketa)</span>' : ''))
-                        + (s.sure ? '' : ' <span style="font-weight:400;color:#c47f00">(bez potwierdzenia z logu)</span>') + '</span>';
-                    return '<span style="font-size:11px;color:#c47f00;font-weight:700">częściowo: ' + s.done + ' z ' + x.rows.length
+                        + (s.sure ? '' : ' <span style="font-weight:400;color:#c47f00">(bez potwierdzenia z logu)</span>')
+                        // Grupa zeszla z listy, ale nie wszystko sie zaksiegowalo — to musi
+                        // byc widoczne PRZY niej, nie tylko w logu sprzed godziny.
+                        + (s.pominiete ? (' <span style="font-weight:400;color:#c47f00">· ' + s.pominiete
+                             + ' pominięte (auftrag Deleted)</span>') : '') + '</span>';
+                    return '<span style="font-size:11px;color:#c47f00;font-weight:700">częściowo: ' + (s.zaks == null ? s.done : s.zaks) + ' z ' + x.rows.length
+                        + (s.pominiete ? (' · ' + s.pominiete + ' pominięte (Deleted)') : '')
                         + ', zostało ' + s.left.length + '</span>';
                  })()
               // v3.66: stan opisów potrąceń obok stanu księgowania. To jest ta jedna
@@ -23524,12 +23586,17 @@
         const done = ksDone(x);
         // Same liczby nie wystarczaja. Przy „potwierdzil 5 z 7" trzeba wiedziec, KTORE
         // dwie zostaly — inaczej jedyna droga to przeklikanie wszystkich siedmiu.
+        // Pozycje pominiete przez Deleted wyjmujemy z „bez potwierdzenia" — inaczej
+        // normalna sytuacja wyglada jak niewyjasniona strata.
+        const usuniete = ksUsuniete(x).filter(function (id){ return done.indexOf(id) < 0; });
         const brakP = x.rows.map(function (rr){ return rr.id; })
-                            .filter(function (id){ return done.indexOf(id) < 0; });
+                            .filter(function (id){ return done.indexOf(id) < 0 && usuniete.indexOf(id) < 0; });
         mkLog('ticket', 'log ticketa potwierdzil ' + done.length + ' z ' + x.rows.length + ' poz.'
               + (done.length ? '' : ' — oznaczam calosc BEZ potwierdzenia'));
-        if (done.length)  mkLog('ticket', '    potwierdzone:      ' + done.join(', '));
-        if (brakP.length) mkLog('ticket', '    BEZ potwierdzenia: ' + brakP.join(', '));
+        if (done.length)     mkLog('ticket', '    potwierdzone:      ' + done.join(', '));
+        if (usuniete.length) mkLog('ticket', '    auftrag Deleted (pominiete, nic nie poszlo): ' + usuniete.join(', '));
+        if (brakP.length)    mkLog('ticket', '    BEZ potwierdzenia: ' + brakP.join(', '));
+        if (usuniete.length) rdMarkDel(x.key, usuniete);
         try {
             const bl = ksBledy(x);
             const powody = Object.keys(bl);
@@ -23567,9 +23634,13 @@
         // „Zwroty zaksiegowane" przy 5 z 7 bylo prawda tylko czesciowa i brzmialo jak
         // pelny sukces. Liczba wchodzi do pierwszego czlonu, zeby nie trzeba bylo jej
         // szukac nizej w liscie grup.
-        const czesci = [done.length && done.length < x.rows.length
-                        ? ('Zwroty: potwierdzone ' + done.length + ' z ' + x.rows.length
-                           + ', zostało ' + (x.rows.length - done.length))
+        // Trzy rozne liczby, ktore dotad zlewaly sie w jedno „Zwroty zaksiegowane":
+        // ile poszlo, ile swiadomie pominieto i ile nadal wisi.
+        const nieZal = x.rows.length - done.length - usuniete.length;
+        const czesci = [(nieZal || usuniete.length)
+                        ? ('Zwroty: zaksięgowane ' + done.length + ' z ' + x.rows.length
+                           + (usuniete.length ? (' · ' + usuniete.length + ' pominięte (auftrag Deleted)') : '')
+                           + (nieZal ? (' · zostało ' + nieZal) : ''))
                         : 'Zwroty zaksięgowane'];
         if (kom.msg) czesci.push(kom.msg);
         if (ark) czesci.push(ark);
