@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.06
+// @version      4.07
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10192,6 +10192,29 @@
         return out;
     }
 
+    // Rozklad kwoty przelewu zbiorczego na pozycje. Liczymy w GROSZACH, na liczbach
+    // calkowitych — na ulamkach dziesietnych sumowanie 2642.95 + 1794 potrafi dac
+    // 4436.949999999999 i dokladne porownanie by nie wyszlo.
+    // Szukamy WSZYSTKICH zestawow, nie pierwszego lepszego: gdy pasuje wiecej niz jeden,
+    // wybor bylby zgadywaniem i modul ma to zglosic, a nie rozstrzygnac.
+    // Przeszukanie jest wykladnicze, wiec ma budzet krokow; po jego przekroczeniu
+    // mowimy wprost, ze nie sprawdzilismy do konca, zamiast po cichu oddac czesc wyniku.
+    function epoZestawy(poz, celGr, limit){
+        const n = poz.length, out = [];
+        let krokow = 0, przerwane = false;
+        const wybor = [];
+        (function idz(i, zostalo){
+            if (przerwane || out.length >= limit) return;
+            if (++krokow > 200000){ przerwane = true; return; }
+            if (zostalo === 0 && wybor.length){ out.push(wybor.slice()); return; }
+            if (i >= n || zostalo < 0) return;
+            wybor.push(poz[i]);
+            idz(i + 1, zostalo - poz[i].gr);
+            wybor.pop();
+            idz(i + 1, zostalo);
+        })(0, celGr);
+        return { zestawy: out, przerwane: przerwane };
+    }
     // Dopasowanie: znormalizowany klucz nazwy musi wystapic w znormalizowanej tresci przelewu.
     // Kilka przelewow do jednej firmy sumuje sie — bank czasem dzieli platnosc na dwa zlecenia.
     function bankMatch(expected, tx) {
@@ -10233,6 +10256,52 @@
             used[i] = (used[i] || []).concat([e.key]);
             e.hits = [i]; e.bank = tx[i].amt; e.diff = 0; e.state = 'amt'; e.bankTxt = tx[i].txt || '';
         });
+        // TRZECIE podejscie — PRZELEW ZBIORCZY. Bank potrafi scalic kilka platnosci w jedno
+        // zlecenie; w wyciagu nie ma wtedy ZADNEJ nazwy dostawcy, tylko „COLLECTIVE ORDER EPO
+        // ISO 20022 E-FINANCE NUMBER …" i laczna kwota. Sprawdzone na wyciagu z 13.08.2026:
+        // jeden taki wiersz na 4436,95 pokrywal dwie firmy — Foshan Espatio 2642,95
+        // i TAIZHOU JINNENGDA 1794,00 — i obie wychodzily wczesniej jako „nie ma przelewu".
+        //
+        // Rozkladamy kwote WYLACZNIE na pozycje, ktorych dotad NIE UDALO SIE dopasowac.
+        // Gdyby brac wszystkie, zestaw mogl by zagarnac firme, ktora ma juz wlasny przelew,
+        // i zrobic z dwoch poprawnych dopasowan jedno bledne.
+        // Suma musi zgadzac sie CO DO GROSZA — zadnej tolerancji, zadnego „najlepszego
+        // przyblizenia": to pieniadze, a nie podpowiedz.
+        const zbior = [];
+        (tx || []).forEach(function (t, i) {
+            if (used[i]) return;
+            if (String(t.txt || '').toUpperCase().indexOf('COLLECTIVE ORDER') < 0) return;
+            zbior.push(i);
+        });
+        zbior.forEach(function (i) {
+            const wolne = list.filter(function (e) { return e.state === 'missing'; })
+                              .map(function (e) { return { e: e, gr: Math.round(e.total * 100) }; })
+                              .filter(function (x) { return x.gr > 0; });
+            if (!wolne.length) return;
+            const r = epoZestawy(wolne, Math.round(tx[i].amt * 100), 2);
+            if (r.przerwane || r.zestawy.length !== 1){
+                // Nie rozstrzygamy. Zostawiamy slad na przelewie, zeby czlowiek wiedzial,
+                // ze to zbiorcze zlecenie i czego probowalismy.
+                tx[i].epoUwaga = r.przerwane
+                    ? ('zbiorcze zlecenie — nie sprawdziłem wszystkich kombinacji ('
+                       + wolne.length + ' pozycji bez przelewu)')
+                    : (r.zestawy.length ? ('zbiorcze zlecenie — na tę kwotę składa się WIĘCEJ NIŻ JEDEN '
+                       + 'zestaw firm, nie zgaduję który') : ('zbiorcze zlecenie — żaden zestaw '
+                       + 'nieprzypisanych pozycji nie daje tej kwoty'));
+                return;
+            }
+            const zest = r.zestawy[0];
+            const nazwy = zest.map(function (x) { return x.e.name; });
+            zest.forEach(function (x) {
+                used[i] = (used[i] || []).concat([x.e.key]);
+                x.e.hits = [i];
+                x.e.bank = x.e.total;
+                x.e.diff = 0;
+                x.e.state = 'epo';
+                x.e.epoKwota = tx[i].amt;
+                x.e.epoRazem = nazwy;
+            });
+        });
         const orphans = [], shared = [];
         (tx || []).forEach(function (t, i) {
             if (!used[i]) orphans.push(t);
@@ -10240,11 +10309,11 @@
         });
         let orphanSum = 0, expSum = 0, hitSum = 0;
         orphans.forEach(function (t) { orphanSum = bal2(orphanSum + t.amt); });
-        const cnt = { ok: 0, diff: 0, missing: 0, nokey: 0, amt: 0 };
+        const cnt = { ok: 0, diff: 0, missing: 0, nokey: 0, amt: 0, epo: 0 };
         list.forEach(function (e) { cnt[e.state]++; expSum = bal2(expSum + e.total); hitSum = bal2(hitSum + e.bank); });
         // Kolejnosc: najpierw to, co wymaga reakcji, potem dopasowane po kwocie (do rzutu okiem),
         // na koncu reszta alfabetycznie.
-        const rank = { diff: 0, missing: 1, nokey: 2, amt: 3, ok: 4 };
+        const rank = { diff: 0, missing: 1, nokey: 2, amt: 3, epo: 4, ok: 5 };
         list.sort(function (a, b) {
             if (rank[a.state] !== rank[b.state]) return rank[a.state] - rank[b.state];
             return String(a.name).localeCompare(String(b.name));
@@ -10252,7 +10321,10 @@
         return { list: list, orphans: orphans, shared: shared, orphanSum: orphanSum,
                  expSum: expSum, hitSum: hitSum,
                  ok: cnt.ok, diff: cnt.diff, missing: cnt.missing, nokey: cnt.nokey, amt: cnt.amt,
-                 // 'amt' NIE jest bledem — kwota sie zgadza, rozni sie tylko nazwa.
+                 epo: cnt.epo,
+                 // Ani 'amt', ani 'epo' NIE sa bledem: przy 'amt' kwota sie zgadza i rozni sie
+                 // tylko nazwa, przy 'epo' kwota tez sie zgadza, tyle ze bank scalil kilka
+                 // platnosci w jedno zlecenie. Oba wymagaja spojrzenia, zaden nie blokuje.
                  bad: cnt.diff + cnt.missing + cnt.nokey };
     }
 
@@ -10267,6 +10339,11 @@
                 (e.hits.length > 1 ? ' w ' + e.hits.length + ' przelewach' : '') + '</span>';
         } else if (e.state === 'missing') {
             tail = '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
+        } else if (e.state === 'epo') {
+            const inne = (e.epoRazem || []).filter(function (n) { return n !== e.name; });
+            tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
+                ' — w zbiorczym przelewie EPO na ' + balFix(e.epoKwota || 0) +
+                (inne.length ? (' razem z: <b>' + balEsc(inne.join(', ')) + '</b>') : '') + '</span>';
         } else if (e.state === 'nokey') {
             tail = '<span style="color:#92400e">nazwa za krótka, żeby jej szukać w pliku — sprawdź ręcznie</span>';
         } else if (e.state === 'amt') {
@@ -10337,9 +10414,10 @@
         const bad  = m.list.filter(function (e) { return e.state !== 'ok'; });
         const good = m.list.filter(function (e) { return e.state === 'ok'; });
         const okAll = !m.bad;
-        const amtTxt = m.amt ? (' &nbsp;·&nbsp; ' + m.amt + ' dopasowan' + (m.amt === 1 ? 'a' : 'e') + ' po kwocie (nazwa w banku inna)') : '';
+        const amtTxt = (m.amt ? (' &nbsp;·&nbsp; ' + m.amt + ' dopasowan' + (m.amt === 1 ? 'a' : 'e') + ' po kwocie (nazwa w banku inna)') : '')
+                     + (m.epo ? (' &nbsp;·&nbsp; ' + m.epo + ' w zbiorczym przelewie EPO') : '');
         const title = okAll
-            ? '✓ Wszystkie ' + (m.ok + m.amt) + ' firm(y) z wklejki mają w pliku przelew na właściwą kwotę (' + balFix(m.expSum) + ')' + amtTxt
+            ? '✓ Wszystkie ' + (m.ok + m.amt + m.epo) + ' firm(y) z wklejki mają w pliku przelew na właściwą kwotę (' + balFix(m.expSum) + ')' + amtTxt
             : '⚠ ' + m.bad + ' z ' + m.list.length + ' firm nie zgadza się z plikiem' +
               (m.ok ? ' (pozostałe ' + m.ok + ' OK)' : '') + amtTxt;
 
