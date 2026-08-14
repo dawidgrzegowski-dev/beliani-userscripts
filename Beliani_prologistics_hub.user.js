@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.22
+// @version      4.33
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10,6 +10,7 @@
 // @match        https://*.mirakl.net/*
 // @match        https://*.myvtex.com/*
 // @match        https://toolbox.manomano.com/*
+// @match        https://seller.octopia.com/*
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
 // @connect      fxds-public-exchange-rates-api.oanda.com
 // @connect      oanda.com
@@ -31,6 +32,8 @@
 // @connect      ebay.de
 // @connect      check24.de
 // @connect      mc.moebel.check24.de
+// @connect      seller.octopia.com
+// @connect      octopia.com
 // @connect      browserapi.manomano.com
 // @connect      manomano.com
 // @connect      core-api.moebel.check24.de
@@ -76,9 +79,439 @@
     const onVtex    = () => /(^|\.)myvtex\.com$/i.test(H);
     // Panel ManoMano — wchodzimy tam WYLACZNIE po to, zeby podejrzec token sesji.
     const onMano    = () => /(^|\.)toolbox\.manomano\.com$/i.test(H);
+    // Cnova FR stoi na Octopii. Dopasowanie jest szerokie (cala domena), bo panel
+    // czesto rozmawia z osobnym hostem API i rejestrator ma tam dzialac tak samo.
+    const onOcto    = () => /(^|\.)octopia\.com$/i.test(H);
 
     const HUB = 'beliani_hub_';
-    const isOn = (id) => { try { return GM_getValue(HUB + id, true); } catch (e) { return true; } };
+    // Moduly, ktore maja byc DOMYSLNIE WYLACZONE. Dopisanie tu id znaczy: nie uruchamiaj
+    // sie, dopoki uzytkownik sam nie zaznaczy w ⚙ Moduly i ustawienia. Rejestrator
+    // przechwytuje kazde zapytanie panelu — takie narzedzie nie moze startowac samo.
+    const MOD_OFF = { rec: 1 };
+    const isOn = (id) => {
+        const dom = MOD_OFF[id] ? false : true;
+        try { return GM_getValue(HUB + id, dom); } catch (e) { return dom; }
+    };
+
+    // ===== Rejestrator zapytan panelu marketplace'u (v4.24) =====
+    // Po co: zeby dodac nowy marketplace do ksiegowania, trzeba wiedziec, JAK jego panel
+    // pobiera zestawienie — pod jaki adres pyta, czym sie uwierzytelnia i co dostaje.
+    // Dotad ustalalem to ze zrzutow HAR: sa ogromne, niosa zywe sesje i pokazuja wszystko
+    // oprocz tego, co klikal czlowiek. Ten modul zapisuje dokladnie to, co potrzebne.
+    //
+    // POSWIADCZEN NIE ZAPISUJEMY. Naglowki uwierzytelniajace ida do raportu jako sam
+    // KSZTALT, tresci zadan logowania sa pomijane, dlugie ciagi maskowane.
+    function init_rec() {
+    (function () {
+        'use strict';
+        const REC_KEY = 'beliani_rec_log';
+        const REC_ON  = 'beliani_rec_on';
+        const REC_MAX = 4000;
+        // Ile tresci zapisujemy. Duzo — bo to wlasnie z ODPOWIEDZI odczytam, jak
+        // zbudowany jest interfejs panelu i co trzeba wyslac, zeby dostac zestawienie.
+        // Maskowanie dziala tak samo niezaleznie od dlugosci.
+        const PODGLAD_MAX = 20000;    // znakow z odpowiedzi (JSON/CSV/tekst)
+        const CIALO_MAX   = 5000;     // znakow z wyslanego zadania
+        const NAGL_MAX    = 400;      // znakow z wartosci naglowka
+        const CALOSC_MAX  = 12000000; // gorny limit calego zapisu; po nim przestajemy
+                                      // dokladac podglady, zeby nie zapchac magazynu
+        let obcieteZBraku = 0;
+        function zaDuzo(){
+            let n = 0;
+            for (let i = 0; i < bufor.length; i++) n += (bufor[i].podglad || '').length + 200;
+            return n > CALOSC_MAX;
+        }
+
+        let bufor = [];
+        try { bufor = JSON.parse(GM_getValue(REC_KEY, '[]')) || []; } catch (e){ bufor = []; }
+        const wlaczony = () => { try { return !!GM_getValue(REC_ON, false); } catch (e){ return false; } };
+
+        // Zapis na dysk jest opozniony i zbiorczy — przy kazdym zapytaniu byloby to
+        // kilkaset zapisow na minute. Trzymamy tez stan MIEDZY przeladowaniami strony,
+        // bo panel nawiguje, a nagranie ma przetrwac cala sciezke uzytkownika.
+        let timer = null;
+        function zapiszPozniej(){
+            if (timer) return;
+            timer = setTimeout(function (){
+                timer = null;
+                try { GM_setValue(REC_KEY, JSON.stringify(bufor)); } catch (e){}
+            }, 800);
+        }
+        function dodaj(w){
+            if (!wlaczony()) return null;
+            w.t = Date.now();
+            bufor.push(w);
+            if (bufor.length > REC_MAX) bufor.splice(0, bufor.length - REC_MAX);
+            zapiszPozniej(); odswiez();
+            return w;
+        }
+
+        // ---------- maskowanie ----------
+        // Wartosci tych naglowkow nie trafiaja do raportu NIGDY. Zapisujemy sam fakt
+        // i ksztalt — to wystarczy, zeby ustalic sposob uwierzytelnienia, a nie daje
+        // nikomu dostepu do konta.
+        const TAJNE = /^(authorization|cookie|set-cookie|x-api-key|x-auth-token|x-xsrf-token|x-csrf-token|proxy-authorization)$/i;
+        const LOGOWANIE = /(login|signin|sign-in|\bauth\b|token|oauth|password|credential)/i;
+
+        function opiszTajny(v){
+            const t = String(v == null ? '' : v);
+            if (/^bearer\s+/i.test(t)){
+                const tok = t.replace(/^bearer\s+/i, ''), cz = tok.split('.');
+                if (cz.length === 3){
+                    let dod = '';
+                    // Z tokenu czytamy WYLACZNIE czasy waznosci — nic z niego nie zapisujemy.
+                    try {
+                        const p = JSON.parse(atob(cz[1].replace(/-/g, '+').replace(/_/g, '/')));
+                        if (p && p.exp){
+                            dod = ', wygasa ' + new Date(p.exp * 1000).toISOString().slice(0, 16).replace('T', ' ');
+                            if (p.iat) dod += ', ważny ' + Math.round((p.exp - p.iat) / 3600) + ' h';
+                        }
+                    } catch (e){}
+                    return '(UKRYTE) Bearer JWT, ' + tok.length + ' znaków' + dod;
+                }
+                return '(UKRYTE) Bearer, ' + tok.length + ' znaków';
+            }
+            return '(UKRYTE) ' + t.length + ' znaków';
+        }
+        function zamaskuj(t){
+            return String(t == null ? '' : t)
+                .replace(/eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}/g, '(JWT-UKRYTY)')
+                .replace(/([?&](?:token|access_token|id_token|password|pass|pwd|secret|key|api_key)=)[^&\s]+/gi, '$1(UKRYTE)')
+                .replace(/("(?:token|access_token|id_token|password|secret|apiKey|api_key)"\s*:\s*")[^"]{4,}(")/gi, '$1(UKRYTE)$2')
+                .replace(/\b[A-Fa-f0-9]{40,}\b/g, '(DŁUGI-CIĄG-UKRYTY)');
+        }
+        function naglowki(h){
+            const out = [];
+            try {
+                if (!h) return out;
+                const push = function (k, v){
+                    out.push(k + ': ' + (TAJNE.test(k) ? opiszTajny(v) : zamaskuj(String(v)).slice(0, NAGL_MAX)));
+                };
+                if (typeof Headers !== 'undefined' && h instanceof Headers) h.forEach(function (v, k){ push(k, v); });
+                else if (Array.isArray(h)) h.forEach(function (p){ push(p[0], p[1]); });
+                else Object.keys(h).forEach(function (k){ push(k, h[k]); });
+            } catch (e){}
+            return out;
+        }
+        function tresc(url, body){
+            if (body == null || body === '') return '';
+            if (LOGOWANIE.test(String(url))) return '(POMINIĘTE — adres wygląda na logowanie/token)';
+            let t = '';
+            try {
+                if (typeof body === 'string') t = body;
+                else if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) t = body.toString();
+                else if (typeof FormData !== 'undefined' && body instanceof FormData){
+                    const p = []; body.forEach(function (v, k){ p.push(k + '=' + (typeof v === 'string' ? v : '(plik)')); });
+                    t = p.join('&');
+                } else t = '(' + Object.prototype.toString.call(body) + ')';
+            } catch (e){ t = '(nie odczytałem)'; }
+            return zamaskuj(t).slice(0, CIALO_MAX);
+        }
+
+        // ---------- przechwycenie fetch ----------
+        const _fetch = window.fetch;
+        if (typeof _fetch === 'function'){
+            window.fetch = function (input, init){
+                let w = null;
+                const t0 = Date.now();
+                try {
+                    const url = (typeof input === 'string') ? input
+                              : (input && input.url) ? input.url : String(input);
+                    w = dodaj({ typ: 'zapytanie', przez: 'fetch',
+                        metoda: String(((init && init.method) || (input && input.method) || 'GET')).toUpperCase(),
+                        url: zamaskuj(url),
+                        nag: naglowki((init && init.headers) || (input && input.headers)),
+                        body: tresc(url, init && init.body) });
+                } catch (e){}
+                const p = _fetch.apply(this, arguments);
+                try {
+                    p.then(function (res){
+                        if (!w) return;
+                        try {
+                            w.ms = Date.now() - t0;
+                            w.status = res.status;
+                            w.ct = (res.headers && res.headers.get('content-type')) || '';
+                            const cl = Number((res.headers && res.headers.get('content-length')) || 0);
+                            if (cl) w.rozmiar = cl;
+                            if (res.url && res.url !== w.url) w.koncowy = zamaskuj(res.url);
+                            // Poczatek odpowiedzi bierzemy TYLKO dla tekstu i tylko gdy adres
+                            // nie wyglada na logowanie — inaczej wpisalibysmy sobie token.
+                            if (/json|csv|text|xml/i.test(w.ct) && (!cl || cl < 2000000) && !LOGOWANIE.test(w.url)){
+                                if (zaDuzo()){ obcieteZBraku++; w.podglad = '(pominięte — zapis osiągnął limit wielkości)'; }
+                                else res.clone().text().then(function (t){
+                                    const pelny = String(t);
+                                    w.podglad = zamaskuj(pelny.slice(0, PODGLAD_MAX))
+                                              + (pelny.length > PODGLAD_MAX ? ('\n… (ucięte, całość miała ' + pelny.length + ' znaków)') : '');
+                                    zapiszPozniej();
+                                }).catch(function (){});
+                            }
+                            zapiszPozniej();
+                        } catch (e){}
+                    }, function (err){
+                        if (w){ w.blad = String((err && err.message) || err); w.ms = Date.now() - t0; zapiszPozniej(); }
+                    });
+                } catch (e){}
+                return p;
+            };
+        }
+
+        // ---------- przechwycenie XMLHttpRequest ----------
+        const _open = XMLHttpRequest.prototype.open;
+        const _send = XMLHttpRequest.prototype.send;
+        const _seth = XMLHttpRequest.prototype.setRequestHeader;
+        XMLHttpRequest.prototype.open = function (m, u){
+            try { this.__rec = { metoda: String(m || 'GET').toUpperCase(), url: String(u || ''), nag: [] }; } catch (e){}
+            return _open.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.setRequestHeader = function (k, v){
+            try { if (this.__rec) this.__rec.nag.push(k + ': ' + (TAJNE.test(k) ? opiszTajny(v) : zamaskuj(String(v)).slice(0, 160))); } catch (e){}
+            return _seth.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function (body){
+            const self = this, t0 = Date.now();
+            let w = null;
+            try {
+                if (self.__rec) w = dodaj({ typ: 'zapytanie', przez: 'xhr', metoda: self.__rec.metoda,
+                    url: zamaskuj(self.__rec.url), nag: self.__rec.nag, body: tresc(self.__rec.url, body) });
+            } catch (e){}
+            try {
+                self.addEventListener('loadend', function (){
+                    if (!w) return;
+                    try {
+                        w.ms = Date.now() - t0;
+                        w.status = self.status;
+                        w.ct = (self.getResponseHeader && self.getResponseHeader('content-type')) || '';
+                        if (/json|csv|text|xml/i.test(w.ct) && !LOGOWANIE.test(w.url)){
+                            const t = (self.responseType === '' || self.responseType === 'text') ? String(self.responseText || '') : '';
+                            if (t){
+                                if (zaDuzo()){ obcieteZBraku++; w.podglad = '(pominięte — zapis osiągnął limit wielkości)'; }
+                                else w.podglad = zamaskuj(t.slice(0, PODGLAD_MAX))
+                                               + (t.length > PODGLAD_MAX ? ('\n… (ucięte, całość miała ' + t.length + ' znaków)') : '');
+                            }
+                        }
+                        zapiszPozniej();
+                    } catch (e){}
+                });
+            } catch (e){}
+            return _send.apply(this, arguments);
+        };
+
+        // ---------- kliki ----------
+        // Bez tego z samych zapytan nie wiadomo, ktore z nich wywolal czlowiek,
+        // a ktore poleciały same. „Kliknalem Pobierz" -> „poszlo TO zapytanie".
+        function opiszEl(el){
+            if (!el || !el.tagName) return '(nieznany element)';
+            const t = String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+            const id = el.id ? ('#' + el.id) : '';
+            const kl = (el.className && typeof el.className === 'string')
+                     ? ('.' + el.className.trim().split(/\s+/).slice(0, 2).join('.')) : '';
+            // ADRES LINKU. To czesto CALA odpowiedz: pobranie pliku bywa zwyklym <a href>,
+            // ktore nie przechodzi ani przez fetch, ani przez XHR. W zapisie z Octopii
+            // (14.08) klikniecie w taki link nie zostawilo po sobie zadnego zapytania,
+            // a opis elementu byl bez href — czyli bez jedynej uzytecznej informacji.
+            let adr = '';
+            try {
+                const h = (el.getAttribute && (el.getAttribute('href') || el.getAttribute('action'))) || '';
+                if (h && h !== '#' && !/^javascript:/i.test(h)) adr = '  → ' + zamaskuj(String(h)).slice(0, 300);
+                const d = el.getAttribute && el.getAttribute('download');
+                if (d != null) adr += '  [pobiera plik' + (d ? (': ' + d) : '') + ']';
+            } catch (e){}
+            return el.tagName.toLowerCase() + id + kl + (t ? (' „' + t + '"') : '') + adr;
+        }
+        document.addEventListener('click', function (ev){
+            if (!wlaczony()) return;
+            try {
+                const el = (ev.target && ev.target.closest)
+                    ? (ev.target.closest('button,a,[role="button"],input[type="submit"],label,li,td') || ev.target)
+                    : ev.target;
+                dodaj({ typ: 'klik', opis: opiszEl(el) });
+            } catch (e){}
+        }, true);
+        // Pobieranie z kodu: skrypt tworzy <a href="blob:…" download>, wola .click()
+        // i usuwa element. Taki klik NIE przechodzi przez dokument, wiec nasluch wyzej
+        // go nie widzi — dlatego podmieniamy sama metode.
+        try {
+            const _aclick = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function (){
+                try {
+                    dodaj({ typ: 'pobranie', url: zamaskuj(String(this.href || '')),
+                            plik: String((this.getAttribute && this.getAttribute('download')) || '') });
+                } catch (e){}
+                return _aclick.apply(this, arguments);
+            };
+        } catch (e){}
+        // Nowe okno/karta — tez bywa sposobem na pobranie pliku.
+        try {
+            const _wopen = window.open;
+            if (typeof _wopen === 'function'){
+                window.open = function (u){
+                    try { if (u) dodaj({ typ: 'okno', url: zamaskuj(String(u)) }); } catch (e){}
+                    return _wopen.apply(this, arguments);
+                };
+            }
+        } catch (e){}
+        // Klasyczny formularz — jego wyslanie to nawigacja, nie fetch.
+        document.addEventListener('submit', function (ev){
+            if (!wlaczony()) return;
+            try {
+                const f = ev.target;
+                dodaj({ typ: 'formularz', metoda: String((f && f.method) || 'GET').toUpperCase(),
+                        url: zamaskuj(String((f && f.action) || '')) });
+            } catch (e){}
+        }, true);
+        window.addEventListener('beforeunload', function (){
+            try { GM_setValue(REC_KEY, JSON.stringify(bufor)); } catch (e){}
+        });
+
+        // ---------- raport ----------
+        function czas(ms){
+            const d = new Date(ms), p = function (n, w){ let x = String(n); while (x.length < (w || 2)) x = '0' + x; return x; };
+            return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+        }
+        function raport(){
+            if (!bufor.length) return 'Nagranie jest puste — włącz „⏺ Nagrywaj" i przejdź ścieżkę w panelu.\n';
+            const L = [], t0 = bufor[0].t;
+            const zap = bufor.filter(function (x){ return x.typ === 'zapytanie'; });
+            L.push('HUB — zapis rozmowy panelu marketplace z serwerem');
+            L.push('wersja HUB : ' + (typeof GM_info !== 'undefined' && GM_info.script ? GM_info.script.version : '?'));
+            L.push('panel      : ' + location.origin);
+            L.push('zapisany   : ' + new Date().toISOString());
+            L.push('zdarzeń    : ' + bufor.length + ' (zapytań ' + zap.length + ')');
+            L.push('');
+            L.push('POŚWIADCZENIA NIE SĄ ZAPISYWANE: nagłówki uwierzytelniające widnieją jako sam');
+            L.push('kształt, treści żądań logowania są pominięte, długie ciągi zamaskowane.');
+            // Skrot: z kim panel rozmawia i co oddaje pliki.
+            const hosty = {}, pliki = [];
+            zap.forEach(function (x){
+                let h = '?';
+                try { h = new URL(x.url, location.origin).host; } catch (e){}
+                hosty[h] = (hosty[h] || 0) + 1;
+                if (/csv|excel|sheet|octet-stream|zip|pdf/i.test(x.ct || '')) pliki.push(x);
+            });
+            L.push('');
+            L.push('hosty, z którymi rozmawiał panel:');
+            Object.keys(hosty).sort(function (a, b){ return hosty[b] - hosty[a]; })
+                  .forEach(function (h){ L.push('   ' + hosty[h] + '×  ' + h); });
+            if (pliki.length){
+                L.push('');
+                L.push('ZAPYTANIA, KTÓRE ODDAŁY PLIK — tu najpewniej siedzi pobieranie zestawienia:');
+                pliki.forEach(function (x){ L.push('   ' + x.metoda + ' ' + x.url + '   [' + x.ct + ']'); });
+            }
+            // Pobrania i otwarcia okien pokazujemy OSOBNO i wysoko. Na Octopii to wlasnie
+            // one niosly zestawienie, a w zapytaniach nie bylo po nich sladu.
+            const pobr = bufor.filter(function (x){ return x.typ === 'pobranie' || x.typ === 'okno' || x.typ === 'formularz'; });
+            if (pobr.length){
+                L.push('');
+                L.push('POBRANIA / OTWARCIA / FORMULARZE — to nie przechodzi przez fetch ani XHR:');
+                pobr.forEach(function (x){
+                    L.push('   ' + (x.typ === 'pobranie' ? 'plik' : (x.typ === 'okno' ? 'okno' : 'form'))
+                           + '  ' + (x.metoda ? (x.metoda + ' ') : '') + (x.url || '(bez adresu)')
+                           + (x.plik ? ('   nazwa: ' + x.plik) : ''));
+                });
+            }
+            // Linki, w ktore ktos kliknal — adres bywa cala odpowiedzia na „skad plik".
+            const linki = bufor.filter(function (x){ return x.typ === 'klik' && / → /.test(x.opis || ''); });
+            if (linki.length){
+                L.push('');
+                L.push('KLIKNIĘTE LINKI (z adresami):');
+                linki.forEach(function (x){ L.push('   ' + x.opis); });
+            }
+            const zAuth = zap.filter(function (x){ return (x.nag || []).some(function (n){ return /^authorization:/i.test(n); }); });
+            L.push('');
+            L.push('uwierzytelnienie: ' + (zAuth.length
+                ? (zAuth.length + ' zapytań z nagłówkiem Authorization — panel używa TOKENU, nie samych ciasteczek')
+                : 'żadne zapytanie nie miało Authorization — najpewniej wystarczą ciasteczka sesji'));
+            // Telemetria (Clarity, RUM, reklamy) potrafi byc polowa zapisu i zaslania
+            // to, co wazne. W skrocie wyzej jest policzona, w szczegolach ja pomijamy.
+            const SZUM = /(clarity\.ms|cdn-cgi\/rum|adtrafficquality|google-analytics|googletagmanager|doubleclick|hotjar|sentry|datadog|newrelic)/i;
+            const pominietych = bufor.filter(function (x){ return x.typ === 'zapytanie' && SZUM.test(x.url || ''); }).length;
+            if (pominietych){
+                L.push('');
+                L.push('(w szczegółach pominięto ' + pominietych + ' zapytań telemetrii — Clarity, RUM, reklamy)');
+            }
+            if (obcieteZBraku){
+                L.push('');
+                L.push('UWAGA: ' + obcieteZBraku + ' odpowiedzi pominięto, bo zapis osiągnął limit wielkości.');
+                L.push('Wyczyść zapis (🧹) i nagraj krótszą ścieżkę, jeśli brakuje czegoś istotnego.');
+            }
+            L.push('');
+            L.push('='.repeat(78));
+            bufor.forEach(function (x){
+                if (x.typ === 'zapytanie' && SZUM.test(x.url || '')) return;
+                const g = '[' + czas(x.t) + '] +' + ((x.t - t0) / 1000).toFixed(1) + 's ';
+                if (x.typ === 'klik'){ L.push(g + '👆 KLIK  ' + x.opis); return; }
+                if (x.typ === 'pobranie'){ L.push(g + '⬇ POBRANIE  ' + (x.url || '')
+                    + (x.plik ? ('   nazwa: ' + x.plik) : '')); return; }
+                if (x.typ === 'okno'){ L.push(g + '🗗 NOWE OKNO  ' + (x.url || '')); return; }
+                if (x.typ === 'formularz'){ L.push(g + '📨 FORMULARZ  ' + (x.metoda || '') + ' ' + (x.url || '')); return; }
+                L.push(g + (x.metoda || '?') + ' ' + (x.url || ''));
+                L.push('        → ' + (x.blad ? ('BŁĄD: ' + x.blad)
+                       : ((x.status == null ? '?' : x.status) + '  ' + (x.ct || '')
+                          + (x.rozmiar ? ('  ' + x.rozmiar + ' B') : '')
+                          + (x.ms != null ? ('  ' + x.ms + ' ms') : ''))));
+                if (x.koncowy) L.push('        przekierowanie → ' + x.koncowy);
+                (x.nag || []).forEach(function (n){ L.push('        nagłówek  ' + n); });
+                if (x.body) L.push('        wysłano   ' + x.body);
+                if (x.podglad) L.push('        odpowiedź ' + x.podglad.replace(/\n/g, ' ⏎ '));
+            });
+            L.push('='.repeat(78));
+            return L.join('\n') + '\n';
+        }
+
+        // ---------- UI ----------
+        const box = document.createElement('div');
+        box.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483000;background:#111827;'
+            + 'color:#fff;border-radius:10px;padding:10px 12px;font:12px Arial,sans-serif;'
+            + 'box-shadow:0 6px 22px rgba(0,0,0,.35);min-width:210px';
+        box.innerHTML =
+            '<div style="font-weight:700;margin-bottom:6px">⏺ Rejestrator zapytań</div>'
+          + '<div id="rec-stan" style="font-size:11px;color:#9ca3af;margin-bottom:8px">—</div>'
+          + '<div style="display:flex;gap:6px;flex-wrap:wrap">'
+          + '<button id="rec-go"   style="padding:4px 10px;border:none;border-radius:6px;background:#dc2626;color:#fff;cursor:pointer;font-weight:700">⏺ Nagrywaj</button>'
+          + '<button id="rec-save" style="padding:4px 10px;border:1px solid #4b5563;border-radius:6px;background:#1f2937;color:#fff;cursor:pointer">📄 Zapisz</button>'
+          + '<button id="rec-clr"  style="padding:4px 10px;border:1px solid #4b5563;border-radius:6px;background:#1f2937;color:#fff;cursor:pointer">🧹</button>'
+          + '</div>'
+          + '<div style="font-size:10px;color:#6b7280;margin-top:6px;max-width:220px">Hasła i tokeny nie są zapisywane — do raportu trafia sam kształt uwierzytelnienia.</div>';
+        function odswiez(){
+            const st = box.querySelector('#rec-stan'), go = box.querySelector('#rec-go');
+            if (!st || !go) return;
+            const on = wlaczony();
+            const zap = bufor.filter(function (x){ return x.typ === 'zapytanie'; }).length;
+            st.textContent = (on ? '● nagrywam — ' : 'zatrzymany — ') + zap + ' zapytań, '
+                           + bufor.filter(function (x){ return x.typ === 'klik'; }).length + ' kliknięć';
+            st.style.color = on ? '#fca5a5' : '#9ca3af';
+            go.textContent = on ? '⏹ Zatrzymaj' : '⏺ Nagrywaj';
+            go.style.background = on ? '#374151' : '#dc2626';
+        }
+        function pokaz(){
+            (document.body || document.documentElement).appendChild(box);
+            box.querySelector('#rec-go').onclick = function (){
+                try { GM_setValue(REC_ON, !wlaczony()); } catch (e){}
+                odswiez();
+            };
+            box.querySelector('#rec-save').onclick = function (){
+                const d = new Date(), p = function (n){ return String(n).length < 2 ? ('0' + n) : String(n); };
+                const nazwa = 'HUB-zapis-panelu-' + location.hostname.replace(/[^a-z0-9]+/gi, '-') + '-'
+                            + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-'
+                            + p(d.getHours()) + p(d.getMinutes()) + '.txt';
+                const b = new Blob([raport()], { type: 'text/plain;charset=utf-8' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(b); a.download = nazwa;
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+            };
+            box.querySelector('#rec-clr').onclick = function (){
+                if (!confirm('Wyczyścić nagranie?')) return;
+                bufor = [];
+                try { GM_setValue(REC_KEY, '[]'); } catch (e){}
+                odswiez();
+            };
+            odswiez();
+        }
+        if (document.body) pokaz();
+        else document.addEventListener('DOMContentLoaded', pokaz);
+    })();
+    }
 
     // ===== Moduły (każdy = oryginalny skrypt owinięty, wnętrze bez zmian) =====
     function init_vies() {
@@ -1083,6 +1516,10 @@
     });
 
     function sleep(ms) {
+        // Czekanie liczymy osobno, bo jako jedyna pozycja podlogi da sie je skrocic
+        // WPROST, bez zmiany architektury — wystarczy zmienic liczbe w kodzie. Zeby
+        // bylo wiadomo, czy warto, trzeba najpierw wiedziec, ile go naprawde jest.
+        try { ksDodajCzas('czekanie (sleep)', ms); } catch (e){}
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
@@ -2255,6 +2692,31 @@
     // droga poszlo (fetch czy ramka) i ile trwalo. Na tym opiera sie ocena etapu 1.
     const KS_LOG_MAX = 5000;
     const ksLogi = [];
+    // ---------- pomiar czasu POZA wczytaniami stron ----------
+    // Log mowil dotad wylacznie o wczytaniach. W przebiegu z 14.08.2026 skladaly sie one
+    // na 61% pracy, a pozostalych 39% — okolo 5900 sekund — nie bylo widac NIGDZIE.
+    // A to wlasnie ta liczba rozstrzyga, czy przejscie zapisu na POST cokolwiek da:
+    // POST skraca wczytania, wiec jesli podloga siedzi w JavaScripcie i w czekaniu,
+    // caly zysk zjada sie sam.
+    //
+    // Koszt pomiaru: jedno performance.now() i jedno dodawanie na etap. ZADNEGO odczytu
+    // DOM, zadnej serializacji, zadnego dopisywania do logu w goracej sciezce — tekst
+    // powstaje dopiero przy skladaniu raportu. Dlatego nie ma tu wylacznika: wlaczony
+    // pomiar nie ma jak spowolnic ksiegowania, a wylaczony nie odpowiedzialby na nic.
+    const ksCzasy = Object.create(null);
+    function ksDodajCzas(nazwa, ms){
+        const a = ksCzasy[nazwa] || (ksCzasy[nazwa] = { n: 0, ms: 0, max: 0 });
+        a.n++; a.ms += ms;
+        if (ms > a.max) a.max = ms;
+    }
+    // Mierzy etap i ZWRACA jego wynik. finally, a nie zwykle dodanie po await — inaczej
+    // etap zakonczony wyjatkiem (a takich tu nie brakuje) wypadlby z rachunku i podloga
+    // wyszlaby zanizona akurat tam, gdzie dzieje sie najwiecej.
+    async function ksMierz(nazwa, fn){
+        const t0 = performance.now();
+        try { return await fn(); }
+        finally { ksDodajCzas(nazwa, performance.now() - t0); }
+    }
     function ksLog(faza, tekst){
         ksLogi.push({ t: Date.now(), faza: String(faza || ''), tekst: String(tekst == null ? '' : tekst) });
         if (ksLogi.length > KS_LOG_MAX) ksLogi.splice(0, ksLogi.length - KS_LOG_MAX);
@@ -2283,17 +2745,89 @@
         L.push('wpisow     : ' + ksLogi.length + (ksLogi.length >= KS_LOG_MAX ? '  (bufor pelny)' : ''));
         L.push('caly przebieg: ' + ((tN - t0) / 1000).toFixed(1) + ' s');
         // Podsumowanie tego, po co ten log powstal: ile stron poszlo ktora droga.
-        let nF = 0, nR = 0, msF = 0, msR = 0;
+        let nF = 0, nR = 0, nZ = 0, msF = 0, msR = 0, msZ = 0;
         ksLogi.forEach(function (e){
             const m = e.tekst.match(/^(fetch|ramka)\s+(\d+) ms/);
-            if (!m) return;
-            if (m[1] === 'fetch'){ nF++; msF += +m[2]; } else { nR++; msR += +m[2]; }
+            if (m){ if (m[1] === 'fetch'){ nF++; msF += +m[2]; } else { nR++; msR += +m[2]; } return; }
+            const z = e.tekst.match(/^przeładowanie po akcji (\d+) ms/);
+            if (z){ nZ++; msZ += +z[1]; }
         });
-        if (nF || nR){
+        if (nF || nR || nZ){
             L.push('');
             L.push('wczytania stron:');
-            if (nF) L.push('   fetch : ' + nF + ' szt., srednio ' + Math.round(msF / nF) + ' ms, razem ' + (msF / 1000).toFixed(1) + ' s');
-            if (nR) L.push('   ramka : ' + nR + ' szt., srednio ' + Math.round(msR / nR) + ' ms, razem ' + (msR / 1000).toFixed(1) + ' s');
+            if (nF) L.push('   fetch : ' + nF + ' szt., srednio ' + Math.round(msF / nF) + ' ms, razem ' + (msF / 1000).toFixed(1) + ' s   (odczyty)');
+            if (nR) L.push('   ramka : ' + nR + ' szt., srednio ' + Math.round(msR / nR) + ' ms, razem ' + (msR / 1000).toFixed(1) + ' s   (sciezka zapisu)');
+            if (nZ) L.push('   zapis : ' + nZ + ' szt., srednio ' + Math.round(msZ / nZ) + ' ms, razem ' + (msZ / 1000).toFixed(1) + ' s   (przeladowanie po wyslaniu formularza)');
+        }
+        // Ile trwala KAZDA pozycja. Przy kilku wierszach da sie to policzyc wzrokiem,
+        // przy kilkudziesieciu juz nie — a to wlasnie tu widac pozycje odstajace.
+        // Numer wyciagamy z krokow modulu: „… [W3] 3001001302-A — …".
+        const poz = {};
+        ksLogi.forEach(function (e){
+            if (e.faza !== 'krok') return;
+            const m = e.tekst.match(/\[W\d+\]\s+(\S+)/);
+            if (!m) return;
+            const id = m[1];
+            if (!poz[id]) poz[id] = { od: e.t, do: e.t, koniec: '' };
+            poz[id].do = e.t;
+            if (/zaksięgowano|zaksiegowano/i.test(e.tekst)) poz[id].koniec = '✔';
+            else if (/ESKALACJA|eskalacja/i.test(e.tekst)) poz[id].koniec = '⚠';
+            else if (/BŁĄD|BLAD|Deleted|Brak ticketu/i.test(e.tekst)) poz[id].koniec = '✖';
+        });
+        const ids = Object.keys(poz);
+        if (ids.length > 1){
+            ids.sort(function (a, b){ return (poz[b].do - poz[b].od) - (poz[a].do - poz[a].od); });
+            L.push('');
+            L.push('pozycje wg czasu (najdluzsze u gory):');
+            ids.forEach(function (id){
+                const sek = ((poz[id].do - poz[id].od) / 1000).toFixed(1);
+                let p = String(sek); while (p.length < 7) p = ' ' + p;
+                L.push('   ' + (poz[id].koniec || ' ') + ' ' + p + ' s   ' + id);
+            });
+            const czasy = ids.map(function (id){ return poz[id].do - poz[id].od; });
+            const sr = czasy.reduce(function (a, b){ return a + b; }, 0) / czasy.length;
+            L.push('   srednio ' + (sr / 1000).toFixed(1) + ' s na pozycje, ' + ids.length + ' pozycji');
+        }
+        // ---------- gdzie idzie czas poza wczytaniami ----------
+        const nazwy = Object.keys(ksCzasy);
+        if (nazwy.length){
+            const zegar = tN - t0;
+            const we = function (k){ return ksCzasy[k] ? ksCzasy[k].ms : 0; };
+            const il = function (k){ return ksCzasy[k] ? ksCzasy[k].n : 0; };
+            const sek = function (ms){ return (ms / 1000).toFixed(1) + ' s'; };
+            const pro = function (ms){ return (100 * ms / (zegar || 1)).toFixed(1) + '%'; };
+            L.push('');
+            L.push('gdzie idzie czas (zegar przebiegu = ' + sek(zegar) + ', pieciu robotnikow naraz):');
+            L.push('   ETAPY POZYCJI — sumy pracy wszystkich robotnikow, wiec moga przekroczyc zegar');
+            ['etap: szukanie ticketu', 'etap: księgowanie'].forEach(function (k){
+                if (!ksCzasy[k]) return;
+                L.push('      ' + k.replace('etap: ', '') + ': ' + il(k) + ' razy, razem ' + sek(we(k))
+                     + ', srednio ' + Math.round(we(k) / il(k)) + ' ms, najdluzej ' + Math.round(ksCzasy[k].max) + ' ms');
+            });
+            L.push('   Z CZEGO SIE SKLADAJA (te same sekundy, widziane od srodka)');
+            ['wypełnianie formularza', 'zmiana statusu ticketu', 'czekanie (sleep)',
+             'odczyt: sieć', 'odczyt: rozbiór strony'].forEach(function (k){
+                if (!ksCzasy[k]) return;
+                L.push('      ' + k + ': ' + il(k) + ' razy, razem ' + sek(we(k))
+                     + ' (' + pro(we(k)) + ' zegara), srednio ' + Math.round(we(k) / il(k)) + ' ms');
+            });
+            if (ksCzasy['odczyt: rozmiar (KB)'])
+                L.push('      przeczytano ' + (ksCzasy['odczyt: rozmiar (KB)'].ms / 1024).toFixed(1)
+                     + ' MB tresci w ' + ksCzasy['odczyt: rozmiar (KB)'].n + ' odczytach');
+            // NAJWAZNIEJSZA LICZBA CALEGO LOGU. Praca etapow minus wszystko, co umiemy
+            // nazwac. To jest podloga, ktorej przejscie zapisu na POST NIE RUSZY —
+            // jesli jest duza, etap 2 nie ma sensu i trzeba szukac gdzie indziej.
+            const praca = we('etap: szukanie ticketu') + we('etap: księgowanie');
+            const nazwane = we('wypełnianie formularza') + we('zmiana statusu ticketu')
+                          + we('czekanie (sleep)') + msF + msR + msZ;
+            const reszta = praca - nazwane;
+            L.push('   PODLOGA — praca etapow ' + sek(praca) + ' minus wczytania, czekanie,'
+                 + ' wypelnianie i zmiany statusu (' + sek(nazwane) + ')');
+            L.push('      = ' + sek(reszta) + ' czystego JavaScriptu, ktorego zaden POST nie skroci');
+            L.push('      (przy pieciu robotnikach to okolo ' + sek(reszta / 5) + ' zegara,'
+                 + ' czyli ' + pro(reszta / 5) + ' calego przebiegu)');
+            if (reszta < 0)
+                L.push('      UWAGA: liczba ujemna — etapy zagniezdzaja sie inaczej, niz zaklada ten rachunek');
         }
         L.push('');
         L.push('Kolumny: [godzina] +sekundy_od_startu  FAZA  tresc');
@@ -2381,8 +2915,16 @@
             const res = await fetch(url, { credentials: 'same-origin',
                                            signal: ctrl ? ctrl.signal : undefined });
             if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
+            const tTekst = performance.now();
             const txt = await res.text();
+            const tParse = performance.now();
+            ksDodajCzas('odczyt: sieć', tParse - t0);
             ctx._doc = new DOMParser().parseFromString(txt, 'text/html');
+            // Parsowanie liczymy OSOBNO od sieci, bo to dwie zupelnie rozne dzwignie.
+            // search.php ma ponad megabajt i jesli jego rozbior kosztuje sekundy, da sie
+            // to naprawic bez ruszania czegokolwiek po stronie zapisu.
+            ksDodajCzas('odczyt: rozbiór strony', performance.now() - tParse);
+            ksDodajCzas('odczyt: rozmiar (KB)', txt.length / 1024);
             const ms = performance.now() - t0;
             recordServerTiming('loadForRead', ms);
             try { ksLog('odczyt', 'fetch ' + Math.round(ms) + ' ms  ' + ksUrlKrotko(url)); } catch (e){}
@@ -2435,6 +2977,18 @@
             const t = setTimeout(() => {
                 if (!done) {
                     done = true;
+                    // Adres bierzemy z RAMKI, bo waitFrameLoad go w ogole nie dostaje.
+                    // Bez tego przekroczenie czasu jest nieprzypisywalne do pozycji: po
+                    // przebiegu z 14.08.2026 (102 pozycje, 5 takich wpisow) nie dalo sie
+                    // ustalic, ktorych ticketow dotyczyly, i trzeba bylo zgadywac po tym,
+                    // ktore pozycje akurat trwaly. A to jest jedyne miejsce w calym module,
+                    // w ktorym nie wiadomo, czy formularz doszedl.
+                    try {
+                        let adr = '';
+                        try { adr = ksUrlKrotko(String((ctx && ctx.iframe && ctx.iframe.src) || '')); } catch (e3){}
+                        ksLog('zapis', 'przeładowanie po akcji TIMEOUT po ' + effectiveMs + ' ms'
+                                     + (adr ? ('  ' + adr) : '  (nie znam adresu ramki)'));
+                    } catch (e2){}
                     reject(new Error('Timeout po akcji'));
                 }
             }, effectiveMs);
@@ -2442,7 +2996,17 @@
                 if (!done) {
                     done = true;
                     clearTimeout(t);
-                    recordServerTiming('waitFrameLoad', performance.now() - t0);
+                    const ms = performance.now() - t0;
+                    recordServerTiming('waitFrameLoad', ms);
+                    // To jest SAM ZAPIS: przeladowanie strony po wyslaniu formularza albo
+                    // klknieciu przycisku. Dotad nie bylo go w logu wcale i wychodzilo
+                    // jako cisza (w przebiegu z 14.08 po 22-36 s).
+                    try {
+                        let gdzie = '';
+                        try { gdzie = ksUrlKrotko(ctx.iframe.contentWindow.location.href); }
+                        catch (e2) { gdzie = ksUrlKrotko(ctx.iframe.src || ''); }
+                        ksLog('zapis', 'przeładowanie po akcji ' + Math.round(ms) + ' ms  ' + gdzie);
+                    } catch (e3){}
                     resolve();
                 }
             };
@@ -2778,6 +3342,11 @@
     }
 
     async function setTicketStatus(wantedStatus, ctx = defaultFrameCtx) {
+        return ksMierz('zmiana statusu ticketu', function (){
+            return setTicketStatusWew(wantedStatus, ctx);
+        });
+    }
+    async function setTicketStatusWew(wantedStatus, ctx = defaultFrameCtx) {
         const doc = getFrameDoc(ctx);
         const win = getFrameWin(ctx);
         const select = findTicketStatusSelect(doc);
@@ -4600,7 +5169,14 @@
         return result;
     }
 
+    // Cienka nakladka zamiast przerabiania srodka: funkcja ma kilka wyjsc i owijanie
+    // kazdego z nich byloby prosba o pomylke.
     async function fillTicket(amount, bookingDate, accountNum, ctx = defaultFrameCtx, dupInfo = null) {
+        return ksMierz('wypełnianie formularza', function (){
+            return fillTicketWew(amount, bookingDate, accountNum, ctx, dupInfo);
+        });
+    }
+    async function fillTicketWew(amount, bookingDate, accountNum, ctx = defaultFrameCtx, dupInfo = null) {
         const doc = getFrameDoc(ctx);
         const win = getFrameWin(ctx);
 
@@ -5666,7 +6242,9 @@
 
             let checkResult;
             try {
-                checkResult = await checkOne(row.orderNumber, row.amount, row.accountNum, row.bookingDate, ctx, { total: row.dupTotal || 1, index: row.dupIndex || 1 });
+                checkResult = await ksMierz('etap: szukanie ticketu', function (){
+                    return checkOne(row.orderNumber, row.amount, row.accountNum, row.bookingDate, ctx, { total: row.dupTotal || 1, index: row.dupIndex || 1 });
+                });
             } catch (e) {
                 previewRows[i].loading = false;
                 previewRows[i].error = e.message;
@@ -5708,7 +6286,7 @@
             logRow.innerHTML = `⏳ [W${workerLabel}] <strong>${row.orderNumber}</strong> — Ticket #${previewRows[i].ticketId} | ${row.amount} | księguję…`;
 
             try {
-                const bookResult = await bookOne(previewRows[i], ctx);
+                const bookResult = await ksMierz('etap: księgowanie', function (){ return bookOne(previewRows[i], ctx); });
                 if (bookResult.ok && bookResult.vatRefund) {
                     previewRows[i].vatRefund = true;
                     previewRows[i].selected = false;
@@ -16937,6 +17515,9 @@
         'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' },
         'Wayfair · Wayfair DE':        { bank: '10',  booking: '9', acct: '1223' },
         'Manor · Manor CH':            { bank: '149', booking: '9', acct: '1092' },
+        // Cnova FR: import 58, konto 1310. Kont NIE sprawdzamy i nie ma tu podzialu
+        // B2B/B2C, ktory przy Amazonie i ManoMano decyduje o koncie i koncie VAT.
+        'Cnova · Cnova FR':            { bank: '58',  booking: '9', acct: '1310' },
         // Joybuy nie ma importu, wiec bank_setting jest mu niepotrzebny — liczy sie
         // samo konto, na ktore idzie platnosc ksiegowana wprost na auftragu.
         'Joybuy · Joybuy DE':          { bank: '',    booking: '9', acct: '1169' },
@@ -17626,7 +18207,12 @@
           brand: 'CHECK24', short: 'Check24', host: 'mc.moebel.check24.de', kind: 'c24', shop: 'Check24 DE' },
         { mp: 'Worten',         ok: false, payer: /WORTEN/i },
         { mp: 'JD / Joybuy',    ok: false, payer: /JINGDONG/i },
-        { mp: 'Cdiscount',      ok: false, payer: /CNOVA/i },
+        // Cnova FR (Cdiscount) placi jako „CNOVA PAY", a w tytule podaje numer virement
+        // i DATE WYPLATY: „Reason for payment: CNOVA PAY 0600195572 11.08.2026". Numer
+        // virement NIE wystepuje w zestawieniu - plik laczymy z wplata po KWOCIE z wiersza
+        // sum, a data z tytulu sluzy do zapytania panelu o wlasciwy eksport.
+        { mp: 'Cnova',          ok: true,  payer: /CNOVA/i, ref: /CNOVA\s*PAY\s+(\d{6,})/i,
+          brand: 'Cdiscount', short: 'Cnova', host: 'seller.octopia.com', kind: 'cnov', shop: 'Cnova FR' },
         { mp: 'Xpollens',       ok: false, payer: /XPOLLENS/i },
         { mp: 'Furniture1',     ok: false, payer: /BALDAI1|Furniture1/i }
     ];
@@ -17652,6 +18238,15 @@
                 if (base.kind === 'mano'){
                     const mmk = String(base.ref || '').toUpperCase().match(/^MANOMANO-([A-Z]{2})-/);
                     if (mmk) base.shop = 'ManoMano ' + mmk[1];
+                }
+                // Cnova: za numerem virement stoi DATA WYPLATY („... 0600195572 11.08.2026").
+                // To ona, a nie data ksiegowania w banku, jest kluczem do eksportu z panelu -
+                // przelew wplywa dzien lub dwa pozniej, wiec pytanie o date z wyciagu
+                // trafialoby w pusty zakres.
+                if (base.kind === 'cnov'){
+                    const cd = raw.match(/CNOVA\s*PAY\s+\d{6,}\s+(\d{2})[.](\d{2})[.](\d{4})/i)
+                            || raw.replace(/\s+/g, ' ').match(/CNOVA PAY \d{6,} (\d{2})[.](\d{2})[.](\d{4})/i);
+                    if (cd) base.payDate = cd[3] + '-' + cd[2] + '-' + cd[1];
                 }
                 // Manor: jeden przelew reguluje kilka dokumentow naraz. Zbieramy komplet
                 // z obu wariantow tekstu — surowego i sklejonego — bo wyciag lamie dlugi
@@ -17801,6 +18396,9 @@
         x.brand = d ? (d.brand || '') : ''; x.short = d ? (d.short || '') : ''; x.host = d ? (d.host || '') : '';
         x.kind = d ? (d.kind || 'mirakl') : ''; x.shop = d ? (d.shop || '') : '';
         x.docs = (d && d.docs && d.docs.length) ? d.docs : null;
+        // Data wyplaty (na razie tylko Cnova) musi przezyc droge do zlecenia - bez niej
+        // pobieranie z panelu nie ma o co zapytac.
+        x.payDate = (d && d.payDate) ? d.payDate : '';
         return x;
     }
 
@@ -19164,6 +19762,552 @@
         c[24] = f2(kwota);
         c[25] = typ || ''; c[26] = kk.acc; c[27] = kk.vat;
         return c;
+    }
+    // ================= CNOVA FR (CDISCOUNT, PANEL OCTOPIA) =================
+    // Zestawienie z Octopii ma TRZY wiersze naglowka:
+    //   0 - puste kolumny, a od K: „Total HT;Total TVA;Total TTC;Devise"
+    //   1 - same sumy; TO JEST KWOTA WYPLATY
+    //   2 - wlasciwy naglowek kolumn
+    // Ustalone na wyplacie z 11.08.2026: „Total net amount" 3447.32 zgadza sie CO DO
+    // GROSZA z przelewem „CNOVA PAY" z wyciagu, a suma wszystkich 131 wierszy pelnego
+    // eksportu daje dokladnie ten wiersz sum. Do banku wchodzi wiec NETTO (HT) - VAT
+    // rozlicza platforma. Wziecie „Total TTC" byloby o 707.21 za duzo.
+    //
+    // Panel oddaje plik w jezyku interfejsu: widzielismy francuski (CSV) i angielski
+    // (xlsx). Uklad kolumn jest w obu IDENTYCZNY, wiec kolumn szukamy po nazwie w obu
+    // jezykach. Porownujemy WYLACZNIE fragmenty bez akcentow („nette", „montant ht") -
+    // przy windows-1252 znaki z akcentem potrafia przyjsc inaczej, a te sa czystym ASCII.
+    const MK_CN_HOST  = 'seller.octopia.com';
+    const MK_CN_KANAL = 'CDISFR';                  // Cdiscount France - jedyny kanal, jaki mamy
+    // Typy z kolumny „Type de facturation". Do importu ida SAME sprzedaze, zwroty na
+    // liste zwrotow, a reszta (prowizje, oplaty, rezerwa gwarancyjna) tylko do pokazania -
+    // ksieguje je kto inny, tak samo jak przy ManoMano i Check24.
+    const CN_SPRZEDAZ = /^vente$/i;
+    const CN_ZWROT    = /^remboursement\s+client$/i;
+    // Koszt transportu jest osobnym wierszem, ale NALEZY DO ZAMOWIENIA: do prologistics
+    // ma wejsc jedna kwota, sprzedaz razem z transportem. W wyplacie z 11.08.2026 wszystkie
+    // 26 wierszy bylo zerowych, ale bywaja niezerowe (rzedu 25-35 EUR) i wtedy pominiecie
+    // ich zanizyloby kwote zamowienia. Nazwy typow sa francuskie niezaleznie od jezyka
+    // interfejsu - angielski eksport tez ma „Frais de port".
+    const CN_TRANSPORT = /^frais\s+de\s+port$/i;
+    function cnNorm(s){ return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+    // mkNum zdejmuje juz apostrof tysiecy („5’159.32") i radzi sobie z obu zapisami
+    // dziesietnymi - nie ma po co pisac drugiego parsera liczb.
+    function cnNum(s){ const v = mkNum(s); return (v == null) ? 0 : v; }
+    // Jeden zapis pola dla wszystkich miejsc, w ktorych skladamy wiersz z powrotem.
+    function cnCsvPole(x){
+        const v = String(x == null ? '' : x);
+        return /[";\r\n]/.test(v) ? ('"' + v.replace(/"/g, '""') + '"') : v;
+    }
+
+    function mkParseCnova(text, opcje){
+        const zrodlo = String(text == null ? '' : text);
+        const rows = mkCsvRows(zrodlo);
+        const zXlsx = !!(opcje && opcje.format === 'xlsx');
+        if (rows.length < 4){
+            // Uklad ma TRZY wiersze naglowka, wiec eksport bez ani jednej operacji ma
+            // dokladnie 3 wiersze i JEST poprawnym zestawieniem Cnovy - tyle ze pustym.
+            // Bez tego rozroznienia komunikat mowi o pliku nieprawde akurat w przypadku,
+            // ktory jest najbardziej prawdopodobny przy zle zadanych parametrach.
+            const n0 = (rows[2] || []).map(cnNorm);
+            const nasz = n0.indexOf('type de facturation') >= 0 || n0.indexOf('invoice type') >= 0;
+            return { err: nasz
+                ? 'to jest zestawienie Cnova z poprawnym nagłówkiem, ale BEZ ANI JEDNEGO WIERSZA — '
+                  + 'albo panel nie ma nic dla tej daty, albo któryś filtr nie trafia; '
+                  + 'porównaj z wynikiem tych samych filtrów wpisanych ręcznie w panelu'
+                : ('plik ma ' + rows.length + ' wiersz(e) — to nie zestawienie Cnova') };
+        }
+        const nag = (rows[2] || []).map(cnNorm);
+        function znajdz(){
+            const chce = Array.prototype.slice.call(arguments);
+            for (let i = 0; i < nag.length; i++)
+                for (let k = 0; k < chce.length; k++)
+                    if (nag[i] === chce[k]) return i;
+            return -1;
+        }
+        function zawiera(re){ for (let i = 0; i < nag.length; i++) if (re.test(nag[i])) return i; return -1; }
+        const iTyp = znajdz('type de facturation', 'invoice type');
+        const iHT  = znajdz('montant ht',  'net amount');
+        const iTVA = znajdz('montant tva', 'vat amount');
+        const iTTC = znajdz('montant ttc', 'gross amount');
+        // Warunek wejscia musi byc OSTRY: mkTypPliku pyta parsery po kolei i pierwszy,
+        // ktory nie odmowi, dostaje plik. Te nazwy razem nie wystepuja w zadnym innym
+        // rozliczeniu, ktore ten modul obsluguje.
+        if (iTyp < 0 || iHT < 0 || iTTC < 0)
+            return { err: 'to nie wygląda na zestawienie Cnova — brak kolumn „Type de facturation" / „Montant HT" / „Montant TTC"' };
+        // Numer zamowienia: FR „Affectations", EN „Operation".
+        const iNr  = znajdz('affectations', 'operation');
+        // Data wyplaty: FR „Date d'échéance nette" - po zdjeciu akcentow zostaje z niej
+        // rozpoznawalne „nette"; EN „Net due date".
+        let iDue = znajdz('net due date'); if (iDue < 0) iDue = zawiera(/(^| )nette( |$)/);
+        // Data operacji: FR „Date d'opération comptable", EN „Accounting date".
+        let iDat = znajdz('accounting date'); if (iDat < 0) iDat = zawiera(/comptable/);
+        const iCur = znajdz('devise', 'currency');
+        if (iNr < 0) return { err: 'zestawienie Cnova bez kolumny z numerem zamówienia („Affectations")' };
+        if (iDue < 0) return { err: 'zestawienie Cnova bez kolumny „Date d’échéance nette" — nie wiem, której wypłaty dotyczy' };
+
+        const sum = rows[1] || [];
+        const totNet = cnNum(sum[iHT]), totVat = cnNum(sum[iTVA]), totGross = cnNum(sum[iTTC]);
+        if (!totNet) return { err: 'w wierszu sum nie ma kwoty „Total HT" — bez niej nie znam kwoty wypłaty' };
+
+        const ord = {}, ordNet = {}, ordN = {}, zwrot = {}, zwrotNote = {}, potr = {}, typy = {};
+        const port = {};
+        let nTrans = 0;
+        const dueSet = {}, waluty = {};
+        let sumaWsz = 0, sprzedazHT = 0, sprzedazTTC = 0, zwrotSum = 0;
+        let payDate = '', cur = '', nWierszy = 0, nSprzedaz = 0, nInnych = 0;
+        for (let i = 3; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || !r.join('').trim()) continue;
+            const typ = String(r[iTyp] || '').trim();
+            if (!typ) continue;
+            nWierszy++;
+            const ht = cnNum(r[iHT]), ttc = cnNum(r[iTTC]);
+            // VAT czytamy zawsze — potrzebny przy doliczaniu transportu do sprzedazy.
+            // Kolumna jest opcjonalna, wiec przy jej braku liczymy zero, a nie NaN.
+            const tva = (iTVA >= 0) ? cnNum(r[iTVA]) : 0;
+            const id = String(r[iNr] || '').trim();
+            sumaWsz = r2(sumaWsz + ht);
+            typy[typ] = (typy[typ] || 0) + 1;
+            const d = String(r[iDue] || '').trim();
+            if (d){ dueSet[d] = (dueSet[d] || 0) + 1; if (!payDate) payDate = d; }
+            if (iCur >= 0){ const w = String(r[iCur] || '').trim().toUpperCase();
+                            if (w){ waluty[w] = (waluty[w] || 0) + 1; if (!cur) cur = w; } }
+            if (CN_SPRZEDAZ.test(typ)){
+                // Sprzedaz bez numeru zamowienia nie ma jak trafic na auftrag - wolimy
+                // odmowic calego pliku, niz po cichu zgubic jedno zamowienie.
+                if (!id) return { err: 'sprzedaż bez numeru zamówienia w wierszu ' + (i + 1) + ' — nie księguję tego pliku' };
+                nSprzedaz++;
+                ord[id]    = r2((ord[id] || 0) + ttc);
+                ordNet[id] = r2((ordNet[id] || 0) + ht);
+                ordN[id]   = (ordN[id] || 0) + 1;
+                sprzedazHT  = r2(sprzedazHT + ht);
+                sprzedazTTC = r2(sprzedazTTC + ttc);
+            } else if (CN_ZWROT.test(typ)){
+                if (!id) continue;
+                // Na liste zwrotow idzie BRUTTO ze znakiem dodatnim - tak samo jak przy
+                // ManoMano, Check24 i Wayfairze: na auftragu ksieguje sie kwote zwrotu.
+                const kw = Math.abs(ttc);
+                zwrot[id] = r2((zwrot[id] || 0) + kw);
+                zwrotSum  = r2(zwrotSum + kw);
+                const opis = ['zwrot', (iDat >= 0 ? String(r[iDat] || '').slice(0, 10) : ''),
+                              f2(kw) + ' ' + (cur || 'EUR')].filter(Boolean).join(' · ');
+                zwrotNote[id] = zwrotNote[id] ? (zwrotNote[id] + '\n\n' + opis) : opis;
+            } else if (CN_TRANSPORT.test(typ)){
+                // Zbieramy OSOBNO i doliczamy do zamowienia dopiero po petli - wiersz
+                // transportu potrafi stac w pliku PRZED swoim „Vente".
+                if (!id){ nInnych++; potr[typ] = r2((potr[typ] || 0) + ht); continue; }
+                nTrans++;
+                if (ht || tva || ttc){
+                    const p0 = port[id] || (port[id] = { ht: 0, tva: 0, ttc: 0, n: 0 });
+                    p0.ht = r2(p0.ht + ht); p0.tva = r2(p0.tva + tva); p0.ttc = r2(p0.ttc + ttc);
+                    p0.n++;
+                }
+            } else {
+                nInnych++;
+                potr[typ] = r2((potr[typ] || 0) + ht);
+            }
+        }
+        // Transport doliczamy do zamowienia. Kolejnosc ma znaczenie: dopiero teraz wiemy,
+        // ktore numery maja w ogole wiersz sprzedazy.
+        const portBezVente = [];
+        let transHT = 0, transTTC = 0;
+        Object.keys(port).forEach(function (id){
+            if (ord[id] == null){ portBezVente.push(id); return; }
+            ord[id]     = r2(ord[id] + port[id].ttc);
+            ordNet[id]  = r2((ordNet[id] || 0) + port[id].ht);
+            sprzedazHT  = r2(sprzedazHT + port[id].ht);
+            sprzedazTTC = r2(sprzedazTTC + port[id].ttc);
+            transHT     = r2(transHT + port[id].ht);
+            transTTC    = r2(transTTC + port[id].ttc);
+        });
+        if (!nSprzedaz && !Object.keys(zwrot).length)
+            return { err: 'w zestawieniu nie ma ani jednej sprzedaży („Vente") ani zwrotu („Remboursement client")' };
+        // Plik z dwiema wyplatami naraz zaksiegowalby sie na jedna wplate - odmawiamy.
+        const dueLista = Object.keys(dueSet);
+        if (dueLista.length > 1)
+            return { err: 'plik miesza ' + dueLista.length + ' wypłat (' + dueLista.sort().join(', ')
+                        + ') — wyeksportuj jedną' };
+
+        // Kontrola „wiersze == wiersz sum" ma sens WYLACZNIE dla pelnego eksportu. Plik
+        // przefiltrowany do samych sprzedazy (tak wygladaly pliki wgrywane dotad recznie)
+        // z zalozenia sie nie domyka, bo nie ma w nim prowizji ani oplat. To nie blad
+        // i nie wolno z tego robic alarmu - pelny eksport poznajemy po innych typach.
+        const pelny = nInnych > 0;
+        const domyka = pelny ? eq(sumaWsz, totNet) : null;
+
+        // Do importu ida WYLACZNIE wiersze „Vente", ale plik zostaje w ukladzie ZRODLOWYM:
+        // ustawienie importu 58 po stronie prologistics jest dopasowane do TYCH kolumn
+        // i do trzech wierszy naglowka. Wiersze bierzemy jako ORYGINALNY TEKST - inaczej
+        // zmienilby sie zapis liczb, pustych pol i koncowek linii.
+        // Wiersza sum NIE ruszamy, chociaz po odfiltrowaniu nie zgadza sie z wierszami:
+        // niesie kwote CALEJ wyplaty i dokladnie tak wygladaly pliki wgrywane recznie.
+        const eol = zrodlo.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+        const linie = zrodlo.split(/\r?\n/);
+        const doImportu = linie.slice(0, 3);
+        // Wiersz sum ZOSTAJE, ale bez kwot. Stoja one w tych samych kolumnach co kwoty
+        // zamowien, wiec import moze wziac je za kolejna pozycje — a „Total gross" 4154.53
+        // to suma calej wyplaty, nie zadne zamowienie. W plikach skladanych dotad recznie
+        // liczby te mialy apostrof tysiecy („6’501.92") i najwyrazniej dlatego nie byly
+        // czytane; my zapisujemy je czysto, wiec ta przypadkowa oslona znika i trzeba
+        // usunac je wprost. Uklad pliku — trzy wiersze naglowka — zostaje nietkniety,
+        // bo tego spodziewa sie ustawienie importu 58.
+        // Decyzja uzytkownika z 14.08.2026: kasujemy WSZYSTKIE TRZY sumy, nie samo brutto,
+        // zeby ten sam problem nie wrocil od strony kolumny netto.
+        if (doImportu.length > 1){
+            const ks = mkCsvRows(doImportu[1])[0];
+            if (ks && ks.length){
+                [iHT, iTVA, iTTC].forEach(function (ix){ if (ix >= 0 && ix < ks.length) ks[ix] = ''; });
+                doImportu[1] = ks.map(cnCsvPole).join(';');
+            }
+        }
+        let wziete = 0, nDoliczonych = 0;
+        // Numery, ktorym trzeba doliczyc transport. Wiersz sprzedazy zostaje wtedy
+        // ORYGINALNY poza trzema polami kwotowymi - reszty (dat, numerow faktur, pustych
+        // pol) nie ruszamy, wiec plik bez transportu wychodzi bajt w bajt jak zrodlo.
+        const dolicz = {};
+        Object.keys(port).forEach(function (id){ if (ord[id] != null) dolicz[id] = port[id]; });
+        const uzyte = {};
+        for (let i = 3; i < linie.length; i++){
+            const L = linie[i];
+            if (!L || !L.trim()) continue;
+            const kom = mkCsvRows(L)[0] || [];
+            if (!CN_SPRZEDAZ.test(String(kom[iTyp] || '').trim())) continue;
+            const id = String(kom[iNr] || '').trim();
+            const p0 = dolicz[id];
+            if (p0 && !uzyte[id]){
+                // Zamowienie o kilku wierszach sprzedazy dostaje transport na PIERWSZYM
+                // z nich - w calosci, nie w kawalkach. Suma zamowienia wychodzi ta sama,
+                // a dzielenie groszy miedzy wiersze tylko utrudnialoby uzgodnienie.
+                uzyte[id] = 1; nDoliczonych++;
+                kom[iHT]  = f2(cnNum(kom[iHT])  + p0.ht);
+                kom[iTTC] = f2(cnNum(kom[iTTC]) + p0.ttc);
+                if (iTVA >= 0) kom[iTVA] = f2(cnNum(kom[iTVA]) + p0.tva);
+                doImportu.push(kom.map(cnCsvPole).join(';'));
+            } else {
+                doImportu.push(L);
+            }
+            wziete++;
+        }
+        // Podzial po liniach zaklada, ze zaden rekord nie lamie sie na dwie linie
+        // (w sprawdzonych plikach nie ma ANI JEDNEGO cudzyslowu). Gdyby zalozenie padlo,
+        // liczby sie rozjada - i lepiej nie wygenerowac nic, niz oddac plik z brakami.
+        // Plik z ARKUSZA idzie do importu tak samo jak z CSV. Uzytkownik robil dotad
+        // dokladnie to samo recznie: pobieral ten arkusz i zapisywal go jako CSV, po czym
+        // zostawial same wiersze sprzedazy. Sprawdzone na eksporcie z 11.08.2026: liczby
+        // wychodza w tym samym zapisie („90.84"), daty w tym samym („2026-07-02"), a naglowek
+        // przepisujemy ZE ZRODLA, wiec jest dokladnie taki, jaki dalby zapis z arkusza.
+        // Jedyna roznica wobec pliku recznego to brak apostrofu tysiecy w wierszu sum —
+        // liczba bez separatora jest dla importu latwiejsza, nie trudniejsza.
+        //
+        // Blokujemy natomiast, gdy transport zostal bez swojego zamowienia: doliczenie go
+        // jest cala trescia zmiany i ciche pominiecie zanizyloby kwote.
+        const impOk = (wziete === nSprzedaz) && !portBezVente.length;
+        const impPowod = portBezVente.length
+            ? ('koszt transportu bez pasującej sprzedaży dla ' + portBezVente.length + ' zamówień ('
+               + portBezVente.slice(0, 3).join(', ') + (portBezVente.length > 3 ? ', …' : '')
+               + ') — nie doliczę go do niczego, więc nie generuję pliku')
+            : (impOk ? '' : ('nie umiem bezpiecznie wyciąć wierszy „Vente" (' + wziete + ' z ' + nSprzedaz + ')'));
+
+        return {
+            payDate: payDate, cur: cur || 'EUR', waluty: Object.keys(waluty),
+            totNet: totNet, totVat: totVat, totGross: totGross,
+            sumaWsz: sumaWsz, pelny: pelny, domyka: domyka,
+            sprzedazHT: sprzedazHT, sprzedazTTC: sprzedazTTC,
+            ord: ord, ordNet: ordNet, ordN: ordN,
+            ref: zwrot, refNote: zwrotNote, zwrotSum: zwrotSum,
+            potr: potr, typy: typy,
+            nSprzedaz: nSprzedaz, nInnych: nInnych, nWierszy: nWierszy,
+            nOrd: Object.keys(ord).length, nZwr: Object.keys(zwrot).length,
+            csvImport: impOk ? (doImportu.join(eol) + eol) : '',
+            impOk: impOk, impPowod: impPowod, zXlsx: zXlsx, nImpWierszy: wziete,
+            nTrans: nTrans, transHT: transHT, transTTC: transTTC,
+            nDoliczonych: nDoliczonych, portBezVente: portBezVente,
+            // Numer zamowienia Cdiscount ma 15 znakow: 11 cyfr daty i licznika, potem
+            // 4 alfanumeryczne („26070200430ZKWX"). Kontrola paczki szuka go po tym wzorcu.
+            wzorNr: '\\b(\\d{11}[A-Z0-9]{4})\\b',
+            zrodlo: zrodlo
+        };
+    }
+    function mkCsvCnova(p){ return (p && p.csvImport) ? p.csvImport : ''; }
+    function cnovPotrOpis(p){
+        const k = Object.keys(p.potr || {});
+        if (!k.length) return 'brak';
+        k.sort(function (a, b){ return Math.abs(p.potr[b]) - Math.abs(p.potr[a]); });
+        return k.slice(0, 5).map(function (t){ return t + ' ' + f2(p.potr[t]); }).join(', ')
+             + (k.length > 5 ? (' i ' + (k.length - 5) + ' inn.') : '');
+    }
+    function cnovZastosuj(j, p, skad){
+        j.shop = 'Cnova FR';
+        if (!j.date){ j.date = p.payDate; j.dateSrc = p.payDate; }
+        if (!j.cur) j.cur = p.cur;
+        const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
+        j.data = { cnov: p, shop: j.shop, gross: p.sprzedazTTC, refund: p.zwrotSum,
+                   net: p.totNet, netOk: (j.amount == null) ? true : eq(p.totNet, j.amount),
+                   ord: p.ord, ref: p.ref, refNote: p.refNote,
+                   unknown: {}, skipped: {}, full: true, both: both,
+                   pays: 1, split: false, rows: p.nWierszy, total: p.nWierszy,
+                   pages: 1, how: skad };
+        const bad = [];
+        // Kontrola pierwsza i najwazniejsza: wiersz sum kontra wyciag. Na wyplacie
+        // z 11.08.2026 zgadzalo sie co do grosza, wiec kazdy rozjazd znaczy, ze to
+        // nie ta wyplata albo ze plik jest niepelny.
+        if (j.amount != null && !eq(p.totNet, j.amount))
+            bad.push('suma z zestawienia ' + f2(p.totNet) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+        if (p.domyka === false)
+            bad.push('wiersze pełnego eksportu dają ' + f2(p.sumaWsz) + ', a wiersz sum ' + f2(p.totNet));
+        if (!p.impOk)
+            bad.push(p.impPowod || ('nie umiem bezpiecznie wyciąć wierszy „Vente" (' + p.nImpWierszy + ' z ' + p.nSprzedaz + ')'));
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join(' · ');
+        // Suma sprzedazy jest WIEKSZA niz wyplata i tak ma byc - prowizje, oplaty
+        // i zwroty sa juz potracone w przelewie, a na zamowienia nie wchodza.
+        j.note = 'wypłata ' + f2(p.totNet) + ' ' + p.cur + ' to kwota NETTO (HT) — VAT rozlicza platforma'
+               + ' · sprzedaży ' + p.nOrd + ' na ' + f2(p.sprzedazTTC) + ' brutto'
+               + (p.transTTC ? (' · doliczono transport ' + f2(p.transTTC) + ' brutto do ' + p.nDoliczonych + ' zam.')
+                             : (p.nTrans ? ' · koszty transportu w tej wypłacie są zerowe' : ''))
+               + (p.pelny ? (' · potrącone w wypłacie: ' + cnovPotrOpis(p)) : ' · plik zawiera same sprzedaże')
+               + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum) + ' — idą na listę zwrotów') : '');
+    }
+    // ---------- Cnova: pobieranie zestawien z panelu ----------
+    // Adres odczytany WPROST ze skryptu panelu (sellerfinancesearch.js): Config.ExportUrl
+    // plus data-url guzika „Export" daje /File/Download/OperationsReportFile, a parametry
+    // to dokladnie te, ktore panel sklada w requestData. Daty ida dd/mm/rrrr, a wybor
+    // wielokrotny wysyla „all", gdy zaznaczone jest wszystko. Zadnego tokena nie ma -
+    // wystarczaja ciasteczka sesji, dlatego idziemy GM_xmlhttpRequest (patrz @connect).
+    // Parametry sa odwzorowaniem TEGO, co panel wysyla ze swojego guzika „Advanced version"
+    // (sellerfinancesearch.js, ApplyAdvancedExport). Odczytane z zapisanego panelu:
+    //   startDate/endDate — formatDate z seller.js zwraca „{0}-{1}-{2}" (dzien-miesiac-rok),
+    //     czyli 11-08-2026. MYSLNIKI, nie ukosniki: ukosniki sa wylacznie w widgetcie daty
+    //     i nigdy nie trafiaja do zapytania. Wersja 4.26 wysylala „11/08/2026" i panel
+    //     nie oddawal zestawienia — to byla przyczyna bledu „mniej niz 4 wiersze".
+    //   orderStates — panel NIE zwija tego pola do „all" (robi to tylko dla eventTypes,
+    //     orderTypes i paymentStates), a samego filtra nie ma nawet w interfejsie, wiec
+    //     realnie leci PUSTE. Wysylanie „all" bylo wartoscia, ktorej serwer nie dostaje
+    //     nigdy od wlasnego frontu.
+    //   paymentStates — domyslnie zaznaczona jest JEDNA z pieciu opcji („paid"), wiec panel
+    //     wysyla „paid". Na takim wlasnie filtrze pobrano recznie zestawienie z 11.08.2026,
+    //     ktore zgadza sie co do grosza z przelewem — powtarzamy je, a nie rozszerzamy.
+    //   eventTypes / orderTypes — tam zaznaczone jest WSZYSTKO (14 z 14 i 2 z 2), a przy
+    //     komplecie panel zwija wybor do literalu „all".
+    //   salesChannelRef — PUSTE, tak jak panel. W 4.27 wysylalismy tu „CDISFR" i panel
+    //     oddal raport BEZ ANI JEDNEGO WIERSZA. Wartosc wzieta byla z parametru
+    //     „salesChannel" wyszukiwarki — to INNA nazwa pola i najwyrazniej inna przestrzen
+    //     wartosci, wiec filtr nie trafial w nic. Selecta kanalu nie ma w interfejsie
+    //     (ten sprzedawca ma jeden kanal), wiec panel zostawia to pole puste i serwer
+    //     bierze kanal z sesji. Nie odstepujemy od zapytania, ktore u czlowieka dziala —
+    //     to byl jedyny nasz wlasny pomysl w tym adresie i to on kosztowal przebieg.
+    function cnovUrl(dataWyplaty){
+        const d = String(dataWyplaty || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!d) throw new Error('nie znam daty wypłaty — bez niej nie mam o co zapytać panelu');
+        const dm = d[3] + '-' + d[2] + '-' + d[1];
+        const q = { fileType: 'OperationsReportFile', orderNumber: '', dateType: 'transfer',
+                    startDate: dm, endDate: dm, orderStates: '', salesChannelRef: '',
+                    eventTypes: 'all', orderTypes: 'all', paymentStates: 'paid' };
+        return 'https://' + MK_CN_HOST + '/File/Download/OperationsReportFile?'
+             + Object.keys(q).map(function (k){ return encodeURIComponent(k) + '=' + encodeURIComponent(q[k]); }).join('&');
+    }
+    function cnovPytanie(dataWyplaty){
+        return 'pytałem o ' + (dataWyplaty || '?')
+             + ' (dateType=transfer, paymentStates=paid, eventTypes=all, orderTypes=all, orderStates i kanał puste — jak w panelu)';
+    }
+    // Co przyszlo? Rozstrzygamy po BAJTACH, zanim cokolwiek zdekodujemy. mkDecode nie
+    // oglada sygnatur: plik binarny przechodzi u niego przez cichy fallback na
+    // windows-1252 i parser mowi potem o pliku nieprawde („brak kolumn"), zamiast
+    // powiedziec, ze dostal arkusz albo strone logowania. Wzor z c24PdfBajty.
+    function cnovSygnatura(u8){
+        // BOM zdejmujemy PO BAJTACH: utf-8 to EF BB BF, utf-16 to FF FE albo FE FF.
+        // Bez tego strona logowania zaczynajaca sie od BOM-u wyglada jak zwykly tekst,
+        // a komunikat mowi wtedy o brakujacych kolumnach zamiast o wygaslej sesji.
+        let p = 0;
+        if (u8.length > 2 && u8[0] === 0xEF && u8[1] === 0xBB && u8[2] === 0xBF) p = 3;
+        else if (u8.length > 1 && ((u8[0] === 0xFF && u8[1] === 0xFE) || (u8[0] === 0xFE && u8[1] === 0xFF))) p = 2;
+        let h = '';
+        for (let i = p; i < Math.min(p + 8, u8.length); i++) h += String.fromCharCode(u8[i]);
+        if (u8.length > 1 && u8[0] === 0x50 && u8[1] === 0x4B) return { typ: 'xlsx', opis: 'arkusz xlsx' };
+        if (h.indexOf('%PDF') === 0) return { typ: 'pdf', opis: 'PDF' };
+        const t = h.replace(/^[\s\ufeff]+/, '');
+        if (t.charAt(0) === '<') return { typ: 'html', opis: 'strona HTML' };
+        if (t.charAt(0) === '{' || t.charAt(0) === '[') return { typ: 'json', opis: 'odpowiedź JSON' };
+        return { typ: 'tekst', opis: 'tekst' };
+    }
+    function cnovPodglad(u8){
+        let t = '';
+        for (let i = 0; i < Math.min(12, u8.length); i++) t += String.fromCharCode(u8[i]);
+        return t.replace(/[^ -~]/g, '.');
+    }
+    // Z naglowkow bierzemy WYLACZNIE trzy pola z bialej listy. Nie dlatego, ze wiadomo,
+    // co jeszcze tam jest, tylko dlatego, ze biala lista jest tania, a czarna zawodzi —
+    // a ten opis trafia do j.msg, ktore jest zapisywane na trwale i pokazywane w kaflu.
+    function cnovOpisOdp(r, u8, sygn){
+        const hh = String((r && r.responseHeaders) || '');
+        const we = function (re){ const m = hh.match(re); return m ? m[1].trim() : ''; };
+        const ct = we(/^\s*content-type\s*:\s*([^\r\n]+)/im);
+        const fn = we(/filename\s*=\s*"?([^";\r\n]+)"?/i);
+        return ['HTTP ' + ((r && r.status) != null ? r.status : '?'),
+                (u8 ? (u8.length + ' B') : ''),
+                (sygn ? sygn.opis : ''),
+                (ct ? ('typ ' + ct.split(';')[0].trim()) : ''),
+                (fn ? ('plik „' + fn + '”') : ''),
+                (u8 && u8.length ? ('początek „' + cnovPodglad(u8) + '”') : '')
+               ].filter(Boolean).join(', ');
+    }
+    // Arkusz czytamy SheetJS-em — jest w @require na gorze pliku. Gdyby CDN nie odpowiedzial,
+    // spadamy na galxXlsx, wlasny czytnik ZIP-a z tego samego modulu (obsluguje Galaxusa).
+    // Kolejnosc jest taka, bo galxXlsx czyta wylacznie xl/worksheets/sheet1.xml i nie
+    // oglada sie na atrybut „r" wiersza — pusty wiersz pominiety w XML-u przesunalby
+    // indeksy, a Cnova czyta pozycyjnie wiersz sum i wiersz naglowka.
+    function cnovXLSX(){
+        try { if (typeof XLSX !== 'undefined' && XLSX) return XLSX; } catch (e){}
+        try { if (typeof window !== 'undefined' && window.XLSX) return window.XLSX; } catch (e){}
+        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX) return unsafeWindow.XLSX; } catch (e){}
+        return null;
+    }
+    function cnovKom(c){
+        if (c == null) return '';
+        // Daty zamieniamy na RRRR-MM-DD SAMI. mkParseCnova porownuje je jako napisy
+        // i data w innym zapisie (albo liczba seryjna z arkusza) wywrocilaby rozpoznanie
+        // wyplaty. Sprawdzenie przez toString, bo instanceof nie dziala miedzy piaskownicami.
+        if (Object.prototype.toString.call(c) === '[object Date]' && !isNaN(c.getTime())){
+            const p = function (x){ return (x < 10 ? '0' : '') + x; };
+            return c.getFullYear() + '-' + p(c.getMonth() + 1) + '-' + p(c.getDate());
+        }
+        return cnCsvPole(c);
+    }
+    async function cnovZArkusza(buf){
+        const X = cnovXLSX();
+        let wiersze = null;
+        if (X){
+            const wb = X.read(new Uint8Array(buf), { type: 'array', cellDates: true });
+            const nazwa = wb && wb.SheetNames && wb.SheetNames[0];
+            const ark = nazwa ? wb.Sheets[nazwa] : null;
+            if (!ark) throw new Error('w arkuszu nie ma ani jednej zakładki');
+            // Octopia deklaruje w arkuszu ZAKRES, ktory nie obejmuje danych: w eksporcie
+            // wyplaty z 11.08.2026 stalo „A1:N3", chociaz wierszy bylo 134. SheetJS ufa
+            // tej deklaracji i oddawal same trzy wiersze naglowka — zestawienie wygladalo
+            // wtedy na PUSTE, chociaz bylo kompletne, a komunikat mowil o pustym raporcie
+            // cos, co bylo nieprawda o pliku. Zakres liczymy wiec z FAKTYCZNYCH komorek
+            // i nadpisujemy deklaracje. Milczace zaufanie do niej kosztowalo dwa przebiegi.
+            let maxR = 0, maxC = 0;
+            Object.keys(ark).forEach(function (k){
+                if (k.charAt(0) === '!') return;
+                let a = null;
+                try { a = X.utils.decode_cell(k); } catch (e){ return; }
+                if (!a) return;
+                if (a.r > maxR) maxR = a.r;
+                if (a.c > maxC) maxC = a.c;
+            });
+            if (maxR > 0 || maxC > 0)
+                ark['!ref'] = X.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: maxR, c: maxC } });
+            wiersze = X.utils.sheet_to_json(ark, { header: 1, raw: true, defval: '', blankrows: true });
+        } else {
+            wiersze = await galxXlsx(buf);
+        }
+        if (!wiersze || !wiersze.length) throw new Error('arkusz jest pusty');
+        // Skladamy z powrotem TEKST, bo mkParseCnova buduje plik importu z linii zrodla —
+        // dostajac same wiersze zostawilby import pusty. Sam plik importu i tak jest przy
+        // arkuszu zablokowany (patrz impPowod), ale reszta kontroli ma dzialac normalnie.
+        return wiersze.map(function (w){
+            return (w || []).map(cnovKom).join(';');
+        }).join('\r\n') + '\r\n';
+    }
+    // Jedna droga dla obu zrodel: pobrania z panelu i pliku wgranego recznie.
+    async function cnovTresc(buf, skad){
+        const u8 = new Uint8Array(buf);
+        const sygn = cnovSygnatura(u8);
+        if (sygn.typ === 'xlsx'){
+            let txt;
+            try { txt = await cnovZArkusza(buf); }
+            catch (e){ throw new Error(skad + ' to arkusz xlsx, którego nie umiem otworzyć: ' + ((e && e.message) || e)); }
+            return { text: txt, format: 'xlsx', sygn: sygn };
+        }
+        if (sygn.typ === 'pdf')
+            throw new Error(skad + ' to PDF, a nie zestawienie');
+        if (sygn.typ === 'html'){
+            // Z cudzej strony bierzemy WYLACZNIE tytul — po nim poznac sciane logowania.
+            // Nic wiecej: ten tekst trafia do j.msg, ktore zapisuje sie na trwale i idzie
+            // przez linkify, wiec wklejony adres zrobilby sie klikalnym odsylaczem.
+            let tyt = '';
+            try {
+                const mt = mkDecode(buf).match(/<title[^>]*>([\s\S]{0,300}?)<\/title>/i);
+                if (mt) tyt = mt[1].replace(/<[^>]*>/g, ' ')
+                                   .replace(/https?:\/\/\S+/gi, '')
+                                   .replace(/[^ -~\u00a0-\u024f]/g, ' ')
+                                   .replace(/\s+/g, ' ').trim().slice(0, 80);
+            } catch (e){}
+            throw new Error('zamiast pliku przyszła strona' + (tyt ? (' „' + tyt + '”') : '')
+                + ' — sesja na ' + MK_CN_HOST + ' prawdopodobnie wygasła, zaloguj się');
+        }
+        if (sygn.typ === 'json')
+            throw new Error('panel oddał odpowiedź JSON zamiast pliku — najczęściej znaczy to, że odrzucił parametry zapytania '
+                          + 'albo wygasła sesja; zaloguj się na ' + MK_CN_HOST + ' i sprawdź eksport ręcznie');
+        return { text: mkDecode(buf), format: 'csv', sygn: sygn };
+    }
+    function cnovPobierz(dataWyplaty){
+        const url = cnovUrl(dataWyplaty);
+        return new Promise(function (res, rej){
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, responseType: 'arraybuffer',
+                headers: { 'Accept': 'text/csv,application/octet-stream,*/*' },
+                timeout: 120000,
+                onload: function (r){
+                    const buf = r.response;
+                    const u8 = (buf && buf.byteLength) ? new Uint8Array(buf) : null;
+                    const sygn = u8 ? cnovSygnatura(u8) : null;
+                    const opis = cnovOpisOdp(r, u8, sygn);
+                    // „HTTP" przed kodem stoi tu celowo: MK_SESS_RE szuka doslownie
+                    // „HTTP 401/403", a bez tego slowa withLogin nie dolozy adresu panelu.
+                    if (r.status !== 200)
+                        return rej(Object.assign(new Error('panel Octopii odpowiedział ' + opis + ' — zaloguj się na ' + MK_CN_HOST), { opis: opis }));
+                    if (!u8)
+                        return rej(Object.assign(new Error('panel oddał pusty plik (' + opis + ')'), { opis: opis }));
+                    res({ buf: buf, opis: opis, sygn: sygn });
+                },
+                onerror:   function (){ rej(new Error('nie mogę połączyć się z ' + MK_CN_HOST)); },
+                ontimeout: function (){ rej(new Error(MK_CN_HOST + ' nie odpowiedział na czas')); }
+            });
+        });
+    }
+    function cnovLeft(jobs){
+        const j = jobs || jobsLoad();
+        return Object.keys(j).filter(function (k){ return j[k].kind === 'cnov' && mkTodo(j[k]); }).length;
+    }
+    async function cnovPass(jobs){
+        const todo = Object.keys(jobs).filter(function (k){ return jobs[k].kind === 'cnov' && mkTodo(jobs[k]); });
+        if (!todo.length) return 0;
+        let ok = 0;
+        for (let i = 0; i < todo.length; i++){
+            const j = jobs[todo[i]];
+            const dw = j.payDate || j.dateSrc || j.date;
+            // Opis odpowiedzi zbieramy OBOK bledu, zeby dolaczyl sie takze wtedy, gdy
+            // wysypie sie dopiero parser. Jedna nieudana proba ma wystarczyc do ustalenia
+            // przyczyny — bez powtarzania eksperymentu i bez zgadywania.
+            let odp = '';
+            try {
+                say('Cnova FR — pobieram zestawienie wypłaty z ' + (dw || '?') + '…');
+                const plik = await cnovPobierz(dw);
+                odp = plik.opis || '';
+                const t = await cnovTresc(plik.buf, 'to, co oddał panel');
+                const p = mkParseCnova(t.text, { format: t.format });
+                if (p.err) throw new Error(p.err);
+                // Potwierdzenie, ze to TA wyplata. Numeru virement („CNOVA PAY 0600195572")
+                // w pliku NIE MA, wiec jedynym lacznikiem z przelewem jest kwota z wiersza
+                // sum - i wlasnie dlatego musi sie zgadzac, zanim cokolwiek zaksiegujemy.
+                if (j.amount != null && !eq(p.totNet, j.amount))
+                    throw new Error('pobrane zestawienie ma sumę ' + f2(p.totNet) + ', a przelew mówi '
+                        + f2(j.amount) + ' — to nie ta wypłata');
+                cnovZastosuj(j, p, 'panel Octopii');
+                ok++;
+            } catch (e){
+                const tresc = (e && e.message) || String(e);
+                const dod = (e && e.opis) ? e.opis : odp;
+                j.status = 'err';
+                j.msg = withLogin(j, tresc + ' · ' + cnovPytanie(dw)
+                        + (dod ? (' · odpowiedź: ' + dod) : ''));
+            }
+            jobsSave(jobs); render();
+        }
+        return ok;
     }
     function mkParseMano(text){
         // Tresc zrodlowa zostaje NIETKNIETA — to ona idzie potem do prologistics.
@@ -20619,6 +21763,10 @@
     function csvBlob(j){
         const txt = csvFor(j);
         if (j.kind === 'galx') return new Blob([cp1252(txt)], { type: 'text/csv' });
+        // Cnova przychodzi w windows-1252 i BEZ BOM-u, a plik importu skladamy
+        // z ORYGINALNYCH linii - musi wiec wrocic w tym samym kodowaniu, inaczej
+        // „Société" i „échéance" w naglowku rozsypia sie po drodze.
+        if (j.kind === 'cnov') return new Blob([cp1252(txt)], { type: 'text/csv' });
         // Pliki Wayfaira wgrywane dotad recznie mialy BOM — zostawiamy go, zeby import
         // dostal naglowek dokladnie tak, jak go dotad widzial. Kwoty piszemy zawsze na
         // dwa miejsca (0,00 zamiast 0), bo scalone wiersze i tak trzeba sformatowac od
@@ -20635,6 +21783,7 @@
         if (j.kind === 'ebay' && j.data && j.data.ebay) return mkCsvEbay(j.data.ebay);
         if (j.kind === 'amz'  && j.data && j.data.amz)  return mkCsvAmz(j.data.amz);
         if (j.kind === 'mano' && j.data && j.data.mano) return mkCsvMano(j.data.mano);
+        if (j.kind === 'cnov' && j.data && j.data.cnov) return mkCsvCnova(j.data.cnov);
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         return mkCsvText(pairsOf(j), j.mp);
     }
@@ -21790,7 +22939,7 @@
               + '<label style="font-size:12px;font-weight:700;color:#fff;background:#7c3aed;border:none;border-radius:6px;padding:5px 12px;cursor:pointer">📎 Dodaj pliki'
               // v3.71: doszlo .txt — raport Amazona („Settlement Report V2") przychodzi
               // jako plik tekstowy z tabulatorami i bez tego nie dalo sie go nawet wskazac.
-              + '<input type="file" id="mk-any" accept=".csv,.txt,.pdf,text/csv,text/plain,application/pdf" multiple style="display:none"></label>'
+              + '<input type="file" id="mk-any" accept=".csv,.txt,.pdf,.xlsx,text/csv,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple style="display:none"></label>'
               + '<button id="mk-all" style="padding:5px 12px;border:1px solid #7c3aed;border-radius:6px;background:#fff;color:#7c3aed;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               // Dawne osobne wejscia zostaja w DOM, tylko ukryte. Ich obsluga jest
               // sprawdzona i dziala — nowe wejscie tylko podrzuca im wlasciwy plik,
@@ -22765,12 +23914,16 @@
     // Opisy potracen produkuje PIEC parserow: Wayfair, ManoMano, Amazon (SAFE-T i Goodwill),
     // eBay i CHECK24. Wymagane sa jednak tylko u Wayfaira i tylko tam ktos ich szuka —
     // po dodaniu ManoMano komentarze zaczely sie pojawiac tam, gdzie nikt ich nie zamawial.
-    // Decyzja z 14.08.2026: zostaje sam Wayfair.
+    // Decyzja z 14.08.2026: zostaje sam Wayfair. Tego samego dnia, pozniej — Amazon wraca:
+    // tam komentarze tez sa potrzebne, i to na KAZDYM rynku (DE, IT, FR, NL, PL). Wystarczy
+    // jeden wpis, bo wszystkie rynki Amazona jada pod tym samym „kind" — gdyby kiedys mialy
+    // sie roznic, rozdzielenie wymaga osobnego klucza, nie doklejenia sufiksu do tego.
+    // Milcza nadal: ManoMano, eBay i CHECK24.
     //
     // Bramka stoi PRZY ZAPISIE do ticketu, nie przy danych. Opis nadal siedzi w wierszu
     // i wychodzi w „Kopiuj z opisem" oraz w logu — milknie wylacznie dopisywanie komentarza.
     // Dokladajac nowy marketplace NIE dopisuj go tutaj bez pytania.
-    const MK_KOM_MP = { wayf: 1 };
+    const MK_KOM_MP = { wayf: 1, amz: 1 };
     const MK_KIND_NAZWA = { wayf: 'Wayfair', mano: 'ManoMano', amz: 'Amazon', ebay: 'eBay',
                             c24: 'CHECK24', c24pdf: 'CHECK24', galx: 'Galaxus',
                             joy: 'JOOM', vtex: 'OBI', bank: 'wyciag',
@@ -24041,7 +25194,7 @@
                         known++;
                         const k = r.ref || (r.txId || (r.date + '_' + r.amount));
                         if (jobs[k] && jobs[k].status === 'done') return;
-                        if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, docs: r.docs || null, payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                        if (!jobs[k]){ add++; jobs[k] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, docs: r.docs || null, payDate: r.payDate || '', payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
                     });
                     jobsSave(jobs);
                     addT += add; knownT += known; otherT += other;
@@ -24079,7 +25232,7 @@
         // podsumowania — wgrany plik nie pojawial sie w komunikacie.
         const MK_TYPY_ETYK = { bank: 'wyciąg', amz: 'raport Amazon', mano: 'rozliczenie ManoMano',
             ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair',
-            c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung' };
+            c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova' };
         const MK_TYPY_NAZWY = Object.keys(MK_TYPY_ETYK);
         function mkTypPliku(txt){
             try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
@@ -24093,6 +25246,9 @@
             // nazw kolumn kwotowych — zaden inny obslugiwany plik tak nie wyglada.
             try { if (!mkParseMano(txt).err) return 'mano'; } catch (e){}
             try { if (!mkParseCheck24(txt, '').err) return 'c24'; } catch (e){}
+            // Cnova na koncu, bo jej warunek wejscia opiera sie na nazwach kolumn
+            // w TRZECIM wierszu - zaden wczesniejszy parser tam nie zaglada.
+            try { if (!mkParseCnova(txt).err) return 'cnov'; } catch (e){}
             return '';
         }
         const anyIn = $('#mk-any');
@@ -24101,7 +25257,7 @@
             try { this.value = ''; } catch (e){}
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
-            const kubelki = { bank: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [] }, nieznane = [];
+            const kubelki = { bank: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [], cnov: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -24110,6 +25266,14 @@
                     const u8 = new Uint8Array(buf);
                     // PDF poznajemy po naglowku pliku, nie po rozszerzeniu.
                     if (u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46) typ = 'c24pdf';
+                    // Arkusz (ZIP). O tym, CZYJ jest, decyduje tresc, nie kontener — xlsx-y
+                    // przychodza takze z Galaxusa. Rozpoznajemy wiec po zamianie na tekst
+                    // i przyjmujemy WYLACZNIE trafienie w Cnove; przy czymkolwiek innym
+                    // zostawiamy dotychczasowe zachowanie, zeby nic nie zabrac sasiadom.
+                    else if (u8.length > 1 && u8[0] === 0x50 && u8[1] === 0x4B){
+                        try { typ = (mkTypPliku(await cnovZArkusza(buf)) === 'cnov') ? 'cnov' : ''; }
+                        catch (e){ typ = ''; }
+                    }
                     else typ = mkTypPliku(mkDecode(buf));
                 } catch (e){ typ = ''; }
                 if (typ) kubelki[typ].push(f); else nieznane.push(f);
@@ -24131,6 +25295,7 @@
             // Raporty pojedynczo: kazdy dotyczy jednej wyplaty i kazdy ma wlasny komunikat.
             kubelki.amz.forEach(function (f){ amzWczytaj(f); });
             kubelki.mano.forEach(function (f){ manoWczytaj(f); });
+            kubelki.cnov.forEach(function (f){ cnovWczytaj(f); });
             kubelki.ebay.forEach(function (f){ ebayWczytaj(f); });
             kubelki.galx.forEach(function (f){ galxWczytaj(f); });
             kubelki.wayf.forEach(function (f){ wayfWczytaj(f); });
@@ -24386,6 +25551,54 @@
                 manoZastosuj(j, p, 'plik ' + f.name);
                 jobsSave(jobs); render();
                 say(manoKomunikat(p, j), (j.status !== 'ready' || p.niepewne.length) ? '#c47f00' : '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
+        }
+        // Zestawienie Cnova. Numer virement z wyciagu („CNOVA PAY 0600195572") NIE wystepuje
+        // w pliku, wiec zlecenia szukamy po KWOCIE z wiersza sum - ta jest rowna przelewowi
+        // co do grosza - a date wyplaty traktujemy jako drugie, niezalezne potwierdzenie.
+        function cnovWczytaj(f){
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = async function(){
+                let p;
+                // Ta sama droga co przy pobieraniu: najpierw sygnatura bajtow, dopiero
+                // potem tekst. Inaczej arkusz zapisany recznie z panelu trafia na mkDecode
+                // i parser mowi o nim nieprawde, zamiast powiedziec, ze to xlsx.
+                try {
+                    const t = await cnovTresc(rd.result, 'wgrany plik');
+                    p = mkParseCnova(t.text, { format: t.format });
+                }
+                catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); return; }
+                if (p.err){ say(p.err, '#c00'); return; }
+                const jobs = jobsLoad();
+                let k = Object.keys(jobs).filter(function (x){
+                    const j0 = jobs[x];
+                    return j0.kind === 'cnov' && j0.amount != null && eq(j0.amount, p.totNet);
+                })[0];
+                if (!k){
+                    // Bez wplaty w wyciagu tez da sie pracowac - zlecenie zakladamy z samego
+                    // pliku, a kluczem jest DATA WYPLATY: jedyne, co w pliku jest niepowtarzalne.
+                    k = 'CNOVA-' + (p.payDate || 'bez-daty');
+                    jobs[k] = { ref: k, date: p.payDate, dateSrc: p.payDate, payDate: p.payDate,
+                                amount: null, cur: p.cur,
+                                mp: 'Cnova', brand: 'Cdiscount', short: 'Cnova',
+                                host: MK_CN_HOST, kind: 'cnov', shop: 'Cnova FR',
+                                docs: null, payer: '', txId: '', status: 'new', msg: '' };
+                }
+                const j = jobs[k];
+                if (j.status === 'done'){ say('To rozliczenie jest już zaksięgowane.', '#c47f00'); return; }
+                // Rozjazd dat pokazujemy, ale NIE blokujemy: bank ksieguje dzien lub dwa
+                // po wyplacie, wiec sama roznica nie znaczy, ze to inne rozliczenie.
+                const ostrz = (j.payDate && p.payDate && j.payDate !== p.payDate)
+                    ? (' · uwaga: przelew mówi o wypłacie z ' + j.payDate + ', a plik z ' + p.payDate) : '';
+                cnovZastosuj(j, p, 'plik ' + f.name);
+                jobsSave(jobs); render();
+                say('Cnova FR · wypłata ' + (p.payDate || '—') + ' na ' + f2(p.totNet) + ' ' + p.cur
+                    + ' · sprzedaży ' + p.nOrd + ' na ' + f2(p.sprzedazTTC) + ' brutto'
+                    + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum) + ' — na listę zwrotów') : '')
+                    + ostrz + (j.msg ? (' — ' + j.msg) : ''),
+                    (j.status === 'ready' && !ostrz) ? '#0a7a2f' : '#c47f00');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -25529,9 +26742,9 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs);
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs);
             // CHECK24 doliczamy do komunikatu, ale NIE do przelotu — nie ma czym go pobrac.
-            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -25544,17 +26757,19 @@
             const ebay = (onMirakl || onVtex) ? 0 : nEbay;
             const c24p = (onMirakl || onVtex) ? 0 : nC24;
             const mano = (onMirakl || onVtex) ? 0 : nMano;
-            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            const cnov = (onMirakl || onVtex) ? 0 : nCnov;
+            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : [])
                               .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : [])
-                              .concat(mano ? [MK_MM_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+                              .concat(mano ? [MK_MM_HOST] : []).concat(cnov ? [MK_CN_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano + cnov) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
                     .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
                     .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : [])
                     .concat(ebay ? ['  • ' + MK_EBAY_HOST + ' — ' + ebay + ' szt. (rozpoznanie wypłaty)'] : [])
                     .concat(c24p ? ['  • ' + MK_C24_HOST + ' — ' + c24p + ' szt. (Details + Abrechnung)'] : [])
-                    .concat(mano ? ['  • ' + MK_MM_HOST + ' — ' + mano + ' szt.'] : []).join('\n')
+                    .concat(mano ? ['  • ' + MK_MM_HOST + ' — ' + mano + ' szt.'] : [])
+                    .concat(cnov ? ['  • ' + MK_CN_HOST + ' — ' + cnov + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -25583,6 +26798,11 @@
                 seen++;
                 try { ok += await mkPrzelot('ManoMano', 'mano', MK_MM_HOST, 'ManoMano', manoPass); }
                 catch (e){ problem.push(MK_MM_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (cnov){
+                seen++;
+                try { ok += await mkPrzelot('Cnova', 'cnov', MK_CN_HOST, 'Cdiscount', cnovPass); }
+                catch (e){ problem.push(MK_CN_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
@@ -25707,7 +26927,9 @@
         const blok = (j.kind === 'amz') ? amzBrakKont(j)
                    : ((j.kind === 'mano' && j.data && j.data.mano && !j.data.mano.impOk)
                         ? 'w pliku ManoMano nie zgadza się liczba wierszy ORDER — nie generuję pliku'
-                        : '');
+                        : ((j.kind === 'cnov' && j.data && j.data.cnov && !j.data.cnov.impOk)
+                             ? (j.data.cnov.impPowod || 'w zestawieniu Cnova nie zgadza się liczba wierszy „Vente"')
+                             : ''));
         if (blok){ say(blok, '#c00'); return; }
         const blob = csvBlob(j);
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
@@ -31790,6 +33012,7 @@
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
+        { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
