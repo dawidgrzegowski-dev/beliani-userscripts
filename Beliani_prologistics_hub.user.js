@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.12
+// @version      4.14
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22497,7 +22497,10 @@
     const MK_KOM_MP = { wayf: 1 };
     const MK_KIND_NAZWA = { wayf: 'Wayfair', mano: 'ManoMano', amz: 'Amazon', ebay: 'eBay',
                             c24: 'CHECK24', c24pdf: 'CHECK24', galx: 'Galaxus',
-                            joy: 'JOOM', vtex: 'OBI', bank: 'wyciag' };
+                            joy: 'JOOM', vtex: 'OBI', bank: 'wyciag',
+                            // Manor, Vente-Unique i Home24 jada wspolna sciezka Mirakla —
+                            // w logu i tak stoi obok lista sklepow, wiec wiadomo ktory to.
+                            mirakl: 'Mirakl' };
     function mkKindNazwa(k){ const n = String(k || ''); return MK_KIND_NAZWA[n] || (n || 'nieznany'); }
     function komWolno(r){ return !!MK_KOM_MP[String((r && r.kind) || '')]; }
     // Wiersze, ktorych opis ma prawo trafic do ticketu. Jedno miejsce dla wszystkich
@@ -23362,24 +23365,38 @@
     // znaczy ze tamten modul przerysowal ja od zera — wtedy cofamy licznik, bo powtorka
     // kilku linii szkodzi mniej niz luka w miejscu, ktorego wlasnie szukamy.
     function ksProbki(){
-        let widziano = 0, ost = Date.now();
+        // v4.13: sledzimy TRESC kazdego wiersza, a nie ich liczbe. Pomiar z 14.08 (Manor,
+        // 5 pozycji) pokazal, ze tamten modul zaklada po jednym wierszu na workera i potem
+        // NADPISUJE je w miejscu („szukam ticketu…" → „zaksiegowano"). Liczenie elementow
+        // widzialo wiec piec linii startowych i 116 s ciszy, chociaz kazda z nich zmieniala
+        // sie po drodze kilka razy.
+        const ostTekst = [];
+        let ost = Date.now(), workerow = 0;
         const czytaj = function (){
             const list = document.getElementById('tm-t-progress-list');
             if (!list) return;
             const ds = list.querySelectorAll('div');
-            if (ds.length < widziano) widziano = 0;
-            for (let i = widziano; i < ds.length; i++){
+            // Lista przerysowana od zera — czyscimy pamiec, zeby nowe wiersze weszly.
+            if (ds.length < ostTekst.length) ostTekst.length = ds.length;
+            for (let i = 0; i < ds.length; i++){
                 const t = String(ds[i].textContent || '').replace(/\s+/g, ' ').trim();
                 if (!t || t.length > 300) continue;
+                if (ostTekst[i] === t) continue;              // nic sie nie zmienilo
+                ostTekst[i] = t;
+                // Ile workerow pracuje naraz — potrzebne, zeby uczciwie opisac „na pozycje".
+                const w = t.match(/(\d+)\s*worker/i);
+                if (w) workerow = Math.max(workerow, parseInt(w[1], 10) || 0);
                 const teraz = Date.now();
                 mkLog('ticket', '  · ' + t + '   (+' + ((teraz - ost) / 1000).toFixed(1) + ' s)');
                 ost = teraz;
             }
-            widziano = ds.length;
         };
         const iv = setInterval(czytaj, 400);
-        // Zwracamy funkcje konczaca: dociaga ostatnie linie i gasi probkowanie.
-        return function (){ try { czytaj(); } catch (e){} clearInterval(iv); };
+        return {
+            // dociaga ostatni stan wierszy i gasi probkowanie
+            stop: function (){ try { czytaj(); } catch (e){} clearInterval(iv); },
+            workerow: function (){ return workerow; }
+        };
     }
     function ksFill(x){
         const ta = document.getElementById('tm-t-input');
@@ -23566,13 +23583,19 @@
         ksMirror(x.date + ' · konto ' + x.acct + (x.accNm ? (' — ' + x.accNm) : ''), x.rows.length);
         const tKs = Date.now();
         mkLog('ticket', '▶ oddaje sterowanie modulowi „Ksiegowanie w tickecie"');
-        const stopProbek = ksProbki();
+        const prob = ksProbki();
         ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
         const r = await ksWait(ksBtn());
-        stopProbek();
+        prob.stop();
+        // Przy pracy rownoleglej „na pozycje" to zwykla srednia i NIE jest czasem jednej
+        // pozycji — piec workerow na pieciu pozycjach robi 121 s lacznie, ale kazda z nich
+        // trwa wtedy okolo 116 s obok siebie. Bez tego zastrzezenia liczba klamie w dol.
+        const nW = prob.workerow();
         mkLog('ticket', (r === 'ok' ? '✔' : '✖') + ' modul ticketa skonczyl: ' + r
               + ' — ' + mkLogSek(tKs) + ' (' + (x.rows.length
-                ? ((Date.now() - tKs) / 1000 / x.rows.length).toFixed(1) : '?') + ' s na pozycje)');
+                ? ((Date.now() - tKs) / 1000 / x.rows.length).toFixed(1) : '?') + ' s na pozycje'
+              + (nW > 1 ? ('; ' + nW + ' workerow rownolegle, wiec to SREDNIA, a nie czas jednej pozycji') : '')
+              + ')');
         ksMirror(null);
         if (r !== 'ok'){
             // Wyjscie w tym miejscu bylo ciche, a wywolujacy pokazuje komunikat tylko
@@ -26091,6 +26114,131 @@
         return r.text();
     }
 
+    // ---------- NOT FOUND: sprawdzenie auftragu po numerze fulfilmentu ----------
+    // „Prologistics nie znalazl auftragu" NIE znaczy, ze auftragu nie ma. Przy Manorze
+    // wplata potrafi trafic na auftrag ze statusem DELETED, a zwrot spada dopiero
+    // w NASTEPNYM cyklu rozliczeniowym — wtedy wplate trzeba zaksiegowac mimo delete,
+    // bo inaczej zawisa bez pokrycia, a zwrot w kolejnym cyklu nie ma sie z czym znosic.
+    // Szukamy wiec sami, po numerze fulfilmentu (search.php?what=ff_number) — ta sama
+    // droga, ktorej uzywa modul „Ksiegowanie w auftragu".
+    const mkNfState = {};        // ff -> { kand: [...], stan, err, zaks }
+    async function nfSprawdz(job, lista, btn){
+        if (!lista.length) return;
+        btn.disabled = true;
+        mkLog('notfound', '▶ szukam auftragow dla ' + lista.length + ' poz. NOT FOUND');
+        for (let i = 0; i < lista.length; i++){
+            const ff = lista[i];
+            say('Szukam auftragu ' + (i + 1) + '/' + lista.length + ' — ' + ff + '…');
+            const st = mkNfState[ff] = { kand: [] };
+            const t0 = Date.now();
+            const f = await crFind(ff);
+            if (f.err){ st.err = f.err; mkLog('notfound', '✖ ' + ff + ': ' + f.err); continue; }
+            const nums = f.nums || [];
+            if (!nums.length){
+                st.stan = 'brak';
+                mkLog('notfound', '· ' + ff + ': nie ma auftragu o tym numerze fulfilmentu');
+                continue;
+            }
+            // Czytamy KAZDEGO kandydata — przy kilku trzeba wiedziec, ktory jest skasowany,
+            // a ktory nie. Bez tego „jest auftrag" nie mowi jeszcze nic uzytecznego.
+            for (let k = 0; k < nums.length; k++){
+                const r = await crRead(nums[k]);
+                st.kand.push({ num: nums[k], ok: !!r.ok, err: r.err || '',
+                               deleted: !!r.deleted, open: r.open, nPay: r.nPay });
+            }
+            st.stan = 'sprawdzone';
+            mkLog('notfound', '· ' + ff + ': ' + st.kand.map(function (c){
+                return c.num + (c.deleted ? ' DELETED' : '') + (c.ok ? '' : ' [' + c.err + ']');
+            }).join(', ') + ' — ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s');
+        }
+        btn.disabled = false;
+        say('Sprawdzone.', '#0a7a2f');
+    }
+    // Ksiegowanie wplaty na skasowanym auftragu. Konto bierzemy z ustawien sklepu,
+    // date z rozliczenia, kwote z wiersza NOT FOUND — komplet pokazujemy w pytaniu,
+    // zeby decyzja zapadala na widocznych liczbach, a nie na zaufaniu do tabeli.
+    async function nfKsieguj(job, ff, num, kwota, btn, rysuj){
+        const c = setLoad()[setKey(job.mp, (job.data && job.data.shop))] || {};
+        const sklep = (job.data && job.data.shop) || job.mp || '?';
+        if (!c.acct){
+            say('Nie ma konta rozliczeniowego dla „' + sklep + '" — uzupełnij w ⚙ Konta.', '#c47f00');
+            return;
+        }
+        const st = mkNfState[ff] || {};
+        const kand = (st.kand || [])[0] || {};
+        const przed = (kand.nPay == null) ? null : kand.nPay;
+        if (!confirm('Zaksięgować wpłatę na SKASOWANYM auftragu?\n\n'
+            + 'fulfilment : ' + ff + '\n'
+            + 'auftrag    : ' + num + '   (status DELETED)\n'
+            + 'kwota      : ' + f2(kwota) + '\n'
+            + 'konto      : ' + c.acct + '\n'
+            + 'data       : ' + job.date + '\n\n'
+            + 'W tym cyklu nie ma zwrotu dla tej pozycji. Jeśli zwrot przyjdzie w kolejnym '
+            + 'rozliczeniu, zaksięgujesz go osobno.\n\n'
+            + 'Tej operacji nie da się cofnąć ze skryptu.')) return;
+        btn.disabled = true;
+        mkLog('notfound', '▶ księguję ' + ff + ' → auftrag ' + num + ' (DELETED) · '
+              + f2(kwota) + ' · konto ' + c.acct + ' · data ' + job.date);
+        say('Księguję ' + ff + ' na auftragu ' + num + '…');
+        const r = await crBook(num, job.date, c.acct, kwota,
+                               String(job.short || job.mp || '') + ' ' + ff);
+        if (!r.ok){
+            st.err = 'nie zaksięgowało: ' + (r.err || '?');
+            mkLog('notfound', '✖ ' + ff + ': ' + st.err);
+            say(st.err, '#c00'); btn.disabled = false;
+            try { rysuj(); } catch (e){}
+            return;
+        }
+        // Sam kod HTTP to za malo, gdy w gre wchodza pieniadze: serwer potrafi oddac 200
+        // i nie zaksiegowac. Czytamy auftrag na nowo i sprawdzamy, czy wiersz platnosci
+        // FAKTYCZNIE przybyl — ta sama zasada, ktora ratowala przy typie klienta.
+        const po = await crRead(num);
+        if (po.ok && przed != null && po.nPay > przed){
+            st.zaks = new Date().toISOString().slice(0, 16).replace('T', ' ');
+            st.err = '';
+            mkLog('notfound', '✔ ' + ff + ': zaksięgowane, wierszy płatności ' + przed + ' → ' + po.nPay);
+            say('Zaksięgowane — na auftragu ' + num + ' przybył wiersz płatności.', '#0a7a2f');
+        } else {
+            st.err = 'wysłane, ale NIE potwierdziłem wiersza płatności — sprawdź auftrag ' + num;
+            mkLog('notfound', '⚠ ' + ff + ': ' + st.err + ' (wierszy płatności '
+                  + (przed == null ? '?' : przed) + ' → ' + (po.ok ? po.nPay : '?') + ')');
+            say(st.err, '#c47f00');
+        }
+        try { rysuj(); } catch (e){}
+    }
+    // Co pokazac w kolumnie „Auftrag" przy wierszu NOT FOUND.
+    function nfKom(ff, kwota, rv){
+        const st = mkNfState[ff];
+        if (!st) return '<span style="color:#888">—</span>';
+        if (st.zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane ' + esc(st.zaks) + '</span>';
+        if (st.err)  return '<span style="color:#c00">' + esc(st.err) + '</span>';
+        if (st.stan === 'brak') return '<span style="color:#c00">nie ma auftragu o tym numerze fulfilmentu</span>';
+        const k = st.kand || [];
+        if (!k.length) return '<span style="color:#888">sprawdzam…</span>';
+        const lnk = function (n){ return '<a href="/auction.php?number=' + esc(n) + '&txnid=3" target="_blank">' + esc(n) + '</a>'; };
+        if (k.length > 1){
+            return '<span style="color:#c47f00">kilka auftragów: ' + k.map(function (c){
+                return lnk(c.num) + (c.deleted ? ' <b>DELETED</b>' : '');
+            }).join(', ') + ' — zaksięguj ręcznie</span>';
+        }
+        const c = k[0];
+        if (!c.ok) return '<span style="color:#c00">' + esc(c.err || 'nie odczytałem auftragu') + '</span>';
+        if (!c.deleted){
+            return '<span style="color:#c47f00">auftrag ' + lnk(c.num)
+                 + ' istnieje i NIE jest skasowany — sprawdź, czemu import go nie znalazł</span>';
+        }
+        // Auftrag skasowany. Zwrot w tym samym cyklu znaczy, ze wplata i tak sie znosi
+        // i nie ma czego ksiegowac — guzik pokazujemy WYLACZNIE gdy zwrotu nie ma.
+        const opis = '<span style="color:#0a7a2f">auftrag ' + lnk(c.num) + ' <b>DELETED</b> · '
+                   + (rv == null ? 'brak zwrotu w tym cyklu' : ('zwrot w tym cyklu ' + f2(rv)))
+                   + '</span>';
+        if (rv != null) return opis + ' <span style="color:#888">— nic nie księguję</span>';
+        return opis + ' <button class="mk-nf-book" data-ff="' + esc(ff) + '" data-num="' + esc(c.num)
+             + '" data-amt="' + esc(String(kwota)) + '" style="margin-left:6px;padding:2px 8px;border:none;'
+             + 'border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:10px">'
+             + '💾 Zaksięguj mimo delete</button>';
+    }
+
     function impRender(job, d){
         const box = document.getElementById('mk-imp-box');
         if (!box) return;
@@ -26159,13 +26307,17 @@
             // byla to sama lista numerow i zeby sprawdzic, czy pozycja faktycznie sie znosi,
             // trzeba bylo porownywac ja recznie z wierszem „rozliczone i zwrócone".
             h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>'
+              +  ' <button id="mk-nf-check" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" title="Szuka auftragu po numerze fulfilmentu — tą samą drogą co moduł „Księgowanie w auftragu”. Import potrafi nie znaleźć auftragu, który JEST, tylko ma status DELETED.">🔍 Szukaj auftragów po fulfilmencie</button>'
               +  '<div style="font-size:10px;color:#888;margin-top:2px">Prologistics nie znalazł auftragu dla tych numerów. '
-              +  'Część tłumaczy zwrot z tego samego cyklu — wtedy wpłata i zwrot znoszą się i nie ma czego księgować.</div>'
+              +  'Część tłumaczy zwrot z tego samego cyklu — wtedy wpłata i zwrot znoszą się i nie ma czego księgować. '
+              +  'Reszta bywa auftragiem ze statusem DELETED: wpłata przyszła, a zwrot spadnie dopiero w kolejnym cyklu — '
+              +  'wtedy trzeba zaksięgować mimo delete.</div>'
               +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
               +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Fulfilment</td>'
               +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
               +  '<td style="padding:1px 6px;text-align:right">Zwrot w tym cyklu</td>'
-              +  '<td style="padding:1px 6px">Co to znaczy</td></tr>';
+              +  '<td style="padding:1px 6px">Co to znaczy</td>'
+              +  '<td style="padding:1px 6px">Auftrag</td></tr>';
             nf.forEach(function (x){
                 const id = String(x.payment_descr == null ? '' : x.payment_descr).trim();
                 const a = impNum(x.amount);
@@ -26183,7 +26335,8 @@
                   +  '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (rv == null ? '—' : f2(rv)) + '</td>'
-                  +  '<td style="padding:2px 6px;color:' + colr + '">' + msg + '</td></tr>';
+                  +  '<td style="padding:2px 6px;color:' + colr + '">' + msg + '</td>'
+                  +  '<td style="padding:2px 6px">' + nfKom(id, a, rv) + '</td></tr>';
             });
             h += '</table></div>';
         }
@@ -26218,6 +26371,19 @@
 
         const re = box.querySelector('#mk-imp-re');
         if (re) re.onclick = function(){ impCheck(job.ref); };
+        const nfb = box.querySelector('#mk-nf-check');
+        if (nfb) nfb.onclick = async function(){
+            const lista = nf.map(function (x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); })
+                            .filter(function (x){ return x; });
+            await nfSprawdz(job, lista, nfb);
+            impRender(job, d);
+        };
+        box.querySelectorAll('.mk-nf-book').forEach(function (b){
+            b.onclick = function(){
+                nfKsieguj(job, b.getAttribute('data-ff'), b.getAttribute('data-num'),
+                          Number(b.getAttribute('data-amt')), b, function (){ impRender(job, d); });
+            };
+        });
         const tr = box.querySelector('#mk-typ-run');
         if (tr) tr.onclick = function(){ amzTypZPaczki(jobsLoad()[job.ref] || job, d, tr); };
         const ts = box.querySelector('#mk-tol-set');
