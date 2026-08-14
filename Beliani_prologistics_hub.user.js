@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.07
+// @version      4.09
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12880,9 +12880,22 @@
             return o;
         }
         // Jeden wiersz = jeden przelew (jeden dostawca). Poprawki reczne trzymamy w state.painEdit[key].
+        // Skad wzieta jest platnosc: laczona (depozyt + balance), sam depozyt albo sam balance.
+        // pcMergedGroups() rozdziela to na trzy kubelki, ale sklejenie ich w jedna liste
+        // gubilo te informacje — a przy wprowadzaniu przelewow ma znaczenie, bo laczona
+        // platnosc to jeden przelew za dwie rzeczy naraz.
+        var PAIN_ZR = {
+            combined: { et: 'ŁĄCZONE', op: 'depozyt + balance w jednym przelewie', kol: '#6b21a8', tlo: '#f5f3ff' },
+            depo:     { et: 'DEPOZYT', op: 'tylko depozyt',                        kol: '#0a58ca', tlo: '#eff6ff' },
+            bal:      { et: 'BALANCE', op: 'tylko balance',                        kol: '#166534', tlo: '#f0fdf4' }
+        };
         function painRows(){
-            var MG = pcMergedGroups(), all = MG.combined.concat(MG.depoOnly).concat(MG.balOnly), out = [];
-            all.forEach(function(G, i){
+            var MG = pcMergedGroups(), out = [];
+            var all = MG.combined.map(function(G){ return { G: G, zr: 'combined' }; })
+                .concat(MG.depoOnly.map(function(G){ return { G: G, zr: 'depo' }; }))
+                .concat(MG.balOnly.map(function(G){ return { G: G, zr: 'bal' }; }));
+            all.forEach(function(W, i){
+                var G = W.G;
                 var ds = pcSumRows(G.dep), bs = pcBalSum(G.bal);
                 var bk = painBankOfG(G), b = bk.bank || {}, geo = piBankGeo(b), ageo = painAgtGeo(b), st = painGroupOk(G);
                 var ed = (state.painEdit && state.painEdit[G.key]) || {};
@@ -12918,6 +12931,7 @@
                     hasBank: bk.n > 0, bankWhy: bk.why || '', conflict: bk.conflict, nBank: bk.n,
                     verified: st.ok && !hintBad, why: st.why,
                     nDep: (G.dep || []).length, nBal: (G.bal || []).length,
+                    sumDep: ds || 0, sumBal: bs || 0, zrodlo: W.zr,
                     e2e: painFirstOrder(G)
                 });
             });
@@ -14647,9 +14661,38 @@
             h += '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;width:100%">';
             h += '<tr style="color:#999;font-size:10px"><td style="padding:1px 4px"></td><td style="padding:1px 4px">Dostawca</td><td style="padding:1px 4px;text-align:right">Kwota ' + PAIN_CCY + '</td><td style="padding:1px 4px">Beneficjent (Nm)</td><td style="padding:1px 4px">Konto</td><td style="padding:1px 4px">BIC</td><td style="padding:1px 4px">Miasto</td><td style="padding:1px 4px">Kraj</td><td style="padding:1px 4px">Status</td></tr>';
             if (!rows.length) h += '<tr><td colspan="9" style="padding:8px;color:#888">Brak danych — kliknij najpierw „Przetwórz”.</td></tr>';
+            // Podsumowanie kazdej grupy liczymy PRZED petla — naglowek ma podac liczbe
+            // platnosci i kwote, a nie sam napis.
+            var wgZr = {};
+            rows.forEach(function(r){
+                var z = r.zrodlo || 'depo';
+                if (!wgZr[z]) wgZr[z] = { n: 0, kwota: 0, zazn: 0 };
+                wgZr[z].n++;
+                wgZr[z].kwota += Number(r.amount) || 0;
+                if (state.painSel[r.key]) wgZr[z].zazn++;
+            });
+            var ostatniaZr = null;
             rows.forEach(function(r){
                 var on = !!state.painSel[r.key];
                 var bg = on ? (r.verified ? '#EAF7EA' : '#FFF6E0') : '#fff';
+                // Naglowek sekcji — wchodzi przy KAZDEJ zmianie zrodla. Wiersze przychodza
+                // pogrupowane (laczone, potem depozyt, potem balance), wiec kazda grupa
+                // dostaje dokladnie jeden naglowek.
+                var zr = r.zrodlo || 'depo';
+                if (zr !== ostatniaZr){
+                    ostatniaZr = zr;
+                    var op = PAIN_ZR[zr] || PAIN_ZR.depo, ag = wgZr[zr] || { n: 0, kwota: 0, zazn: 0 };
+                    h += '<tr><td colspan="9" style="padding:8px 6px 3px 6px;border-top:2px solid '
+                       + op.kol + ';background:' + op.tlo + '">'
+                       + '<span style="font-weight:700;color:' + op.kol + ';font-size:11px;letter-spacing:.4px">'
+                       + op.et + '</span>'
+                       + '<span style="color:#666;font-size:10px"> — ' + op.op + '</span>'
+                       + '<span style="float:right;color:' + op.kol + ';font-size:11px;font-weight:700">'
+                       + ag.n + ' płatnoś' + (ag.n === 1 ? 'ć' : (ag.n < 5 ? 'ci' : 'ci'))
+                       + ' · ' + ag.kwota.toFixed(2) + ' ' + PAIN_CCY
+                       + (ag.zazn !== ag.n ? ('<span style="color:#c47f00"> · zaznaczonych ' + ag.zazn + '</span>') : '')
+                       + '</span></td></tr>';
+                }
                 if (r.acctHintBad) bg = on ? '#FDECEC' : '#FFF5F5';
                 var st = r.verified
                     ? '<span style="color:#0a0;font-weight:700">✓ sprawdzone</span>'
@@ -14663,7 +14706,11 @@
                 var tl = painChars(r.title, strict).txt.length;
                 h += '<tr style="background:' + bg + '">'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top"><input type="checkbox" class="pain-chk" data-key="' + pcAttr(r.key) + '"' + (on ? ' checked' : '') + '></td>'
-                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top;max-width:170px">' + esc(r.sup) + '<div style="font-size:10px;color:#888">D' + r.nDep + ' / B' + r.nBal + '</div></td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top;max-width:170px">' + esc(r.sup) + '<div style="font-size:10px;color:#888">'
+                       + (r.nDep ? ('depozyt ' + r.nDep + '×' + (r.sumDep ? (' ' + r.sumDep.toFixed(2)) : '')) : '')
+                       + (r.nDep && r.nBal ? ' + ' : '')
+                       + (r.nBal ? ('balance ' + r.nBal + '×' + (r.sumBal ? (' ' + r.sumBal.toFixed(2)) : '')) : '')
+                       + '</div></td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;text-align:right;vertical-align:top">' + painInp('amount', r.key, r.amount.toFixed(2), 78) + (r.amountEdited ? '<div style="font-size:10px;color:#0a58ca">było ' + r.amountBase.toFixed(2) + '</div>' : '') + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('name', r.key, r.name, 210) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('acc', r.key, r.acc, 165) + (painIbanOk(r.acc) ? '<div style="font-size:10px;color:#0a0">IBAN ✓</div>' : '') + '</td>'
@@ -21433,7 +21480,13 @@
     panel.innerHTML =
         '<div style="display:flex;justify-content:space-between;align-items:center;background:#f5f3ff;padding:12px 16px;border-bottom:1px solid #ddd6fe">'
       +   '<div style="font-weight:700;color:#5b21b6">Księgowanie Marketplace\'s <span style="font-weight:400;font-size:11px;opacity:.6">v' + MK_VER + ' · ' + (onMirakl ? 'Mirakl' : (onVtex ? 'OBI' : 'prologistics')) + '</span></div>'
-      +   '<button id="mk-close" style="padding:4px 12px;border:1px solid #ddd6fe;border-radius:6px;background:#fff;cursor:pointer">✕</button>'
+      +   '<div style="display:flex;gap:6px;align-items:center">'
+      // Log siedzi w naglowku, a nie przy zwrotach, bo naglowek jest ZAWSZE — sekcja
+      // zwrotow znika, gdy nie ma ani jednej grupy, a wtedy log bywa najbardziej potrzebny.
+      +     '<button id="mk-log-save" title="Zapisuje plik .txt z pelnym przebiegiem ksiegowania: kazdy krok z godzina i czasem trwania, wynik modulu ticketa, opisy, arkusz. Do wklejenia w rozmowie z Claude." style="padding:4px 10px;border:1px solid #ddd6fe;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📄 Log</button>'
+      +     '<button id="mk-log-copy" title="To samo do schowka" style="padding:4px 8px;border:1px solid #ddd6fe;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋</button>'
+      +     '<button id="mk-close" style="padding:4px 12px;border:1px solid #ddd6fe;border-radius:6px;background:#fff;cursor:pointer">✕</button>'
+      +   '</div>'
       + '</div>'
       + '<div style="padding:12px 16px">'
       +   (onProlo
@@ -21546,6 +21599,17 @@
         (document.body || document.documentElement).appendChild(panel);
     }
     $('#mk-close').onclick = function(){ panel.style.display = 'none'; };
+    $('#mk-log-save').onclick = function(){
+        mkLogZapisz();
+        say('Log zapisany — ' + mkLogi.length + ' wpisów.', '#0a7a2f');
+    };
+    $('#mk-log-copy').onclick = function(){
+        const t = mkLogTekst();
+        if (!navigator.clipboard){ say('Nie mam dostępu do schowka — użyj „📄 Log".', '#c47f00'); return; }
+        navigator.clipboard.writeText(t)
+            .then(function (){ say('Log skopiowany — ' + mkLogi.length + ' wpisów.', '#0a7a2f'); })
+            .catch(function (){ say('Schowek odmówił — użyj „📄 Log".', '#c47f00'); });
+    };
 
     function jobList(){
         const j = jobsLoad();
@@ -22347,6 +22411,100 @@
         btn.disabled = false;
     }
 
+    // ---------- log ksiegowan ----------
+    // Po co: jedyna informacja o przebiegu byl jednolinijkowy pasek stanu, ktory nadpisuje
+    // sam siebie — po ksiegowaniu nie dalo sie odtworzyc, co sie stalo ani ile co trwalo.
+    // Log zapamietuje kazdy krok razem z czasem. Trzymamy go w pamieci karty, nie w
+    // GM_setValue: interesuje nas biezacy przebieg, a zapis do storage przy kazdej pozycji
+    // tylko by go spowalnial.
+    const MK_LOG_MAX = 4000;
+    const mkLogi = [];
+    function mkLog(faza, tekst){
+        mkLogi.push({ t: Date.now(), faza: String(faza || ''), tekst: String(tekst == null ? '' : tekst) });
+        // Bufor obcinamy od POCZATKU — przy dlugim przebiegu wazniejsze jest to, co dzieje
+        // sie teraz, niz to, co bylo cztery tysiace wpisow temu.
+        if (mkLogi.length > MK_LOG_MAX) mkLogi.splice(0, mkLogi.length - MK_LOG_MAX);
+    }
+    function mkLogSek(t0){ return ((Date.now() - t0) / 1000).toFixed(1) + ' s'; }
+    function mkLogCzas(ms){
+        const d = new Date(ms);
+        const p = function (n, w){ let x = String(n); while (x.length < (w || 2)) x = '0' + x; return x; };
+        return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+    }
+    function mkLogTekst(){
+        if (!mkLogi.length) return 'Log jest pusty — w tej karcie nic jeszcze nie ksiegowano.\n';
+        const L = [], t0 = mkLogi[0].t, tN = mkLogi[mkLogi.length - 1].t;
+        L.push('HUB — log ksiegowan marketplace');
+        L.push('wersja HUB : ' + MK_VER);
+        L.push('zapisany   : ' + new Date().toISOString());
+        L.push('wpisow     : ' + mkLogi.length + (mkLogi.length >= MK_LOG_MAX ? '  (bufor pelny — najstarsze obciete)' : ''));
+        L.push('caly przebieg: ' + ((tN - t0) / 1000).toFixed(1) + ' s');
+        L.push('');
+        L.push('Kolumny: [godzina] +sekundy_od_startu  FAZA  tresc');
+        L.push('==============================================================================');
+        let poprz = t0;
+        mkLogi.forEach(function (e){
+            // Przerwa dluzsza niz 5 s dostaje wlasna linie. To ona pokazuje, gdzie przebieg
+            // NAPRAWDE stal — takze wtedy, gdy tego kroku nikt nie opomiarowal.
+            const luka = e.t - poprz;
+            if (luka > 5000) L.push('        … cisza ' + (luka / 1000).toFixed(1) + ' s …');
+            poprz = e.t;
+            let sek = '+' + ((e.t - t0) / 1000).toFixed(1);
+            while (sek.length < 9) sek = ' ' + sek;
+            let fz = String(e.faza);
+            while (fz.length < 10) fz = fz + ' ';
+            L.push('[' + mkLogCzas(e.t) + '] ' + sek + '  ' + fz + '  ' + e.tekst);
+        });
+        L.push('==============================================================================');
+        return L.join('\n') + '\n';
+    }
+    function mkLogNazwa(){
+        const d = new Date(), p = function (n){ return String(n).length < 2 ? ('0' + n) : String(n); };
+        return 'HUB-log-ksiegowan-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate())
+             + '-' + p(d.getHours()) + p(d.getMinutes()) + '.txt';
+    }
+    function mkLogZapisz(){
+        const blob = new Blob([mkLogTekst()], { type: 'text/plain;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob); a.download = mkLogNazwa();
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+    }
+
+    // ---------- komu wolno dopisac komentarz do ticketu ----------
+    // Opisy potracen produkuje PIEC parserow: Wayfair, ManoMano, Amazon (SAFE-T i Goodwill),
+    // eBay i CHECK24. Wymagane sa jednak tylko u Wayfaira i tylko tam ktos ich szuka —
+    // po dodaniu ManoMano komentarze zaczely sie pojawiac tam, gdzie nikt ich nie zamawial.
+    // Decyzja z 14.08.2026: zostaje sam Wayfair.
+    //
+    // Bramka stoi PRZY ZAPISIE do ticketu, nie przy danych. Opis nadal siedzi w wierszu
+    // i wychodzi w „Kopiuj z opisem" oraz w logu — milknie wylacznie dopisywanie komentarza.
+    // Dokladajac nowy marketplace NIE dopisuj go tutaj bez pytania.
+    const MK_KOM_MP = { wayf: 1 };
+    const MK_KIND_NAZWA = { wayf: 'Wayfair', mano: 'ManoMano', amz: 'Amazon', ebay: 'eBay',
+                            c24: 'CHECK24', c24pdf: 'CHECK24', galx: 'Galaxus',
+                            joy: 'JOOM', vtex: 'OBI', bank: 'wyciag' };
+    function mkKindNazwa(k){ const n = String(k || ''); return MK_KIND_NAZWA[n] || (n || 'nieznany'); }
+    function komWolno(r){ return !!MK_KOM_MP[String((r && r.kind) || '')]; }
+    // Wiersze, ktorych opis ma prawo trafic do ticketu. Jedno miejsce dla wszystkich
+    // czterech uzyc (status grupy, guzik kontroli, dopisywanie, sprawdzanie) — inaczej
+    // ktores z nich zostaloby przy starej regule.
+    function komWiersze(rows){
+        return (rows || []).filter(function (r){ return r.note && komWolno(r); });
+    }
+    // Pozycje z opisem, ktorych marketplace komentarzy NIE zostawia. Nie sa bledem —
+    // mowimy o nich wprost, zeby cisza nie wygladala na przeoczenie.
+    function komMilczace(rows){
+        return (rows || []).filter(function (r){ return r.note && !komWolno(r); });
+    }
+    function komMilczaceMp(rows){
+        const mp = [];
+        komMilczace(rows).forEach(function (r){
+            const n = mkKindNazwa(r.kind); if (mp.indexOf(n) < 0) mp.push(n);
+        });
+        return mp;
+    }
+
     // ---------- zwroty zbiorczo, per data i konto ----------
     // Ksiegowanie w tickecie przyjmuje JEDNO konto na raz, wiec zwroty ze wszystkich
     // zestawien danego dnia grupujemy po koncie i podajemy osobno dla kazdego.
@@ -22376,7 +22534,10 @@
                 if (!v) return;                                  // zerowe wiersze wysylki pomijamy
                 // Opis potracenia (Wayfair) zostaje przy pozycji — bez niego przy
                 // ksiegowaniu nie widac, czego zwrot dotyczyl i skad sie wzial.
-                g[key].rows.push({ id: id, amt: v, ref: j.ref, note: (j.data.refNote || {})[id] || '' });
+                // kind = rodzaj marketplace. Bez niego nie da sie pozniej powiedziec,
+                // czy temu opisowi wolno trafic do ticketu (patrz MK_KOM_MP).
+                g[key].rows.push({ id: id, amt: v, ref: j.ref, kind: j.kind,
+                                   note: (j.data.refNote || {})[id] || '' });
                 g[key].sum = r2(g[key].sum + v);
             });
         });
@@ -22513,7 +22674,9 @@
     function rcState(id){ return rcLoad()[String(id)] || null; }
     // Podsumowanie dla grupy: ile pozycji z opisem ma go juz w tickecie.
     function rcGroup(x){
-        const zOpisem = (x.rows || []).filter(function (r){ return r.note; });
+        // Tylko te, ktorych opis ma prawo trafic do ticketu — inaczej grupa z ManoMano
+        // wisialaby w nieskonczonosc jako „opisy: jeszcze nie dopisywane".
+        const zOpisem = komWiersze(x.rows);
         if (!zOpisem.length) return null;
         let ok = 0, zle = 0;
         zOpisem.forEach(function (r){ const s = rcState(r.id); if (s){ if (s.ok) ok++; else zle++; } });
@@ -22628,7 +22791,7 @@
               // v3.90: kontrola stanu faktycznego — czyta kazdy ticket na swiezo i mowi,
               // czy opis TAM JEST. Odpowiedz na „zaksiegowalo i nie ma": zamiast wierzyc
               // zapisowi sprzed minut, pytamy sam ticket.
-              +  (x.rows.some(function (r){ return r.note; })
+              +  (komWiersze(x.rows).length
                     ? '<button class="mk-rv" data-g="' + i + '"' + (refBusy ? ' disabled' : '')
                       + ' style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:'
                       + (refBusy ? 'default' : 'pointer') + ';font-size:11px">🔍 Sprawdź opisy w ticketach</button>'
@@ -22693,7 +22856,7 @@
         }; });
         box.querySelectorAll('.mk-rv').forEach(function (b){ b.onclick = async function(){
             const k = keys[+b.getAttribute('data-g')], x = g[k];
-            const zOpisem = x.rows.filter(function (r){ return r.note; });
+            const zOpisem = komWiersze(x.rows);
             if (!zOpisem.length) return;
             if (typeof window.__TM_TICKET_COMMENT_CHECK !== 'function'){
                 say('Moduł „Księgowanie w tickecie" jest wyłączony — nie mam czym czytać ticketów.', '#c47f00');
@@ -23186,7 +23349,13 @@
     // #mk-status), a zaraz po tej funkcji szedl komunikat o arkuszu — i kasowal kazda
     // informacje o tym, ze komentarze NIE poszly. Wynik skladamy teraz na koncu.
     async function refComment(x, done){
-        const zOpisem = x.rows.filter(function (r){ return r.note; });
+        const zOpisem = komWiersze(x.rows);
+        const milczace = komMilczace(x.rows);
+        if (milczace.length){
+            mkLog('komentarz', 'pomijam ' + milczace.length + ' poz. z opisem ('
+                  + komMilczaceMp(x.rows).join(', ') + ') — komentarze w ticketach '
+                  + 'zostawiamy wylacznie przy Wayfairze');
+        }
         // Puste „done" znaczylo dotad „nie odczytalem logu" i komentowalismy wszystko.
         // To bylo sluszne, dopoki nie umielismy odczytac POWODOW. Teraz umiemy: gdy log
         // wprost mowi „Timeout" albo „Brak ticketu", brak potwierdzenia nie jest juz
@@ -23198,8 +23367,15 @@
             return !powodyPre[r.id];
         });
         if (!zOpisem.length){
+            // Dwa rozne powody ciszy. „Nie ma opisu" i „opis jest, ale ten marketplace
+            // komentarzy nie zostawia" to nie to samo i nie wolno ich mylic.
+            if (milczace.length){
+                return { msg: 'opisów nie dopisuję — ' + milczace.length + ' poz. ma opis ('
+                              + komMilczaceMp(x.rows).join(', ') + '), ale komentarze w ticketach '
+                              + 'zostawiamy wyłącznie przy Wayfairze', col: '#666' };
+            }
             return { msg: 'opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
-                          + '(dostarcza je rozliczenie Wayfaira, a przy Amazonie SAFE-T i Goodwill)', col: '#666' };
+                          + '(dostarcza je rozliczenie Wayfaira)', col: '#666' };
         }
         // v3.66: powod pominiecia zapisujemy PRZY POZYCJI. Dotad zostawal wylacznie
         // w komunikacie na pasku, ktory znikal — i pozycja bez komentarza wygladala
@@ -23230,8 +23406,13 @@
             say('Dopisuję opis potrącenia ' + (i + 1) + '/' + want.length
                 + (ok || bad.length ? (' (✔ ' + ok + (bad.length ? (' · ✖ ' + bad.length) : '') + ')') : '')
                 + ' — ' + want[i].id + '… (10-30 s na pozycję)');
+            const tPoz = Date.now();
             try {
                 const r = await window.__TM_TICKET_COMMENT(want[i].id, want[i].note);
+                mkLog('komentarz', want[i].id + ': '
+                      + ((r && r.ok) ? ('✔ ' + (r.duplikat ? 'byl juz na tickecie' : (r.potwierdzone || 'zapisany')))
+                                     : ('✖ ' + ((r && r.error) || 'nie powiodlo sie')))
+                      + ' — ' + mkLogSek(tPoz));
                 if (r && r.ok){
                     ok++;
                     rcMark(want[i].id, true, r.duplikat ? 'był już na tickecie'
@@ -23243,6 +23424,7 @@
                 }
             } catch (e){
                 const p = (e && e.message) || String(e);
+                mkLog('komentarz', want[i].id + ': ✖ wyjatek — ' + p + ' — ' + mkLogSek(tPoz));
                 bad.push(want[i].id + ': ' + p);
                 rcMark(want[i].id, false, p);
             }
@@ -23272,8 +23454,17 @@
     // kazde przerysowanie stawialoby swieze, klikalne „▶ Zaksięguj".
     let refBusy = false;
     async function bookRefunds(x){
+        const mp = [];
+        (x.rows || []).forEach(function (r){
+            const n = mkKindNazwa(r.kind); if (mp.indexOf(n) < 0) mp.push(n);
+        });
+        mkLog('start', '=== zwroty ' + x.date + ' · konto ' + (x.acct || '—')
+              + (x.accNm ? (' (' + x.accNm + ')') : '') + ' · ' + x.rows.length + ' poz. · '
+              + f2(x.sum) + ' · ' + mp.join(', ')
+              + ' · sklepy: ' + Object.keys(x.shops || {}).join(', ') + ' ===');
         const err = ksFill(x);
-        if (err){ say(err, '#c47f00'); return err; }
+        if (err){ mkLog('start', '✖ nie ruszylo: ' + err); say(err, '#c47f00'); return err; }
+        mkLog('start', 'formularz modulu ticketa wypelniony (' + x.rows.length + ' wierszy TSV)');
         refBusy = true;
         try { return await bookRefundsWlasciwe(x); }
         finally { refBusy = false; try { renderRef(); } catch (e){} }
@@ -23281,8 +23472,12 @@
     async function bookRefundsWlasciwe(x){
         say('Księguję zwroty: ' + x.rows.length + ' poz. na ' + f2(x.sum) + ', konto ' + x.acct + '…');
         ksMirror(x.date + ' · konto ' + x.acct + (x.accNm ? (' — ' + x.accNm) : ''), x.rows.length);
+        const tKs = Date.now();
+        mkLog('ticket', '▶ oddaje sterowanie modulowi „Ksiegowanie w tickecie"');
         ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
         const r = await ksWait(ksBtn());
+        mkLog('ticket', (r === 'ok' ? '✔' : '✖') + ' modul ticketa skonczyl: ' + r
+              + ' — ' + mkLogSek(tKs));
         ksMirror(null);
         if (r !== 'ok'){
             // Wyjscie w tym miejscu bylo ciche, a wywolujacy pokazuje komunikat tylko
@@ -23294,6 +23489,12 @@
         // a przebieg sie zakonczyl, oznaczamy calosc, ale z adnotacja — lepiej pokazac
         // niepewnosc niz udawac, ze wiemy.
         const done = ksDone(x);
+        mkLog('ticket', 'log ticketa potwierdzil ' + done.length + ' z ' + x.rows.length + ' poz.'
+              + (done.length ? '' : ' — oznaczam calosc BEZ potwierdzenia'));
+        try {
+            const bl = ksBledy(x);
+            Object.keys(bl).forEach(function (id){ mkLog('ticket', '    ' + id + ': ' + bl[id]); });
+        } catch (e){ mkLog('ticket', '    (nie odczytalem powodow z logu: ' + ((e && e.message) || e) + ')'); }
         if (done.length) rdMark(x.key, done, true);
         else rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
         // Opis potracenia z rozliczenia trafia do ticketu jako komentarz — tam go szuka
@@ -23302,11 +23503,16 @@
         // Zwroty zaksiegowane — odhaczamy je w arkuszu. Niepowodzenie tego kroku nie
         // cofa ksiegowania, trafia tylko na pasek stanu.
         let ark = '';
+        const tArk = Date.now();
         try {
             const res = await shMarkRefunded(x.keys);
             if (res) ark = 'w arkuszu oznaczonych ' + (res.updated || 0)
                 + ((res.missing && res.missing.length) ? (', nie znalazłem ' + res.missing.length + ' wierszy') : '');
-        } catch (e){ ark = 'arkusz: ' + ((e && e.message) || e); }
+            mkLog('arkusz', '✔ ' + (ark || 'arkusz pominiety') + ' — ' + mkLogSek(tArk));
+        } catch (e){
+            ark = 'arkusz: ' + ((e && e.message) || e);
+            mkLog('arkusz', '✖ ' + ark + ' — ' + mkLogSek(tArk));
+        }
         // Jeden komunikat na koncu. Dotad komunikat o arkuszu wchodzil PO komunikacie
         // o komentarzach i go zamazywal — informacja, ze komentarz nie poszedl, ginela
         // po ulamku sekundy i nie bylo jak sie o niej dowiedziec.
@@ -23314,6 +23520,7 @@
         if (kom.msg) czesci.push(kom.msg);
         if (ark) czesci.push(ark);
         say(czesci.join(' · '), (kom.col === '#c47f00') ? '#c47f00' : '#0a7a2f');
+        mkLog('koniec', '=== ' + czesci.join(' · ') + ' ===');
         return '';
     }
     async function bookAllRefunds(b){
