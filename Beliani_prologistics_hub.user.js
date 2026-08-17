@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.34
+// @version      4.35
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23662,8 +23662,19 @@
             // nie ma z czym byc porownane: idzie na osobna liste, a nie do „zlych kont".
             const ocz = (tab && typ) ? tab.vat[typ] : '';
             if (!ocz){
-                bezTypu.push({ id: id, typ: typ || '(nierozstrzygniety)', kwota: brutto,
-                               konta: w.map(function (r){ return r.konto; }).filter(Boolean).join(', ') });
+                // Konta podajemy BEZ POWTORZEN, a osobno mowimy, z ilu wierszy sie to
+                // wzielo. Wczesniej lista sklejala konto z kazdego wiersza po kolei
+                // („3252, 3252, 3252") i wygladalo to na blad, a byly to po prostu trzy
+                // wiersze tego samego zamowienia: sprzedaz i dwie korekty zwrotu.
+                const kt = [];
+                w.forEach(function (r){ if (r.konto && kt.indexOf(r.konto) < 0) kt.push(r.konto); });
+                const zwrocone = (p.ref[id] != null) ? Math.abs(r2(p.ref[id])) : null;
+                bezTypu.push({ id: id, typ: typ || '', kwota: brutto,
+                               konta: kt.join(', '),
+                               nSprz: w.filter(function (r){ return r.sprzedaz; }).length,
+                               nKor:  w.filter(function (r){ return r.zwrot; }).length,
+                               zwrot: zwrocone,
+                               pelny: (zwrocone != null && Math.abs(zwrocone - brutto) < 0.02) });
             }
             w.forEach(function (r){
                 if (!r.konto){ obce.push({ id: id, auf: r.auf, deb: r.deb, cre: r.cre, kwota: r.kwota }); return; }
@@ -23732,7 +23743,12 @@
         sek('ZWROT BEZ ŚLADU w prologistics', k.brakZwrot, function (x){
             return x.id + '  ' + f2(x.kwota) + (x.wierszy ? ('  (są inne wiersze: ' + x.wierszy + ')') : ''); });
         sek('TYP KLIENTA NIEROZSTRZYGNIĘTY — konta nie sprawdziłem', k.bezTypu, function (x){
-            return x.id + '  ' + f2(x.kwota) + '  konta: ' + (x.konta || '—'); });
+            return x.id + '  ' + f2(x.kwota)
+                 + '  konto ' + (x.konta || '—')
+                 + '  (' + (x.nSprz + x.nKor) + ' wiersze w prologistics: ' + x.nSprz + ' sprzedaż, '
+                 + x.nKor + ' korekt' + (x.nKor === 1 ? 'a' : 'y') + ')'
+                 + (x.pelny ? '  — zwrócone w całości, dlatego typ klienta jest nie do ustalenia'
+                            : (x.zwrot != null ? ('  — zwrócono ' + f2(x.zwrot)) : '')); });
         sek('WIERSZ NIE DOTYCZY TEGO KONTA', k.obce, function (x){
             return (x.id || '?') + '  ' + (x.auf || '') + '  ' + x.deb + '/' + x.cre + '  ' + f2(x.kwota); });
         sek('W PROLOGISTICS, A NIE MA W ROZLICZENIU', k.wolne, function (x){
@@ -23778,7 +23794,12 @@
             return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota) + '</div>'; });
         sek('Typ klienta nierozstrzygnięty — konta nie sprawdziłem', k.bezTypu, '#c47f00', function (x){
             return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota)
-                 + ' · konta: ' + mmEsc(x.konta || '—') + '</div>'; });
+                 + ' · konto <b>' + mmEsc(x.konta || '—') + '</b>'
+                 + ' · ' + (x.nSprz + x.nKor) + ' wiersze w prologistics ('
+                 + x.nSprz + ' sprzedaż, ' + x.nKor + ' korekt' + (x.nKor === 1 ? 'a' : 'y') + ')'
+                 + (x.pelny ? ' · <span style="color:#666">zwrócone w całości — dlatego typu klienta nie da się ustalić</span>'
+                            : (x.zwrot != null ? (' · zwrócono ' + f2(x.zwrot)) : ''))
+                 + '</div>'; });
         sek('Wiersz nie dotyczy tego konta', k.obce, '#c47f00', function (x){
             return '<div><code>' + mmEsc(x.id || '?') + '</code> · ' + mmEsc(x.auf || '')
                  + ' · ' + mmEsc(x.deb) + '/' + mmEsc(x.cre) + ' · ' + f2(x.kwota) + '</div>'; });
