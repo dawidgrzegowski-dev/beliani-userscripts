@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.38
+// @version      4.39
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19914,7 +19914,12 @@
             // Starsze eksporty dopisywaly do identyfikatora sufiks „-wpłata".
             const idPl = surowy.replace(/-wpłata\s*$/i, '').trim();
             const kwotaSur = alleNum(r[iKw]);
-            const data = String(r[iDatK] != null && String(r[iDatK]).trim() ? r[iDatK] : (r[iDat] || '')).trim();
+            // DATA RUCHU PIENIEDZY to kolumna „data" (A), a NIE „data zaksiegowania" (B).
+            // Sprawdzone na wyciagu z 10-16.08.2026: przy wplacie z 14.08.2026 15:19 kolumna B
+            // pokazuje 03.08 albo 30.07 — to data zamowienia, wczesniejsza od przeplywu.
+            // Wersja 4.38 wolala kolumne B i przez to zwroty poszlyby na tickety z data
+            // SPRZED przelewu, a zakres zlecenia siegal 27.07 zamiast 10.08.
+            const data = String(r[iDat] != null ? r[iDat] : '').trim();
 
             // Blokada srodkow ma w nazwie slowo „zwrot", ale nie jest zwrotem — sprawdzamy
             // ja PIERWSZA, inaczej wpadlaby na liste zwrotow i zostalaby zaksiegowana.
@@ -19978,10 +19983,17 @@
         // Zakres dat sluzy za klucz zlecenia: jeden plik operacji = jedno zlecenie.
         // Daty w pliku sa w postaci „16.08.2026 23:01"; do klucza chcemy RRRR-MM-DD,
         // bo tylko taki sortuje sie zgodnie z kalendarzem.
+        // Zakres bierzemy z CALEGO pliku operacji, nie tylko z wierszy, ktore ksiegujemy.
+        // Tak nazywa sie import u uzytkownika („10.08.2026-16.08.2026 Allegro 1071") i tak
+        // jest uczciwiej: plik obejmuje caly okres, a nie tylko dni, w ktorych akurat byla
+        // wplata. Same wplaty i zwroty z tego pliku miescily sie w 10-14.08, ale operacje
+        // siegaly 16.08 — nazwa ma opisywac plik, a nie jego czesc.
         const zakres = (function (){
             const d = [];
-            Object.keys(ordData).forEach(function (k){ const x = alleYmd(ordData[k]); if (x) d.push(x); });
-            Object.keys(refData).forEach(function (k){ const x = alleYmd(refData[k]); if (x) d.push(x); });
+            for (let k = 1; k < ops.length; k++){
+                const x = alleYmd((ops[k] || [])[iDat]);
+                if (x) d.push(x);
+            }
             d.sort();
             return { od: d[0] || '', doo: d[d.length - 1] || '' };
         })();
@@ -27649,12 +27661,26 @@
     // Data i sklep nie wystarczaja, zeby po tygodniu poznac, ktore to zestawienie —
     // rozpoznaje sie je po KWOCIE z wyciagu, wiec ona tez wchodzi do nazwy.
     function fileBase(j){
-        const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
-        const ds = d ? (d[3] + '.' + d[2] + '.' + d[1]) : 'export';
-        return ds + ' ' + (j.data && j.data.shop ? j.data.shop : (j.shop || 'marketplace'));
+        const dn = function (ymd){
+            const m = String(ymd || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+            return m ? (m[3] + '.' + m[2] + '.' + m[1]) : '';
+        };
+        // Allegro nie ma JEDNEJ daty wyplaty — kazda wplata przychodzi w innym dniu, wiec
+        // pojedyncza data w nazwie bylaby nieprawdziwa. Nazwe robi ZAKRES dat z pliku
+        // operacji plus numer konta: „10.08.2026-16.08.2026 Allegro 1071".
+        const p = (j.kind === 'alle' && j.data) ? j.data.alle : null;
+        if (p && p.od){
+            const zak = dn(p.od) + (p.doo && p.doo !== p.od ? ('-' + dn(p.doo)) : '');
+            return zak + ' Allegro ' + (p.konto || '?');
+        }
+        return (dn(j.date) || 'export') + ' ' + (j.data && j.data.shop ? j.data.shop : (j.shop || 'marketplace'));
     }
     function fileName(j){
-        const a = isFinite(j.amount) ? (' ' + Number(j.amount).toFixed(2) + (j.cur ? (' ' + j.cur) : '')) : '';
+        // isFinite(null) to w JavaScripcie PRAWDA (Number(null) === 0), wiec zlecenie bez
+        // kwoty z wyciagu — Allegro, bo tam nie ma jednej wyplaty — dostawalo w nazwie
+        // „0.00 PLN" i wygladalo na wyplate zerowa. Pytamy wiec najpierw o istnienie.
+        const a = (j.amount != null && isFinite(j.amount))
+            ? (' ' + Number(j.amount).toFixed(2) + (j.cur ? (' ' + j.cur) : '')) : '';
         return fileBase(j) + a + ' do prolo.csv';
     }
     function doCsv(ref){
