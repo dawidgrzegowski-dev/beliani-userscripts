@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.35
+// @version      4.38
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17518,6 +17518,10 @@
         // Cnova FR: import 58, konto 1310. Kont NIE sprawdzamy i nie ma tu podzialu
         // B2B/B2C, ktory przy Amazonie i ManoMano decyduje o koncie i koncie VAT.
         'Cnova · Cnova FR':            { bank: '58',  booking: '9', acct: '1310' },
+        // Allegro: numeru ustawienia importu nie znamy z gory — modul podpowie go sam
+        // po nazwie konta (bsGuess), tak jak przy Amazonie. Konto jest tu pewne.
+        'Allegro · Allegro Beliani':        { bank: '', booking: '9', acct: '1071' },
+        'Allegro · Allegro Beliani Polska': { bank: '', booking: '9', acct: '1069' },
         // Joybuy nie ma importu, wiec bank_setting jest mu niepotrzebny — liczy sie
         // samo konto, na ktore idzie platnosc ksiegowana wprost na auftragu.
         'Joybuy · Joybuy DE':          { bank: '',    booking: '9', acct: '1169' },
@@ -17767,8 +17771,7 @@
         return cc ? (s ? (s + ' ' + cc[1]) : shop) : (s || shop || '');
     }
     function shRow(j, c){
-        const rf = (j.data && j.data.ref) || {};
-        const nRef = Object.keys(rf).filter(function (k){ return Math.abs(rf[k]) > 0.004; }).length;
+        const nRef = refPozycje(j).filter(function (x){ return Math.abs(x.amt) > 0.004; }).length;
         return {
             data: j.date,                    // data wplywu z wyciagu
             marketplace: mkShort(j),
@@ -18279,6 +18282,28 @@
     // Wyciag UBS: blok metadanych, naglowek dopiero przy „Trade date", srednik jako separator
     // i — co wazne — SREDNIKI WEWNATRZ pol w cudzyslowach (adres platnika). Naiwny split
     // rozjechalby kazdy wiersz, wiec parsujemy znak po znaku.
+    // Raporty zamowien Allegro sa na PRZECINKU i maja pola w cudzyslowach (adresy
+    // z przecinkami w srodku). mkCsvRows jest na sredniku i tutaj by nie zadzialal,
+    // wiec obok stoi blizniak na przecinku — ten sam automat, inny separator.
+    function mkCsvRowsPrzecinek(text){
+        const s = String(text || '').replace(/^\ufeff/, '');
+        const rows = []; let f = '', row = [], q = false;
+        for (let i = 0; i < s.length; i++){
+            const c = s.charAt(i);
+            if (q){
+                if (c !== '"') { f += c; continue; }
+                if (s.charAt(i + 1) === '"') { f += '"'; i++; continue; }
+                q = false; continue;
+            }
+            if (c === '"') { q = true; continue; }
+            if (c === ',') { row.push(f); f = ''; continue; }
+            if (c === '\r') continue;
+            if (c === '\n') { row.push(f); rows.push(row); row = []; f = ''; continue; }
+            f += c;
+        }
+        if (f !== '' || row.length) { row.push(f); rows.push(row); }
+        return rows;
+    }
     function mkCsvRows(text){
         const s = String(text || '').replace(/^﻿/, '');
         const rows = []; let f = '', row = [], q = false;
@@ -19631,11 +19656,23 @@
 
         // Goodwill po stronie zwrotow — te nie ida do CSV, tylko na liste zwrotow,
         // i tez maja zostawic komentarz w tickecie.
+        // Goodwill NIE dolacza sie do zwyklego zwrotu tego samego zamowienia. To osobna
+        // decyzja Amazona (w pliku ma nawet inny merchant-fulfillment-id) i ksieguje sie ja
+        // jako osobna pozycje. Do v4.36 obie kwoty schodzily sie w jedna — zwrot 167.22
+        // plus Goodwill 30 dawal jeden wpis na 197.22 zamiast dwoch. Modul ticketow rozdziela
+        // je od v3.43 wlasnym kluczem („|G" / „|N"), wiec tam bylo dobrze; sumowanie siedzialo
+        // TUTAJ, bo zwroty trzymamy pod samym numerem zamowienia.
+        //
+        // Zamiast zmieniac ten klucz — a czyta go piec miejsc, lacznie z ksiegowaniem —
+        // dokladamy OSOBNA liste pozycji dodatkowych. Numer zamowienia zostaje ten sam,
+        // wiec wszystko, co dopasowuje po numerze, dziala jak dotad; przybywa tylko drugi
+        // wiersz o wlasnej kwocie. Modul ticketow radzi sobie z dwiema pozycjami tego
+        // samego zamowienia od v3.43.
+        const refExtra = [];
         gw.filter(function (x){ return x.ref; }).forEach(function (x){
-            ref[x.order] = r2((ref[x.order] || 0) + x.amt);
-            const bylo = refNote[x.order] ? (refNote[x.order] + '\n\n') : '';
-            refNote[x.order] = bylo + 'Goodwill (Refund) — ' + opisWspolny + '\n'
-                + 'Zamówienie ' + x.order + ' · ' + f2(Math.abs(x.amt)) + ' ' + (cur || '');
+            refExtra.push({ id: x.order, amt: Math.abs(x.amt), rodzaj: 'Goodwill',
+                note: 'Goodwill (Refund) — ' + opisWspolny + '\n'
+                    + 'Zamówienie ' + x.order + ' · ' + f2(Math.abs(x.amt)) + ' ' + (cur || '') });
         });
 
         const netOk = Math.abs(sumAll - total) < 0.01;
@@ -19644,6 +19681,7 @@
             kraj: amzKraj(dom),                                   // v3.96: 'de' / 'pl' / …
             net: total, sumAll: r2(sumAll), netOk: netOk,
             ord: ord, ref: ref, refNote: refNote, refSign: refSign, ids: ids,
+            refExtra: refExtra,
             gross: gross, refund: refund, nOrd: nOrd, nRef: nRef,
             rekomp: rekompN, rekompSum: rekompSum, rekompN: Object.keys(rekomp).length,
             chargeback: Object.keys(chgOrd).length,
@@ -19688,6 +19726,411 @@
         if (kb.length) cz.push('brak konta VAT dla: '
             + kb.map(function (x){ return x + ' (' + b[x] + ' zam.)'; }).join(', '));
         return cz.join(' · ') + ' — uzupełnij tabelę kont MK_AMZ_ACC w skrypcie, pliku nie generuję';
+    }
+
+    // ================= ALLEGRO PL (KONTA 1069 / 1071) =================
+    // Zrodla sa TRZY i kazde odpowiada za co innego:
+    //   1. plik operacji (xlsx z panelu, zakladka „operacje") — pieniadze: co i kiedy
+    //      wplynelo albo zostalo zwrocone. Zamowienia poznajemy po kolumnie C, ktora
+    //      niesie identyfikator PLATNOSCI (UUID), a nie numer zamowienia.
+    //   2. raporty zamowien (orderReport-*.csv, zwykle w archiwach ZIP) — TLUMACZ:
+    //      PaymentId -> OrderId oraz sposob dostawy. Bez nich kolumna C jest nie do uzycia.
+    //   3. billing (allegro-billing-*.csv) — KLASYFIKACJA klienta.
+    //
+    // O tym, czy zamowienie jest B2C, decyduje obecnosc wiersza „Naliczenie VAT e-commerce"
+    // w billingu. Sprawdzone na 6581 zamowieniach z 13 miesiecy: sygnal pokrywa sie
+    // w 99,8% z obecnoscia NIP-u w raporcie zamowien, ale NIE jest mu rowny — i to billing
+    // jest rozstrzygajacy (rok pracy na tej regule, decyzja z 17.08.2026). Kuszace
+    // „BuyerAccountType" z raportu zamowien jest ZLYM tropem: rozjezdza sie z billingiem
+    // na 700 zamowieniach, bo m.in. 701 kupujacych prywatnych podalo NIP.
+    //
+    // Zamowienia, ktorego billing nie obejmuje W OGOLE, nie klasyfikujemy na sile. Stary
+    // program milczaco robil z takiego B2B; my wypisujemy je osobno, bo to nie jest wiedza,
+    // tylko brak danych.
+    const MK_ALLE_VAT = { 'B2B': { vat: '3209', alt: '3204' }, 'B2C': { vat: '3292', alt: '' } };
+    // Konto rozliczeniowe poznajemy po sprzedawcy z raportu zamowien. Plik operacji tej
+    // informacji NIE ZAWIERA — sprawdzone na calym eksporcie: nie ma w nim ani „1069",
+    // ani „1071", ani niczego, co by je rozroznialo.
+    const MK_ALLE_SPRZ = {
+        'BELIANI':   { acc: '1071', nazwa: 'Allegro Beliani' },
+        '58578594':  { acc: '1071', nazwa: 'Allegro Beliani' }
+        // 1069 („Allegro Beliani Polska") — DOPISZ tu login i SellerId, gdy beda znane.
+        // Do tego czasu pliki tego konta nie rozpoznaja sie same i modul o tym powie,
+        // zamiast przypisac je po cichu do 1071.
+    };
+    // Sprzedawcow, ktorych nie ma w tabeli, modul UCZY SIE od uzytkownika: przy pierwszym
+    // pliku pyta raz i zapamietuje. Lepsze niz wpisywanie na sztywno, bo pierwsze
+    // przypisanie robi czlowiek patrzac na konkretny plik, a nie ja na podstawie nazw kont
+    // w prologistics — „Allegro Beliani Polska" kontra „Allegro Beliani" to za malo,
+    // zeby na tej podstawie wyslac caly import.
+    const MK_ALLE_KEY = 'mkt_alle_sprzedawcy';
+    function alleMapaLoad(){
+        try { return JSON.parse(GM_getValue(MK_ALLE_KEY, '{}')) || {}; } catch (e){ return {}; }
+    }
+    function alleMapaSave(o){ try { GM_setValue(MK_ALLE_KEY, JSON.stringify(o || {})); } catch (e){} }
+    function alleSprzedawca(login, sellerId){
+        const L = String(login || '').trim().toUpperCase(), I = String(sellerId || '').trim();
+        const w = MK_ALLE_SPRZ[L] || MK_ALLE_SPRZ[I];
+        if (w) return w;
+        const u = alleMapaLoad();
+        const k = u[L] || u[I];
+        return k ? { acc: k, nazwa: 'Allegro ' + k, nauczone: true } : null;
+    }
+    function alleZapamietaj(login, konto){
+        const u = alleMapaLoad();
+        u[String(login || '').trim().toUpperCase()] = String(konto || '').trim();
+        alleMapaSave(u);
+    }
+    // Kwoty w pliku operacji: „-166.02 zl", „1 923.54 zl". Separator dziesietny bywa kropka
+    // i przecinek, tysiace bywaja rozdzielone spacja — mkNum radzi sobie z obydwoma.
+    // „16.08.2026 23:01" -> „2026-08-16". Zwraca pusty string, gdy nie rozpozna —
+    // zgadywanie daty przy ksiegowaniu jest gorsze niz jej brak.
+    function alleYmd(v){
+        const m = String(v == null ? '' : v).trim().match(/^(\d{2})[.](\d{2})[.](\d{4})/);
+        if (m) return m[3] + '-' + m[2] + '-' + m[1];
+        const i = String(v == null ? '' : v).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+        return i ? (i[1] + '-' + i[2] + '-' + i[3]) : '';
+    }
+    // Do modulu ticketow data idzie w zapisie dziennym: „16.08.2026".
+    function alleDmy(v){
+        const y = alleYmd(v);
+        return y ? (y.slice(8, 10) + '.' + y.slice(5, 7) + '.' + y.slice(0, 4)) : '';
+    }
+    function alleNum(v){
+        const t = String(v == null ? '' : v).replace(/z\u0142/gi, '').trim();
+        const x = mkNum(t);
+        return (x == null) ? 0 : x;
+    }
+    // Typy operacji z kolumny D. Ksiegujemy WYLACZNIE wplaty i zwroty; reszta to przeplywy
+    // wewnetrzne Allegro (prowizje, wyplaty na konto, blokady srodkow) i ksieguje je kto
+    // inny. „Zabezpieczenie srodkow na poczet zwrotu" jest tu osobno wymienione, bo samo
+    // slowo „zwrot" w nazwie wciagneloby je do zwrotow — a to tylko blokada, nie pieniadze.
+    const ALLE_BLOKADA = /zabezpieczenie\s+środków\s+na\s+poczet\s+zwrotu/i;
+    const ALLE_WPLATA  = /wpłata/i;
+    const ALLE_ZWROT   = /zwrot/i;
+    // Sposob dostawy, przy ktorym NIE odejmujemy 6 zl. Reszta dostaw z kosztem 6,00 zl
+    // to doliczona przez Allegro oplata, ktora nie nalezy do zamowienia.
+    const ALLE_INPOST  = /paczkomat/i;
+
+    // Raport zamowien: PaymentId -> OrderId, sposob dostawy, sprzedawca. Plik ma DWIE
+    // tabele — pod zamowieniami stoi druga, z pozycjami ofert („OfferId, LineItemId,
+    // Quantity"). Czytamy wylacznie pierwsza; bez tego ciecia pozycje ofert weszlyby
+    // do slownika jako zamowienia bez numeru.
+    function mkParseAlleMapa(tekst){
+        const rows = mkCsvRowsPrzecinek(tekst);
+        if (!rows.length) return { err: 'pusty raport zamówień' };
+        const hdr = rows[0].map(function (x){ return String(x || '').trim(); });
+        const ix = {};
+        hdr.forEach(function (h, i){ if (h && ix[h] == null) ix[h] = i; });
+        const need = ['OrderId', 'PaymentId', 'SellerLogin', 'DeliveryMethod'];
+        const brak = need.filter(function (k){ return ix[k] == null; });
+        if (brak.length) return { err: 'to nie wygląda na raport zamówień Allegro — brak kolumn: ' + brak.join(', ') };
+        const mapa = Object.create(null), dost = Object.create(null), sprz = Object.create(null);
+        let ile = 0;
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || !r.length) continue;
+            if (String(r[0] || '') === 'OfferId') break;          // druga tabela — koniec
+            if (r.length < hdr.length) continue;
+            const ord = String(r[ix['OrderId']] || '').trim();
+            const pay = String(r[ix['PaymentId']] || '').trim();
+            if (!ord) continue;
+            ile++;
+            const dm = String(r[ix['DeliveryMethod']] || '').trim();
+            if (pay){ mapa[pay] = ord; dost[pay] = dm; }
+            mapa[ord] = ord; dost[ord] = dm;                      // gdy operacja niesie juz OrderId
+            const sl = String(r[ix['SellerLogin']] || '').trim();
+            if (sl) sprz[sl.toUpperCase()] = (sprz[sl.toUpperCase()] || 0) + 1;
+        }
+        return { mapa: mapa, dost: dost, sprz: sprz, nZam: ile };
+    }
+    // Billing: zbior zamowien z „Naliczenie VAT e-commerce" (B2C) oraz zbior WSZYSTKICH
+    // zamowien, ktore billing w ogole wymienia — po to, zeby odroznic „to nie jest B2C"
+    // od „billing o tym zamowieniu nic nie wie".
+    function mkParseAlleBilling(tekst){
+        const rows = mkCsvRows(tekst);                            // billing jest na SREDNIKU
+        if (!rows.length) return { err: 'pusty plik billingu' };
+        const hdr = rows[0].map(function (x){ return String(x || '').trim().toLowerCase(); });
+        const iTyp = hdr.indexOf('typ operacji'), iSzcz = hdr.indexOf('szczegóły operacji');
+        if (iTyp < 0 || iSzcz < 0)
+            return { err: 'to nie wygląda na billing Allegro — brak kolumn „Typ operacji" / „Szczegóły operacji"' };
+        const b2c = Object.create(null), znane = Object.create(null);
+        const WZ = /Identyfikator zamówienia:\s*([0-9a-fA-F-]{36})/;
+        let nVat = 0;
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || r.length <= iSzcz) continue;
+            const m = String(r[iSzcz] || '').match(WZ);
+            if (!m) continue;
+            const id = m[1];
+            znane[id] = 1;
+            if (/Naliczenie VAT e-commerce/i.test(String(r[iTyp] || ''))){ b2c[id] = 1; nVat++; }
+        }
+        return { b2c: b2c, znane: znane, nVat: nVat, nZnane: Object.keys(znane).length };
+    }
+
+    function mkParseAlle(ops, mapy, bill, kontoWymuszone){
+        if (!ops || !ops.length) return { err: 'pusty plik operacji' };
+        const hdr = (ops[0] || []).map(function (x){ return String(x || '').trim().toLowerCase(); });
+        const iId = hdr.indexOf('identyfikator'), iOp = hdr.indexOf('operacja');
+        const iKw = hdr.indexOf('kwota'), iDost = hdr.indexOf('dostawa');
+        const iDat = hdr.indexOf('data'), iDatK = hdr.indexOf('data zaksięgowania');
+        if (iId < 0 || iOp < 0 || iKw < 0)
+            return { err: 'to nie wygląda na plik operacji Allegro — brak kolumn „identyfikator" / „operacja" / „kwota"' };
+
+        // Slowniki z raportow zamowien — moze ich byc kilka (miesiac po miesiacu).
+        const mapa = Object.create(null), dost = Object.create(null), sprzL = Object.create(null);
+        let nZam = 0;
+        (mapy || []).forEach(function (m){
+            if (!m || m.err) return;
+            Object.keys(m.mapa).forEach(function (k){ mapa[k] = m.mapa[k]; });
+            Object.keys(m.dost).forEach(function (k){ if (m.dost[k]) dost[k] = m.dost[k]; });
+            Object.keys(m.sprz).forEach(function (k){ sprzL[k] = (sprzL[k] || 0) + m.sprz[k]; });
+            nZam += m.nZam || 0;
+        });
+        // Konto rozliczeniowe: z raportow zamowien, chyba ze uzytkownik wskazal wprost.
+        const loginy = Object.keys(sprzL);
+        let konto = String(kontoWymuszone || '').trim(), kontoZ = konto ? 'wskazane ręcznie' : '';
+        let sprzedawca = loginy.join(', ');
+        if (!konto && loginy.length === 1){
+            const s = alleSprzedawca(loginy[0], '');
+            if (s){ konto = s.acc; kontoZ = 'rozpoznane po sprzedawcy „' + loginy[0] + '"'; }
+        }
+
+        const b2c = (bill && !bill.err) ? bill.b2c : null;
+        const znaneB = (bill && !bill.err) ? bill.znane : null;
+
+        const ord = Object.create(null), ordTyp = Object.create(null), ordData = Object.create(null);
+        const ref = Object.create(null), refNote = Object.create(null), refData = Object.create(null);
+        const wOrd = [], brakMap = [], brakKlasy = [], pominiete = Object.create(null);
+        const odjete = [];
+        let nWpl = 0, nZwr = 0, nInne = 0, sumaWpl = 0, sumaZwr = 0;
+
+        for (let i = 1; i < ops.length; i++){
+            const r = ops[i] || [];
+            const opis = String(r[iOp] == null ? '' : r[iOp]).trim();
+            if (!opis) continue;
+            const surowy = String(r[iId] == null ? '' : r[iId]).trim();
+            // Starsze eksporty dopisywaly do identyfikatora sufiks „-wpłata".
+            const idPl = surowy.replace(/-wpłata\s*$/i, '').trim();
+            const kwotaSur = alleNum(r[iKw]);
+            const data = String(r[iDatK] != null && String(r[iDatK]).trim() ? r[iDatK] : (r[iDat] || '')).trim();
+
+            // Blokada srodkow ma w nazwie slowo „zwrot", ale nie jest zwrotem — sprawdzamy
+            // ja PIERWSZA, inaczej wpadlaby na liste zwrotow i zostalaby zaksiegowana.
+            if (ALLE_BLOKADA.test(opis)){ pominiete[opis] = (pominiete[opis] || 0) + 1; nInne++; continue; }
+            const wplata = ALLE_WPLATA.test(opis), zwrot = !wplata && ALLE_ZWROT.test(opis);
+            if (!wplata && !zwrot){ pominiete[opis] = (pominiete[opis] || 0) + 1; nInne++; continue; }
+
+            const nr = idPl ? mapa[idPl] : '';
+            if (!nr){
+                brakMap.push({ id: idPl, opis: opis, kwota: kwotaSur, data: data,
+                               rodzaj: wplata ? 'wpłata' : 'zwrot' });
+                continue;
+            }
+            // Regula 6 zl: doliczona przez Allegro oplata za dostawe nie nalezy do
+            // zamowienia. Wyjatkiem jest Paczkomat — tam 6 zl jest czescia zamowienia.
+            let kwota = kwotaSur;
+            const dm = dost[idPl] || dost[nr] || '';
+            if (Math.abs(Math.abs(alleNum(r[iDost])) - 6) < 0.005){
+                if (ALLE_INPOST.test(dm)){
+                    odjete.push({ nr: nr, powod: 'Paczkomat — 6 zł zostaje', dostawa: dm });
+                } else {
+                    kwota = r2(kwota - (kwota < 0 ? -6 : 6));
+                    odjete.push({ nr: nr, powod: 'odjęto 6 zł', dostawa: dm || '(nie znam sposobu dostawy)' });
+                }
+            }
+            // Klasyfikacja: WYLACZNIE z billingu.
+            let typ = '';
+            if (b2c) typ = b2c[nr] ? 'B2C' : (znaneB[nr] ? 'B2B' : '');
+            if (!typ) brakKlasy.push({ nr: nr, kwota: kwota, rodzaj: wplata ? 'wpłata' : 'zwrot',
+                                       powod: b2c ? 'billing nic nie wie o tym zamówieniu' : 'nie wskazano billingu' });
+
+            if (wplata){
+                nWpl++; sumaWpl = r2(sumaWpl + kwota);
+                ord[nr] = r2((ord[nr] || 0) + kwota);
+                if (typ) ordTyp[nr] = typ;
+                if (!ordData[nr]) ordData[nr] = data;
+            } else {
+                // Zwroty NIE ida do pliku importu — ksieguje sie je na auftragu, a KAZDY
+                // ma wlasna date, wiec modul ticketow bierze date z wiersza. Kwota idzie
+                // dodatnia, tak samo jak przy ManoMano, Cnovie i Check24.
+                const kw = Math.abs(kwota);
+                nZwr++; sumaZwr = r2(sumaZwr + kw);
+                ref[nr] = r2((ref[nr] || 0) + kw);
+                if (typ) ordTyp[nr] = ordTyp[nr] || typ;
+                if (!refData[nr]) refData[nr] = data;
+                const o = ['zwrot', String(data).slice(0, 10), f2(kw) + ' PLN'].filter(Boolean).join(' \u00b7 ');
+                refNote[nr] = refNote[nr] ? (refNote[nr] + '\n\n' + o) : o;
+            }
+        }
+        // Wiersze importu: JEDEN plik na oba typy klienta, konto i konto VAT per wiersz.
+        // Dotad robilo sie dwa importy, bo konta wpisywalo sie zbiorczo na zakladke.
+        Object.keys(ord).sort().forEach(function (nr){
+            const typ = ordTyp[nr] || '';
+            const kv = MK_ALLE_VAT[typ] || null;
+            const c = new Array(35).fill('');
+            c[6] = 'Order'; c[7] = nr;
+            c[24] = f2(ord[nr]);
+            c[25] = typ; c[26] = konto; c[27] = kv ? kv.vat : '';
+            wOrd.push({ r: c, nr: nr, typ: typ, kwota: ord[nr] });
+        });
+        // Zakres dat sluzy za klucz zlecenia: jeden plik operacji = jedno zlecenie.
+        // Daty w pliku sa w postaci „16.08.2026 23:01"; do klucza chcemy RRRR-MM-DD,
+        // bo tylko taki sortuje sie zgodnie z kalendarzem.
+        const zakres = (function (){
+            const d = [];
+            Object.keys(ordData).forEach(function (k){ const x = alleYmd(ordData[k]); if (x) d.push(x); });
+            Object.keys(refData).forEach(function (k){ const x = alleYmd(refData[k]); if (x) d.push(x); });
+            d.sort();
+            return { od: d[0] || '', doo: d[d.length - 1] || '' };
+        })();
+        const bezTypu = wOrd.filter(function (x){ return !x.typ; }).length;
+        const bezKonta = konto ? 0 : wOrd.length;
+
+        return {
+            konto: konto, kontoZrodlo: kontoZ, sprzedawca: sprzedawca, loginy: loginy,
+            ord: ord, typOrd: ordTyp, dataOrd: ordData,
+            ref: ref, refNote: refNote, refData: refData,
+            wOrd: wOrd, nWpl: nWpl, nZwr: nZwr, nInne: nInne,
+            sumaWpl: sumaWpl, sumaZwr: sumaZwr,
+            nOrd: Object.keys(ord).length, nZwrOrd: Object.keys(ref).length,
+            brakMap: brakMap, brakKlasy: brakKlasy, pominiete: pominiete, odjete: odjete,
+            bezTypu: bezTypu, bezKonta: bezKonta, nZam: nZam,
+            billing: bill && !bill.err ? { nVat: bill.nVat, nZnane: bill.nZnane } : null,
+            od: zakres.od, doo: zakres.doo,
+            wzorNr: '\\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\b',
+            cur: 'PLN'
+        };
+    }
+    // Plik importu — ten sam uklad co Amazon: 35 kolumn, srednik, BOM, bez naglowka.
+    const MK_ALLE_HOST = 'salescenter.allegro.com';
+    // Raporty zamowien przychodza w archiwach ZIP (jedno na miesiac). galxUnzip jest
+    // uniwersalnym czytnikiem ZIP-a — nazwa mowi „xlsx", bo powstal dla Galaxusa, ale
+    // czyta kazde archiwum. Zwracamy WSZYSTKIE pliki .csv, bo w jednym archiwum bywa
+    // ich kilka i kazdy jest osobnym miesiacem.
+    async function alleZipCsv(buf){
+        const zip = await galxUnzip(buf);
+        const nazwy = Object.keys(zip).filter(function (k){ return /[.]csv$/i.test(k); });
+        const out = [];
+        for (let i = 0; i < nazwy.length; i++)
+            out.push({ nazwa: nazwy[i], tekst: await galxPart(zip, nazwy[i]) });
+        return out;
+    }
+    // Plik operacji poznajemy po naglowku, nie po nazwie ani zakladce — nazwe da sie
+    // zmienic przy zapisie, tresci nie.
+    function alleCzyOperacje(txt){
+        const w = mkCsvRows(String(txt || '').slice(0, 4000))[0] || [];
+        const h = w.map(function (x){ return String(x || '').trim().toLowerCase(); });
+        return h.indexOf('identyfikator') >= 0 && h.indexOf('operacja') >= 0 && h.indexOf('kwota') >= 0;
+    }
+    function alleCzyBilling(txt){
+        const w = mkCsvRows(String(txt || '').slice(0, 4000))[0] || [];
+        const h = w.map(function (x){ return String(x || '').trim().toLowerCase(); });
+        return h.indexOf('typ operacji') >= 0 && h.indexOf('szczegóły operacji') >= 0;
+    }
+    function alleCzyMapa(txt){
+        const w = mkCsvRowsPrzecinek(String(txt || '').slice(0, 4000))[0] || [];
+        const h = w.map(function (x){ return String(x || '').trim(); });
+        return h.indexOf('OrderId') >= 0 && h.indexOf('PaymentId') >= 0 && h.indexOf('SellerLogin') >= 0;
+    }
+    function mkCsvAlle(p){
+        const linie = ((p && p.wOrd) || []).map(function (x){
+            return (x.r || []).map(function (c){ return (c == null) ? '' : String(c); }).join(';');
+        });
+        return '\ufeff' + linie.join('\r\n') + '\r\n';
+    }
+    // Bramka przed wygenerowaniem pliku — ta sama zasada co przy Amazonie: lepiej nie dac
+    // pliku wcale, niz dac wiersz z pustym kontem. Prologistics taki wiersz przyjmie
+    // i zaksieguje bylejak, a wychodzi to dopiero przy zamknieciu miesiaca.
+    // Trzy pliki przychodza OSOBNO i w dowolnej kolejnosci, wiec zbieramy je w jednym
+    // miejscu i po kazdym nowym skladamy zlecenie od nowa. Dzieki temu mozna dorzucic
+    // brakujacy raport zamowien juz po wczytaniu operacji i wynik sam sie poprawi.
+    let ALLE = { ops: null, opsNazwa: '', mapy: [], mapyNazwy: [], bill: null, billNazwa: '' };
+    function alleStanOpis(){
+        const cz = [];
+        cz.push(ALLE.ops ? ('operacje: ' + ALLE.opsNazwa) : 'operacje: BRAK');
+        cz.push('raporty zamówień: ' + (ALLE.mapy.length ? ALLE.mapy.length + ' szt.' : 'BRAK'));
+        cz.push('billing: ' + (ALLE.bill ? ALLE.billNazwa : 'BRAK'));
+        return cz.join(' · ');
+    }
+    // Nieznany sprzedawca: pytamy RAZ i zapamietujemy. Nie zgadujemy po nazwie konta
+    // w prologistics — pomylka wyslalaby caly import na cudze konto.
+    function alleSpytajOKonto(login){
+        const w = prompt('Nie znam sprzedawcy Allegro „' + login + '".\n\n'
+                       + 'Na które konto rozliczeniowe księgować jego sprzedaż?\n'
+                       + 'Wpisz 1069 (Allegro Beliani Polska) albo 1071 (Allegro Beliani).\n\n'
+                       + 'Zapamiętam ten wybór i nie zapytam ponownie.', '');
+        const k = String(w == null ? '' : w).trim();
+        if (k !== '1069' && k !== '1071') return '';
+        alleZapamietaj(login, k);
+        return k;
+    }
+    function alleZbuduj(skad){
+        if (!ALLE.ops){ say('Allegro — ' + alleStanOpis() + '. Wskaż plik operacji.', '#c47f00'); return; }
+        const mapy = ALLE.mapy.map(function (t){ return mkParseAlleMapa(t); });
+        const zle = mapy.filter(function (m){ return m.err; });
+        const bill = ALLE.bill ? mkParseAlleBilling(ALLE.bill) : null;
+        if (bill && bill.err){ say('Billing: ' + bill.err, '#c00'); return; }
+
+        let p = mkParseAlle(ALLE.ops, mapy, bill, '');
+        if (p.err){ say(p.err, '#c00'); return; }
+        // Konto nierozpoznane, ale sprzedawca znany z raportow — pytamy i zapamietujemy.
+        if (!p.konto && p.loginy && p.loginy.length === 1){
+            const k = alleSpytajOKonto(p.loginy[0]);
+            if (k) p = mkParseAlle(ALLE.ops, mapy, bill, k);
+        }
+        const jobs = jobsLoad();
+        const konto = p.konto || '?';
+        const klucz = 'ALLEGRO-' + konto + '-' + (p.od || '') + (p.doo && p.doo !== p.od ? ('..' + p.doo) : '');
+        const wpis = konto !== '?' ? alleSprzedawca(p.loginy[0] || '', '') : null;
+        const sklep = (wpis && wpis.nazwa) || ('Allegro ' + konto);
+        if (!jobs[klucz]){
+            jobs[klucz] = { ref: klucz, date: p.doo || p.od || '', dateSrc: p.doo || p.od || '',
+                            amount: null, cur: 'PLN',
+                            mp: 'Allegro', brand: 'Allegro', short: 'Allegro',
+                            host: MK_ALLE_HOST, kind: 'alle', shop: sklep,
+                            docs: null, payer: '', txId: '', status: 'new', msg: '' };
+        }
+        const j = jobs[klucz];
+        if (j.status === 'done'){ say('To zestawienie jest już zaksięgowane.', '#c47f00'); return; }
+        j.shop = sklep;
+        j.data = { alle: p, shop: sklep, gross: p.sumaWpl, refund: p.sumaZwr,
+                   net: p.sumaWpl, netOk: true,
+                   ord: p.ord, ref: p.ref, refNote: p.refNote, refData: p.refData,
+                   typOrd: p.typOrd,
+                   unknown: {}, skipped: {}, full: true, both: [],
+                   pays: 1, split: false, rows: p.nWpl + p.nZwr, total: p.nWpl + p.nZwr,
+                   pages: 1, how: skad };
+        const bad = [];
+        if (!p.konto) bad.push('nie wiem, czy to konto 1069 czy 1071'
+                             + (p.loginy.length ? (' — sprzedawca „' + p.loginy.join(', ') + '"') : ' — raporty zamówień nie wskazały sprzedawcy'));
+        if (!ALLE.mapy.length) bad.push('brak raportów zamówień — bez nich nie przetłumaczę identyfikatorów płatności na numery zamówień');
+        if (p.brakMap.length) bad.push(p.brakMap.length + ' operacji bez zamówienia w raportach — dorzuć archiwum obejmujące starsze miesiące');
+        if (!ALLE.bill) bad.push('brak billingu — bez niego nie rozstrzygnę B2B/B2C');
+        else if (p.bezTypu) bad.push(p.bezTypu + ' zamówień, o których billing nic nie wie');
+        zle.forEach(function (m){ bad.push('raport zamówień: ' + m.err); });
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join(' · ');
+        j.note = 'wpłat ' + p.nWpl + ' na ' + f2(p.sumaWpl) + ' PLN · zwrotów ' + p.nZwr + ' na ' + f2(p.sumaZwr)
+               + ' · B2C ' + Object.keys(p.typOrd).filter(function (k){ return p.typOrd[k] === 'B2C'; }).length
+               + ' / B2B ' + Object.keys(p.typOrd).filter(function (k){ return p.typOrd[k] === 'B2B'; }).length
+               + (p.odjete.length ? (' · reguła 6 zł: ' + p.odjete.length + ' wierszy') : '')
+               + ' · pominięte operacje: ' + (Object.keys(p.pominiete).join(', ') || 'brak')
+               + ' · zwroty idą na listę zwrotów z DATĄ Z WIERSZA';
+        jobsSave(jobs); render();
+        say('Allegro ' + konto + ' · ' + (p.od || '?') + (p.doo && p.doo !== p.od ? (' – ' + p.doo) : '')
+            + ' · wpłat ' + p.nWpl + ' na ' + f2(p.sumaWpl) + ' · zwrotów ' + p.nZwr
+            + (j.msg ? (' — ' + j.msg) : ''), bad.length ? '#c47f00' : '#0a7a2f');
+    }
+    function alleBrakKont(j){
+        const p = j && j.data && j.data.alle;
+        if (!p) return '';
+        const cz = [];
+        if (!p.konto) cz.push('nie wiem, czy to konto 1069 czy 1071 — raporty zamówień nie wskazały sprzedawcy'
+                            + (p.loginy && p.loginy.length ? (' (widzę: ' + p.loginy.join(', ') + ')') : ''));
+        if (p.bezTypu) cz.push(p.bezTypu + ' zamówień bez rozstrzygniętego typu klienta — dołóż billing obejmujący ten okres');
+        return cz.length ? (cz.join(' \u00b7 ') + ' — pliku nie generuję') : '';
     }
 
     // ================= MANOMANO =================
@@ -21784,6 +22227,7 @@
         if (j.kind === 'amz'  && j.data && j.data.amz)  return mkCsvAmz(j.data.amz);
         if (j.kind === 'mano' && j.data && j.data.mano) return mkCsvMano(j.data.mano);
         if (j.kind === 'cnov' && j.data && j.data.cnov) return mkCsvCnova(j.data.cnov);
+        if (j.kind === 'alle' && j.data && j.data.alle) return mkCsvAlle(j.data.alle);
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         return mkCsvText(pairsOf(j), j.mp);
     }
@@ -22939,7 +23383,7 @@
               + '<label style="font-size:12px;font-weight:700;color:#fff;background:#7c3aed;border:none;border-radius:6px;padding:5px 12px;cursor:pointer">📎 Dodaj pliki'
               // v3.71: doszlo .txt — raport Amazona („Settlement Report V2") przychodzi
               // jako plik tekstowy z tabulatorami i bez tego nie dalo sie go nawet wskazac.
-              + '<input type="file" id="mk-any" accept=".csv,.txt,.pdf,.xlsx,text/csv,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple style="display:none"></label>'
+              + '<input type="file" id="mk-any" accept=".csv,.txt,.pdf,.xlsx,.zip,text/csv,text/plain,application/pdf,application/zip,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple style="display:none"></label>'
               + '<button id="mk-all" style="padding:5px 12px;border:1px solid #7c3aed;border-radius:6px;background:#fff;color:#7c3aed;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz zestawienia</button>'
               // Dawne osobne wejscia zostaja w DOM, tylko ukryte. Ich obsluga jest
               // sprawdzona i dziala — nowe wejscie tylko podrzuca im wlasciwy plik,
@@ -23149,7 +23593,7 @@
             let det = linkify(j.booked ? impMsgPoKsieg(j.msg) : (j.msg || ''));
             if (!j.data) det += manorBox(j);
             if (j.data){
-                const n = Object.keys(j.data.ord || {}).length, nr = Object.keys(j.data.ref || {}).length;
+                const n = Object.keys(j.data.ord || {}).length, nr = refIle(j);
                 det = 'zamówień: <b>' + n + '</b> na ' + f2(j.data.gross) + (nr ? (' · zwrotów: <b>' + nr + '</b> na ' + f2(j.data.refund)) : '') +
                       ' · kontrola netto ' + (j.data.netOk ? '<b style="color:#0a7a2f">✓</b>' : '<b style="color:#c00">✗ ' + f2(j.data.net) + '</b>');
                 if (j.data.unknown && Object.keys(j.data.unknown).length) det += ' · <b style="color:#c00">nierozpoznane typy: ' + esc(Object.keys(j.data.unknown).join(', ')) + '</b>';
@@ -23259,7 +23703,7 @@
                 // Osobny przycisk przy kazdym wierszu tylko dublowalby te sama droge.
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span> ' : '')
-                  +  (Object.keys(j.data.ref || {}).length ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
+                  +  (refIle(j) ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
                   // v3.82: osobnego guzika „Sprawdź typy klienta" juz nie ma. Kontrola
                   // przeniosla sie do widoku PACZKI IMPORTU, gdzie prologistics podaje juz
                   // gotowe przypisanie zamowienie -> auftrag. Nie trzeba niczego szukac,
@@ -24152,6 +24596,34 @@
     // ---------- zwroty zbiorczo, per data i konto ----------
     // Ksiegowanie w tickecie przyjmuje JEDNO konto na raz, wiec zwroty ze wszystkich
     // zestawien danego dnia grupujemy po koncie i podajemy osobno dla kazdego.
+    // Wszystkie pozycje zwrotow jednego zlecenia: te trzymane pod numerem zamowienia
+    // plus pozycje dodatkowe (dzis: Goodwill Amazona), ktore CELOWO nie sa z nimi sumowane.
+    // Kazde miejsce liczace albo wypisujace zwroty ma przechodzic tedy — inaczej Goodwill
+    // znika z licznika albo z listy, a to gorsze niz sumowanie, bo nie widac, ze czegos brak.
+    function refPozycje(j){
+        const out = [];
+        const rf = (j && j.data && j.data.ref) || {};
+        const sg = (j && j.data && j.data.refSign) || {};
+        const nt = (j && j.data && j.data.refNote) || {};
+        // Data i typ klienta wedruja przy pozycji, bo modul ticketow przy Allegro bierze
+        // date Z WIERSZA (kazdy zwrot ma wlasna) i potrzebuje typu do wyboru konta.
+        const dt = (j && j.data && j.data.refData) || {};
+        const tp = (j && j.data && j.data.typOrd) || {};
+        Object.keys(rf).forEach(function (id){
+            const v = Math.abs(rf[id]) * ((sg[id] === -1) ? -1 : 1);
+            if (!v) return;                                   // zerowe wiersze wysylki pomijamy
+            out.push({ id: id, amt: v, note: nt[id] || '', rodzaj: '',
+                       data: dt[id] || '', typ: tp[id] || '' });
+        });
+        ((j && j.data && j.data.refExtra) || []).forEach(function (x){
+            const v = Math.abs(x.amt) * ((x.sign === -1) ? -1 : 1);
+            if (!v) return;
+            out.push({ id: x.id, amt: v, note: x.note || '', rodzaj: x.rodzaj || '',
+                       data: x.data || '', typ: x.typ || '' });
+        });
+        return out;
+    }
+    function refIle(j){ return refPozycje(j).length; }
     function refGroups(){
         const g = {}, sets = setLoad(), acc = mkAcctLoad();
         jobList().forEach(function (j){
@@ -24167,27 +24639,34 @@
             g[key].shops[j.data.shop] = 1;
             // jedno zestawienie = jeden wiersz w arkuszu, nawet gdy ma kilka zwrotow
             if (!g[key].seen[j.ref]){ g[key].seen[j.ref] = 1; g[key].keys.push(shKey(j, c.acct)); }
-            ids.forEach(function (id){
-                // v3.71: domyslnie na liste idzie WARTOSC BEZWZGLEDNA — parsery zapisuja
-                // zwroty raz na plus, raz na minus i lista ma je pokazywac jednolicie.
-                // Wyjatkiem sa pozycje oznaczone przez parser jako refSign = −1: SAFE-T
-                // Amazona jest w pliku DODATNI (Amazon oddaje koszt), a zaksiegowac trzeba
-                // go ze znakiem minus. Znak wedruje az do pola kwoty w module ticketa.
-                const sgn = ((j.data.refSign || {})[id] === -1) ? -1 : 1;
-                const v = Math.abs(j.data.ref[id]) * sgn;
-                if (!v) return;                                  // zerowe wiersze wysylki pomijamy
-                // Opis potracenia (Wayfair) zostaje przy pozycji — bez niego przy
-                // ksiegowaniu nie widac, czego zwrot dotyczyl i skad sie wzial.
-                // kind = rodzaj marketplace. Bez niego nie da sie pozniej powiedziec,
-                // czy temu opisowi wolno trafic do ticketu (patrz MK_KOM_MP).
-                g[key].rows.push({ id: id, amt: v, ref: j.ref, kind: j.kind,
-                                   note: (j.data.refNote || {})[id] || '' });
-                g[key].sum = r2(g[key].sum + v);
+            // v3.71: domyslnie na liste idzie WARTOSC BEZWZGLEDNA — parsery zapisuja zwroty
+            // raz na plus, raz na minus i lista ma je pokazywac jednolicie. Wyjatkiem sa
+            // pozycje oznaczone przez parser jako refSign = −1: SAFE-T Amazona jest w pliku
+            // DODATNI (Amazon oddaje koszt), a zaksiegowac trzeba go ze znakiem minus.
+            // Znak wedruje az do pola kwoty w module ticketa. Znak i sklejenie obu list
+            // robi refPozycje — tu zostaje samo wpisanie wierszy.
+            refPozycje(j).forEach(function (x){
+                // Opis potracenia (Wayfair) zostaje przy pozycji — bez niego przy ksiegowaniu
+                // nie widac, czego zwrot dotyczyl. kind = rodzaj marketplace: bez niego nie
+                // da sie powiedziec, czy temu opisowi wolno trafic do ticketu (MK_KOM_MP).
+                g[key].rows.push({ id: x.id, amt: x.amt, ref: j.ref, kind: j.kind,
+                                   note: x.note, rodzaj: x.rodzaj,
+                                   data: x.data || '', typ: x.typ || '' });
+                g[key].sum = r2(g[key].sum + x.amt);
             });
         });
         return g;
     }
     function refTsv(rows){
+        // Allegro ma WLASNY uklad: data | numer | kwota | typ. Modul ticketow rozpoznaje go
+        // po danych (UUID w drugiej kolumnie i „B2B"/„B2C" w czwartej) i bierze wtedy date
+        // Z KAZDEGO WIERSZA — bo przy Allegro zwroty z jednej paczki maja rozne daty
+        // ksiegowania. Naglowka NIE dajemy: tamten parser czyta same wiersze.
+        const alle = rows.length && rows.every(function (r){ return r.data && /^B2[BC]$/i.test(String(r.typ || '')); });
+        if (alle)
+            return rows.map(function (r){
+                return alleDmy(r.data) + '\t' + r.id + '\t' + f2(Math.abs(r.amt)) + '\t' + r.typ;
+            }).join('\n');
         return 'Order number\tAmount\n' + rows.map(function (r){ return r.id + '\t' + f2(r.amt); }).join('\n');
     }
     // To samo z opisem potracenia w trzeciej kolumnie. Do modulu ticketa NIE idzie —
@@ -25430,7 +25909,8 @@
         // podsumowania — wgrany plik nie pojawial sie w komunikacie.
         const MK_TYPY_ETYK = { bank: 'wyciąg', amz: 'raport Amazon', mano: 'rozliczenie ManoMano',
             ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair',
-            c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova' };
+            c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova',
+            alleops: 'operacje Allegro', allemap: 'raport zamówień Allegro', allebil: 'billing Allegro' };
         const MK_TYPY_NAZWY = Object.keys(MK_TYPY_ETYK);
         function mkTypPliku(txt){
             try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
@@ -25447,6 +25927,10 @@
             // Cnova na koncu, bo jej warunek wejscia opiera sie na nazwach kolumn
             // w TRZECIM wierszu - zaden wczesniejszy parser tam nie zaglada.
             try { if (!mkParseCnova(txt).err) return 'cnov'; } catch (e){}
+            // Billing Allegro to zwykly CSV na sredniku — poznajemy go po dwoch nazwach
+            // kolumn, ktorych nie ma zaden inny obslugiwany plik.
+            try { if (alleCzyBilling(txt)) return 'allebil'; } catch (e){}
+            try { if (alleCzyMapa(txt)) return 'allemap'; } catch (e){}
             return '';
         }
         const anyIn = $('#mk-any');
@@ -25455,7 +25939,8 @@
             try { this.value = ''; } catch (e){}
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
-            const kubelki = { bank: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [], cnov: [] }, nieznane = [];
+            const kubelki = { bank: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [], cnov: [],
+                              alleops: [], allemap: [], allebil: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -25469,8 +25954,17 @@
                     // i przyjmujemy WYLACZNIE trafienie w Cnove; przy czymkolwiek innym
                     // zostawiamy dotychczasowe zachowanie, zeby nic nie zabrac sasiadom.
                     else if (u8.length > 1 && u8[0] === 0x50 && u8[1] === 0x4B){
-                        try { typ = (mkTypPliku(await cnovZArkusza(buf)) === 'cnov') ? 'cnov' : ''; }
-                        catch (e){ typ = ''; }
+                        // Archiwum. Moga to byc raporty zamowien Allegro (ZIP z plikami .csv),
+                        // arkusz operacji Allegro albo arkusz Cnovy. Rozstrzyga TRESC, nie
+                        // rozszerzenie — te trzy rzeczy przychodza w tym samym opakowaniu.
+                        try {
+                            const csvy = await alleZipCsv(buf);
+                            if (csvy.some(function (x){ return alleCzyMapa(x.tekst); })) typ = 'allemap';
+                            else {
+                                const txt = await cnovZArkusza(buf);
+                                typ = alleCzyOperacje(txt) ? 'alleops' : (mkTypPliku(txt) === 'cnov' ? 'cnov' : '');
+                            }
+                        } catch (e){ typ = ''; }
                     }
                     else typ = mkTypPliku(mkDecode(buf));
                 } catch (e){ typ = ''; }
@@ -25494,6 +25988,11 @@
             kubelki.amz.forEach(function (f){ amzWczytaj(f); });
             kubelki.mano.forEach(function (f){ manoWczytaj(f); });
             kubelki.cnov.forEach(function (f){ cnovWczytaj(f); });
+            // Allegro: NAJPIERW raporty zamowien i billing, na koncu operacje — wtedy
+            // zlecenie sklada sie raz, z kompletem danych, zamiast trzy razy po kawalku.
+            for (let i = 0; i < kubelki.allemap.length; i++) await alleWczytajMapy(kubelki.allemap[i]);
+            for (let i = 0; i < kubelki.allebil.length; i++) await alleWczytajBilling(kubelki.allebil[i]);
+            for (let i = 0; i < kubelki.alleops.length; i++) await alleWczytajOps(kubelki.alleops[i]);
             kubelki.ebay.forEach(function (f){ ebayWczytaj(f); });
             kubelki.galx.forEach(function (f){ galxWczytaj(f); });
             kubelki.wayf.forEach(function (f){ wayfWczytaj(f); });
@@ -25799,6 +26298,44 @@
                     (j.status === 'ready' && !ostrz) ? '#0a7a2f' : '#c47f00');
             };
             rd.readAsArrayBuffer(f);
+        }
+        // Allegro. Trzy rodzaje plikow trafiaja do wspolnej skladnicy, a zlecenie
+        // przeliczane jest po kazdym z nich — kolejnosc wrzucania nie ma znaczenia.
+        async function alleWczytajOps(f){
+            try {
+                const buf = await f.arrayBuffer();
+                const txt = await cnovZArkusza(buf);          // arkusz -> tekst, tym samym czytnikiem co Cnova
+                ALLE.ops = mkCsvRows(txt); ALLE.opsNazwa = f.name;
+                alleZbuduj('plik ' + f.name);
+            } catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); }
+        }
+        async function alleWczytajMapy(f){
+            try {
+                const buf = await f.arrayBuffer();
+                const u8 = new Uint8Array(buf);
+                let dodane = 0;
+                if (u8.length > 1 && u8[0] === 0x50 && u8[1] === 0x4B){
+                    const pliki = await alleZipCsv(buf);
+                    pliki.forEach(function (x){
+                        if (!alleCzyMapa(x.tekst)) return;
+                        if (ALLE.mapyNazwy.indexOf(x.nazwa) >= 0) return;   // to samo archiwum drugi raz
+                        ALLE.mapy.push(x.tekst); ALLE.mapyNazwy.push(x.nazwa); dodane++;
+                    });
+                } else {
+                    const t = mkDecode(buf);
+                    if (alleCzyMapa(t) && ALLE.mapyNazwy.indexOf(f.name) < 0){
+                        ALLE.mapy.push(t); ALLE.mapyNazwy.push(f.name); dodane++;
+                    }
+                }
+                if (!dodane){ say('W ' + f.name + ' nie znalazłem raportu zamówień Allegro (albo już go mam).', '#c47f00'); return; }
+                alleZbuduj('pliki ' + ALLE.mapyNazwy.length);
+            } catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); }
+        }
+        async function alleWczytajBilling(f){
+            try {
+                ALLE.bill = mkDecode(await f.arrayBuffer()); ALLE.billNazwa = f.name;
+                alleZbuduj('plik ' + f.name);
+            } catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); }
         }
         // Raport Amazona. Zlecenie zakladamy z samego pliku — kluczem jest settlement-id
         // ZE SRODKA, nie nazwa pliku: ta sama wyplata pobrana drugi raz przyjdzie jako
@@ -27125,9 +27662,10 @@
         const blok = (j.kind === 'amz') ? amzBrakKont(j)
                    : ((j.kind === 'mano' && j.data && j.data.mano && !j.data.mano.impOk)
                         ? 'w pliku ManoMano nie zgadza się liczba wierszy ORDER — nie generuję pliku'
+                        : (j.kind === 'alle' ? alleBrakKont(j)
                         : ((j.kind === 'cnov' && j.data && j.data.cnov && !j.data.cnov.impOk)
                              ? (j.data.cnov.impPowod || 'w zestawieniu Cnova nie zgadza się liczba wierszy „Vente"')
-                             : ''));
+                             : '')));
         if (blok){ say(blok, '#c00'); return; }
         const blob = csvBlob(j);
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName(j);
@@ -27684,8 +28222,14 @@
     }
     function doCopyRef(ref){
         const j = jobsLoad()[ref]; if (!j || !j.data) return;
-        const t = Object.keys(j.data.ref).sort().map(function (id){ return id + '\t' + f2(Math.abs(j.data.ref[id])); }).join('\n');
-        try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); say('Skopiowano ' + Object.keys(j.data.ref).length + ' zwrotów — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
+        // Goodwill idzie osobnym wierszem o tym samym numerze zamowienia — modul ticketow
+        // rozroznia pozycje po parze (numer, kwota) i radzi sobie z dwiema takimi na jednym
+        // zamowieniu od v3.43.
+        const poz = refPozycje(j).slice().sort(function (a, b){
+            return a.id < b.id ? -1 : (a.id > b.id ? 1 : (Math.abs(a.amt) - Math.abs(b.amt)));
+        });
+        const t = refTsv(poz);
+        try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); say('Skopiowano ' + poz.length + ' zwrotów — wklej w Księgowaniu w tickecie.', '#0a7a2f'); }
         catch (e){ say('Nie udało się skopiować.', '#c00'); }
     }
     // ---------- paczka importu: kontrola i ksiegowanie ----------
