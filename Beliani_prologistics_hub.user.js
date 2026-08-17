@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.44
+// @version      4.49
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12540,6 +12540,25 @@
           + '<button id="wp-xlsx" class="chn-btn ghost" title="Zapisuje plik .xlsx z calym przetworzonym widokiem: dostawcy, konta beneficjentow, SWIFT, tytuly przelewow, kwoty i status kazdej platnosci, plus puste kolumny Wprowadzone / Kto / Data / Uwagi. Do wyslania mailem osobom, ktore wklepuja przelewy do banku. Niezalezne od Kopiuj depo i Kopiuj balance.">📊 Excel do banku (xlsx)</button>'
           + '<span id="wp-log-status" style="font-size:11px;color:#666"></span>'
           + '</div>'
+          + '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7">'
+          + '<div style="font-weight:700;font-size:12px;color:#750000;margin-bottom:3px">\ud83d\udd2c Próbki P/I \u2014 opis budowy plików</div>'
+          + '<div style="font-size:11px;color:#666;margin-bottom:6px;line-height:1.45">'
+          +   'Podaj <b>zakresy orderów</b>, np. <code style="background:#F6E7E6;padding:1px 4px;border-radius:3px">17952-18100, 18300-18450</code> \u2014 do 1000 orderów na przebieg. '
+          +   'Pobiorę P/I każdego z nich i złożę JEDEN raport tekstowy opisujący ich <b>budowę</b>: arkusze, ukryte kolumny, '
+          +   'gdzie stoją \u201eTotal\u201d, \u201eDeposit\u201d i blok bankowy \u2014 oraz co z tego odczytał dzisiejszy parser. '
+          +   'Raport służy do ustalenia wspólnego schematu, żeby odczyt działał u wszystkich dostawców. '
+          +   'Samych plików nigdzie nie wysyłam \u2014 zostają w przeglądarce, zapisuje się tylko raport.'
+          + '</div>'
+          + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          + '<input type="text" id="tm-pi-zakres" placeholder="17952-18100, 18300-18450" spellcheck="false" style="flex:1;min-width:220px;font-size:12px;font-family:monospace;padding:4px 7px;border:1px solid #FFCCB7;border-radius:6px">'
+          + '<label style="font-size:11px;color:#666;white-space:nowrap" title="Ile plików pobieram naraz. Powyżej 5 zysk jest już niewielki, a obciążenie prologistics rośnie.">naraz '
+          +   '<input type="number" id="tm-pi-watki" value="5" min="1" max="8" style="width:46px;font-size:12px;padding:3px 4px;border:1px solid #FFCCB7;border-radius:6px">'
+          + '</label>'
+          + '<button id="tm-pi-run" class="chn-btn maroon" title="Pobiera P/I dla podanych orderów i zapisuje jeden plik .txt z opisem ich budowy \u2014 same pliki zostaja w przegladarce">\ud83d\udd2c Pobierz i opisz</button>'
+          + '<button id="tm-pi-stop" class="chn-btn ghost" style="display:none" title="Kończy zaczęte pobrania i zapisuje raport z tego, co już zebrane">\u23f9 Przerwij</button>'
+          + '<span id="tm-pi-status" style="font-size:11px;color:#666"></span>'
+          + '</div>'
+          + '</div>'
           + '</div>';
         document.body.appendChild(wp);
         wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
@@ -12851,7 +12870,10 @@
         function saveCache(){ if (_saveT) return; _saveT = setTimeout(function(){ _saveT = null; try { GM_setValue('chn_order_cid', JSON.stringify(_cid)); GM_setValue('chn_cid_acc', JSON.stringify(_acc)); } catch(e){} }, 800); }
         async function fetchT(url, ms){
             var ctl = new AbortController(); var t = setTimeout(function(){ try { ctl.abort(); } catch(e){} }, ms || 20000);
-            try { var r = await fetch(url, { credentials: 'same-origin', signal: ctl.signal }); clearTimeout(t); return await r.text(); } catch(e){ clearTimeout(t); return null; }
+            // Blad HTTP to NIE jest tresc strony. Bez tej kontroli strona bledu albo
+            // przekierowanie na logowanie wracaly jako zwykly tekst i byly parsowane
+            // tak, jakby byly zamowieniem — z pustym wynikiem zapisywanym do cache.
+            try { var r = await fetch(url, { credentials: 'same-origin', signal: ctl.signal }); clearTimeout(t); if (!r.ok) return null; return await r.text(); } catch(e){ clearTimeout(t); return null; }
         }
         // Nieudany fetch (timeout, chwilowy blad sieci) to NIE jest odpowiedz
         // „firma nie ma konta". Wpisany do cache i zapisany przez saveCache
@@ -16422,7 +16444,18 @@
             else if (b.swiftBad) m.push('czytelnego SWIFT-u/BIC-u (w P/I stoi „' + String(b.swiftRaw || b.swift).slice(0, 60) + '”)');
             return m.length ? 'w bloku „Bank information” w P/I nie da się odczytać: ' + m.join(', ') : '';
         }
-        function scanPIbank(aoa){
+        // aoaEt — arkusz BEZ wygaszania ukrytych kolumn, uzywany WYLACZNIE do znalezienia
+        // etykiet („BENEFICIARY'S ACCOUNT NO.:" itp.). Wartosci czytamy dalej z „aoa",
+        // czyli z pominieciem kolumn ukrytych — bo to wlasnie tam potrafi siedziec STARY
+        // numer konta i po to ta ochrona powstala.
+        //
+        // P/I PRIYA (order 21671): caly blok bankowy ma podpisy w kolumnie A, a wartosci
+        // w kolumnie D. Kolumna A jest ukryta, wiec po wygaszeniu znikaly podpisy i modul
+        // mowil „brak danych bankowych w P/I", chociaz numer konta i SWIFT byly na miejscu.
+        // Ciagnelo to za soba drugi blad: bez SWIFT-u nie dalo sie rozpoznac kraju, wiec
+        // tytul przelewu do Indii wychodzil jako „Deposit" zamiast „Advance payment".
+        function scanPIbank(aoa, aoaEt){
+            var et = aoaEt || aoa;
             var out = { name: '', addr: '', bankName: '', bankAddr: '', acc: '', swift: '', sheet: '' };
             var nums = [], numSeen = {}, raw = [], lastRaw = -1;
             // SWIFT sprawdza pozniej format AAAACCXX — tu przyjmujemy co jest, zeby
@@ -16433,22 +16466,27 @@
                 if (piBareNum(val) && d.length >= 8 && d.length <= 24 && !numSeen[d]){ numSeen[d] = 1; nums.push(d); }
                 if (key === 'acc' && !out.accBad) out.accBad = String(val).replace(/\s+/g, ' ').trim().slice(0, 90);
             }
-            for (var i = 0; i < aoa.length; i++){
-                var row = aoa[i] || [];
-                for (var j = 0; j < row.length; j++){
-                    var hit = piBankCell(row[j]);
+            for (var i = 0; i < et.length; i++){
+                var row = aoa[i] || [];                       // WARTOSCI — bez ukrytych kolumn
+                var rowEt = et[i] || [];                      // ETYKIETY — pelny arkusz
+                for (var j = 0; j < rowEt.length; j++){
+                    var hit = piBankCell(rowEt[j]);
                     if (!hit) continue;
                     // Surowy zrzut wiersza do logu — zeby dalo sie zdiagnozowac uklad pliku.
                     if (lastRaw !== i && raw.length < 30){
                         lastRaw = i;
-                        raw.push('w' + (i + 1) + ': ' + row.map(function(x){ return String(x == null ? '' : x).replace(/\s+/g, ' ').trim(); })
+                        raw.push('w' + (i + 1) + ': ' + rowEt.map(function(x){ return String(x == null ? '' : x).replace(/\s+/g, ' ').trim(); })
                             .filter(function(x){ return x; }).join(' | ').slice(0, 220));
                     }
                     if (out[hit.key]) continue;
                     var v = '', rej = 0;
-                    if (hit.val && want(hit.key, hit.val)) v = hit.val;
+                    // Wartosc doklejona do samego podpisu bierzemy TYLKO wtedy, gdy ta
+                    // komorka jest widoczna. W ukrytej kolumnie podpis wolno przeczytac,
+                    // ale stojaca przy nim liczbe juz nie — to jest cala tresc ochrony.
+                    var wlasna = (row[j] != null) ? piBankCell(row[j]) : null;
+                    if (wlasna && wlasna.val && want(hit.key, wlasna.val)) v = wlasna.val;
                     else {
-                        if (hit.val) { note(hit.key, hit.val); rej++; }
+                        if (wlasna && wlasna.val) { note(hit.key, wlasna.val); rej++; }
                         for (var c = j + 1; c < row.length && rej < 4 && !v; c++){
                             var cv = String(row[c] == null ? '' : row[c]).trim();
                             if (!cv) continue;
@@ -16633,7 +16671,7 @@
                 if (!acc){ for (var c2 = 0; c2 < lrow.length; c2++){ if (isAccLbl(lrow[c2])){ var d2 = normAcc(lrow[c2]); if (d2.length >= 8 && d2.length > acc.length) acc = d2; } } }
                 if (acc.length < 8){ for (var w = Math.max(0, accLblRow - 3); w <= accLblRow + 3 && w < aoa.length; w++){ var wr = aoa[w] || []; for (var wj = 0; wj < wr.length; wj++){ if (isCleanAcc(wr[wj])){ var d3 = normAcc(wr[wj]); if (d3.length > acc.length) acc = d3; } } } }
             }
-            return { pct: pct, amount: amount, acc: acc, bank: scanPIbank(aoa) };
+            return { pct: pct, amount: amount, acc: acc, bank: scanPIbank(aoa, et) };
         }
         function piSheetOrderMatch(aoa, order){
             var ord = String(order == null ? '' : order).replace(/\D+/g, '');
@@ -16703,6 +16741,12 @@
             // informacji o ukrytych kolumnach i wrocilibysmy do czytania 20%
             // z kolumny, ktorej nikt nie widzi.
             var wb; try { wb = X.read(u8, { type: 'array', cellStyles: true }); } catch(e){ return { err: 'P/I nieczytelne' }; }
+            return parsePIxlsxZWb(X, wb, order);
+        }
+        // Ta sama logika, ale na JUZ otwartym skoroszycie. Rozdzielone, bo X.read na
+        // pliku wazacym kilka MB (z cellStyles) jest najdrozsza czescia calego przebiegu
+        // i kolektor probek robil ja dwa razy na kazdy order: raz do opisu, raz do odczytu.
+        function parsePIxlsxZWb(X, wb, order){
             var meta = (wb.Workbook && wb.Workbook.Sheets) || [];
             function pick(wantHidden){
                 var best = null, bestScore = -1;
@@ -16735,7 +16779,7 @@
                     // Tu tak samo: ukryta kolumna moze niesc STARY numer konta,
                     // a wtedy szukanie zapasowe podstawiloby go zamiast biezacego.
                     var aoa = piAoa(X, ws); if (!aoa) continue;
-                    var b = scanPIbank(aoa);
+                    var b = scanPIbank(aoa, piAoaAll(X, ws));
                     if (!b.ok) continue;
                     var k = normAcc(b.acc) + '|' + b.swift;
                     if (seen[k]) continue;
@@ -16797,6 +16841,21 @@
             if (lib && lib.GlobalWorkerOptions) { try { if (!lib.GlobalWorkerOptions.workerSrc) lib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch(e){} }
             return Promise.resolve(lib);
         }
+        // Linie PDF-a podane jako arkusz: kazda linia to wiersz o JEDNEJ komorce.
+        // Nie piszemy osobnego parsera bloku bankowego dla PDF-ow — piBankCell i tak
+        // rozdziela „ETYKIETA: wartosc", wiec podanie mu linii daje PDF-om caly zestaw
+        // regul, ktore arkusze juz maja: literowke „BANEFICIARY'S", dwukropek pelnej
+        // szerokosci, test ksztaltu numeru konta i ten sam prog kompletnosci
+        // (nazwa + konto + poprawny SWIFT). Osobny parser trzeba by testowac od zera,
+        // a chodzi o numer, na ktory idzie przelew.
+        //
+        // Uklad wielokolumnowy jest tu bezpieczny w dobra strone: gdy pdf.js sklei
+        // etykiete z tekstem sasiedniej kolumny, czlon przed dwukropkiem przekroczy
+        // 60 znakow i piBankKey go odrzuci. Blok wyjdzie jako niekompletny, a nie jako
+        // zly numer konta.
+        function piPdfAoa(lines){
+            return String(lines == null ? '' : lines).split('\n').map(function (l){ return [piTekst(l)]; });
+        }
         async function parsePIpdf(u8){
             var lib = await getPdfjs();
             if (!lib) return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie (brak pdf.js)' };
@@ -16804,14 +16863,567 @@
             try { var doc = await lib.getDocument({ data: u8 }).promise; for (var pg = 1; pg <= doc.numPages; pg++){ var page = await doc.getPage(pg); var tc = await page.getTextContent(); txt += tc.items.map(function(it){ return it.str; }).join(' ') + '\n'; lines += pdfLinesFromItems(tc.items) + '\n'; } } catch(e){ return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie' }; }
             var dep = extractPdfDeposit(lines) || extractPdfDeposit(txt);
             var acc = extractPdfAccount(lines) || extractPdfAccount(txt);
-            return { pct: dep ? dep.pct : null, amount: dep ? dep.amount : null, acc: acc };
+            // Do 4.48 P/I w PDF nie zwracalo bloku bankowego W OGOLE, wiec kazdy taki
+            // plik wychodzil jako „brak danych bankowych" niezaleznie od tresci —
+            // a beneficjent, bank i SWIFT stoja w nim tak samo jak w arkuszu.
+            var bank = scanPIbank(piPdfAoa(lines));
+            bank.sheet = 'PDF';
+            return { pct: dep ? dep.pct : null, amount: dep ? dep.amount : null, acc: acc, bank: bank };
         }
-        async function parsePI(buf, order){
+        // wbGotowe — skoroszyt juz otwarty przez wolajacego (kolektor probek). Podanie go
+        // oszczedza drugi X.read tego samego pliku; pominiecie zachowuje stare zachowanie.
+        async function parsePI(buf, order, wbGotowe){
             var u8 = new Uint8Array(buf);
             var sig = String.fromCharCode(u8[0] || 0, u8[1] || 0, u8[2] || 0, u8[3] || 0);
             if (sig === '%PDF') return await parsePIpdf(u8);
+            if (wbGotowe){ var X0 = getXLSX(); if (X0) return parsePIxlsxZWb(X0, wbGotowe, order); }
             return parsePIxlsx(u8, order);
         }
+        // ================= PROBKI P/I =================
+        // To NIE jest uczenie maszynowe. Zbieramy PROBKI i opisujemy ich BUDOWE, zeby
+        // z nich odczytac jawna regule i wpisac ja do kodu — model uczylby sie „na oko"
+        // i przy nowym dostawcy mylilby sie bez ostrzezenia, a tu chodzi o pieniadze.
+        // Raport celowo nie zawiera samych plikow: P/I potrafi wazyc kilka MB, a do
+        // ustalenia schematu potrzebny jest uklad arkusza, nie jego zawartosc.
+        var PI_PROB_ZAKRES_MAX = 3000;   // najszerszy POJEDYNCZY zakres wpisany w pole
+        var PI_PROB_ORDERY_MAX = 1000;   // ile orderow na jeden przebieg
+        var PI_PROB_WATKI      = 5;      // ile plikow pobieramy naraz (pole w panelu)
+        var PI_PROB_STOP       = { tak: false };
+        var PI_PROB_CACHE      = {};     // order -> wynik; powtorzony zakres nie pobiera drugi raz
+
+        function piZakresy(txt){
+            var out = [], seen = {};
+            String(txt == null ? '' : txt).split(/[^0-9-]+/).forEach(function (kaw){
+                if (!kaw) return;
+                var m = kaw.match(/^(\d+)-(\d+)$/);
+                if (m){
+                    var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+                    if (!isFinite(a) || !isFinite(b)) return;
+                    if (a > b){ var t = a; a = b; b = t; }
+                    // Zakres ma granice: literowka „1-99999" zamienilaby sie w dziesiatki
+                    // tysiecy zapytan do prologistics.
+                    if (b - a > PI_PROB_ZAKRES_MAX) return;
+                    for (var i = a; i <= b; i++){ if (!seen[i]){ seen[i] = 1; out.push(i); } }
+                    return;
+                }
+                var n0 = parseInt(kaw, 10);
+                if (isFinite(n0) && n0 > 0 && !seen[n0]){ seen[n0] = 1; out.push(n0); }
+            });
+            return out.sort(function (a, b){ return a - b; });
+        }
+        // Pula robotnikow: „lista" przerabiana po „n" naraz, wyniki zachowuja kolejnosc
+        // wejscia. Pobieranie po jednym bylo waskim gardlem — na kazdy order idzie strona
+        // zamowienia plus plik potrafiacy wazyc kilka MB, a przez wiekszosc tego czasu
+        // przegladarka po prostu czeka na siec i nic nie robi.
+        //
+        // Dlaczego nie runPool (istnieje w tym samym module): runPool nie ma try/catch,
+        // wiec pierwszy wyjatek w robotniku odrzuca Promise.all i wywraca caly przebieg,
+        // zostawiajac reszte robotnikow w locie. Przy kilkuset orderach oznacza to utrate
+        // wszystkiego, co zebrane. Tu kazdy wyjatek zostaje przy swoim orderze, a przebieg
+        // da sie przerwac guzikiem i zapisac to, co juz jest.
+        async function piPula(lista, ile, robota, postep){
+            var wynik = new Array(lista.length), nast = 0, zrobione = 0;
+            async function robotnik(){
+                while (true){
+                    if (PI_PROB_STOP.tak) return;
+                    var k = nast++;
+                    if (k >= lista.length) return;
+                    try { wynik[k] = await robota(lista[k], k); }
+                    catch (e){ wynik[k] = { order: lista[k], stan: 'wyjątek: ' + ((e && e.message) || e), sig: 'wyjatek', linie: [] }; }
+                    zrobione++;
+                    if (postep) postep(zrobione, lista.length);
+                }
+            }
+            var w = [], n = Math.max(1, Math.min(ile, lista.length));
+            for (var q = 0; q < n; q++) w.push(robotnik());
+            await Promise.all(w);
+            return wynik;
+        }
+        // Etykiety, ktore w P/I cokolwiek znacza. Celowo szersze niz to, co dzis czyta
+        // parser — chodzi o to, zeby ZOBACZYC jak dostawcy nazywaja te same rzeczy
+        // („Deposit", „Advance payment", „30% T/T in advance", „Down payment").
+        var PI_ETY_A = /(deposit|advance|down\s*payment|pre-?payment|prepaid|t\/t|telegraphic|balance|remain\w*|outstanding|payment\s*terms?|terms?\s*of\s*payment|total|beneficiary|swift|iban|bank|account|a\/c)/i;
+        var PI_WALUTY = /\b(USD|EUR|CNY|RMB|INR|GBP|PLN|CHF|HKD)\b/;
+        function piHiddenRows(ws){
+            var out = {}, rows = (ws && ws['!rows']) || [];
+            for (var i = 0; i < rows.length; i++){
+                var r = rows[i];
+                if (r && (r.hidden === true || r.hidden === 1)) out[i] = 1;
+            }
+            return out;
+        }
+        // Jedna komorka w zapisie, z ktorego widac TYP i FORMAT — bo o regule przesadza
+        // wlasnie to, czy 15% siedzi jako liczba 0.15 z formatem procentowym, jako liczba
+        // 15, czy jako tekst „15%”. Sam odczyt wartosci tego nie pokazuje.
+        function piKomOpis(X, ws, r, c, ukrK, ukrW){
+            var k = ws[X.utils.encode_cell({ r: r, c: c })];
+            if (!k) return null;
+            var v = k.v;
+            if (v == null || String(v).trim() === '') return null;
+            var pre = X.utils.encode_col(c);
+            var zn = (ukrK[c] ? 'K' : '') + (ukrW[r] ? 'W' : '');
+            if (zn) pre += '[ukr' + zn + ']';
+            if (k.t === 'n'){
+                var proc = /%/.test(String(k.z || '')) ? '%' : '';
+                var wid = (k.w != null && String(k.w).trim() !== String(v)) ? ('~' + String(k.w).trim()) : '';
+                return pre + proc + '#' + v + wid;
+            }
+            if (k.t === 'd') return pre + 'D=' + String(k.w || v).trim();
+            if (k.t === 'b') return pre + 'B=' + v;
+            // 80 znakow, nie 38. Przy krotszym ucinaniu order 20100 pokazal
+            // „D=BANK CODE-BRANCH CODE-ACCOUNT NUMBER 0…" i nie dalo sie stwierdzic,
+            // czy numer konta w ogole tam jest — a to byla jedyna prawdziwa luka
+            // odczytu na 150 zbadanych zamowien.
+            return pre + '="' + String(v).replace(/\s+/g, ' ').trim().slice(0, 80) + '"';
+        }
+        // Opis JEDNEGO arkusza prosto z komorek, a nie z tablicy wierszy. Powod: funkcje
+        // piAoa/piAoaAll wolaja sheet_to_json z blankrows:false, wiec puste wiersze WYPADAJA
+        // i numer w tablicy przestaje odpowiadac numerowi wiersza w Excelu. W raporcie, ktory
+        // ma sluzyc do porownywania ukladow, przesuniete numery byly by mylace.
+        function piOpisArkusza(X, ws, nazwa, ukrytyArkusz, waluty){
+            // Wczesne wyjscia MUSZA oddac to samo pole 'ety' co sciezka glowna — bez niego
+            // piOpisWb wywracalo sie na pierwszym pustym arkuszu i przebieg konczyl sie
+            // wyjatkiem zamiast raportem.
+            if (!ws || !ws['!ref']) return { linie: ['  arkusz „' + nazwa + '" — pusty'], sig: 'pusty', ety: {} };
+            var R;
+            try { R = X.utils.decode_range(ws['!ref']); }
+            catch (e){ return { linie: ['  arkusz „' + nazwa + '" — zakres nieczytelny: ' + ws['!ref']], sig: 'zly-zakres', ety: {} }; }
+            var L = [];
+            var ukrK = piHiddenCols(ws), ukrW = piHiddenRows(ws);
+            var lk = []; for (var kk in ukrK) lk.push(X.utils.encode_col(Number(kk)));
+            var lw = []; for (var ww in ukrW) lw.push(Number(ww) + 1);
+            var mer = (ws['!merges'] || []).length;
+            L.push('  arkusz „' + nazwa + '"' + (ukrytyArkusz ? ' [ARKUSZ UKRYTY]' : '')
+                 + ' | zakres ' + ws['!ref']
+                 + ' | ukryte kolumny: ' + (lk.length ? lk.join(',') : 'brak')
+                 + ' | ukryte wiersze: ' + (lw.length ? (lw.length > 12 ? (lw.slice(0, 12).join(',') + '…razem ' + lw.length) : lw.join(',')) : 'brak')
+                 + ' | scaleń: ' + mer);
+            // Krok 1: ktore wiersze w ogole warto pokazac.
+            var wybrane = {}, totale = [], etyKol = {};
+            for (var r = R.s.r; r <= R.e.r; r++){
+                var maEty = false, maProc = false;
+                for (var c = R.s.c; c <= R.e.c; c++){
+                    var k = ws[X.utils.encode_cell({ r: r, c: c })];
+                    if (!k || k.v == null) continue;
+                    if (k.t === 'n' && /%/.test(String(k.z || ''))) maProc = true;
+                    if (typeof k.v === 'string'){
+                        var s0 = String(k.v).trim();
+                        if (s0.indexOf('%') >= 0) maProc = true;
+                        if (waluty){ var mw = s0.match(PI_WALUTY); if (mw && waluty.indexOf(mw[1]) === -1) waluty.push(mw[1]); }
+                        var m0 = s0.length < 60 ? s0.match(PI_ETY_A) : null;
+                        if (m0){
+                            maEty = true;
+                            var key = m0[1].toLowerCase().replace(/[\s.]+/g, '');
+                            if (etyKol[key] == null) etyKol[key] = X.utils.encode_col(c);
+                            if (/^total\b/i.test(s0)) totale.push(r);
+                        }
+                    }
+                }
+                if (maEty || maProc) wybrane[r] = 1;
+            }
+            // Wiersz depozytu nie zawsze ma wlasny podpis — u czesci dostawcow stoi po prostu
+            // POD suma. Dlatego kilka wierszy za kazdym „Total" pokazujemy bezwarunkowo.
+            for (var ti = 0; ti < totale.length; ti++){
+                for (var d = 1; d <= 6; d++){ var rr0 = totale[ti] + d; if (rr0 <= R.e.r) wybrane[rr0] = 1; }
+            }
+            // Krok 2: wypisanie.
+            var klucze = []; for (var kx in wybrane) klucze.push(Number(kx));
+            klucze.sort(function (a, b){ return a - b; });
+            var ile = 0;
+            for (var q = 0; q < klucze.length; q++){
+                if (ile >= 48){ L.push('    …(pominięto ' + (klucze.length - q) + ' dalszych wierszy)'); break; }
+                var rw = klucze[q], opis = [];
+                for (var cc = R.s.c; cc <= R.e.c; cc++){
+                    var o = piKomOpis(X, ws, rw, cc, ukrK, ukrW);
+                    if (o) opis.push(o);
+                }
+                if (!opis.length) continue;
+                ile++;
+                L.push('    w' + (rw + 1) + (ukrW[rw] ? ' [WIERSZ UKRYTY]' : '') + ': ' + opis.join(' | ').slice(0, 420));
+            }
+            // Gdy nie ma ani jednej etykiety, sam komunikat „nie znalazlem" nic nie mowi:
+            // przy orderze 20105 arkusz mial 260 wierszy i 6 kolumn, i dopiero ich tresc
+            // pokazalaby, ze to w ogole nie jest P/I. Pokazujemy wiec poczatek arkusza.
+            if (!ile){
+                L.push('    (nie znalazłem ani jednej etykiety ani procentu — pierwsze wiersze poniżej)');
+                var pok = 0;
+                for (var rz = R.s.r; rz <= R.e.r && pok < 8; rz++){
+                    var op2 = [];
+                    for (var cz = R.s.c; cz <= R.e.c; cz++){
+                        var o2 = piKomOpis(X, ws, rz, cz, ukrK, ukrW);
+                        if (o2) op2.push(o2);
+                    }
+                    if (!op2.length) continue;
+                    pok++;
+                    L.push('    w' + (rz + 1) + ': ' + op2.join(' | ').slice(0, 300));
+                }
+            }
+            var sig = 'k:' + (lk.join('') || '-')
+                    + '/w:' + (lw.length ? 'ukr' : '-')
+                    + '/dep:' + (etyKol['deposit'] || '-')
+                    + '/adv:' + (etyKol['advance'] || etyKol['downpayment'] || etyKol['prepayment'] || '-')
+                    + '/tot:' + (etyKol['total'] || '-')
+                    + '/ben:' + (etyKol['beneficiary'] || '-')
+                    + '/swi:' + (etyKol['swift'] || '-');
+            return { linie: L, sig: sig, ety: etyKol };
+        }
+        function piOpisWb(X, wb){
+            var L = [], sig = [], waluty = [], maDep = false;
+            var meta = (wb.Workbook && wb.Workbook.Sheets) || [];
+            L.push('  arkuszy: ' + wb.SheetNames.length + ' (' + wb.SheetNames.join(', ') + ')');
+            for (var si = 0; si < wb.SheetNames.length; si++){
+                var nm = wb.SheetNames[si], ws = wb.Sheets[nm];
+                if (!ws) continue;
+                var hid = !!(meta[si] && meta[si].Hidden);
+                var o = piOpisArkusza(X, ws, nm, hid, waluty);
+                L = L.concat(o.linie);
+                sig.push((hid ? 'H' : '') + o.sig);
+                // Uwaga: „Deposit Value" stoi w naglowku ukrytego arkusza WSAD w KAZDYM
+                // pliku z tej rodziny, wiec sam ten arkusz nie moze przesadzac o tym,
+                // czy P/I ma wiersz depozytu.
+                var ety = o.ety || {};
+                if (!hid && (ety['deposit'] || ety['advance'] || ety['downpayment'] || ety['prepayment'])) maDep = true;
+            }
+            if (waluty.length) L.push('  waluty w tekscie: ' + waluty.join(', '));
+            return { linie: L, sig: 'xlsx|ark' + wb.SheetNames.length + '|' + sig.join(' ;; '), waluty: waluty, maDep: maDep };
+        }
+        // P/I bywa PDF-em. Dotad raport kwitowal to jednym zdaniem, wiec ukladow PDF-owych
+        // nie dalo sie z niego wyczytac w ogole — a parsePIpdf nie zwraca danych bankowych,
+        // wiec akurat tam wiedza o ukladzie jest najbardziej potrzebna.
+        async function piOpisPdf(u8){
+            var lib = await getPdfjs();
+            if (!lib) return { linie: ['  format: PDF — brak pdf.js, nie opiszę budowy'], sig: 'pdf|bez-pdfjs' };
+            var lines = '', stron = 0;
+            try {
+                var doc = await lib.getDocument({ data: u8 }).promise;
+                stron = doc.numPages;
+                for (var pg = 1; pg <= doc.numPages && pg <= 6; pg++){
+                    var page = await doc.getPage(pg);
+                    var tc = await page.getTextContent();
+                    lines += pdfLinesFromItems(tc.items) + '\n';
+                }
+            } catch (e){ return { linie: ['  format: PDF — nieczytelny: ' + ((e && e.message) || e)], sig: 'pdf|blad' }; }
+            var bk = scanPIbank(piPdfAoa(lines));
+            var tab = lines.split('\n'), L = ['  format: PDF | stron: ' + stron + ' | linii tekstu: ' + tab.length
+                     + ' | blok bankowy z linii: ' + (bk.ok ? 'kompletny' : ('niekompletny — ' + (piBankWhy(bk) || 'brak etykiet')))], ile = 0;
+            for (var i = 0; i < tab.length && ile < 40; i++){
+                var t = tab[i].replace(/\s+/g, ' ').trim();
+                if (!t || !PI_ETY_A.test(t)) continue;
+                ile++; L.push('    L' + (i + 1) + ': ' + t.slice(0, 220));
+            }
+            if (!ile) L.push('    (żadna linia nie pasuje do etykiet)');
+            return { linie: L, sig: 'pdf|stron' + stron, waluty: [] };
+        }
+        // Dostawca ze strony zamowienia — bez niego nie da sie zgrupowac ukladow „po firmie",
+        // a to najwazniejsze pytanie przy uogolnianiu reguly.
+        function piDostawca(html){
+            var m = String(html == null ? '' : html).match(/op_suppliers\.php\?company_id=(\d+)[^>]*>([\s\S]{0,160}?)<\/a>/i);
+            if (!m) return { cid: '', nazwa: '' };
+            var nz = m[2].replace(/<[^>]+>/g, ' ').replace(/&amp;/gi, '&').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+            return { cid: m[1], nazwa: nz };
+        }
+        // Wszystkie P/I na zamowieniu, nie tylko wybrane. Gdy parser czyta nie to, co trzeba,
+        // pierwsze pytanie brzmi „czy w ogole wzial wlasciwy plik".
+        function piKandydaci(html){
+            var sec = piSection(html);
+            if (sec == null) return [];
+            var re = /<a[^>]*href="([^"]*doc\.php\?[^"]*doc_id=(\d+)[^"]*)"/gi, m, out = [];
+            while ((m = re.exec(sec)) !== null){
+                if (/[?&](?:del|delete|remove)\b/i.test(m[1]) || /action=(?:del|remove)/i.test(m[1])) continue;
+                var tail = sec.slice(re.lastIndex, re.lastIndex + 400);
+                var cut = tail.search(/<a[\s>]/i); if (cut >= 0) tail = tail.slice(0, cut);
+                var dm = tail.match(/\bon\s+(\d{4}-\d{2}-\d{2})/i);
+                out.push({ id: m[2], data: dm ? dm[1] : '' });
+            }
+            return out;
+        }
+        function piMB(n){ return n >= 1048576 ? ((n / 1048576).toFixed(1) + ' MB') : (Math.round(n / 1024) + ' kB'); }
+        // Jedna ponowna proba po przerwie. Przy jednym orderze czkawki sieci nie bylo widac,
+        // ale przy kilkuset przebieg bez ponowienia zostawia w raporcie „nie pobrano" tam,
+        // gdzie plik istnieje — a to w raporcie o UKLADACH wyglada jak nieznany schemat,
+        // czyli myli dokladnie w tym, do czego raport sluzy.
+        async function piZPonowieniem(fn){
+            var r = await fn();
+            if (r != null) return r;
+            if (PI_PROB_STOP.tak) return null;
+            await new Promise(function (res){ setTimeout(res, 2000); });
+            if (PI_PROB_STOP.tak) return null;
+            return await fn();
+        }
+        async function piProbkaOrder(order){
+            if (PI_PROB_CACHE[order]) return PI_PROB_CACHE[order];
+            var t0 = Date.now(), msSiec = 0, msOdczyt = 0;
+            var r = { order: order, linie: [], sig: 'brak', stan: '', dostawca: '', cid: '',
+                      pct: null, amount: null, acc: '', arkusz: '', err: '', bankOk: false,
+                      swift: '', bankAcc: '', benef: '', kraj: '', tytul: '', waluty: [],
+                      rozmiar: 0, plik: '', kand: [], ms: 0, msSiec: 0, msOdczyt: 0,
+                      format: 'xlsx', maDep: false, podejrzany: false };
+            function koniec(){
+                r.ms = Date.now() - t0; r.msSiec = msSiec; r.msOdczyt = msOdczyt;
+                if (!r.stan) r.stan = 'odczytany';
+                if (r.podejrzany !== true) r.podejrzany = (r.sig.indexOf('brak') === 0 || r.sig === 'nie-order' || r.sig === 'nieczytelny');
+                PI_PROB_CACHE[order] = r; return r;
+            }
+            var tA = Date.now();
+            var h = await piZPonowieniem(function (){ return fetchT('/op_order.php?id=' + encodeURIComponent(order)); });
+            msSiec += Date.now() - tA;
+            if (h == null){ r.stan = 'nie otwarto strony zamówienia'; r.sig = 'brak-strony'; return koniec(); }
+            // Odpowiedz 200 nie znaczy jeszcze, ze to zamowienie: prologistics potrafi oddac
+            // formularz logowania albo pusta strone dla nieistniejacego id. Bez tego
+            // rozroznienia raport pokazywalby „brak P/I" tam, gdzie problem jest zupelnie inny.
+            if (!/op_suppliers\.php\?company_id=/i.test(h) && piSection(h) == null){
+                r.stan = /type=["']?password|name=["']?password/i.test(h)
+                    ? 'strona logowania — sesja prologistics wygasła'
+                    : 'to nie jest strona zamówienia (order nie istnieje?)';
+                r.sig = 'nie-order';
+                return koniec();
+            }
+            var d = piDostawca(h); r.dostawca = d.nazwa; r.cid = d.cid;
+            r.kand = piKandydaci(h);
+            var piUrl = extractLatestPI(h);
+            if (!piUrl){ r.stan = 'brak pliku P/I'; r.sig = 'brak-pi'; return koniec(); }
+            r.plik = piUrl;
+            var tB = Date.now();
+            var adr = piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl;
+            var buf = await piZPonowieniem(function (){ return fetchBin(adr); });
+            msSiec += Date.now() - tB;
+            if (!buf){ r.stan = 'nie pobrano pliku'; r.sig = 'brak-pobrania'; return koniec(); }
+            var u8 = new Uint8Array(buf);
+            r.rozmiar = u8.length;
+            var sig4 = String.fromCharCode(u8[0] || 0, u8[1] || 0, u8[2] || 0, u8[3] || 0);
+            var tC = Date.now(), pi = null;
+            if (sig4 === '%PDF'){
+                // pdf.js potrafi przejac bufor na wlasnosc, wiec do opisu i do parsera ida
+                // OSOBNE kopie — inaczej drugie wywolanie dostaloby pusta tablice.
+                r.format = 'pdf';
+                var oP = await piOpisPdf(u8.slice());
+                r.linie = oP.linie; r.sig = oP.sig;
+                pi = await parsePI(u8.slice().buffer, order);
+            } else {
+                var X = getXLSX();
+                if (!X){ r.stan = 'brak SheetJS'; r.sig = 'brak-sheetjs'; return koniec(); }
+                var wb = null;
+                try { wb = X.read(u8, { type: 'array', cellStyles: true }); }
+                catch (e){ r.stan = 'plik nieczytelny: ' + ((e && e.message) || e); r.sig = 'nieczytelny'; return koniec(); }
+                var oX = piOpisWb(X, wb);
+                r.linie = oX.linie; r.sig = oX.sig; r.waluty = oX.waluty; r.maDep = oX.maDep;
+                // Ten sam skoroszyt idzie do parsera — otwieranie pliku po raz drugi bylo
+                // najdrozsza pojedyncza czescia przebiegu.
+                pi = parsePIxlsxZWb(X, wb, order);
+            }
+            msOdczyt = Date.now() - tC;
+            r.pct = (pi && pi.pct != null) ? pi.pct : null;
+            r.amount = (pi && pi.amount != null) ? pi.amount : null;
+            r.acc = (pi && pi.acc) || '';
+            r.arkusz = (pi && pi.sheet) || '';
+            r.err = (pi && pi.err) || '';
+            var b = pi && pi.bank;
+            r.bankOk = !!(b && b.ok);
+            r.swift = (b && b.swift) || '';
+            r.bankAcc = (b && b.acc) || '';
+            r.benef = (b && b.name) || '';
+            r.kraj = r.swift ? pcSwiftKraj(r.swift) : '';
+            r.tytul = (r.kraj && PC_ADV_KRAJE[r.kraj]) ? 'Advance payment' : 'Deposit';
+            // Rozroznienie, ktorego brakowalo w pierwszym przebiegu: na 150 zamowien 23 byly
+            // opisane jako „nie odczytany", ale 18 z nich to P/I BEZ wiersza depozytu, a 5
+            // ma depozyt rowny zeru. Faktyczna luka odczytu byla jedna. Zlanie tych trzech
+            // rzeczy w jeden komunikat kazalo szukac bledu tam, gdzie go nie ma.
+            if (r.pct != null && r.amount != null && r.amount !== 0) r.stan = 'odczytany';
+            else if ((r.pct === 0 || r.amount === 0)) r.stan = 'depozyt 0% (bez zaliczki)';
+            else if (r.pct == null && r.amount == null) r.stan = r.maDep ? 'NIE ODCZYTANY — jest wiersz depozytu' : 'P/I bez wiersza depozytu';
+            else r.stan = 'NIE ODCZYTANY — ' + (r.pct == null ? 'brak procentu' : 'brak kwoty');
+            // „Do zbadania" to tylko realne luki: brak wiersza depozytu i depozyt zerowy sa
+            // wlasciwoscia dokumentu, nie bledem. Od 4.49 PDF-y czytaja blok bankowy tak
+            // samo jak arkusze, wiec nie maja juz taryfy ulgowej — brak bloku w PDF-ie
+            // jest teraz tak samo podejrzany jak w arkuszu.
+            r.podejrzany = (r.stan.indexOf('NIE ODCZYTANY') === 0) || !r.bankOk;
+            return koniec();
+        }
+        function piWiersz(r){
+            return r.order
+                 + ' | ' + (r.dostawca || '—')
+                 + ' | ' + (r.rozmiar ? piMB(r.rozmiar) : '—')
+                 + ' | ' + (r.pct != null ? (r.pct + '%') : '—') + ' / ' + (r.amount != null ? r.amount : '—')
+                 + ' | konto ' + (r.acc || '—')
+                 + ' | bank ' + (r.bankOk ? 'ok' : 'BRAK') + ' ' + (r.bankAcc || '—')
+                 + ' | SWIFT ' + (r.swift || '—') + (r.kraj ? (' ' + r.kraj + ' → ' + r.tytul) : '')
+                 + ' | ' + (r.ms / 1000).toFixed(1) + ' s'
+                 + (r.stan !== 'odczytany' ? (' | ' + r.stan) : '')
+                 + (r.err ? (' | błąd: ' + r.err) : '');
+        }
+        function piRaport(wyniki, sekundy, watki){
+            var ok = wyniki.filter(Boolean);
+            var L = [];
+            var sumSiec = 0, sumOdczyt = 0;
+            ok.forEach(function (r){ sumSiec += r.msSiec || 0; sumOdczyt += r.msOdczyt || 0; });
+            var grupy = {}, kolejnosc = [];
+            ok.forEach(function (r){
+                var k = r.sig || 'brak';
+                if (!grupy[k]){ grupy[k] = []; kolejnosc.push(k); }
+                grupy[k].push(r);
+            });
+            kolejnosc.sort(function (a, b){ return grupy[b].length - grupy[a].length; });
+            var doZbadania = ok.filter(function (r){ return r.podejrzany; });
+            var stany = {}, stanKol = [];
+            ok.forEach(function (r){ var k = r.stan || '?'; if (!stany[k]){ stany[k] = 0; stanKol.push(k); } stany[k]++; });
+            stanKol.sort(function (a, b){ return stany[b] - stany[a]; });
+
+            L.push('BELIANI — próbki P/I: opis budowy plików');
+            L.push('HUB          : v' + VER);
+            L.push('Wygenerowano : ' + pcNow());
+            L.push('Orderów      : ' + ok.length + (ok.length ? (' (' + ok[0].order + '…' + ok[ok.length - 1].order + ')') : '')
+                 + ', pobierane po ' + watki + ' naraz');
+            L.push('Czas         : ' + sekundy + ' s'
+                 + (ok.length ? (' — średnio ' + (sekundy / ok.length).toFixed(2) + ' s/order') : '')
+                 + ' | sieć ' + Math.round(sumSiec / 1000) + ' s, odczyt plików ' + Math.round(sumOdczyt / 1000) + ' s (sumy z wątków)');
+            L.push('Po co        : ustalenie WSPÓLNEGO schematu P/I, żeby odczyt depozytu');
+            L.push('               i danych bankowych działał u wszystkich dostawców.');
+            L.push('');
+            L.push('OZNACZENIA');
+            L.push('  w35           numer wiersza TAKI JAK W EXCELU (nie przesunięty)');
+            L.push('  A[ukrK]       kolumna A jest ukryta;  [ukrW] — ukryty wiersz');
+            L.push('  #6273         komórka LICZBOWA o wartości 6273');
+            L.push('  %#0.15        liczba z formatem procentowym (0.15 = 15%)');
+            L.push('  ~6,273.00     tak tę liczbę widzi człowiek w Excelu');
+            L.push('  ="Deposit"    komórka TEKSTOWA');
+            L.push('');
+            L.push('===== STANY ODCZYTU =====');
+            L.push('„P/I bez wiersza depozytu" i „depozyt 0%" to WŁAŚCIWOŚĆ dokumentu, nie błąd —');
+            L.push('do zbadania idą tylko pozycje faktycznie nieodczytane.');
+            stanKol.forEach(function (k){ L.push('  ' + (stany[k] + '').padStart(4, ' ') + '  ' + k); });
+            L.push('');
+            L.push('===== UKŁADY (od najczęstszego) =====');
+            kolejnosc.forEach(function (k, i){
+                var g = grupy[k];
+                var odcz = g.filter(function (r){ return r.stan === 'odczytany'; }).length;
+                var luki = g.filter(function (r){ return r.podejrzany; }).length;
+                var bank = g.filter(function (r){ return r.bankOk; }).length;
+                var kraje = {};
+                g.forEach(function (r){ if (r.kraj) kraje[r.kraj] = (kraje[r.kraj] || 0) + 1; });
+                var lk = Object.keys(kraje).map(function (c){ return c + ' ' + kraje[c]; });
+                L.push('UKŁAD ' + (i + 1) + ' — ' + g.length + ' z ' + ok.length + ' orderów');
+                L.push('   podpis    : ' + k);
+                L.push('   parser    : odczytał ' + odcz + ' | do zbadania ' + luki
+                     + ' | bank kompletny ' + bank + ', brak ' + (g.length - bank));
+                L.push('   kraje     : ' + (lk.length ? lk.join(', ') : '—')
+                     + (lk.length === 1 ? (' → tytuł: ' + g[0].tytul) : ''));
+                L.push('   dostawcy  : ' + (function (){
+                    var d = {}, o = [];
+                    g.forEach(function (r){ var nz = r.dostawca || '—'; if (!d[nz]){ d[nz] = 1; o.push(nz); } });
+                    return o.slice(0, 6).join(' · ') + (o.length > 6 ? (' …(' + o.length + ')') : '');
+                })());
+                L.push('   przykłady : ' + g.slice(0, 6).map(function (r){ return r.order; }).join(', '));
+                L.push('');
+            });
+            L.push('===== DO ZBADANIA (' + doZbadania.length + ') =====');
+            L.push('Tylko realne luki: brak odczytu mimo istniejącego wiersza depozytu,');
+            L.push('brak bloku bankowego w arkuszu, plik nie do otwarcia, order bez P/I.');
+            if (!doZbadania.length) L.push('(brak — wszystko odczytane)');
+            doZbadania.slice(0, 200).forEach(function (r){ L.push('  ' + piWiersz(r)); });
+            if (doZbadania.length > 200) L.push('  …(oraz ' + (doZbadania.length - 200) + ' dalszych)');
+            L.push('');
+            L.push('===== SZCZEGÓŁY =====');
+            L.push('Pełny opis budowy: po 2 przedstawicieli każdego układu + wszystkie „do zbadania".');
+            L.push('');
+            var pokazane = {}, szcz = [];
+            kolejnosc.forEach(function (k){ grupy[k].slice(0, 2).forEach(function (r){ if (!pokazane[r.order]){ pokazane[r.order] = 1; szcz.push(r); } }); });
+            doZbadania.slice(0, 60).forEach(function (r){ if (!pokazane[r.order]){ pokazane[r.order] = 1; szcz.push(r); } });
+            szcz.sort(function (a, b){ return a.order - b.order; });
+            szcz.forEach(function (r){
+                L.push('===== order ' + r.order + ' — ' + (r.dostawca || '(dostawca nieznany)')
+                     + (r.cid ? (' [company_id ' + r.cid + ']') : '') + ' =====');
+                L.push('  podpis układu: ' + r.sig);
+                if (r.plik) L.push('  plik: ' + r.plik + (r.rozmiar ? (' | ' + piMB(r.rozmiar)) : ''));
+                if (r.kand && r.kand.length > 1){
+                    L.push('  P/I na zamówieniu: ' + r.kand.length + ' — ' + r.kand.map(function (x){ return 'doc_id ' + x.id + (x.data ? (' ' + x.data) : ''); }).join(' · '));
+                }
+                L = L.concat(r.linie || []);
+                L.push('  ODCZYT PARSERA: procent ' + (r.pct != null ? r.pct : '—')
+                     + ' | kwota ' + (r.amount != null ? r.amount : '—')
+                     + ' | konto ' + (r.acc || '—')
+                     + ' | arkusz ' + (r.arkusz || '—')
+                     + (r.err ? (' | BŁĄD: ' + r.err) : ''));
+                L.push('  BLOK BANKOWY : ' + (r.bankOk ? 'kompletny' : 'NIEKOMPLETNY')
+                     + ' | beneficjent ' + (r.benef || '—')
+                     + ' | konto ' + (r.bankAcc || '—')
+                     + ' | SWIFT ' + (r.swift || '—'));
+                L.push('  TYTUŁ PRZELEWU: kraj z SWIFT ' + (r.kraj || '—') + ' → „' + r.tytul + '"');
+                if (r.stan !== 'odczytany') L.push('  STAN: ' + r.stan);
+                L.push('  czas: ' + (r.ms / 1000).toFixed(1) + ' s (sieć ' + (r.msSiec / 1000).toFixed(1) + ' s, odczyt ' + (r.msOdczyt / 1000).toFixed(1) + ' s)');
+                L.push('');
+            });
+            L.push('===== WSZYSTKIE ORDERY (po jednej linii) =====');
+            ok.forEach(function (r){ L.push(piWiersz(r)); });
+            L.push('');
+            L.push('===== PODSUMOWANIE =====');
+            L.push('orderów: ' + ok.length
+                 + ' | odczytanych: ' + ok.filter(function (r){ return r.stan === 'odczytany'; }).length
+                 + ' | do zbadania: ' + doZbadania.length
+                 + ' | bank kompletny: ' + ok.filter(function (r){ return r.bankOk; }).length
+                 + ' | układów: ' + kolejnosc.length);
+            return L.join('\n');
+        }
+        async function piProbki(btn){
+            var inp = document.getElementById('tm-pi-zakres');
+            var st = document.getElementById('tm-pi-status');
+            var wIn = document.getElementById('tm-pi-watki');
+            var stopBtn = document.getElementById('tm-pi-stop');
+            function say(t){ if (st) st.textContent = t; }
+            var lista = piZakresy(inp && inp.value);
+            if (!lista.length){ say('Podaj numer albo zakres, np. 17952-17990.'); return; }
+            if (lista.length > PI_PROB_ORDERY_MAX){
+                say('To ' + lista.length + ' orderów — na jeden przebieg wchodzi ' + PI_PROB_ORDERY_MAX + '.'); return;
+            }
+            var watki = parseInt((wIn && wIn.value) || PI_PROB_WATKI, 10);
+            if (!isFinite(watki) || watki < 1) watki = 1;
+            // Przegladarka i tak trzyma okolo 6 rownoleglych polaczen na jeden serwer,
+            // wiec powyzej tego dokladamy juz tylko kolejki i obciazenia prologistics,
+            // a nie predkosci. Osiem to gorna granica z zapasem.
+            if (watki > 8) watki = 8;
+            if (lista.length > 200 && !confirm('Pobiorę P/I dla ' + lista.length + ' orderów, po ' + watki + ' naraz.\n'
+                + 'To potrwa i obciąży prologistics. Zaczynamy?')) return;
+            PI_PROB_STOP.tak = false;
+            if (btn) btn.disabled = true;
+            if (stopBtn) stopBtn.style.display = '';
+            var t0 = Date.now();
+            var wyniki = await piPula(lista, watki, piProbkaOrder, function (zrob, ile){
+                var sek = (Date.now() - t0) / 1000;
+                var tempo = sek > 0 ? (zrob / sek) : 0;
+                var zostalo = tempo > 0 ? Math.round((ile - zrob) / tempo) : 0;
+                say(zrob + ' z ' + ile + ' · ' + tempo.toFixed(1) + '/s · zostało ~' + zostalo + ' s'
+                  + (PI_PROB_STOP.tak ? ' · przerywam…' : ''));
+            });
+            var sek = Math.round((Date.now() - t0) / 1000);
+            var zebrane = wyniki.filter(Boolean);
+            if (!zebrane.length){ say('Nic nie zebrano.'); if (btn) btn.disabled = false; if (stopBtn) stopBtn.style.display = 'none'; return; }
+            var txt = piRaport(zebrane, sek, watki)
+                    + (PI_PROB_STOP.tak ? ('\n\nPRZEBIEG PRZERWANY — zebrano ' + zebrane.length + ' z ' + lista.length + ' orderów.') : '');
+            try {
+                var blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
+                var a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = 'PI-probki-' + pcNow().slice(0, 10) + '.txt';
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+            } catch (e){}
+            var odcz = zebrane.filter(function (r){ return r.stan === 'odczytany'; }).length;
+            say((PI_PROB_STOP.tak ? 'Przerwane. ' : 'Gotowe. ') + zebrane.length + ' orderów w ' + sek + ' s · odczytanych ' + odcz
+              + ' · do zbadania ' + zebrane.filter(function (r){ return r.podejrzany; }).length + '. Raport zapisany.');
+            if (btn) btn.disabled = false;
+            if (stopBtn) stopBtn.style.display = 'none';
+        }
+        // Guziki podpinamy przez delegacje — panel powstaje w innym miejscu i nie chcemy
+        // ingerowac w jego istniejace podpiecia.
+        document.addEventListener('click', function (e){
+            var t = e && e.target;
+            if (!t) return;
+            if (t.id === 'tm-pi-run'){ e.preventDefault(); piProbki(t); }
+            else if (t.id === 'tm-pi-stop'){
+                e.preventDefault(); PI_PROB_STOP.tak = true;
+                var st = document.getElementById('tm-pi-status');
+                if (st) st.textContent = 'przerywam — kończę zaczęte pobrania i zapiszę to, co zebrane…';
+            }
+        });
         async function checkOnePI(order){
             // Slad do logu: co skrypt zobaczyl w tym zamowieniu (komentarze, konta, P/I).
             var dg = state.diag.dep[order] = { cs: [], com: null, banks: [], piUrl: '', pi: null };
