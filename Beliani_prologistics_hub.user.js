@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.41
+// @version      4.44
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -2525,8 +2525,9 @@
         <div id="tm-t-parse-preview" style="margin-top:4px;font-size:11px;color:#555;min-height:16px;"></div>
 
         <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-            <label style="font-size:12px;color:#333;white-space:nowrap;">📅 Data:</label>
+            <label id="tm-t-date-lbl" style="font-size:12px;color:#333;white-space:nowrap;">📅 Data:</label>
             <input id="tm-t-date" type="text" placeholder="YYYY-MM-DD" style="width:120px;padding:5px 7px;border:1px solid #ccc;border-radius:5px;font-size:12px;">
+            <span id="tm-t-date-info" style="display:none;font-size:11px;color:#b45309;font-weight:700;white-space:nowrap;">nieużywana — każdy wiersz ma własną</span>
             <label style="font-size:12px;color:#333;white-space:nowrap;">Konto:</label>
             <div style="position:relative;width:340px;max-width:100%;">
                 <input id="tm-t-account" type="text" value="1000" autocomplete="off" placeholder="numer lub nazwa konta..." style="width:100%;box-sizing:border-box;padding:5px 7px;border:1px solid #ccc;border-radius:5px;font-size:12px;">
@@ -2539,7 +2540,7 @@
                 <label style="margin-left:6px;"><input type="radio" name="tm-t-allegro-acc-r" value="1071"> 1071 (PL Beliani)</label>
             </span>
         </div>
-        <div id="tm-t-allegro-note" style="display:none;margin-top:4px;font-size:11px;color:#b45309;">🔒 Format Allegro: data brana z listy (per wiersz), konto tylko 1069/1071.</div>
+        <div id="tm-t-allegro-note" style="display:none;margin-top:4px;font-size:11px;color:#b45309;">🔒 Format Allegro: <b>każdy zwrot księguje się na SWOJEJ dacie</b> z listy — pole „Data" wyżej jest wtedy nieużywane. Konto tylko 1069/1071.</div>
 
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
             <button id="tm-t-check-btn" style="flex:1;min-width:180px;padding:9px;background:#332524;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">🔍 Sprawdź ordery</button>
@@ -3114,12 +3115,32 @@
         const accInp = document.getElementById('tm-t-account');
         const accToggle = document.getElementById('tm-t-allegro-acc');
         const note = document.getElementById('tm-t-allegro-note');
+        const dinfo = document.getElementById('tm-t-date-info');
         if (!dateInp || !accInp) return;
 
-        if (isAllegroMode) {
+        // v4.42: o tym, czy pole daty jest uzywane, decyduja DANE, a nie marketplace.
+        // buildPreviewRows i tak bierze date Z WIERSZA, gdy pozycja ja ma („rowDate =
+        // item.date ? item.date : bookingDate"), wiec przy liscie z wlasnymi datami
+        // wartosc w polu nie trafia NIGDZIE. Pokazywanie jej tam bylo mylace: wygladalo,
+        // jakby cala paczka miala isc na ten dzien. Teraz pole gasnie zawsze, gdy KAZDA
+        // pozycja niesie wlasna date — nie tylko przy Allegro, bo tak samo dziala format
+        // „noticket". Blokada konta zostaje wylacznie przy Allegro, bo tylko tam wybor
+        // jest ograniczony do 1069/1071.
+        const dateZWiersza = items.length > 0 && items.every(i => /^\d{4}-\d{2}-\d{2}$/.test(String(i.date || '')));
+        if (dateZWiersza) {
             dateInp.disabled = true;
             dateInp.placeholder = 'z listy (per wiersz)';
             dateInp.value = '';
+            dateInp.style.background = '#f3f4f6';
+            if (dinfo) dinfo.style.display = '';
+        } else {
+            dateInp.disabled = false;
+            dateInp.placeholder = 'YYYY-MM-DD';
+            dateInp.style.background = '';
+            if (dinfo) dinfo.style.display = 'none';
+        }
+
+        if (isAllegroMode) {
             // Zapamietaj konto sprzed przelaczenia — patrz komentarz w galezi else.
             if (accInp.dataset.prevAcc === undefined) accInp.dataset.prevAcc = accInp.value;
             const r = document.querySelector('input[name="tm-t-allegro-acc-r"]:checked');
@@ -3129,8 +3150,6 @@
             if (accToggle) accToggle.style.display = '';
             if (note) note.style.display = '';
         } else {
-            dateInp.disabled = false;
-            dateInp.placeholder = 'YYYY-MM-DD';
             accInp.readOnly = false;
             // Wyjscie z trybu Allegro przywraca konto sprzed przelaczenia. Wczesniej
             // w polu zostawalo 1069 narzucone przez Allegro i kolejna, zwykla wklejka
@@ -16559,13 +16578,28 @@
             var cc = addrC || bicC || nmC;
             return { town: pbBankTown(addr, cc), ctry: cc, src: addrC ? 'addr' : (bicC ? 'bic' : (nmC ? 'name' : '')) };
         }
-        function scanPIsheet(aoa){
+        // aoaEt — ten sam arkusz BEZ wygaszonych kolumn. Etykiet szukamy w nim, a wartosci
+        // dalej w „aoa", czyli z pominieciem kolumn ukrytych. Gdy nie podano, obie role
+        // pelni „aoa" — tak jak dzialalo do 4.42.
+        function scanPIsheet(aoa, aoaEt){
             var pct = null, amount = null, acc = '';
-            var depRow = -1, depLabel = '';
-            for (var i = 0; i < aoa.length && depRow < 0; i++){ var row = aoa[i] || []; for (var j = 0; j < row.length; j++){ var ct = String(row[j] == null ? '' : row[j]).trim(); if (/^deposit\b/i.test(ct) && ct.length < 20){ depRow = i; depLabel = ct; break; } } }
+            var depRow = -1, depLabel = '', totRowNum = -1;
+            var et = aoaEt || aoa;
+            for (var i = 0; i < et.length && depRow < 0; i++){ var row = et[i] || []; for (var j = 0; j < row.length; j++){ var ct = String(row[j] == null ? '' : row[j]).trim(); if (/^deposit\b/i.test(ct) && ct.length < 20){ depRow = i; depLabel = ct; break; } } }
             if (depRow < 0){
                 var totRow = -1;
-                for (var t = 0; t < aoa.length && totRow < 0; t++){ var rw = aoa[t] || []; for (var tj = 0; tj < rw.length; tj++){ if (/^total\b/i.test(String(rw[tj] == null ? '' : rw[tj]).trim())){ totRow = t; break; } } }
+                // „Total" musi byc etykieta WIERSZA SUM, a nie naglowkiem kolumny. W P/I PRIYA
+                // w wierszu naglowkow stoja „Total Volume (M3)" i „Total Weight (KG)" — sam
+                // wzorzec /^total/ trafial w nie i sciezka zapasowa schodzila o dwa wiersze
+                // nizej, na pierwsza POZYCJE. Zadamy wiec, zeby ten wiersz niosl jakakolwiek
+                // liczbe: wiersz naglowkow jej nie ma, wiersz sum ma zawsze.
+                for (var t = 0; t < et.length && totRow < 0; t++){
+                    var rw = et[t] || [];
+                    var maLiczbe = rw.some(function (v){ return typeof v === 'number' && isFinite(v); });
+                    if (!maLiczbe) continue;
+                    for (var tj = 0; tj < rw.length; tj++){ if (/^total\b/i.test(String(rw[tj] == null ? '' : rw[tj]).trim())){ totRow = t; break; } }
+                }
+                totRowNum = totRow;
                 if (totRow >= 0){ for (var rr = totRow + 1; rr <= totRow + 2 && rr < aoa.length; rr++){ var r2 = aoa[rr] || []; var hasF = r2.some(function(v){ return typeof v === 'number' && v > 0 && v <= 1; }); var hasA = r2.some(function(v){ return typeof v === 'number' && v > 1; }); if (hasF && hasA){ depRow = rr; depLabel = ''; break; } } }
             }
             if (depRow >= 0){
@@ -16574,6 +16608,21 @@
                 if (lm) pct = parseFloat(String(lm[1]).replace(',', '.'));
                 if (pct === null){ for (var pp = 0; pp < drow.length; pp++){ var pv = drow[pp]; if (typeof pv === 'number' && pv > 0 && pv <= 1){ pct = pv * 100; pctCol = pp; break; } if (typeof pv === 'string' && pv.indexOf('%') !== -1){ var pf = parseFloat(pv.replace(',', '.').replace(/[^0-9.]/g, '')); if (isFinite(pf)){ pct = pf; pctCol = pp; break; } } } }
                 for (var k = 0; k < drow.length; k++){ if (k === pctCol) continue; var kc = drow[k]; if (typeof kc === 'string' && /%|deposit|balance/i.test(kc)) continue; var n = (typeof kc === 'number' && isFinite(kc)) ? kc : parseMoney(kc); if (isFinite(n) && n > 1){ amount = n; break; } }
+            }
+            // KONTROLA RACHUNKOWA. Wiersz depozytu ma spelniac „suma x procent = kwota".
+            // W P/I PRIYA: 6273 x 15% = 940.95 co do grosza. Wiersz pozycji, na ktory
+            // zeszla sciezka zapasowa (42149 przy 10.81% z objetosci), nie spelnia tego
+            // przy zadnej kombinacji liczb z wiersza sum — i o to chodzi.
+            //
+            // Rachunek sprawdzamy TYLKO wtedy, gdy wiersz depozytu zostal ZGADNIETY
+            // (nie mial podpisu „Deposit"). Gdy podpis byl, ufamy mu: sa P/I, w ktorych
+            // depozyt liczy sie od innej podstawy niz widoczna suma i nie chcemy ich
+            // odrzucac. Gdy zgadywalismy, a rachunek sie nie zgadza — wolimy powiedziec
+            // „nie umiem odczytac" niz podac liczbe, ktora wyglada na odczytana.
+            if (depRow >= 0 && !depLabel && pct != null && amount != null && totRowNum >= 0){
+                var sumy = (et[totRowNum] || []).filter(function (v){ return typeof v === 'number' && isFinite(v) && v > 1; });
+                var zgadza = sumy.some(function (t0){ return Math.abs(t0 * (pct / 100) - amount) <= Math.max(0.02, Math.abs(amount) * 0.005); });
+                if (!zgadza){ pct = null; amount = null; }
             }
             if (pct === null){ for (var q = 0; q < aoa.length && pct === null; q++){ var qr = aoa[q] || []; for (var qj = 0; qj < qr.length; qj++){ var qm = String(qr[qj] == null ? '' : qr[qj]).match(/(\d+(?:[.,]\d+)?)\s*%\s*deposit/i); if (qm){ pct = parseFloat(String(qm[1]).replace(',', '.')); break; } } } }
             var accLblRow = -1;
@@ -16631,6 +16680,23 @@
             }
             return aoa;
         }
+        // Ten sam arkusz, ale BEZ wygaszania ukrytych kolumn. Sluzy wylacznie do szukania
+        // ETYKIET („Deposit", „Total"), nie wartosci. Powod: ukrywanie kolumny chroni nas
+        // przed czytaniem KWOTY, ktorej nikt nie widzi — ale etykieta to nie kwota.
+        // P/I PRIYA (order 21671) ma ukryte kolumny A, G, M, O, W, a slowa „Deposit"
+        // i „Total" stoja wlasnie w kolumnie A. Po wygaszeniu znikaly, uruchamiala sie
+        // sciezka zapasowa i modul czytal 11% / 42149 z wiersza pozycji zamiast
+        // 15% / 940.95 z wiersza depozytu.
+        function piAoaAll(X, ws){
+            var aoa;
+            try { aoa = X.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false }); }
+            catch(e){ return null; }
+            for (var r = 0; r < aoa.length; r++){
+                var row = aoa[r]; if (!row) continue;
+                for (var c = 0; c < row.length; c++) row[c] = piTekst(row[c]);
+            }
+            return aoa;
+        }
         function parsePIxlsx(u8, order){
             var X = getXLSX(); if (!X) return { err: 'brak SheetJS' };
             // cellStyles:true jest tu KONIECZNE — bez niego SheetJS nie odda
@@ -16646,7 +16712,7 @@
                     var nm = wb.SheetNames[si];
                     var ws = wb.Sheets[nm]; if (!ws) continue;
                     var aoa = piAoa(X, ws); if (!aoa) continue;
-                    var r = scanPIsheet(aoa);
+                    var r = scanPIsheet(aoa, piAoaAll(X, ws));
                     if (r.pct == null && !r.acc) continue;
                     var sc = 0;
                     if (piSheetOrderMatch(aoa, order)) sc += 100;
