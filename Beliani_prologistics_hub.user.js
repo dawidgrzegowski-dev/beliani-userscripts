@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.33
+// @version      4.34
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23631,6 +23631,183 @@
         return L.join('\n');
     }
 
+    // ================= MANOMANO ↔ EXPORT PAYMENTS =================
+    // Ten sam uklad co przy Amazonie: wiedza o marketplace zostaje TUTAJ, a uzgodnienie
+    // i pobieranie zestawien mieszkaja w module Salda. Rozne sa tylko reguly, bo raport
+    // ManoMano niesie co innego niz raport Amazona — nie ma w nim SKU, dat pozycji ani
+    // listy „do wyjasnienia", za to ma klasyfikacje typu klienta, po ktorej poznaje sie
+    // wlasciwe konto VAT.
+    //
+    // Numerem laczacym obie strony jest numer zamowienia ManoMano („M" + 12 cyfr), ktory
+    // w prologistics stoi w kolumnie „Fulfillment number". Sprawdzone na wyplacie
+    // MANOMANO-DE-20260808-722497 kontra export konta 1266 z 12.08.2026: wszystkie
+    // 44 zamowienia i 4 zwroty znalazly sie po obu stronach.
+    function mkKontrolaMano(p, ex){
+        const kraj = String(p.kraj || '').toLowerCase();
+        const tab = MK_MM_ACC[kraj] || null;
+        const poFf = Object.create(null);
+        (ex || []).forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
+
+        const brakuje = [], zleKonto = [], zlaKwota = [], brakZwrot = [], obce = [], bezTypu = [];
+        Object.keys(p.ord).forEach(function (id){
+            const typ = p.typOrd[id] || '';
+            const brutto = r2(p.ord[id]);
+            const w = poFf[id] || [];
+            if (!w.length){
+                brakuje.push({ id: id, kwota: brutto, typ: typ, maZwrot: p.ref[id] != null });
+                return;
+            }
+            // Konto VAT bierzemy z tej samej tabeli, ktora decyduje o imporcie — jedno
+            // zrodlo prawdy. Zamowienie, ktorego typu klienta parser NIE rozstrzygnal,
+            // nie ma z czym byc porownane: idzie na osobna liste, a nie do „zlych kont".
+            const ocz = (tab && typ) ? tab.vat[typ] : '';
+            if (!ocz){
+                bezTypu.push({ id: id, typ: typ || '(nierozstrzygniety)', kwota: brutto,
+                               konta: w.map(function (r){ return r.konto; }).filter(Boolean).join(', ') });
+            }
+            w.forEach(function (r){
+                if (!r.konto){ obce.push({ id: id, auf: r.auf, deb: r.deb, cre: r.cre, kwota: r.kwota }); return; }
+                if (ocz && r.sprzedaz && r.konto !== ocz)
+                    zleKonto.push({ id: id, typ: typ, konto: r.konto, ocz: ocz,
+                                    auf: r.auf, kwota: r.kwota, paid: r.paid });
+            });
+            // Kwote porownujemy tylko po wierszach SPRZEDAZY. Zamowienie widoczne
+            // w exporcie wylacznie jako korekta sprzedano w innym okresie i zestawianie
+            // go z brutto z TEGO rozliczenia nie mialoby sensu — tak samo jak przy Amazonie.
+            const sprz = w.filter(function (r){ return r.sprzedaz; });
+            if (sprz.length){
+                const suma = r2(sprz.reduce(function (a, r){ return a + r.kwota; }, 0));
+                if (Math.abs(suma - brutto) > 0.02)
+                    zlaKwota.push({ id: id, wExporcie: suma, wRaporcie: brutto,
+                                    roznica: r2(suma - brutto), typ: typ,
+                                    auf: sprz.map(function (r){ return r.auf; }).filter(Boolean).join(', ') });
+            }
+        });
+        // Zwroty: szukamy sladu w OBU kierunkach, tak jak przy Amazonie. Nie kazdy zwrot
+        // musi byc korekta — bywa ksiegowany po stronie wplaty i warunek „musi byc korekta"
+        // zglaszalby jako brak cos, co jest zaksiegowane.
+        Object.keys(p.ref || {}).forEach(function (id){
+            const w = poFf[id] || [];
+            if (w.some(function (r){ return r.zwrot; })) return;
+            const a = Math.abs(r2(p.ref[id]));
+            if (w.some(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
+            brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
+        });
+        // Wiersze exportu bez odpowiednika w rozliczeniu — druga strona tej samej kontroli.
+        const znane = Object.create(null);
+        Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
+        Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
+        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[r.ff]; });
+
+        return { kraj: kraj, brakuje: brakuje, zleKonto: zleKonto, zlaKwota: zlaKwota,
+                 brakZwrot: brakZwrot, obce: obce, bezTypu: bezTypu, wolne: wolne,
+                 nOrd: Object.keys(p.ord).length, nZwr: Object.keys(p.ref || {}).length,
+                 nEx: (ex || []).length, brakTabeli: !tab };
+    }
+    function mmEsc(x){
+        return String(x == null ? '' : x).replace(/[&<>"]/g, function (c){
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+        });
+    }
+    function mmKnTekst(p, k, zle){
+        const L = [];
+        L.push('ManoMano ' + String(k.kraj || '').toUpperCase() + ' ↔ Export payments');
+        L.push('rozliczenie ' + (p.payRef || '?') + ' z ' + (p.payDate || '?'));
+        L.push('zamówień ' + k.nOrd + ', zwrotów ' + k.nZwr + ', wierszy w zestawieniu ' + k.nEx);
+        if (k.brakTabeli) L.push('UWAGA: nie mam tabeli kont dla rynku „' + k.kraj + '"');
+        (zle || []).forEach(function (x){ L.push('błąd pobierania: ' + x); });
+        const sek = function (tyt, tab, fmt){
+            if (!tab.length) return;
+            L.push('');
+            L.push(tyt + ' (' + tab.length + ')');
+            tab.forEach(function (x){ L.push('   ' + fmt(x)); });
+        };
+        sek('BRAK PŁATNOŚCI w prologistics', k.brakuje, function (x){
+            return x.id + '  ' + f2(x.kwota) + (x.typ ? ('  ' + x.typ) : '') + (x.maZwrot ? '  (ma zwrot)' : ''); });
+        sek('ZŁE KONTO SPRZEDAŻY', k.zleKonto, function (x){
+            return x.id + '  jest ' + x.konto + ', powinno ' + x.ocz + '  (' + x.typ + ', ' + f2(x.kwota) + ')'; });
+        sek('KWOTA SIĘ NIE ZGADZA', k.zlaKwota, function (x){
+            return x.id + '  w prologistics ' + f2(x.wExporcie) + ', w rozliczeniu ' + f2(x.wRaporcie)
+                 + '  (różnica ' + f2(x.roznica) + ')'; });
+        sek('ZWROT BEZ ŚLADU w prologistics', k.brakZwrot, function (x){
+            return x.id + '  ' + f2(x.kwota) + (x.wierszy ? ('  (są inne wiersze: ' + x.wierszy + ')') : ''); });
+        sek('TYP KLIENTA NIEROZSTRZYGNIĘTY — konta nie sprawdziłem', k.bezTypu, function (x){
+            return x.id + '  ' + f2(x.kwota) + '  konta: ' + (x.konta || '—'); });
+        sek('WIERSZ NIE DOTYCZY TEGO KONTA', k.obce, function (x){
+            return (x.id || '?') + '  ' + (x.auf || '') + '  ' + x.deb + '/' + x.cre + '  ' + f2(x.kwota); });
+        sek('W PROLOGISTICS, A NIE MA W ROZLICZENIU', k.wolne, function (x){
+            return (x.ff || '—') + '  ' + (x.auf || '') + '  ' + f2(x.kwota); });
+        const bl = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+        L.push('');
+        L.push(bl ? ('DO SPRAWDZENIA: ' + bl + ' pozycji') : 'Wszystko się zgadza.');
+        return L.join('\n');
+    }
+    function mmKnRender(p, k, zle){
+        const bl = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+        const H = [];
+        H.push('<div style="border:1px solid ' + (bl ? '#f5c2c7' : '#badbcc') + ';background:'
+             + (bl ? '#fff5f5' : '#f3fbf6') + ';border-radius:8px;padding:8px;margin-bottom:8px">'
+             + '<div style="font-weight:700">' + (bl ? ('Do sprawdzenia: ' + bl + ' pozycji') : 'Wszystko się zgadza')
+             + '</div><div style="font-size:11px;color:#555;margin-top:2px">'
+             + 'rozliczenie ' + mmEsc(p.payRef || '?') + ' z ' + mmEsc(p.payDate || '?')
+             + ' · zamówień ' + k.nOrd + ' · zwrotów ' + k.nZwr
+             + ' · wierszy w zestawieniu ' + k.nEx + '</div></div>');
+        if (k.brakTabeli)
+            H.push('<div style="color:#c00;font-size:11px;margin-bottom:6px">Nie mam tabeli kont dla rynku „'
+                 + mmEsc(k.kraj) + '" — uzupełnij MK_MM_ACC.</div>');
+        (zle || []).forEach(function (x){
+            H.push('<div style="color:#c00;font-size:11px">błąd pobierania: ' + mmEsc(x) + '</div>');
+        });
+        const sek = function (tyt, tab, kolor, wiersz){
+            if (!tab.length) return;
+            H.push('<div style="margin-top:8px"><div style="font-weight:700;color:' + kolor + ';font-size:12px">'
+                 + mmEsc(tyt) + ' (' + tab.length + ')</div>'
+                 + '<div style="font-size:11px;line-height:1.6;max-height:220px;overflow:auto">'
+                 + tab.map(wiersz).join('') + '</div></div>');
+        };
+        sek('Brak płatności w prologistics', k.brakuje, '#c00', function (x){
+            return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota)
+                 + (x.typ ? (' · ' + mmEsc(x.typ)) : '') + (x.maZwrot ? ' · <b>ma zwrot</b>' : '') + '</div>'; });
+        sek('Złe konto sprzedaży', k.zleKonto, '#c00', function (x){
+            return '<div><code>' + mmEsc(x.id) + '</code> · jest <b>' + mmEsc(x.konto)
+                 + '</b>, powinno <b>' + mmEsc(x.ocz) + '</b> · ' + mmEsc(x.typ) + ' · ' + f2(x.kwota) + '</div>'; });
+        sek('Kwota się nie zgadza', k.zlaKwota, '#c00', function (x){
+            return '<div><code>' + mmEsc(x.id) + '</code> · prologistics ' + f2(x.wExporcie)
+                 + ' vs rozliczenie ' + f2(x.wRaporcie) + ' · różnica <b>' + f2(x.roznica) + '</b></div>'; });
+        sek('Zwrot bez śladu w prologistics', k.brakZwrot, '#c00', function (x){
+            return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota) + '</div>'; });
+        sek('Typ klienta nierozstrzygnięty — konta nie sprawdziłem', k.bezTypu, '#c47f00', function (x){
+            return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota)
+                 + ' · konta: ' + mmEsc(x.konta || '—') + '</div>'; });
+        sek('Wiersz nie dotyczy tego konta', k.obce, '#c47f00', function (x){
+            return '<div><code>' + mmEsc(x.id || '?') + '</code> · ' + mmEsc(x.auf || '')
+                 + ' · ' + mmEsc(x.deb) + '/' + mmEsc(x.cre) + ' · ' + f2(x.kwota) + '</div>'; });
+        sek('W prologistics, a nie ma w rozliczeniu', k.wolne, '#c47f00', function (x){
+            return '<div><code>' + mmEsc(x.ff || '—') + '</code> · ' + mmEsc(x.auf || '')
+                 + ' · ' + f2(x.kwota) + '</div>'; });
+        return H.join('');
+    }
+    // Most do modulu Salda — ten sam ksztalt co __TM_AMZ_KONTROLA, wiec ekran po tamtej
+    // stronie moze traktowac oba marketplace jednakowo.
+    window.__TM_MM_KONTROLA = {
+        raport: function (tekst){ return mkParseMano(tekst); },
+        wiersze: mkExpZAoa,
+        sprawdz: mkKontrolaMano,
+        render: mmKnRender,
+        tekst: mmKnTekst,
+        kontoRozl: function (kraj){
+            const k = MK_MM_ACC[String(kraj || '').toLowerCase()];
+            return k ? k.acc : '';
+        },
+        konta: function (){
+            return Object.keys(MK_MM_ACC).map(function (k){
+                return { kraj: k, acc: MK_MM_ACC[k].acc, nazwa: 'ManoMano ' + k.toUpperCase() };
+            }).filter(function (x){ return x.acc; })
+              .sort(function (a, b){ return a.nazwa.localeCompare(b.nazwa); });
+        },
+        obsluga: Object.keys(MK_MM_ACC)
+    };
+
     // v3.92: most do modulu Salda. Kontrola ksiegowania siedzi TAM, bo tam mieszkaja
     // wszystkie uzgodnienia (PayPal, wyciag bankowy) i tam jest juz gotowe pobieranie
     // zestawien z prologistics. Tutaj zostaje sama wiedza o Amazonie: jak czytac raport,
@@ -31174,6 +31351,8 @@
         // dociagamy z prologistics tym samym mostem co PayPal.
         { id: 'amazon', nazwa: 'Amazon ↔ Export payments',
           opis: 'rozliczenie Amazona kontra zestawienie z prologistics · sprawdza też konta sprzedaży', gotowe: true },
+        { id: 'mano', nazwa: 'ManoMano ↔ Export payments',
+          opis: 'rozliczenie ManoMano kontra zestawienie z prologistics · łączy po numerze zamówienia z kolumny „Fulfillment number"', gotowe: true },
         { id: 'saferpay', nazwa: 'Saferpay ↔ Export payments', opis: 'jeszcze nie zrobione', gotowe: false }
     ];
     // Konta PayPal, ktore uzgadniamy. Numery sa stale, ale ETYKIETY czytamy z zywego
@@ -31278,7 +31457,9 @@
         p.querySelectorAll('.sal-poz').forEach(function (d){
             const x = SAL_LISTA.filter(function (y){ return y.id === d.getAttribute('data-id'); })[0];
             if (x && x.gotowe) d.onclick = function (){
-                (x.id === 'bank' ? salRysujBank : (x.id === 'amazon' ? salRysujAmz : salRysujPP))();
+                (x.id === 'bank' ? salRysujBank
+                    : (x.id === 'amazon' ? salRysujAmz
+                    : (x.id === 'mano' ? salRysujMM : salRysujPP)))();
             };
         });
     }
@@ -31482,6 +31663,164 @@
             const k = most.sprawdz(SAL_AMZ, SAL_AEXP.rows);
             SAL_AWYNIK = most.tekst(SAL_AMZ, k, SAL_AEXP.zle);
             out.innerHTML = most.render(SAL_AMZ, k, SAL_AEXP.zle);
+            kop.style.display = '';
+            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+            salSay(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
+                   blady ? '#c47f00' : '#0a7a2f');
+        } catch (e){
+            salSay('Błąd porównania: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+
+    // ---------- ManoMano ↔ Export payments ----------
+    // Swiadomie OSOBNY ekran, a nie uogolnienie amazonowego: tamten dziala i obraca
+    // pieniedzmi, a uogolnianie go w tym samym kroku, w ktorym dokladamy nowy rynek,
+    // znaczyloby, ze bledem w nowym kodzie da sie zepsuc stary. Wspolne jest to, co
+    // NAPRAWDE jest wspolne: pobieranie zestawienia (salPobierzAmzExp czyta konto
+    // z tego samego pola #sal-akonto) i odczyt wierszy (mkExpZAoa).
+    let SAL_MM = null;          // sparsowane rozliczenie ManoMano
+    let SAL_MWYNIK = '';        // wynik tekstowy do schowka
+    function salMmMost(){
+        return (typeof window.__TM_MM_KONTROLA === 'object' && window.__TM_MM_KONTROLA) || null;
+    }
+    function salMmInfo(){
+        const p = salPanel(), a = p.querySelector('#sal-mminfo'), e = p.querySelector('#sal-aexpinfo');
+        if (a) a.textContent = SAL_MM
+            ? ('Rozliczenie ' + (SAL_MM.payRef || '?') + ' z ' + (SAL_MM.payDate || '?')
+               + ' · zamówień ' + SAL_MM.nOrd + ' · zwrotów ' + SAL_MM.nZwr)
+            : 'Plik: nie wskazany.';
+        if (e && SAL_AEXP) e.textContent = 'Zestawienie: ' + SAL_AEXP.rows.length + ' wierszy.';
+    }
+    async function salRysujMM(){
+        const p = salPanel(), u = salUst();
+        const most = salMmMost();
+        const rynki = most ? most.konta() : [];
+        const et = await salEtykiety(), akt = salAktywne();
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · ManoMano ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+
+            + (most ? '' : '<div style="border:1px solid #f5c2c7;background:#fff5f5;border-radius:8px;padding:8px;margin-bottom:8px;color:#c00">'
+                + 'Moduł „Księgowanie Marketplace\'s" jest wyłączony w launcherze — bez niego nie odczytam rozliczenia ManoMano.</div>')
+
+            + '<div style="color:#555;margin-bottom:8px;font-size:11px">Sprawdzam, czy każde zamówienie z rozliczenia ma płatność w prologistics, '
+            + 'czy kwoty się zgadzają, czy sprzedaż siedzi na właściwym koncie VAT i czy każdy zwrot zostawił ślad. '
+            + 'Łączę po numerze zamówienia — w prologistics stoi on w kolumnie „Fulfillment number". '
+            + 'Zakres dat ustaw tak, żeby objął dni księgowania tej wypłaty; zestawienie pobiorę sam.</div>'
+
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.do) + '" style="font-size:12px;width:130px"></label>'
+            + '<button id="sal-apobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
+            + '</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Rynek <span style="font-weight:400;color:#888;font-size:11px">'
+            + '— po wskazaniu rozliczenia ustawiam go sam, wprost z pliku</span></div>'
+            + '<select id="sal-akonto" style="width:100%;font-size:12px;padding:4px;'
+            + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
+            + (rynki.length
+                ? rynki.map(function (r){
+                      const stan = (r.acc in akt) ? (akt[r.acc] ? '' : '  · nieaktywne') : '';
+                      return '<option value="' + salEsc(r.acc) + '" data-kraj="' + salEsc(r.kraj) + '"'
+                          + (r.kraj === 'de' ? ' selected' : '') + '>'
+                          + salEsc(r.nazwa) + ' — ' + salEsc(et[r.acc] || r.acc) + salEsc(stan) + '</option>';
+                  }).join('')
+                : '<option value="">— moduł marketplace\'ów wyłączony —</option>')
+            + '</select></div>'
+            + '<div id="sal-aexpinfo" style="font-size:11px;color:#888;margin-bottom:8px">Zestawienie: jeszcze nie pobrane.</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Rozliczenie z ManoMano</div>'
+            + '<label style="font-size:11px;display:block">plik wypłaty (.csv) '
+            + '<input type="file" id="sal-fmm" accept=".csv,text/csv,text/plain" style="font-size:11px"></label>'
+            + '<div id="sal-mminfo" style="font-size:11px;color:#888;margin-top:4px">Plik: nie wskazany.</div>'
+            + '</div>'
+
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<button id="sal-mporownaj" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
+            + '<button id="sal-mkopiuj" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
+            + '</div>'
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
+            + '<div id="sal-mwynik"></div>';
+
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-apobierz').onclick = function (){ salPobierzAmzExp(this); };
+        p.querySelector('#sal-fmm').onchange = function (){ salWczytajMM(this.files); };
+        p.querySelector('#sal-mporownaj').onclick = function (){ salPorownajMM(this); };
+        p.querySelector('#sal-mkopiuj').onclick = function (){
+            try { GM_setClipboard(SAL_MWYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
+            catch (e){ salSay('Nie udało się skopiować.', '#c00'); }
+        };
+        const zapiszUst = function (){
+            const o = salUst();
+            o.od = p.querySelector('#sal-od').value;
+            o.do = p.querySelector('#sal-do').value;
+            salUstZapisz(o);
+        };
+        p.querySelector('#sal-od').onchange = zapiszUst;
+        p.querySelector('#sal-do').onchange = zapiszUst;
+        salMmInfo();
+    }
+    async function salWczytajMM(files){
+        const most = salMmMost();
+        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!files || !files.length) return;
+        try {
+            const buf = await files[0].arrayBuffer();
+            const u8 = new Uint8Array(buf);
+            // Rozliczenia ManoMano widzielismy dotad w UTF-8, ale znacznik kolejnosci
+            // bajtow sprawdzamy tak samo jak przy Amazonie — jeden plik w UTF-16
+            // wystarczylby, zeby caly odczyt zamienil sie w krzaki bez slowa wyjasnienia.
+            let txt;
+            if (u8.length > 1 && u8[0] === 0xFF && u8[1] === 0xFE) txt = new TextDecoder('utf-16le').decode(u8);
+            else if (u8.length > 1 && u8[0] === 0xFE && u8[1] === 0xFF) txt = new TextDecoder('utf-16be').decode(u8);
+            else txt = new TextDecoder('utf-8').decode(u8);
+            const p = most.raport(txt);
+            if (p.err){ SAL_MM = null; salSay(p.err, '#c00'); salMmInfo(); return; }
+            SAL_MM = p;
+            // Rynek ustawiamy SAMI, wprost z rozliczenia — pomylka „raport FR, konto DE"
+            // dalaby wynik, ktory wyglada wiarygodnie i jest w calosci bez sensu.
+            let dop = '';
+            const sel = salPanel().querySelector('#sal-akonto');
+            if (sel && p.kraj){
+                const opt = Array.prototype.slice.call(sel.options).filter(function (o){
+                    return o.getAttribute('data-kraj') === String(p.kraj).toLowerCase();
+                })[0];
+                if (opt){ sel.value = opt.value; dop = ' · ustawiłem rynek ' + String(p.kraj).toUpperCase()
+                                                     + ' (konto ' + opt.value + ')'; }
+                else dop = ' · UWAGA: nie mam w tabeli kont rynku ' + String(p.kraj).toUpperCase();
+            }
+            salMmInfo();
+            salSay('Wczytano rozliczenie ' + (p.payRef || '?') + dop, '#0a7a2f');
+        } catch (e){
+            SAL_MM = null; salMmInfo();
+            salSay('Nie mogę odczytać pliku: ' + ((e && e.message) || e), '#c00');
+        }
+    }
+    function salPorownajMM(b){
+        const p = salPanel(), most = salMmMost();
+        const out = p.querySelector('#sal-mwynik'), kop = p.querySelector('#sal-mkopiuj');
+        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!SAL_MM){ salSay('Wskaż plik rozliczenia ManoMano.', '#c47f00'); return; }
+        if (!SAL_AEXP || !SAL_AEXP.rows.length){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
+        // Rozliczenie i zestawienie MUSZA dotyczyc tego samego konta rozliczeniowego —
+        // inaczej porownanie oglada dwa rozne rynki i kazdy wynik jest przypadkowy.
+        const kontoSel = String(p.querySelector('#sal-akonto').value || '').trim();
+        const kontoRap = most.kontoRozl(SAL_MM.kraj);
+        if (kontoRap && kontoSel && kontoRap !== kontoSel){
+            salSay('Rozliczenie dotyczy ManoMano ' + String(SAL_MM.kraj || '').toUpperCase()
+                 + ' (konto ' + kontoRap + '), a zestawienie pobrałeś dla konta ' + kontoSel
+                 + '. Ustaw właściwy rynek i pobierz jeszcze raz.', '#c00');
+            return;
+        }
+        b.disabled = true;
+        try {
+            const k = most.sprawdz(SAL_MM, SAL_AEXP.rows);
+            SAL_MWYNIK = most.tekst(SAL_MM, k, SAL_AEXP.zle);
+            out.innerHTML = most.render(SAL_MM, k, SAL_AEXP.zle);
             kop.style.display = '';
             const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
             salSay(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
