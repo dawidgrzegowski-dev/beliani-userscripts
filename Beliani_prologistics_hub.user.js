@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.49
+// @version      4.57
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13665,6 +13665,27 @@
         }
         function painEsc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); }
         function painNorm(s){ return String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+        // Konto NIE-IBAN-owe (Chiny, Hongkong, Indonezja, Tajwan) idzie do pliku tak, jak
+        // stoi w P/I — Z MYSLNIKAMI. Do 4.50 przechodzilo przez painNorm, ktore zdejmuje
+        // wszystko poza literami i cyframi, wiec „134-00-2220313-6" wychodzilo do banku
+        // jako „1340022203136" — inny ciag znakow niz ten, ktory dostawca podal i ktory
+        // byl uzywany przy przelewach skladanych recznie.
+        //
+        // painNorm powstalo DLA IBAN-u, gdzie zdejmowanie separatorow jest obowiazkowe:
+        // suma kontrolna liczy sie na formie bez spacji. Othr/Id zadnej takiej reguly nie
+        // ma — to zwykly Max34Text i bank beneficjenta dostaje doslownie to, co wpiszemy.
+        //
+        // Zdejmujemy wylacznie biale znaki i znaki spoza zestawu dopuszczonego przez SPS.
+        // Myslnik, ukosnik, kropka i nawiasy sa w PAIN_SWIFT_OK, wiec zostaja.
+        function painAcctOthr(s){
+            var t = String(s == null ? '' : s).toUpperCase(), out = '';
+            for (var i = 0; i < t.length; i++){
+                var ch = t.charAt(i);
+                if (/\s/.test(ch)) continue;
+                if (PAIN_SWIFT_OK.test(ch)) out += ch;
+            }
+            return out;
+        }
         // Kwoty licz w groszach - suma kontrolna musi sie zgadzac co do centa.
         function painCents(n){ var v = Number(n); return isFinite(v) ? Math.round(v * 100) : 0; }
         function painAmt(cents){ return (cents / 100).toFixed(2); }
@@ -13682,6 +13703,16 @@
             return rem === 1;
         }
         function painBicOk(s){ return /^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(painNorm(s)); }
+        // Co widac w tabeli, a co idzie do pliku. Roznica miedzy tymi dwoma rzeczami byla
+        // niewidoczna az do momentu, w ktorym bank pokazal inny numer konta — wiec gdy
+        // zapis do pliku rozni sie od tego, co stoi w polu, mowimy o tym wprost.
+        function painAccNote(r){
+            if (painIbanOk(r.acc)) return '<div style="font-size:10px;color:#0a0">IBAN ✓ — do pliku bez spacji</div>';
+            var out = painAcctOthr(r.acc), widac = String(r.acc == null ? '' : r.acc).trim();
+            if (!out) return '';
+            if (out === widac.toUpperCase()) return '';
+            return '<div style="font-size:10px;color:#888">do pliku: ' + painEsc(out) + '</div>';
+        }
         // Adres hybrydowy: TwnNm i Ctry osobno, cala reszta w max 2 x 70 znakow AdrLine.
         // Usuwa nazwe miasta z tekstu adresu — tylko jako cala fraze, razem z osieroconym
         // przecinkiem. Miasto i tak idzie w TwnNm, a powtorzone w AdrLine robilo z adresu
@@ -13851,6 +13882,11 @@
                 if (!r.hasBank) errs.push(p + (r.bankWhy || 'brak bloku bankowego w P/I') + ' — uzupełnij dane ręcznie.');
                 if (!painTxt(r.name, 140, strict)) errs.push(p + 'brak nazwy beneficjenta.');
                 if (!painNorm(r.acc)) errs.push(p + 'brak numeru konta beneficjenta.');
+                // .slice(0, 34) w budowie pliku ucinalby numer PO CICHU. Lepiej zatrzymac
+                // caly plik i kazac skrocic recznie, niz wyslac przelew na obciety numer.
+                var accOut = painIbanOk(r.acc) ? painNorm(r.acc) : painAcctOthr(r.acc);
+                if (accOut.length > 34) errs.push(p + 'numer konta ma ' + accOut.length
+                    + ' znaków, a do pain.001 wchodzi najwyżej 34 — popraw zapis konta.');
                 if (!painBicOk(r.bic)) errs.push(p + 'BIC „' + r.bic + '” niepoprawny.');
                 if (r.acctHintBad) warns.push(p + '⛔ ' + (r.why[0] || 'komentarz wskazuje inne konto') + ' — wiersz jest ODZNACZONY; zaznacz go ręcznie dopiero po sprawdzeniu, na który numer ma iść przelew.');
                 if (!painTxt(r.town, 35, strict)) errs.push(p + 'brak miasta beneficjenta — TwnNm obowiązkowe w obu wariantach adresu SPS (strukturalnym i hybrydowym).');
@@ -13969,7 +14005,7 @@
                 c('Cdtr');
                 o('CdtrAcct'); o('Id');
                 if (painIbanOk(r.acc)) e('IBAN', painNorm(r.acc));
-                else { o('Othr'); e('Id', painNorm(r.acc).slice(0, 34)); c('Othr'); }
+                else { o('Othr'); e('Id', painAcctOthr(r.acc).slice(0, 34)); c('Othr'); }
                 c('Id'); c('CdtrAcct');
                 o('RmtInf'); e('Ustrd', painTxt(r.title, PAIN_TITLE_MAX, strict)); c('RmtInf');
                 c('CdtTrfTxInf');
@@ -15608,7 +15644,7 @@
                        + '</div></td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;text-align:right;vertical-align:top">' + painInp('amount', r.key, r.amount.toFixed(2), 78) + (r.amountEdited ? '<div style="font-size:10px;color:#0a58ca">było ' + r.amountBase.toFixed(2) + '</div>' : '') + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('name', r.key, r.name, 210) + '</td>'
-                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('acc', r.key, r.acc, 165) + (painIbanOk(r.acc) ? '<div style="font-size:10px;color:#0a0">IBAN ✓</div>' : '') + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('acc', r.key, r.acc, 165) + painAccNote(r) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('bic', r.key, r.bic, 95) + (r.bic && !painBicOk(r.bic) ? '<div style="font-size:10px;color:#c00">zły BIC</div>' : '') + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('town', r.key, r.town, 105) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('ctry', r.key, r.ctry, 34) + '</td>'
@@ -16944,6 +16980,20 @@
         // („Deposit", „Advance payment", „30% T/T in advance", „Down payment").
         var PI_ETY_A = /(deposit|advance|down\s*payment|pre-?payment|prepaid|t\/t|telegraphic|balance|remain\w*|outstanding|payment\s*terms?|terms?\s*of\s*payment|total|beneficiary|swift|iban|bank|account|a\/c)/i;
         var PI_WALUTY = /\b(USD|EUR|CNY|RMB|INR|GBP|PLN|CHF|HKD)\b/;
+        // Podpis WIERSZA depozytu: „Deposit", „Deposit 15%", „Deposit:". Celowo WASKI —
+        // „Deposit Value" z naglowka arkusza WSAD ma sie tu NIE lapac.
+        var PI_DEP_ETY = /^deposit\s*(?:\d+(?:[.,]\d+)?\s*%)?\s*[:：]?$/i;
+        // Zaliczka bywa nazwana inaczej niz „Deposit" — ale nadal musi byc podpisem WIERSZA.
+        var PI_ADV_ETY = /^(?:advance\s*payment|down\s*payment|pre-?payment|prepayment)\s*(?:\d+(?:[.,]\d+)?\s*%)?\s*[:：]?$/i;
+        // Czy w wierszu stoi jakakolwiek liczba. Uzywane do odroznienia wiersza depozytu
+        // wypelnionego liczbami od takiego, w ktorym dostawca wpisal same napisy.
+        function wierszMaLiczbe(ws, X, R, r){
+            for (var c = R.s.c; c <= R.e.c; c++){
+                var k = ws[X.utils.encode_cell({ r: r, c: c })];
+                if (k && k.t === 'n' && isFinite(k.v)) return true;
+            }
+            return false;
+        }
         function piHiddenRows(ws){
             var out = {}, rows = (ws && ws['!rows']) || [];
             for (var i = 0; i < rows.length; i++){
@@ -16955,7 +17005,7 @@
         // Jedna komorka w zapisie, z ktorego widac TYP i FORMAT — bo o regule przesadza
         // wlasnie to, czy 15% siedzi jako liczba 0.15 z formatem procentowym, jako liczba
         // 15, czy jako tekst „15%”. Sam odczyt wartosci tego nie pokazuje.
-        function piKomOpis(X, ws, r, c, ukrK, ukrW){
+        function piKomOpis(X, ws, r, c, ukrK, ukrW, dl){
             var k = ws[X.utils.encode_cell({ r: r, c: c })];
             if (!k) return null;
             var v = k.v;
@@ -16974,13 +17024,16 @@
             // „D=BANK CODE-BRANCH CODE-ACCOUNT NUMBER 0…" i nie dalo sie stwierdzic,
             // czy numer konta w ogole tam jest — a to byla jedyna prawdziwa luka
             // odczytu na 150 zbadanych zamowien.
-            return pre + '="' + String(v).replace(/\s+/g, ' ').trim().slice(0, 80) + '"';
+            return pre + '="' + String(v).replace(/\s+/g, ' ').trim().slice(0, dl || 80) + '"';
         }
         // Opis JEDNEGO arkusza prosto z komorek, a nie z tablicy wierszy. Powod: funkcje
         // piAoa/piAoaAll wolaja sheet_to_json z blankrows:false, wiec puste wiersze WYPADAJA
         // i numer w tablicy przestaje odpowiadac numerowi wiersza w Excelu. W raporcie, ktory
         // ma sluzyc do porownywania ukladow, przesuniete numery byly by mylace.
-        function piOpisArkusza(X, ws, nazwa, ukrytyArkusz, waluty){
+        // pelny — tryb dla zamowien, ktore trafily do „do zbadania": wypisujemy KAZDY
+        // niepusty wiersz, dluzsze wartosci i liste scalen. Reszta zamowien zostaje przy
+        // skrocie, zeby raport z tysiaca orderow dalo sie przeczytac.
+        function piOpisArkusza(X, ws, nazwa, ukrytyArkusz, waluty, pelny){
             // Wczesne wyjscia MUSZA oddac to samo pole 'ety' co sciezka glowna — bez niego
             // piOpisWb wywracalo sie na pierwszym pustym arkuszu i przebieg konczyl sie
             // wyjatkiem zamiast raportem.
@@ -16988,7 +17041,7 @@
             var R;
             try { R = X.utils.decode_range(ws['!ref']); }
             catch (e){ return { linie: ['  arkusz „' + nazwa + '" — zakres nieczytelny: ' + ws['!ref']], sig: 'zly-zakres', ety: {} }; }
-            var L = [];
+            var L = [], depTekstowy = false, depWiersz = false;
             var ukrK = piHiddenCols(ws), ukrW = piHiddenRows(ws);
             var lk = []; for (var kk in ukrK) lk.push(X.utils.encode_col(Number(kk)));
             var lw = []; for (var ww in ukrW) lw.push(Number(ww) + 1);
@@ -17016,6 +17069,16 @@
                             var key = m0[1].toLowerCase().replace(/[\s.]+/g, '');
                             if (etyKol[key] == null) etyKol[key] = X.utils.encode_col(c);
                             if (/^total\b/i.test(s0)) totale.push(r);
+                            // Wiersz depozytu, w ktorym NIE MA ani jednej liczby. U FUZHOU VICTOR
+                            // (ordery 20189 i 20195) stoi tam O=„%" i P=„15" — jako tekst, w zlych
+                            // kolumnach. Kwoty depozytu nie ma w pliku w ogole, wiec parser slusznie
+                            // nic nie odczytuje; chodzi tylko o to, zeby powiedziec DLACZEGO.
+                            // Etykieta musi byc podpisem WIERSZA („Deposit", „Deposit 15%", „Deposit:"),
+                            // a nie naglowkiem kolumny: arkusz WSAD ma w naglowku „Deposit Value",
+                            // przez co luzniejszy wzorzec bral caly naglowek za wiersz depozytu.
+                            // Ta sama pulapka co „Total Volume (M3)" w 4.43.
+                            if (PI_DEP_ETY.test(s0) || PI_ADV_ETY.test(s0)) depWiersz = true;
+                            if (PI_DEP_ETY.test(s0)) depTekstowy = !wierszMaLiczbe(ws, X, R, r);
                         }
                     }
                 }
@@ -17026,20 +17089,31 @@
             for (var ti = 0; ti < totale.length; ti++){
                 for (var d = 1; d <= 6; d++){ var rr0 = totale[ti] + d; if (rr0 <= R.e.r) wybrane[rr0] = 1; }
             }
+            if (pelny){
+                for (var rp = R.s.r; rp <= R.e.r; rp++) wybrane[rp] = 1;
+                var mg = ws['!merges'] || [];
+                if (mg.length){
+                    var opisM = [];
+                    for (var mi = 0; mi < mg.length && mi < 24; mi++){
+                        try { opisM.push(X.utils.encode_range(mg[mi])); } catch (e){}
+                    }
+                    L.push('    scalenia: ' + opisM.join(' ') + (mg.length > 24 ? (' …razem ' + mg.length) : ''));
+                }
+            }
             // Krok 2: wypisanie.
             var klucze = []; for (var kx in wybrane) klucze.push(Number(kx));
             klucze.sort(function (a, b){ return a - b; });
             var ile = 0;
             for (var q = 0; q < klucze.length; q++){
-                if (ile >= 48){ L.push('    …(pominięto ' + (klucze.length - q) + ' dalszych wierszy)'); break; }
+                if (ile >= (pelny ? 400 : 48)){ L.push('    …(pominięto ' + (klucze.length - q) + ' dalszych wierszy)'); break; }
                 var rw = klucze[q], opis = [];
                 for (var cc = R.s.c; cc <= R.e.c; cc++){
-                    var o = piKomOpis(X, ws, rw, cc, ukrK, ukrW);
+                    var o = piKomOpis(X, ws, rw, cc, ukrK, ukrW, pelny ? 200 : 80);
                     if (o) opis.push(o);
                 }
                 if (!opis.length) continue;
                 ile++;
-                L.push('    w' + (rw + 1) + (ukrW[rw] ? ' [WIERSZ UKRYTY]' : '') + ': ' + opis.join(' | ').slice(0, 420));
+                L.push('    w' + (rw + 1) + (ukrW[rw] ? ' [WIERSZ UKRYTY]' : '') + ': ' + opis.join(' | ').slice(0, pelny ? 1200 : 420));
             }
             // Gdy nie ma ani jednej etykiety, sam komunikat „nie znalazlem" nic nie mowi:
             // przy orderze 20105 arkusz mial 260 wierszy i 6 kolumn, i dopiero ich tresc
@@ -17065,32 +17139,37 @@
                     + '/tot:' + (etyKol['total'] || '-')
                     + '/ben:' + (etyKol['beneficiary'] || '-')
                     + '/swi:' + (etyKol['swift'] || '-');
-            return { linie: L, sig: sig, ety: etyKol };
+            return { linie: L, sig: sig, ety: etyKol, depTekstowy: depTekstowy, depWiersz: depWiersz };
         }
-        function piOpisWb(X, wb){
-            var L = [], sig = [], waluty = [], maDep = false;
+        function piOpisWb(X, wb, pelny){
+            var L = [], sig = [], waluty = [], maDep = false, depTekst = false;
             var meta = (wb.Workbook && wb.Workbook.Sheets) || [];
             L.push('  arkuszy: ' + wb.SheetNames.length + ' (' + wb.SheetNames.join(', ') + ')');
             for (var si = 0; si < wb.SheetNames.length; si++){
                 var nm = wb.SheetNames[si], ws = wb.Sheets[nm];
                 if (!ws) continue;
                 var hid = !!(meta[si] && meta[si].Hidden);
-                var o = piOpisArkusza(X, ws, nm, hid, waluty);
+                var o = piOpisArkusza(X, ws, nm, hid, waluty, pelny);
                 L = L.concat(o.linie);
                 sig.push((hid ? 'H' : '') + o.sig);
                 // Uwaga: „Deposit Value" stoi w naglowku ukrytego arkusza WSAD w KAZDYM
                 // pliku z tej rodziny, wiec sam ten arkusz nie moze przesadzac o tym,
                 // czy P/I ma wiersz depozytu.
                 var ety = o.ety || {};
-                if (!hid && (ety['deposit'] || ety['advance'] || ety['downpayment'] || ety['prepayment'])) maDep = true;
+                // Do 4.55 brano tu SAMO wystapienie slowa w arkuszu — a naglowek ukrytego
+                // wsadu ma kolumne „Deposit Value", wiec P/I bez zaliczki wychodzilo jako
+                // „NIE ODCZYTANY — jest wiersz depozytu". W probie 17000-17599 dotyczylo to
+                // 7 z 11 takich zamowien. Teraz liczy sie tylko podpis WIERSZA.
+                if (!hid && o.depWiersz) maDep = true;
+                if (!hid && o.depTekstowy) depTekst = true;
             }
             if (waluty.length) L.push('  waluty w tekscie: ' + waluty.join(', '));
-            return { linie: L, sig: 'xlsx|ark' + wb.SheetNames.length + '|' + sig.join(' ;; '), waluty: waluty, maDep: maDep };
+            return { linie: L, sig: 'xlsx|ark' + wb.SheetNames.length + '|' + sig.join(' ;; '), waluty: waluty, maDep: maDep, depTekst: depTekst };
         }
         // P/I bywa PDF-em. Dotad raport kwitowal to jednym zdaniem, wiec ukladow PDF-owych
         // nie dalo sie z niego wyczytac w ogole — a parsePIpdf nie zwraca danych bankowych,
         // wiec akurat tam wiedza o ukladzie jest najbardziej potrzebna.
-        async function piOpisPdf(u8){
+        async function piOpisPdf(u8, pelny){
             var lib = await getPdfjs();
             if (!lib) return { linie: ['  format: PDF — brak pdf.js, nie opiszę budowy'], sig: 'pdf|bez-pdfjs' };
             var lines = '', stron = 0;
@@ -17106,21 +17185,65 @@
             var bk = scanPIbank(piPdfAoa(lines));
             var tab = lines.split('\n'), L = ['  format: PDF | stron: ' + stron + ' | linii tekstu: ' + tab.length
                      + ' | blok bankowy z linii: ' + (bk.ok ? 'kompletny' : ('niekompletny — ' + (piBankWhy(bk) || 'brak etykiet')))], ile = 0;
-            for (var i = 0; i < tab.length && ile < 40; i++){
+            for (var i = 0; i < tab.length && ile < (pelny ? 400 : 40); i++){
                 var t = tab[i].replace(/\s+/g, ' ').trim();
-                if (!t || !PI_ETY_A.test(t)) continue;
-                ile++; L.push('    L' + (i + 1) + ': ' + t.slice(0, 220));
+                if (!t) continue;
+                if (!pelny && !PI_ETY_A.test(t)) continue;
+                ile++; L.push('    L' + (i + 1) + ': ' + t.slice(0, pelny ? 400 : 220));
             }
             if (!ile) L.push('    (żadna linia nie pasuje do etykiet)');
             return { linie: L, sig: 'pdf|stron' + stron, waluty: [] };
         }
         // Dostawca ze strony zamowienia — bez niego nie da sie zgrupowac ukladow „po firmie",
         // a to najwazniejsze pytanie przy uogolnianiu reguly.
+        var PI_DOST_ETY = /^(?:suppliers?|dostawca|company|firma|name|nazwa|supplier name|-+)$/i;
+        // Nazwy dostawcy NIE MA w tekscie linku. Na stronie zamowienia sa dwa odnosniki do
+        // op_suppliers.php i oba sa etykietami: „Suppliers" z menu oraz „Supplier"
+        // (id="sup_a") jako podpis kolumny w naglowku tabeli — caly wiersz jest pogrubiony
+        // i ma tlo CCFFCC. Sama nazwa stoi w wierszu PONIZEJ, jako WYBRANA opcja listy
+        // rozwijanej, ktora zaczyna sie od „---" i wymienia wszystkich dostawcow.
+        //
+        // Numer firmy bierzemy z href tego podpisu — wskazuje aktualnie wybranego dostawce —
+        // i po nim odnajdujemy wlasciwa opcje. Dzieki temu nazwa i numer na pewno dotycza
+        // TEGO SAMEGO dostawcy, a nie pierwszej lepszej pozycji z listy.
         function piDostawca(html){
-            var m = String(html == null ? '' : html).match(/op_suppliers\.php\?company_id=(\d+)[^>]*>([\s\S]{0,160}?)<\/a>/i);
-            if (!m) return { cid: '', nazwa: '' };
-            var nz = m[2].replace(/<[^>]+>/g, ' ').replace(/&amp;/gi, '&').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
-            return { cid: m[1], nazwa: nz };
+            var h = String(html == null ? '' : html);
+            var m = h.match(/id=["']sup_a["'][^>]*href=["'][^"']*company_id=(\d+)/i)
+                 || h.match(/op_suppliers\.php\?company_id=(\d+)/i);
+            var cid = m ? m[1] : '';
+            if (!cid) return { cid: '', nazwa: '' };
+            // Szukamy w okolicy podpisu, zeby nie trafic w liste z zupelnie innego pola.
+            var i = h.search(/id=["']sup_a["']/i);
+            var okno = i >= 0 ? h.slice(i, i + 30000) : h;
+            function czysc(x){
+                return String(x == null ? '' : x)
+                    .replace(/<[^>]+>/g, ' ')
+                    .replace(/&amp;/gi, '&').replace(/&nbsp;/gi, ' ')
+                    .replace(/&quot;/gi, '"').replace(/&#0?39;|&apos;/gi, "'")
+                    .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+                    .replace(/\s+/g, ' ').trim();
+            }
+            var nz = '';
+            try {
+                var reOpt = new RegExp('<option[^>]*\\bvalue\\s*=\\s*["\']?' + cid + '["\']?[^>]*>([\\s\\S]{0,200}?)<\\/option>', 'i');
+                var mo = reOpt.exec(okno);
+                if (mo) nz = czysc(mo[1]);
+            } catch (e){}
+            // Zapasowo: opcja oznaczona jako wybrana. Gdyby lista miala inne wartosci niz
+            // company_id, to nadal jest wlasciwy dostawca — po prostu bez powiazania z numerem.
+            if (!nz){
+                var ms = /<option[^>]*\bselected\b[^>]*>([\s\S]{0,200}?)<\/option>/i.exec(okno);
+                if (ms) nz = czysc(ms[1]);
+            }
+            if (PI_DOST_ETY.test(nz)) nz = '';
+            return { cid: cid, nazwa: nz };
+        }
+        // Czym podpisac dostawce w raporcie. Sam numer firmy tez jest konkretem — po nim
+        // da sie zamowienia pogrupowac — a dotad przy braku nazwy stala goła kreska.
+        function piDostPodpis(r){
+            if (r && r.dostawca) return r.dostawca + (r.cid ? (' [' + r.cid + ']') : '');
+            if (r && r.cid) return 'firma ' + r.cid;
+            return '—';
         }
         // Wszystkie P/I na zamowieniu, nie tylko wybrane. Gdy parser czyta nie to, co trzeba,
         // pierwsze pytanie brzmi „czy w ogole wzial wlasciwy plik".
@@ -17191,7 +17314,7 @@
             var u8 = new Uint8Array(buf);
             r.rozmiar = u8.length;
             var sig4 = String.fromCharCode(u8[0] || 0, u8[1] || 0, u8[2] || 0, u8[3] || 0);
-            var tC = Date.now(), pi = null;
+            var tC = Date.now(), pi = null, wbPelne = null;
             if (sig4 === '%PDF'){
                 // pdf.js potrafi przejac bufor na wlasnosc, wiec do opisu i do parsera ida
                 // OSOBNE kopie — inaczej drugie wywolanie dostaloby pusta tablice.
@@ -17205,8 +17328,9 @@
                 var wb = null;
                 try { wb = X.read(u8, { type: 'array', cellStyles: true }); }
                 catch (e){ r.stan = 'plik nieczytelny: ' + ((e && e.message) || e); r.sig = 'nieczytelny'; return koniec(); }
+                wbPelne = wb;
                 var oX = piOpisWb(X, wb);
-                r.linie = oX.linie; r.sig = oX.sig; r.waluty = oX.waluty; r.maDep = oX.maDep;
+                r.linie = oX.linie; r.sig = oX.sig; r.waluty = oX.waluty; r.maDep = oX.maDep; r.depTekst = oX.depTekst;
                 // Ten sam skoroszyt idzie do parsera — otwieranie pliku po raz drugi bylo
                 // najdrozsza pojedyncza czescia przebiegu.
                 pi = parsePIxlsxZWb(X, wb, order);
@@ -17219,10 +17343,16 @@
             r.err = (pi && pi.err) || '';
             var b = pi && pi.bank;
             r.bankOk = !!(b && b.ok);
+            r.bankWhy = (b && !b.ok) ? (piBankWhy(b) || '') : '';
             r.swift = (b && b.swift) || '';
             r.bankAcc = (b && b.acc) || '';
             r.benef = (b && b.name) || '';
-            r.kraj = r.swift ? pcSwiftKraj(r.swift) : '';
+            // Kraj wyliczamy TYLKO z kompletnego bloku. Order 20203 ma w polu SWIFT napis
+            // „HONGKONG", ktory przypadkiem ma ksztalt BIC-a (6 liter + 2), wiec raport
+            // pokazywal „kraj KO" — nieistniejacy kod, wyssany z bledu w P/I. Ksiegowanie
+            // i tak tego nie uzywa (pcAdvance wymaga bloku kompletnego), ale w raporcie
+            // taka informacja tylko myli.
+            r.kraj = (r.bankOk && r.swift) ? pcSwiftKraj(r.swift) : '';
             r.tytul = (r.kraj && PC_ADV_KRAJE[r.kraj]) ? 'Advance payment' : 'Deposit';
             // Rozroznienie, ktorego brakowalo w pierwszym przebiegu: na 150 zamowien 23 byly
             // opisane jako „nie odczytany", ale 18 z nich to P/I BEZ wiersza depozytu, a 5
@@ -17230,23 +17360,35 @@
             // rzeczy w jeden komunikat kazalo szukac bledu tam, gdzie go nie ma.
             if (r.pct != null && r.amount != null && r.amount !== 0) r.stan = 'odczytany';
             else if ((r.pct === 0 || r.amount === 0)) r.stan = 'depozyt 0% (bez zaliczki)';
-            else if (r.pct == null && r.amount == null) r.stan = r.maDep ? 'NIE ODCZYTANY — jest wiersz depozytu' : 'P/I bez wiersza depozytu';
+            else if (r.pct == null && r.amount == null) r.stan = r.depTekst
+                ? 'wiersz depozytu wypełniony TEKSTEM, nie liczbami — P/I do poprawy u dostawcy'
+                : (r.maDep ? 'NIE ODCZYTANY — jest wiersz depozytu' : 'P/I bez wiersza depozytu');
             else r.stan = 'NIE ODCZYTANY — ' + (r.pct == null ? 'brak procentu' : 'brak kwoty');
             // „Do zbadania" to tylko realne luki: brak wiersza depozytu i depozyt zerowy sa
             // wlasciwoscia dokumentu, nie bledem. Od 4.49 PDF-y czytaja blok bankowy tak
             // samo jak arkusze, wiec nie maja juz taryfy ulgowej — brak bloku w PDF-ie
             // jest teraz tak samo podejrzany jak w arkuszu.
-            r.podejrzany = (r.stan.indexOf('NIE ODCZYTANY') === 0) || !r.bankOk;
+            r.podejrzany = (r.stan.indexOf('NIE ODCZYTANY') === 0) || (r.stan.indexOf('wiersz depozytu') === 0) || !r.bankOk;
+            // Dopiero TERAZ wiadomo, ze cos jest nie tak — a skoroszyt wciaz mamy otwarty,
+            // wiec opis powtarzamy w trybie pelnym. Drugi opis kosztuje ulamek sekundy,
+            // bo plik jest juz sparsowany; to nie jest drugi X.read.
+            if (r.podejrzany){
+                try {
+                    if (r.format === 'pdf'){ var pP = await piOpisPdf(u8.slice(), true); r.linie = pP.linie; }
+                    else if (wbPelne){ var pX = piOpisWb(getXLSX(), wbPelne, true); r.linie = pX.linie; }
+                    r.linie.unshift('  [PEŁNY ZRZUT — zamówienie z brakami, wypisuję wszystko]');
+                } catch (e){ r.linie.push('  (pełny zrzut nie powiódł się: ' + ((e && e.message) || e) + ')'); }
+            }
             return koniec();
         }
         function piWiersz(r){
             return r.order
-                 + ' | ' + (r.dostawca || '—')
+                 + ' | ' + piDostPodpis(r)
                  + ' | ' + (r.rozmiar ? piMB(r.rozmiar) : '—')
                  + ' | ' + (r.pct != null ? (r.pct + '%') : '—') + ' / ' + (r.amount != null ? r.amount : '—')
                  + ' | konto ' + (r.acc || '—')
                  + ' | bank ' + (r.bankOk ? 'ok' : 'BRAK') + ' ' + (r.bankAcc || '—')
-                 + ' | SWIFT ' + (r.swift || '—') + (r.kraj ? (' ' + r.kraj + ' → ' + r.tytul) : '')
+                 + ' | SWIFT ' + (r.swift || '—') + (r.kraj ? (' ' + r.kraj + ' → ' + r.tytul) : (r.bankWhy ? ' [blok niekompletny]' : ''))
                  + ' | ' + (r.ms / 1000).toFixed(1) + ' s'
                  + (r.stan !== 'odczytany' ? (' | ' + r.stan) : '')
                  + (r.err ? (' | błąd: ' + r.err) : '');
@@ -17309,7 +17451,7 @@
                      + (lk.length === 1 ? (' → tytuł: ' + g[0].tytul) : ''));
                 L.push('   dostawcy  : ' + (function (){
                     var d = {}, o = [];
-                    g.forEach(function (r){ var nz = r.dostawca || '—'; if (!d[nz]){ d[nz] = 1; o.push(nz); } });
+                    g.forEach(function (r){ var nz = piDostPodpis(r); if (!d[nz]){ d[nz] = 1; o.push(nz); } });
                     return o.slice(0, 6).join(' · ') + (o.length > 6 ? (' …(' + o.length + ')') : '');
                 })());
                 L.push('   przykłady : ' + g.slice(0, 6).map(function (r){ return r.order; }).join(', '));
@@ -17323,14 +17465,16 @@
             if (doZbadania.length > 200) L.push('  …(oraz ' + (doZbadania.length - 200) + ' dalszych)');
             L.push('');
             L.push('===== SZCZEGÓŁY =====');
-            L.push('Pełny opis budowy: po 2 przedstawicieli każdego układu + wszystkie „do zbadania".');
+            L.push('Po 2 przedstawicieli każdego układu (opis skrócony) + WSZYSTKIE „do zbadania"');
+            L.push('— te ostatnie z PEŁNYM zrzutem: każdy niepusty wiersz, dłuższe wartości, lista scaleń.');
             L.push('');
             var pokazane = {}, szcz = [];
             kolejnosc.forEach(function (k){ grupy[k].slice(0, 2).forEach(function (r){ if (!pokazane[r.order]){ pokazane[r.order] = 1; szcz.push(r); } }); });
-            doZbadania.slice(0, 60).forEach(function (r){ if (!pokazane[r.order]){ pokazane[r.order] = 1; szcz.push(r); } });
+            // Bez limitu: zamowienia z brakami sa tym, po co ten raport powstal.
+            doZbadania.forEach(function (r){ if (!pokazane[r.order]){ pokazane[r.order] = 1; szcz.push(r); } });
             szcz.sort(function (a, b){ return a.order - b.order; });
             szcz.forEach(function (r){
-                L.push('===== order ' + r.order + ' — ' + (r.dostawca || '(dostawca nieznany)')
+                L.push('===== order ' + r.order + ' — ' + (r.dostawca || (r.cid ? ('firma ' + r.cid) : '(dostawca nieznany)'))
                      + (r.cid ? (' [company_id ' + r.cid + ']') : '') + ' =====');
                 L.push('  podpis układu: ' + r.sig);
                 if (r.plik) L.push('  plik: ' + r.plik + (r.rozmiar ? (' | ' + piMB(r.rozmiar)) : ''));
@@ -17347,7 +17491,8 @@
                      + ' | beneficjent ' + (r.benef || '—')
                      + ' | konto ' + (r.bankAcc || '—')
                      + ' | SWIFT ' + (r.swift || '—'));
-                L.push('  TYTUŁ PRZELEWU: kraj z SWIFT ' + (r.kraj || '—') + ' → „' + r.tytul + '"');
+                if (r.bankWhy) L.push('  BRAKUJE      : ' + r.bankWhy);
+                if (r.bankOk) L.push('  TYTUŁ PRZELEWU: kraj z SWIFT ' + (r.kraj || '—') + ' → „' + r.tytul + '"');
                 if (r.stan !== 'odczytany') L.push('  STAN: ' + r.stan);
                 L.push('  czas: ' + (r.ms / 1000).toFixed(1) + ' s (sieć ' + (r.msSiec / 1000).toFixed(1) + ' s, odczyt ' + (r.msOdczyt / 1000).toFixed(1) + ' s)');
                 L.push('');
@@ -20596,6 +20741,12 @@
         const ordVat = Object.create(null);
         const ref = Object.create(null), refNote = Object.create(null), refData = Object.create(null);
         const wOrd = [], brakMap = [], brakKlasy = [], pominiete = Object.create(null);
+        // Numer operacji z pliku Allegro (PaymentId) obok numeru zamowienia (OrderId).
+        // Do importu i do prologistics idzie WYLACZNIE numer zamowienia — kolumna L — wiec
+        // przy NOT FOUND, gdy auftragu nie ma, nie bylo czym szukac w panelu Allegro:
+        // tam wyszukuje sie po numerze operacji. Mapowanie idzie w jedna strone
+        // (PaymentId -> OrderId), wiec drugi numer trzeba zachowac tutaj, przy parsowaniu.
+        const zrodlo = Object.create(null);
         const odjete = [];
         let nWpl = 0, nZwr = 0, nInne = 0, sumaWpl = 0, sumaZwr = 0;
 
@@ -20625,6 +20776,12 @@
                 brakMap.push({ id: idPl, opis: opis, kwota: kwotaSur, data: data,
                                rodzaj: wplata ? 'wpłata' : 'zwrot' });
                 continue;
+            }
+            // Zapisujemy PRZED podzialem na wplaty i zwroty, zeby oba rodzaje operacji
+            // mialy swoj numer — przy NOT FOUND ze zwrotem szuka sie wlasnie po zwrocie.
+            if (idPl && idPl !== nr){
+                if (!zrodlo[nr]) zrodlo[nr] = [];
+                if (zrodlo[nr].indexOf(idPl) === -1) zrodlo[nr].push(idPl);
             }
             // Regula 6 zl: doliczona przez Allegro oplata za dostawe nie nalezy do
             // zamowienia. Wyjatkiem jest Paczkomat — tam 6 zl jest czescia zamowienia.
@@ -20716,6 +20873,7 @@
             wOrd: wOrd, nWpl: nWpl, nZwr: nZwr, nInne: nInne,
             sumaWpl: sumaWpl, sumaZwr: sumaZwr,
             nOrd: Object.keys(ord).length, nZwrOrd: Object.keys(ref).length,
+            zrodlo: zrodlo,
             brakMap: brakMap, brakKlasy: brakKlasy, pominiete: pominiete, odjete: odjete,
             bezTypu: bezTypu, bezKonta: bezKonta, nZam: nZam,
             billing: bill && !bill.err ? { nVat: bill.nVat, nZnane: bill.nZnane } : null,
@@ -20941,6 +21099,235 @@
         c[24] = f2(kwota);
         c[25] = typ || ''; c[26] = kk.acc; c[27] = kk.vat;
         return c;
+    }
+    // ================= HOMEDECO (NL) =================
+    // Rozliczenie Homedeco to CSV z wierszami per POZYCJA zamowienia, nie per zamowienie.
+    // Regule odczytalem z DWOCH miesiecy (czerwiec i lipiec 2026, 829 zamowien, 1884
+    // wiersze) zestawionych z tym, co prologistics faktycznie zaksiegowal:
+    //
+    //  * ksieguje sie BRUTTO, czyli „purchase_price". „to_receive" to kwota po prowizji
+    //    (to_receive = purchase_price - commission zgadza sie na wszystkich 922 wierszach
+    //    z cena, bez wyjatku) i do ksiegowania nie trafia nigdy.
+    //  * „Purchase refund" znosi „Purchase" O TEJ SAMEJ KWOCIE w obrebie zamowienia.
+    //  * co zostaje z wplat idzie do AUFTRAGU, co zostaje ze zwrotow — do TICKETU.
+    //  * „Discount" idzie ZAWSZE osobno do ticketu, w kwocie |to_receive|, i NIGDY nie
+    //    jest kompensowany z wplatami. To wlasnie ten punkt domyka przypadek „dwie wplaty
+    //    i jeden zwrot": zostaje jedna wplata do auftragu, a rabat idzie osobno.
+    //    Sprawdzone na 26419421, 26424190, 26424777 i 26425055 — co do grosza.
+    //  * wiersz „Purchase" BEZ ceny, z ujemnym „to_receive", to korekta prowizji.
+    //    Nie ksieguje sie go wcale (12 takich na dwa miesiace, po jednej dacie w miesiacu).
+    //
+    // Zostaje jeden przypadek, ktorego z samego pliku rozstrzygnac SIE NIE DA: gdy wplata
+    // i zwrot znosza sie dokladnie. Na 48 takich zamowien 36 zaksiegowano po obu stronach
+    // (wplata w auftragu, zwrot w tickecie), a 12 nie zaksiegowano wcale. Decyduje o tym
+    // stan auftragu, nie rozliczenie — dlatego modul sprawdza go w prologistics.
+    const MK_HD_ROZL = '1349';       // konto rozliczeniowe Homedeco NL
+    const MK_HD_SPRZ = '3241';       // konto sprzedazy
+    const MK_HD_KOL  = ['ordernumber', 'ordered_at', 'mutation_at', 'description',
+                        'purchase_price', 'to_receive', 'commission', 'commission_vat', 'country'];
+    function hdCzyPlik(txt){
+        const w = mkCsvRowsPrzecinek(String(txt || '').slice(0, 4000))[0] || [];
+        const h = w.map(function (x){ return String(x || '').trim().toLowerCase(); });
+        return MK_HD_KOL.every(function (k){ return h.indexOf(k) >= 0; });
+    }
+    function hdNum(v){
+        const t = String(v == null ? '' : v).trim();
+        if (!t) return null;
+        const x = parseFloat(t.replace(/\s/g, '').replace(',', '.'));
+        return isFinite(x) ? x : null;
+    }
+    function hdRodzaj(opis){
+        const t = String(opis == null ? '' : opis).trim().toLowerCase();
+        if (t.indexOf('purchase refund') === 0) return 'zwrot';
+        if (t.indexOf('purchase') === 0) return 'wplata';
+        if (t.indexOf('discount') === 0) return 'rabat';
+        return 'inne';
+    }
+    function hdData(v){
+        const m = String(v == null ? '' : v).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+        return m ? (m[1] + '-' + m[2] + '-' + m[3]) : '';
+    }
+    // Nazwa pozycji bez czlonu rodzaju — do notatki przy zwrocie w tickecie.
+    function hdOpisPozycji(opis){
+        const m = String(opis == null ? '' : opis).match(/\(([^)]*)\)\s*$/);
+        return m ? m[1].trim() : String(opis == null ? '' : opis).trim();
+    }
+    function mkParseHd(tekst){
+        const rows = mkCsvRowsPrzecinek(tekst);
+        if (!rows.length) return { err: 'pusty plik rozliczenia' };
+        const hdr = (rows[0] || []).map(function (x){ return String(x || '').trim().toLowerCase(); });
+        const ix = {};
+        hdr.forEach(function (h, i){ if (h && ix[h] == null) ix[h] = i; });
+        const brak = MK_HD_KOL.filter(function (k){ return ix[k] == null; });
+        if (brak.length) return { err: 'to nie wygląda na rozliczenie Homedeco — brak kolumn: ' + brak.join(', ') };
+
+        const naglowek = (rows[0] || []).slice();
+        const poZam = Object.create(null), kolejnosc = [];
+        let odd = '', dod = '';
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i];
+            if (!r || !r.length) continue;
+            const nr = String(r[ix['ordernumber']] || '').trim();
+            if (!nr) continue;
+            const rodzaj = hdRodzaj(r[ix['description']]);
+            const poz = {
+                nr: nr, rodzaj: rodzaj, pola: r,
+                brutto: hdNum(r[ix['purchase_price']]),
+                netto: hdNum(r[ix['to_receive']]),
+                prowizja: hdNum(r[ix['commission']]),
+                data: hdData(r[ix['mutation_at']]),
+                opis: String(r[ix['description']] || '').trim(),
+                kraj: String(r[ix['country']] || '').trim()
+            };
+            if (poz.data){ if (!odd || poz.data < odd) odd = poz.data; if (!dod || poz.data > dod) dod = poz.data; }
+            if (!poZam[nr]){ poZam[nr] = []; kolejnosc.push(nr); }
+            poZam[nr].push(poz);
+        }
+        if (!kolejnosc.length) return { err: 'rozliczenie nie ma ani jednego wiersza z numerem zamówienia' };
+
+        const ord = Object.create(null), ordData = Object.create(null);
+        const ref = Object.create(null), refNote = Object.create(null), refData = Object.create(null);
+        const wOrd = [], znosza = [], pominiete = [], zostajeZwrot = [];
+        let nWpl = 0, nZwr = 0, nRab = 0, sumaWpl = 0, sumaZwr = 0, sumaNetto = 0;
+
+        kolejnosc.forEach(function (nr){
+            const poz = poZam[nr];
+            poz.forEach(function (p){ if (p.netto != null) sumaNetto = r2(sumaNetto + p.netto); });
+            const wpl = poz.filter(function (p){ return p.rodzaj === 'wplata' && p.brutto; });
+            const zwr = poz.filter(function (p){ return p.rodzaj === 'zwrot' && p.brutto; });
+            const rab = poz.filter(function (p){ return p.rodzaj === 'rabat'; });
+            // Korekty prowizji: „Purchase" bez ceny. Nie ksieguja sie — ale maja byc widoczne.
+            poz.forEach(function (p){
+                if (p.rodzaj === 'wplata' && !p.brutto)
+                    pominiete.push({ nr: nr, kwota: p.netto, data: p.data, opis: p.opis, powod: 'korekta prowizji — bez kwoty brutto' });
+                else if (p.rodzaj === 'inne')
+                    pominiete.push({ nr: nr, kwota: p.netto, data: p.data, opis: p.opis, powod: 'nieznany rodzaj operacji' });
+            });
+            // Kompensata: zwrot znosi wplate o TEJ SAMEJ kwocie brutto.
+            const woln = wpl.slice(), zwrW = [];
+            zwr.forEach(function (z){
+                let i = -1;
+                for (let k = 0; k < woln.length; k++) if (Math.abs(woln[k].brutto - z.brutto) < 0.005){ i = k; break; }
+                if (i >= 0) woln.splice(i, 1); else zwrW.push(z);
+            });
+            const skompensowane = wpl.length - woln.length;
+            // Rabat idzie do ticketu ZAWSZE, niezaleznie od kompensaty.
+            rab.forEach(function (p){
+                const kw = Math.abs(p.netto || 0);
+                if (!kw) return;
+                nRab++;
+                ref[nr] = r2((ref[nr] || 0) - kw);
+                refData[nr] = refData[nr] || p.data;
+                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '') + 'rabat ' + f2(kw);
+                sumaZwr = r2(sumaZwr + kw);
+            });
+            zwrW.forEach(function (p){
+                nZwr++;
+                ref[nr] = r2((ref[nr] || 0) - p.brutto);
+                refData[nr] = refData[nr] || p.data;
+                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '') + hdOpisPozycji(p.opis);
+                sumaZwr = r2(sumaZwr + p.brutto);
+                zostajeZwrot.push({ nr: nr, kwota: p.brutto, data: p.data });
+            });
+            woln.forEach(function (p){
+                nWpl++;
+                ord[nr] = r2((ord[nr] || 0) + p.brutto);
+                if (!ordData[nr]) ordData[nr] = p.data;
+                sumaWpl = r2(sumaWpl + p.brutto);
+                // Plik importu ma UKLAD PLIKU ZRODLOWEGO — prologistics importuje rozliczenie
+                // Homedeco wprost, wiec nie przepisujemy go na wspolny uklad 35 kolumn.
+                // Do pliku ida DOKLADNIE te wiersze, ktore maja sie zaksiegowac w auftragach:
+                // to, co zostalo z wplat po skompensowaniu zwrotow. Wiersz przepisujemy
+                // w calosci, bez ruszania jakiejkolwiek kolumny.
+                wOrd.push({ r: p.pola, nr: nr, kwota: p.brutto, data: p.data });
+            });
+            // Wplata i zwrot znosza sie CO DO GROSZA i nic nie zostaje: z pliku nie wynika,
+            // czy ksiegowac oba, czy nic. Odkladamy do sprawdzenia w prologistics.
+            if (skompensowane > 0 && !woln.length && !zwrW.length){
+                znosza.push({ nr: nr, kwota: r2(wpl.reduce(function (a, p){ return a + p.brutto; }, 0)),
+                              pozycji: skompensowane,
+                              data: (wpl[0] && wpl[0].data) || '',
+                              dataZwrot: (zwr[0] && zwr[0].data) || '' });
+            }
+        });
+
+        return {
+            ord: ord, dataOrd: ordData, ref: ref, refNote: refNote, refData: refData,
+            wOrd: wOrd, znosza: znosza, pominiete: pominiete, zostajeZwrot: zostajeZwrot,
+            naglowek: naglowek,
+            nWpl: nWpl, nZwr: nZwr, nRab: nRab,
+            sumaWpl: sumaWpl, sumaZwr: sumaZwr, sumaNetto: r2(sumaNetto),
+            nOrd: Object.keys(ord).length, nZwrOrd: Object.keys(ref).length,
+            nZam: kolejnosc.length, konto: MK_HD_ROZL,
+            od: odd, doo: dod, cur: 'EUR'
+        };
+    }
+    // Plik wyjsciowy jest zgodny ze ZRODLEM: bez BOM, przecinek, CRLF, z naglowkiem
+    // i zakonczony nowa linia — dokladnie tak wyglada rozliczenie z Homedeco i taki
+    // plik idzie do importu. Cudzyslowy stawiamy wedlug zwyklej zasady CSV: tylko
+    // wokol pol z przecinkiem, cudzyslowem albo zlamaniem wiersza (w lipcowym pliku
+    // takie pole jest jedno).
+    function mkCsvHd(p){
+        const pole = function (c){
+            const v = String(c == null ? '' : c);
+            return /[",\r\n]/.test(v) ? ('"' + v.replace(/"/g, '""') + '"') : v;
+        };
+        const L = [];
+        if (p && p.naglowek && p.naglowek.length) L.push(p.naglowek.map(pole).join(','));
+        ((p && p.wOrd) || []).forEach(function (x){ L.push((x.r || []).map(pole).join(',')); });
+        return L.join('\r\n') + '\r\n';
+    }
+    // Stan auftragu dla zamowien, w ktorych wplata i zwrot znosza sie dokladnie.
+    // Jedno wejscie na strone auftragu daje OBA potrzebne sygnaly: open amount
+    // („Auftrag value - Total of Payments") i to, czy wisi na nim ticket.
+    const hdStan = {};              // nr -> { auf, open, tickety, stan, err }
+    async function hdSprawdzStan(lista, postep){
+        for (let i = 0; i < (lista || []).length; i++){
+            const nr = lista[i];
+            if (postep) postep(i + 1, lista.length, nr);
+            const st = hdStan[nr] = { kand: [] };
+            const f = await crFind(nr);
+            const nums = f.nums || [];
+            if (!nums.length){ st.stan = 'brak'; st.err = f.err || ''; continue; }
+            for (let k = 0; k < nums.length; k++){
+                let html = '';
+                try {
+                    const res = await fetch('/auction.php?number=' + encodeURIComponent(nums[k]) + '&txnid=3', { credentials: 'same-origin' });
+                    html = await res.text();
+                } catch (e){ st.kand.push({ num: nums[k], err: 'nie otwarto auftragu' }); continue; }
+                const d = new DOMParser().parseFromString(html, 'text/html');
+                const tick = [];
+                d.querySelectorAll('a[href*="rma.php"][href*="rma_id="]').forEach(function (a){
+                    const m = (a.getAttribute('href') || '').match(/[?&]rma_id=(\d+)/i);
+                    if (m && tick.indexOf(m[1]) < 0) tick.push(m[1]);
+                });
+                st.kand.push({ num: nums[k], open: crOpen(d), tickety: tick,
+                               deleted: !!d.querySelector('.auftrag-status--deleted'),
+                               err: d.querySelector('form#book') ? '' : 'brak formularza płatności' });
+            }
+            st.stan = 'sprawdzone';
+        }
+        return hdStan;
+    }
+    // Werdykt dla jednego zamowienia. „Ksieguj oba" tylko wtedy, gdy auftrag ma OPEN AMOUNT
+    // i wisi na nim ticket — czyli dokladnie warunek, ktory podal uzytkownik. Przy braku
+    // ktoregokolwiek z tych dwoch nie ma czego ksiegowac i zamowienie pomijamy.
+    function hdWerdykt(nr){
+        const st = hdStan[nr];
+        if (!st) return { stan: '?', opis: 'nie sprawdzone' };
+        if (st.stan === 'brak') return { stan: 'brak', opis: 'nie ma auftragu o tym numerze — nie ma czego księgować' };
+        const zywe = (st.kand || []).filter(function (c){ return !c.deleted && !c.err; });
+        if (!zywe.length) return { stan: 'pomin', opis: 'auftrag jest, ale skasowany albo bez formularza płatności' };
+        if (zywe.length > 1) return { stan: 'recznie', opis: zywe.length + ' auftragi — rozstrzygnij ręcznie', kand: zywe };
+        const c = zywe[0];
+        const maOpen = c.open != null && Math.abs(c.open) > 0.005;
+        const maTicket = (c.tickety || []).length > 0;
+        if (maOpen && maTicket)
+            return { stan: 'ksieguj', num: c.num, open: c.open, tickety: c.tickety,
+                     opis: 'open amount ' + f2(c.open) + ' i ticket ' + c.tickety.join(', ') + ' — wpłata do auftragu, zwrot do ticketu' };
+        return { stan: 'pomin', num: c.num, open: c.open, tickety: c.tickety,
+                 opis: (maOpen ? 'jest open amount, ale nie ma ticketu' : 'auftrag bez open amount')
+                     + ' — nic do zaksięgowania' };
     }
     // ================= CNOVA FR (CDISCOUNT, PANEL OCTOPIA) =================
     // Zestawienie z Octopii ma TRZY wiersze naglowka:
@@ -24900,28 +25287,34 @@
             return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
         });
     }
-    function mmKnTekst(p, k, zle){
+    // „opis" — dwie pierwsze linie naglowka. Podanie go pozwala uzyc tego samego
+    // wypisu dla Allegro, ktore nie ma ani kraju, ani numeru wyplaty. Pominiecie
+    // zachowuje wypis ManoMano co do znaku.
+    // „pomin" — sekcje, ktore wolajacy wypisuje sam, bogaciej. Liczniki i podsumowanie
+    // licza sie DALEJ z pelnego zestawu, zeby pominiecie sekcji nie zaniżało liczby usterek.
+    function mmKnTekst(p, k, zle, opis, pomin){
         const L = [];
-        L.push('ManoMano ' + String(k.kraj || '').toUpperCase() + ' ↔ Export payments');
-        L.push('rozliczenie ' + (p.payRef || '?') + ' z ' + (p.payDate || '?'));
+        L.push((opis && opis.tytul) || ('ManoMano ' + String(k.kraj || '').toUpperCase() + ' ↔ Export payments'));
+        L.push((opis && opis.zrodlo) || ('rozliczenie ' + (p.payRef || '?') + ' z ' + (p.payDate || '?')));
         L.push('zamówień ' + k.nOrd + ', zwrotów ' + k.nZwr + ', wierszy w zestawieniu ' + k.nEx);
-        if (k.brakTabeli) L.push('UWAGA: nie mam tabeli kont dla rynku „' + k.kraj + '"');
+        if (k.brakTabeli && !(opis && opis.tytul)) L.push('UWAGA: nie mam tabeli kont dla rynku „' + k.kraj + '"');
         (zle || []).forEach(function (x){ L.push('błąd pobierania: ' + x); });
-        const sek = function (tyt, tab, fmt){
+        const sek = function (tyt, tab, fmt, id){
             if (!tab.length) return;
+            if (pomin && id && pomin[id]) return;
             L.push('');
             L.push(tyt + ' (' + tab.length + ')');
             tab.forEach(function (x){ L.push('   ' + fmt(x)); });
         };
         sek('BRAK PŁATNOŚCI w prologistics', k.brakuje, function (x){
-            return x.id + '  ' + f2(x.kwota) + (x.typ ? ('  ' + x.typ) : '') + (x.maZwrot ? '  (ma zwrot)' : ''); });
+            return x.id + '  ' + f2(x.kwota) + (x.typ ? ('  ' + x.typ) : '') + (x.maZwrot ? '  (ma zwrot)' : ''); }, 'brakuje');
         sek('ZŁE KONTO SPRZEDAŻY', k.zleKonto, function (x){
             return x.id + '  jest ' + x.konto + ', powinno ' + x.ocz + '  (' + x.typ + ', ' + f2(x.kwota) + ')'; });
         sek('KWOTA SIĘ NIE ZGADZA', k.zlaKwota, function (x){
             return x.id + '  w prologistics ' + f2(x.wExporcie) + ', w rozliczeniu ' + f2(x.wRaporcie)
                  + '  (różnica ' + f2(x.roznica) + ')'; });
         sek('ZWROT BEZ ŚLADU w prologistics', k.brakZwrot, function (x){
-            return x.id + '  ' + f2(x.kwota) + (x.wierszy ? ('  (są inne wiersze: ' + x.wierszy + ')') : ''); });
+            return x.id + '  ' + f2(x.kwota) + (x.wierszy ? ('  (są inne wiersze: ' + x.wierszy + ')') : ''); }, 'brakZwrot');
         sek('TYP KLIENTA NIEROZSTRZYGNIĘTY — konta nie sprawdziłem', k.bezTypu, function (x){
             return x.id + '  ' + f2(x.kwota)
                  + '  konto ' + (x.konta || '—')
@@ -24938,24 +25331,25 @@
         L.push(bl ? ('DO SPRAWDZENIA: ' + bl + ' pozycji') : 'Wszystko się zgadza.');
         return L.join('\n');
     }
-    function mmKnRender(p, k, zle){
+    function mmKnRender(p, k, zle, opis, pomin){
         const bl = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
         const H = [];
         H.push('<div style="border:1px solid ' + (bl ? '#f5c2c7' : '#badbcc') + ';background:'
              + (bl ? '#fff5f5' : '#f3fbf6') + ';border-radius:8px;padding:8px;margin-bottom:8px">'
              + '<div style="font-weight:700">' + (bl ? ('Do sprawdzenia: ' + bl + ' pozycji') : 'Wszystko się zgadza')
              + '</div><div style="font-size:11px;color:#555;margin-top:2px">'
-             + 'rozliczenie ' + mmEsc(p.payRef || '?') + ' z ' + mmEsc(p.payDate || '?')
+             + mmEsc((opis && opis.zrodlo) || ('rozliczenie ' + (p.payRef || '?') + ' z ' + (p.payDate || '?')))
              + ' · zamówień ' + k.nOrd + ' · zwrotów ' + k.nZwr
              + ' · wierszy w zestawieniu ' + k.nEx + '</div></div>');
-        if (k.brakTabeli)
+        if (k.brakTabeli && !(opis && opis.tytul))
             H.push('<div style="color:#c00;font-size:11px;margin-bottom:6px">Nie mam tabeli kont dla rynku „'
                  + mmEsc(k.kraj) + '" — uzupełnij MK_MM_ACC.</div>');
         (zle || []).forEach(function (x){
             H.push('<div style="color:#c00;font-size:11px">błąd pobierania: ' + mmEsc(x) + '</div>');
         });
-        const sek = function (tyt, tab, kolor, wiersz){
+        const sek = function (tyt, tab, kolor, wiersz, id){
             if (!tab.length) return;
+            if (pomin && id && pomin[id]) return;
             H.push('<div style="margin-top:8px"><div style="font-weight:700;color:' + kolor + ';font-size:12px">'
                  + mmEsc(tyt) + ' (' + tab.length + ')</div>'
                  + '<div style="font-size:11px;line-height:1.6;max-height:220px;overflow:auto">'
@@ -24963,7 +25357,7 @@
         };
         sek('Brak płatności w prologistics', k.brakuje, '#c00', function (x){
             return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota)
-                 + (x.typ ? (' · ' + mmEsc(x.typ)) : '') + (x.maZwrot ? ' · <b>ma zwrot</b>' : '') + '</div>'; });
+                 + (x.typ ? (' · ' + mmEsc(x.typ)) : '') + (x.maZwrot ? ' · <b>ma zwrot</b>' : '') + '</div>'; }, 'brakuje');
         sek('Złe konto sprzedaży', k.zleKonto, '#c00', function (x){
             return '<div><code>' + mmEsc(x.id) + '</code> · jest <b>' + mmEsc(x.konto)
                  + '</b>, powinno <b>' + mmEsc(x.ocz) + '</b> · ' + mmEsc(x.typ) + ' · ' + f2(x.kwota) + '</div>'; });
@@ -24971,7 +25365,7 @@
             return '<div><code>' + mmEsc(x.id) + '</code> · prologistics ' + f2(x.wExporcie)
                  + ' vs rozliczenie ' + f2(x.wRaporcie) + ' · różnica <b>' + f2(x.roznica) + '</b></div>'; });
         sek('Zwrot bez śladu w prologistics', k.brakZwrot, '#c00', function (x){
-            return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota) + '</div>'; });
+            return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota) + '</div>'; }, 'brakZwrot');
         sek('Typ klienta nierozstrzygnięty — konta nie sprawdziłem', k.bezTypu, '#c47f00', function (x){
             return '<div><code>' + mmEsc(x.id) + '</code> · ' + f2(x.kwota)
                  + ' · konto <b>' + mmEsc(x.konta || '—') + '</b>'
@@ -24988,6 +25382,332 @@
                  + ' · ' + f2(x.kwota) + '</div>'; });
         return H.join('');
     }
+    // ---------- Allegro <-> Export payments ----------
+    // Osobna funkcja, a nie uogolnienie mkKontrolaMano — tamta obraca pieniedzmi i dziala,
+    // a przerabianie jej w tym samym kroku, w ktorym dokladamy nowy rynek, znaczyloby, ze
+    // bledem w nowym kodzie da sie zepsuc stary. To sama decyzja, co przy dokladaniu
+    // ManoMano do Amazona. Rozni sie tu jedna rzecz: konto sprzedazy bierzemy z tabeli
+    // MK_ALLE_VAT (B2B 3209 / B2C 3292), a nie z tabeli krajow.
+    function mkKontrolaAlle(p, ex){
+        const poFf = Object.create(null);
+        (ex || []).forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
+
+        const brakuje = [], zleKonto = [], zlaKwota = [], brakZwrot = [], obce = [], bezTypu = [];
+        Object.keys(p.ord).forEach(function (id){
+            const typ = p.typOrd[id] || '';
+            const brutto = r2(p.ord[id]);
+            const w = poFf[id] || [];
+            if (!w.length){
+                brakuje.push({ id: id, kwota: brutto, typ: typ, maZwrot: p.ref[id] != null });
+                return;
+            }
+            // Zamowienie bez rozstrzygnietego typu klienta nie ma z czym byc porownane —
+            // idzie na osobna liste, a nie do „zlych kont".
+            const kv = typ ? MK_ALLE_VAT[typ] : null;
+            const ocz = kv ? kv.vat : '';
+            // Konto alternatywne jest ROWNIE poprawne. W zestawieniu 10-16.08.2026 piec
+            // zamowien B2B ma sprzedaz na 3204, bo VAT przeksiegowano: pierwotny wiersz
+            // 1069/3209 zostal odwrocony (3209/1069) i zaksiegowany od nowa na 1069/3204.
+            // Bez tego wyjatku kazde takie zamowienie wyszloby jako „zle konto sprzedazy",
+            // a jest zaksiegowane dokladnie tak, jak powinno.
+            const alt = (kv && kv.alt) ? kv.alt : '';
+            if (!ocz){
+                const kt = [];
+                w.forEach(function (r){ if (r.konto && kt.indexOf(r.konto) < 0) kt.push(r.konto); });
+                const zwrocone = (p.ref[id] != null) ? Math.abs(r2(p.ref[id])) : null;
+                bezTypu.push({ id: id, typ: typ || '', kwota: brutto,
+                               konta: kt.join(', '),
+                               nSprz: w.filter(function (r){ return r.sprzedaz; }).length,
+                               nKor:  w.filter(function (r){ return r.zwrot; }).length,
+                               zwrot: zwrocone,
+                               pelny: (zwrocone != null && Math.abs(zwrocone - brutto) < 0.02) });
+            }
+            w.forEach(function (r){
+                if (!r.konto){ obce.push({ id: id, auf: r.auf, deb: r.deb, cre: r.cre, kwota: r.kwota }); return; }
+                if (ocz && r.sprzedaz && r.konto !== ocz && r.konto !== alt)
+                    zleKonto.push({ id: id, typ: typ, konto: r.konto,
+                                    ocz: ocz + (alt ? (' albo ' + alt) : ''),
+                                    auf: r.auf, kwota: r.kwota, paid: r.paid });
+            });
+            // Kwote porownujemy tylko po wierszach SPRZEDAZY — zamowienie widoczne
+            // w zestawieniu wylacznie jako korekta sprzedano w innym okresie.
+            const sprz = w.filter(function (r){ return r.sprzedaz; });
+            if (sprz.length){
+                const suma = r2(sprz.reduce(function (a, r){ return a + r.kwota; }, 0));
+                if (Math.abs(suma - brutto) > 0.02)
+                    zlaKwota.push({ id: id, wExporcie: suma, wRaporcie: brutto,
+                                    roznica: r2(suma - brutto), typ: typ,
+                                    auf: sprz.map(function (r){ return r.auf; }).filter(Boolean).join(', ') });
+            }
+        });
+        // Zwroty: slad w OBU kierunkach. Zwrot bywa zaksiegowany po stronie wplaty
+        // i warunek „musi byc korekta" zglaszalby jako brak cos, co jest zaksiegowane.
+        Object.keys(p.ref || {}).forEach(function (id){
+            const w = poFf[id] || [];
+            if (w.some(function (r){ return r.zwrot; })) return;
+            const a = Math.abs(r2(p.ref[id]));
+            if (w.some(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
+            brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
+        });
+        const znane = Object.create(null);
+        Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
+        Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
+        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[r.ff]; });
+
+        // Zamowienie, ktorego nie ma w prologistics, a w TYM SAMYM zestawieniu ma i wplate,
+        // i zwrot: pieniadze sie znosza i nie ma czego ksiegowac. Dotad wychodzilo jako DWIE
+        // osobne usterki — „brak platnosci" i „zwrot bez sladu" — pod tym samym numerem,
+        // i trzeba bylo recznie zauwazyc, ze to jedno zdarzenie.
+        //
+        // Roznica 6 zl to doliczona przez Allegro oplata za dostawe: import odejmuje ja od
+        // wplaty (poza Paczkomatem), a zwrot przychodzi z nia w srodku. Nazywamy ja po
+        // imieniu zamiast zostawiac „nie zgadza sie o 6".
+        const wZwrocie = Object.create(null);
+        brakZwrot.forEach(function (x){ wZwrocie[x.id] = x; });
+        const znoszaSie = [];
+        const bezPary = [], zwrBezPary = [];
+        brakuje.forEach(function (x){
+            const z = wZwrocie[x.id];
+            if (!z){ bezPary.push(x); return; }
+            const roznica = r2(Math.abs(z.kwota) - Math.abs(x.kwota));
+            const pelne = Math.abs(roznica) < 0.02;
+            const dostawa = Math.abs(Math.abs(roznica) - 6) < 0.02;
+            znoszaSie.push({ id: x.id, typ: x.typ, wplata: x.kwota, zwrot: Math.abs(z.kwota),
+                             roznica: roznica, pelne: pelne, dostawa: dostawa,
+                             wyjasnione: pelne || dostawa });
+        });
+        brakZwrot.forEach(function (x){ if (!znoszaSie.some(function (y){ return y.id === x.id; })) zwrBezPary.push(x); });
+
+        return { konto: p.konto || '', brakuje: bezPary, zleKonto: zleKonto, zlaKwota: zlaKwota,
+                 brakZwrot: zwrBezPary, obce: obce, bezTypu: bezTypu, wolne: wolne,
+                 znoszaSie: znoszaSie,
+                 // Do licznika usterek ida tylko te pary, ktorych roznicy nie umiemy nazwac.
+                 znoszaZle: znoszaSie.filter(function (x){ return !x.wyjasnione; }).length,
+                 nOrd: Object.keys(p.ord).length, nZwr: Object.keys(p.ref || {}).length,
+                 nEx: (ex || []).length, brakTabeli: false };
+    }
+    // Auftrag po numerze fulfilmentu — ta sama droga, ktorej uzywa lista NOT FOUND przy
+    // imporcie (search.php?what=ff_number). „Prologistics nie znalazl" nie znaczy jeszcze,
+    // ze auftragu nie ma: bywa skasowany albo zamowienie poszlo pod innym numerem.
+    const alleAufState = {};      // ff -> { kand: [...], stan, err }
+    async function alleSprawdzAuftragi(lista, postep){
+        for (let i = 0; i < (lista || []).length; i++){
+            const ff = lista[i];
+            if (postep) postep(i + 1, lista.length, ff);
+            const st = alleAufState[ff] = { kand: [] };
+            const f = await crFind(ff);
+            if (f.err && !(f.nums || []).length){ st.err = f.err; st.stan = 'brak'; continue; }
+            const nums = f.nums || [];
+            if (!nums.length){ st.stan = 'brak'; continue; }
+            for (let k = 0; k < nums.length; k++){
+                const r = await crRead(nums[k]);
+                st.kand.push({ num: nums[k], ok: !!r.ok, err: r.err || '',
+                               deleted: !!r.deleted, open: r.open, nPay: r.nPay });
+            }
+            st.stan = 'sprawdzone';
+        }
+        return alleAufState;
+    }
+    function alleAufKom(ff){
+        const st = alleAufState[ff];
+        if (!st) return '<span style="color:#888">—</span>';
+        if (st.stan === 'brak')
+            return '<span style="color:#0a7a2f">nie ma auftragu o tym numerze</span>';
+        const lnk = function (nr){ return '<a href="/auction.php?number=' + mmEsc(nr) + '&txnid=3" target="_blank">' + mmEsc(nr) + '</a>'; };
+        if (!st.kand.length) return '<span style="color:#888">sprawdzam…</span>';
+        return st.kand.map(function (c){
+            return lnk(c.num) + (c.deleted ? ' <b style="color:#c47f00">DELETED</b>'
+                                           : ' <b style="color:#c00">ISTNIEJE</b>')
+                 + (c.ok ? '' : ' <span style="color:#c00">[' + mmEsc(c.err) + ']</span>');
+        }).join(', ');
+    }
+    // Numery operacji Allegro dla numeru zamowienia — po nich szuka sie w panelu sprzedawcy,
+    // gdy auftragu nie ma. To ten sam slownik, ktory od 4.52 zasila liste NOT FOUND.
+    function alleNrOp(p, id){
+        const lista = (p && p.zrodlo && p.zrodlo[id]) || [];
+        if (!lista.length) return '<span style="color:#888">—</span>';
+        return lista.map(function (nr){
+            return '<a href="https://' + MK_ALLE_HOST + '/orders?query=' + encodeURIComponent(nr)
+                 + '" target="_blank" title="Szukaj w panelu sprzedawcy Allegro">' + mmEsc(nr) + '</a>';
+        }).join('<br>');
+    }
+    function alleKnOpis(p){
+        return { tytul: 'Allegro ' + (p.konto || '?') + ' ↔ Export payments',
+                 zrodlo: 'operacje ' + (p.od || '?') + (p.doo && p.doo !== p.od ? ('…' + p.doo) : '')
+                       + (p.sprzedawca ? (' · sprzedawca ' + p.sprzedawca) : '') };
+    }
+    // Allegro wypisuje dwie sekcje SAMO — bogaciej niz wspolny render: z numerem operacji
+    // w Allegro i z wynikiem szukania auftragu. Reszte rysuje wspolny kod, a liczniki
+    // i tak licza sie z pelnego zestawu.
+    const ALLE_POMIN = { brakuje: 1, brakZwrot: 1 };
+    function alleKnTekst(p, k, zle){
+        const L = [];
+        const podst = mmKnTekst(p, k, zle, alleKnOpis(p), ALLE_POMIN).split('\n');
+        // Sekcje wlasne wstawiamy zaraz za naglowkiem, przed reszta.
+        const wl = [];
+        if ((k.znoszaSie || []).length){
+            wl.push('');
+            wl.push('WPŁATA I ZWROT ZNOSZĄ SIĘ — nie ma czego księgować (' + k.znoszaSie.length + ')');
+            k.znoszaSie.forEach(function (x){
+                wl.push('   ' + x.id + '  wpłata ' + f2(x.wplata) + ', zwrot ' + f2(x.zwrot)
+                      + (x.pelne ? '  — w całości'
+                                 : (x.dostawa ? ('  — różnica ' + f2(x.roznica) + ' to opłata za dostawę')
+                                              : ('  — RÓŻNICA ' + f2(x.roznica) + ' bez wyjaśnienia')))
+                      + '   nr operacji: ' + (((p.zrodlo || {})[x.id] || []).join(', ') || '—'));
+            });
+        }
+        if ((k.brakuje || []).length){
+            wl.push('');
+            wl.push('BRAK PŁATNOŚCI w prologistics (' + k.brakuje.length + ')');
+            k.brakuje.forEach(function (x){
+                wl.push('   ' + x.id + '  ' + f2(x.kwota) + (x.typ ? ('  ' + x.typ) : '')
+                      + '   nr operacji: ' + (((p.zrodlo || {})[x.id] || []).join(', ') || '—'));
+            });
+        }
+        if ((k.brakZwrot || []).length){
+            wl.push('');
+            wl.push('ZWROT BEZ ŚLADU w prologistics (' + k.brakZwrot.length + ')');
+            k.brakZwrot.forEach(function (x){
+                wl.push('   ' + x.id + '  ' + f2(x.kwota)
+                      + '   nr operacji: ' + (((p.zrodlo || {})[x.id] || []).join(', ') || '—'));
+            });
+        }
+        // naglowek to pierwsze trzy linie wspolnego wypisu
+        return podst.slice(0, 3).concat(wl).concat(podst.slice(3)).join('\n');
+    }
+    function alleKnRender(p, k, zle){
+        const H = [];
+        const tab = function (tyt, kolor, naglowki, wiersze){
+            H.push('<div style="margin-top:8px"><div style="font-weight:700;color:' + kolor + ';font-size:12px">'
+                 + mmEsc(tyt) + '</div>'
+                 + '<div style="max-height:260px;overflow:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+                 + '<tr style="color:#999;font-size:10px">'
+                 + naglowki.map(function (h){ return '<td style="padding:1px 6px">' + mmEsc(h) + '</td>'; }).join('')
+                 + '</tr>' + wiersze.join('') + '</table></div></div>');
+        };
+        const kom = function (t){ return '<td style="padding:2px 6px">' + t + '</td>'; };
+        const kwo = function (t){ return '<td style="padding:2px 6px;text-align:right">' + t + '</td>'; };
+        if ((k.znoszaSie || []).length){
+            tab('Wpłata i zwrot znoszą się — nie ma czego księgować (' + k.znoszaSie.length + ')', '#0a7a2f',
+                ['Zamówienie', 'Nr operacji w Allegro', 'Wpłata', 'Zwrot', 'Różnica', 'Auftrag'],
+                k.znoszaSie.map(function (x){
+                    const opis = x.pelne ? '<span style="color:#0a7a2f">w całości</span>'
+                               : (x.dostawa ? ('<span style="color:#0a7a2f">' + f2(x.roznica) + ' — dostawa</span>')
+                                            : ('<span style="color:#c00"><b>' + f2(x.roznica) + '</b> bez wyjaśnienia</span>'));
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom('<code>' + mmEsc(x.id) + '</code>')
+                         + '<td style="padding:2px 6px;font-family:monospace;font-size:10px">' + alleNrOp(p, x.id) + '</td>'
+                         + kwo(f2(x.wplata)) + kwo(f2(x.zwrot)) + kom(opis) + kom(alleAufKom(x.id)) + '</tr>';
+                }));
+        }
+        if ((k.brakuje || []).length){
+            tab('Brak płatności w prologistics (' + k.brakuje.length + ')', '#c00',
+                ['Zamówienie', 'Nr operacji w Allegro', 'Wpłata', 'Typ', 'Auftrag'],
+                k.brakuje.map(function (x){
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom('<code>' + mmEsc(x.id) + '</code>')
+                         + '<td style="padding:2px 6px;font-family:monospace;font-size:10px">' + alleNrOp(p, x.id) + '</td>'
+                         + kwo(f2(x.kwota)) + kom(mmEsc(x.typ || '—')) + kom(alleAufKom(x.id)) + '</tr>';
+                }));
+        }
+        if ((k.brakZwrot || []).length){
+            tab('Zwrot bez śladu w prologistics (' + k.brakZwrot.length + ')', '#c00',
+                ['Zamówienie', 'Nr operacji w Allegro', 'Zwrot', 'Auftrag'],
+                k.brakZwrot.map(function (x){
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom('<code>' + mmEsc(x.id) + '</code>')
+                         + '<td style="padding:2px 6px;font-family:monospace;font-size:10px">' + alleNrOp(p, x.id) + '</td>'
+                         + kwo(f2(x.kwota)) + kom(alleAufKom(x.id)) + '</tr>';
+                }));
+        }
+        return mmKnRender(p, k, zle, alleKnOpis(p), ALLE_POMIN) + H.join('');
+    }
+    // Numery, dla ktorych warto poszukac auftragu: wszystko, czego prologistics nie ma.
+    function alleDoSprawdzenia(k){
+        const out = [];
+        ((k && k.znoszaSie) || []).forEach(function (x){ if (out.indexOf(x.id) < 0) out.push(x.id); });
+        ((k && k.brakuje) || []).forEach(function (x){ if (out.indexOf(x.id) < 0) out.push(x.id); });
+        ((k && k.brakZwrot) || []).forEach(function (x){ if (out.indexOf(x.id) < 0) out.push(x.id); });
+        return out;
+    }
+    // Rozpoznanie plikow Allegro po TRESCI — ta sama droga co przy wrzucaniu ich do
+    // ekranu importu, ale do OSOBNEJ skladnicy: kontrola w Saldach nie moze podmieniac
+    // wsadu, z ktorego sklada sie zlecenie ksiegowania.
+    async function alleZbierz(files){
+        const S = { ops: null, opsNazwa: '', mapy: [], mapyNazwy: [], bill: null, billNazwa: '', nieznane: [] };
+        for (let i = 0; i < (files || []).length; i++){
+            const f = files[i];
+            try {
+                const buf = await f.arrayBuffer();
+                const u8 = new Uint8Array(buf);
+                if (u8.length > 1 && u8[0] === 0x50 && u8[1] === 0x4B){
+                    // Archiwum albo arkusz — oba maja naglowek „PK". Rozstrzyga tresc.
+                    let wzieto = false;
+                    try {
+                        const csvy = await alleZipCsv(buf);
+                        csvy.forEach(function (x){
+                            if (!alleCzyMapa(x.tekst)) return;
+                            if (S.mapyNazwy.indexOf(x.nazwa) >= 0) return;
+                            S.mapy.push(x.tekst); S.mapyNazwy.push(x.nazwa); wzieto = true;
+                        });
+                    } catch (e){}
+                    if (!wzieto){
+                        const txt = await cnovZArkusza(buf);
+                        if (alleCzyOperacje(txt)){ S.ops = mkCsvRows(txt); S.opsNazwa = f.name; wzieto = true; }
+                        else if (alleCzyBilling(txt)){ S.bill = txt; S.billNazwa = f.name; wzieto = true; }
+                        else if (alleCzyMapa(txt) && S.mapyNazwy.indexOf(f.name) < 0){
+                            S.mapy.push(txt); S.mapyNazwy.push(f.name); wzieto = true;
+                        }
+                    }
+                    if (!wzieto) S.nieznane.push(f.name);
+                    continue;
+                }
+                const t = mkDecode(buf);
+                if (alleCzyOperacje(t)){ S.ops = mkCsvRows(t); S.opsNazwa = f.name; }
+                else if (alleCzyBilling(t)){ S.bill = t; S.billNazwa = f.name; }
+                else if (alleCzyMapa(t)){
+                    if (S.mapyNazwy.indexOf(f.name) < 0){ S.mapy.push(t); S.mapyNazwy.push(f.name); }
+                }
+                else S.nieznane.push(f.name);
+            } catch (e){ S.nieznane.push(f.name + ' (' + ((e && e.message) || e) + ')'); }
+        }
+        return S;
+    }
+    // Most do modulu Salda. Allegro rozni sie od Amazona i ManoMano tym, ze rozliczenie
+    // sklada sie z TRZECH plikow, a nie z jednego — wiec most oddaje osobno zbieranie
+    // plikow i osobno zlozenie z nich raportu.
+    window.__TM_ALLE_KONTROLA = {
+        zbierz: alleZbierz,
+        raport: function (S, konto){
+            if (!S || !S.ops) return { err: 'brak pliku operacji Allegro' };
+            const mapy = (S.mapy || []).map(function (t){ return mkParseAlleMapa(t); });
+            const zle = mapy.filter(function (m){ return m && m.err; });
+            const bill = S.bill ? mkParseAlleBilling(S.bill) : null;
+            const p = mkParseAlle(S.ops, mapy, bill, konto || '');
+            if (p && !p.err){
+                p.uwagi = [];
+                if (!S.mapy.length) p.uwagi.push('brak raportów zamówień — bez nich nie przetłumaczę identyfikatorów płatności na numery zamówień');
+                zle.forEach(function (m){ p.uwagi.push('raport zamówień: ' + m.err); });
+                if (!bill) p.uwagi.push('brak billingu — bez niego nie rozstrzygnę B2B/B2C, więc kont sprzedaży nie sprawdzę');
+                else if (bill.err) p.uwagi.push('billing: ' + bill.err);
+                if (p.brakMap && p.brakMap.length)
+                    p.uwagi.push(p.brakMap.length + ' operacji bez zamówienia w raportach — dorzuć archiwum obejmujące starsze miesiące');
+            }
+            return p;
+        },
+        wiersze: mkExpZAoa,
+        sprawdz: mkKontrolaAlle,
+        render: alleKnRender,
+        tekst: alleKnTekst,
+        auftragi: alleSprawdzAuftragi,
+        doSprawdzenia: alleDoSprawdzenia,
+        // Konta rozliczeniowe Allegro. 1069 nie ma jeszcze znanego loginu, wiec w Saldach
+        // wybiera sie je recznie — tak samo jak przy imporcie.
+        konta: function (){
+            return [{ acc: '1069', nazwa: 'Allegro Beliani Polska' },
+                    { acc: '1071', nazwa: 'Allegro Beliani' }];
+        }
+    };
     // Most do modulu Salda — ten sam ksztalt co __TM_AMZ_KONTROLA, wiec ekran po tamtej
     // stronie moze traktowac oba marketplace jednakowo.
     window.__TM_MM_KONTROLA = {
@@ -29199,6 +29919,17 @@
         }
         try { rysuj(); } catch (e){}
     }
+    // Numery operacji Allegro dla danego numeru zamowienia, kazdy jako link do
+    // wyszukiwarki panelu sprzedawcy. Adres jest ten sam, ktorego uzywa modul Allegro
+    // przy podpowiadaniu zamowien (SC + '/orders?query=') — nie wymyslamy nowego.
+    function nfZrodlo(zrod, id){
+        const lista = (zrod && id && zrod[id]) || [];
+        if (!lista.length) return '<span style="color:#888">—</span>';
+        return lista.map(function (nrOp){
+            return '<a href="https://' + MK_ALLE_HOST + '/orders?query=' + encodeURIComponent(nrOp)
+                 + '" target="_blank" title="Szukaj tego numeru w panelu sprzedawcy Allegro">' + esc(nrOp) + '</a>';
+        }).join('<br>');
+    }
     // Co pokazac w kolumnie „Auftrag" przy wierszu NOT FOUND.
     function nfKom(ff, kwota, rv){
         const st = mkNfState[ff];
@@ -29295,6 +30026,10 @@
               +  ' style="padding:4px 10px;border:none;border-radius:6px;background:' + (near.length ? '#0a7a2f' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (near.length ? 'pointer' : 'default') + ';font-size:11px">✔ Ustaw OK i zaksięguj na subkoncie (' + near.length + ')</button>'
               +  '<span id="mk-fix-msg" style="font-size:11px;color:#666"></span></div></div>';
         }
+        // Allegro: numer operacji z pliku zrodlowego, po ktorym szuka sie w panelu
+        // sprzedawcy. Starsze paczki go nie maja — wtedy kolumna po prostu nie powstaje.
+        const zrod = (job && job.data && job.data.alle && job.data.alle.zrodlo) || null;
+        const maZrod = !!(zrod && Object.keys(zrod).length);
         if (nf.length){
             // Numer fulfilmentu, wplata i zwrot z tego samego cyklu OBOK SIEBIE. Wczesniej
             // byla to sama lista numerow i zeby sprawdzic, czy pozycja faktycznie sie znosi,
@@ -29304,9 +30039,12 @@
               +  '<div style="font-size:10px;color:#888;margin-top:2px">Prologistics nie znalazł auftragu dla tych numerów. '
               +  'Część tłumaczy zwrot z tego samego cyklu — wtedy wpłata i zwrot znoszą się i nie ma czego księgować. '
               +  'Reszta bywa auftragiem ze statusem DELETED: wpłata przyszła, a zwrot spadnie dopiero w kolejnym cyklu — '
-              +  'wtedy trzeba zaksięgować mimo delete.</div>'
+              +  'wtedy trzeba zaksięgować mimo delete.'
+              +  (maZrod ? ' <b>Nr operacji w Allegro</b> to numer z pliku operacji — po nim szukasz zamówienia w panelu sprzedawcy, gdy auftragu nie ma.' : '')
+              +  '</div>'
               +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
               +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Fulfilment</td>'
+              +  (maZrod ? '<td style="padding:1px 6px">Nr operacji w Allegro</td>' : '')
               +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
               +  '<td style="padding:1px 6px;text-align:right">Zwrot w tym cyklu</td>'
               +  '<td style="padding:1px 6px">Co to znaczy</td>'
@@ -29326,6 +30064,7 @@
                   +  (id ? esc(id) : '<span style="color:#c00">brak numeru w paczce</span>')
                   +  (au ? (' <a href="' + esc(au.url) + '" target="_blank" style="font-weight:400">' + esc(au.label) + '</a>') : '')
                   +  '</td>'
+                  +  (maZrod ? ('<td style="padding:2px 6px;font-family:monospace;font-size:10px">' + nfZrodlo(zrod, id) + '</td>') : '')
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (rv == null ? '—' : f2(rv)) + '</td>'
                   +  '<td style="padding:2px 6px;color:' + colr + '">' + msg + '</td>'
@@ -32681,6 +33420,10 @@
           opis: 'rozliczenie Amazona kontra zestawienie z prologistics · sprawdza też konta sprzedaży', gotowe: true },
         { id: 'mano', nazwa: 'ManoMano ↔ Export payments',
           opis: 'rozliczenie ManoMano kontra zestawienie z prologistics · łączy po numerze zamówienia z kolumny „Fulfillment number"', gotowe: true },
+        // Allegro rozni sie od poprzednich tym, ze „rozliczenie" to nie jeden plik, tylko
+        // TRZY: operacje, raporty zamowien i billing — te same, ktore idą do importu.
+        { id: 'alle', nazwa: 'Allegro ↔ Export payments',
+          opis: 'operacje Allegro kontra zestawienie z prologistics · te same pliki co do importu · sprawdza też konta sprzedaży B2B/B2C', gotowe: true },
         { id: 'saferpay', nazwa: 'Saferpay ↔ Export payments', opis: 'jeszcze nie zrobione', gotowe: false }
     ];
     // Konta PayPal, ktore uzgadniamy. Numery sa stale, ale ETYKIETY czytamy z zywego
@@ -32787,7 +33530,8 @@
             if (x && x.gotowe) d.onclick = function (){
                 (x.id === 'bank' ? salRysujBank
                     : (x.id === 'amazon' ? salRysujAmz
-                    : (x.id === 'mano' ? salRysujMM : salRysujPP)))();
+                    : (x.id === 'mano' ? salRysujMM
+                    : (x.id === 'alle' ? salRysujAlle : salRysujPP))))();
             };
         });
     }
@@ -33152,6 +33896,196 @@
             kop.style.display = '';
             const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
             salSay(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
+                   blady ? '#c47f00' : '#0a7a2f');
+        } catch (e){
+            salSay('Błąd porównania: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+
+    // ---------- Allegro ↔ Export payments ----------
+    // Osobny ekran, tak jak ManoMano obok Amazona. Jedyna roznica wobec tamtych: strone
+    // marketplace'u skladaja TRZY pliki i wrzuca sie je razem, a modul rozpoznaje kazdy
+    // po tresci — tak samo jak ekran importu, wiec nie trzeba pamietac, ktory jest ktory.
+    let SAL_ALLE = null;        // skladnica plikow (operacje, raporty zamowien, billing)
+    let SAL_ALLE_P = null;      // zlozone „rozliczenie"
+    let SAL_ALLE_WYNIK = '';   // wynik tekstowy do schowka (SAL_AWYNIK nalezy do ekranu Amazona)
+    function salAlleMost(){
+        return (typeof window.__TM_ALLE_KONTROLA === 'object' && window.__TM_ALLE_KONTROLA) || null;
+    }
+    function salAlleInfo(){
+        const p = salPanel(), a = p.querySelector('#sal-alleinfo'), e = p.querySelector('#sal-aexpinfo');
+        if (a){
+            if (!SAL_ALLE) a.textContent = 'Pliki: nie wskazane.';
+            else {
+                const cz = [];
+                cz.push(SAL_ALLE.ops ? ('operacje: ' + SAL_ALLE.opsNazwa) : 'operacje: BRAK');
+                cz.push('raporty zamówień: ' + (SAL_ALLE.mapy.length ? (SAL_ALLE.mapy.length + ' szt.') : 'BRAK'));
+                cz.push('billing: ' + (SAL_ALLE.bill ? SAL_ALLE.billNazwa : 'BRAK'));
+                if (SAL_ALLE.nieznane.length) cz.push('nierozpoznane: ' + SAL_ALLE.nieznane.join(', '));
+                if (SAL_ALLE_P && !SAL_ALLE_P.err)
+                    cz.push('→ zamówień ' + SAL_ALLE_P.nOrd + ', zwrotów ' + SAL_ALLE_P.nZwrOrd);
+                a.textContent = cz.join(' · ');
+            }
+        }
+        if (e && SAL_AEXP) e.textContent = 'Zestawienie: ' + SAL_AEXP.rows.length + ' wierszy.';
+    }
+    async function salRysujAlle(){
+        const p = salPanel(), u = salUst();
+        const most = salAlleMost();
+        const konta = most ? most.konta() : [];
+        const et = await salEtykiety(), akt = salAktywne();
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · Allegro ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+
+            + (most ? '' : '<div style="border:1px solid #f5c2c7;background:#fff5f5;border-radius:8px;padding:8px;margin-bottom:8px;color:#c00">'
+                + 'Moduł „Księgowanie Marketplace\'s" jest wyłączony w launcherze — bez niego nie odczytam plików Allegro.</div>')
+
+            + '<div style="color:#555;margin-bottom:8px;font-size:11px">Sprawdzam, czy każde zamówienie z operacji Allegro ma płatność w prologistics, '
+            + 'czy kwoty się zgadzają, czy sprzedaż siedzi na właściwym koncie VAT (B2B 3209 / B2C 3292) i czy każdy zwrot zostawił ślad. '
+            + 'Łączę po numerze zamówienia — w prologistics stoi on w kolumnie „Fulfillment number". '
+            + 'Zakres dat ustaw tak, żeby objął dni księgowania tej wypłaty; zestawienie pobiorę sam.</div>'
+
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.do) + '" style="font-size:12px;width:130px"></label>'
+            + '<button id="sal-apobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
+            + '</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Konto rozliczeniowe <span style="font-weight:400;color:#888;font-size:11px">'
+            + '— 1069 nie ma jeszcze znanego loginu sprzedawcy, więc wybierasz je ręcznie</span></div>'
+            + '<select id="sal-akonto" style="width:100%;font-size:12px;padding:4px;'
+            + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
+            + (konta.length
+                ? konta.map(function (r){
+                      const stan = (r.acc in akt) ? (akt[r.acc] ? '' : '  · nieaktywne') : '';
+                      return '<option value="' + salEsc(r.acc) + '">'
+                          + salEsc(r.nazwa) + ' — ' + salEsc(et[r.acc] || r.acc) + salEsc(stan) + '</option>';
+                  }).join('')
+                : '<option value="">— moduł marketplace\'ów wyłączony —</option>')
+            + '</select></div>'
+            + '<div id="sal-aexpinfo" style="font-size:11px;color:#888;margin-bottom:8px">Zestawienie: jeszcze nie pobrane.</div>'
+
+            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+            + '<div style="font-weight:700;margin-bottom:4px">Pliki Allegro <span style="font-weight:400;color:#888;font-size:11px">'
+            + '— te same co do importu: operacje, raporty zamówień (mogą być w ZIP-ie) i billing</span></div>'
+            + '<label style="font-size:11px;display:block">wrzuć wszystkie naraz '
+            + '<input type="file" id="sal-falle" multiple style="font-size:11px"></label>'
+            + '<div id="sal-alleinfo" style="font-size:11px;color:#888;margin-top:4px">Pliki: nie wskazane.</div>'
+            + '</div>'
+
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<button id="sal-alporownaj" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
+            + '<button id="sal-alauf" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
+            + 'title="Dla zamówień, których prologistics nie znalazł, szuka auftragu po numerze fulfilmentu — tą samą drogą co moduł „Księgowanie w auftragu". Auftrag bywa skasowany i wtedy import go nie widzi.">🔍 Szukaj auftragów po fulfilmencie</button>'
+            + '<button id="sal-alkopiuj" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
+            + '</div>'
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
+            + '<div id="sal-alwynik"></div>';
+
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-apobierz').onclick = function (){ salPobierzAmzExp(this); };
+        p.querySelector('#sal-falle').onchange = function (){ salWczytajAlle(this.files); };
+        p.querySelector('#sal-alporownaj').onclick = function (){ salPorownajAlle(this); };
+        p.querySelector('#sal-alauf').onclick = function (){ salAlleAuftragi(this); };
+        p.querySelector('#sal-akonto').onchange = function (){ salZlozAlle(); };
+        p.querySelector('#sal-alkopiuj').onclick = function (){
+            try { GM_setClipboard(SAL_ALLE_WYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
+            catch (e){ salSay('Nie udało się skopiować.', '#c00'); }
+        };
+        const zapiszUst = function (){
+            const o = salUst();
+            o.od = p.querySelector('#sal-od').value;
+            o.do = p.querySelector('#sal-do').value;
+            salUstZapisz(o);
+        };
+        p.querySelector('#sal-od').onchange = zapiszUst;
+        p.querySelector('#sal-do').onchange = zapiszUst;
+        salAlleInfo();
+    }
+    // Skladamy „rozliczenie" po kazdej zmianie wsadu ORAZ po zmianie konta — konto wchodzi
+    // do parsowania (decyduje, ktore konto sprzedazy jest oczekiwane), wiec przeliczenie
+    // po samym wyborze z listy jest konieczne.
+    function salZlozAlle(){
+        const most = salAlleMost();
+        if (!most || !SAL_ALLE || !SAL_ALLE.ops){ SAL_ALLE_P = null; salAlleInfo(); return; }
+        const sel = salPanel().querySelector('#sal-akonto');
+        const konto = String((sel && sel.value) || '').trim();
+        SAL_ALLE_P = most.raport(SAL_ALLE, konto);
+        salAlleInfo();
+        if (SAL_ALLE_P && SAL_ALLE_P.err){ salSay(SAL_ALLE_P.err, '#c00'); return; }
+        const uw = (SAL_ALLE_P && SAL_ALLE_P.uwagi) || [];
+        if (uw.length) salSay(uw.join(' · '), '#c47f00');
+        else salSay('Wsad kompletny — zamówień ' + SAL_ALLE_P.nOrd + ', zwrotów ' + SAL_ALLE_P.nZwrOrd + '.', '#0a7a2f');
+    }
+    async function salWczytajAlle(files){
+        const most = salAlleMost();
+        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!files || !files.length) return;
+        salSay('Czytam ' + files.length + ' plik' + (files.length === 1 ? '' : 'ów') + '…');
+        try {
+            SAL_ALLE = await most.zbierz(files);
+            salZlozAlle();
+        } catch (e){
+            SAL_ALLE = null; SAL_ALLE_P = null; salAlleInfo();
+            salSay('Nie mogę odczytać plików: ' + ((e && e.message) || e), '#c00');
+        }
+    }
+    // Wynik ostatniego porownania — zeby po sprawdzeniu auftragow narysowac go od nowa,
+    // bez powtarzania calego uzgodnienia.
+    let SAL_ALLE_K = null;
+    async function salAlleAuftragi(b){
+        const most = salAlleMost();
+        if (!most || !SAL_ALLE_K || !SAL_ALLE_P) return;
+        const lista = most.doSprawdzenia(SAL_ALLE_K);
+        if (!lista.length){ salSay('Nie ma czego szukać — wszystko ma pokrycie w prologistics.', '#0a7a2f'); return; }
+        b.disabled = true;
+        try {
+            await most.auftragi(lista, function (i, ile, ff){
+                salSay('Szukam auftragu ' + i + '/' + ile + ' — ' + ff + '…');
+            });
+            const p = salPanel();
+            p.querySelector('#sal-alwynik').innerHTML = most.render(SAL_ALLE_P, SAL_ALLE_K, SAL_AEXP.zle);
+            SAL_ALLE_WYNIK = most.tekst(SAL_ALLE_P, SAL_ALLE_K, SAL_AEXP.zle);
+            salSay('Sprawdzone — ' + lista.length + ' numer' + (lista.length === 1 ? '' : 'ów') + '.', '#0a7a2f');
+        } catch (e){
+            salSay('Błąd szukania auftragów: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+    function salPorownajAlle(b){
+        const p = salPanel(), most = salAlleMost();
+        const out = p.querySelector('#sal-alwynik'), kop = p.querySelector('#sal-alkopiuj');
+        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!SAL_ALLE || !SAL_ALLE.ops){ salSay('Wskaż pliki Allegro — bez pliku operacji nie ma czego porównywać.', '#c47f00'); return; }
+        if (!SAL_ALLE_P || SAL_ALLE_P.err){ salSay((SAL_ALLE_P && SAL_ALLE_P.err) || 'Nie złożyłem rozliczenia z wgranych plików.', '#c00'); return; }
+        if (!SAL_AEXP || !SAL_AEXP.rows.length){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
+        // Konto z plikow i konto zestawienia MUSZA byc te same — inaczej porownanie oglada
+        // dwa rozne konta rozliczeniowe i kazdy wynik jest przypadkowy.
+        const kontoSel = String(p.querySelector('#sal-akonto').value || '').trim();
+        if (SAL_ALLE_P.konto && kontoSel && SAL_ALLE_P.konto !== kontoSel){
+            salSay('Operacje wskazują konto ' + SAL_ALLE_P.konto + ', a zestawienie pobrałeś dla ' + kontoSel
+                 + '. Ustaw właściwe konto i pobierz jeszcze raz.', '#c00');
+            return;
+        }
+        b.disabled = true;
+        try {
+            const k = most.sprawdz(SAL_ALLE_P, SAL_AEXP.rows);
+            SAL_ALLE_K = k;
+            SAL_ALLE_WYNIK = most.tekst(SAL_ALLE_P, k, SAL_AEXP.zle);
+            out.innerHTML = most.render(SAL_ALLE_P, k, SAL_AEXP.zle);
+            kop.style.display = '';
+            // Guzik szukania auftragow ma sens dopiero wtedy, gdy jest czego szukac.
+            const doSpr = most.doSprawdzenia(k);
+            const auf = p.querySelector('#sal-alauf');
+            if (auf) auf.style.display = doSpr.length ? '' : 'none';
+            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
+                        + (k.znoszaZle || 0);
+            const znosi = (k.znoszaSie || []).length;
+            salSay((blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.')
+                 + (znosi ? (' Wpłata i zwrot znoszą się w ' + znosi + ' zamówieni' + (znosi === 1 ? 'u' : 'ach') + '.') : ''),
                    blady ? '#c47f00' : '#0a7a2f');
         } catch (e){
             salSay('Błąd porównania: ' + ((e && e.message) || e), '#c00');
