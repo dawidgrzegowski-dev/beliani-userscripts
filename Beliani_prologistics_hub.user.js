@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.39
+// @version      4.41
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -17743,6 +17743,20 @@
         return !!j && j.status !== 'done' && !j.payer;   // zlecenie z wyciagu ma platnika
     }
     function mkDataCell(j){
+        // Allegro nie ma JEDNEJ daty. Kolumna pokazywala date konca zakresu i wygladalo to
+        // tak, jakby cala paczka miala zostac zaksiegowana na ten dzien — a tak nie jest:
+        // kazda wplata niesie wlasna date w pliku, a pole nadpisania daty zostaje puste.
+        // Dlatego zamiast pojedynczej daty pokazujemy ZAKRES i mowimy to wprost.
+        const pa = (j.kind === 'alle' && j.data) ? j.data.alle : null;
+        if (pa && pa.od){
+            const dn = function (y){
+                const m = String(y || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+                return m ? (m[3] + '.' + m[2] + '.' + m[1]) : '';
+            };
+            const zak = dn(pa.od) + (pa.doo && pa.doo !== pa.od ? (' – ' + dn(pa.doo)) : '');
+            return '<div style="font-size:11px">' + esc(zak) + '</div>'
+                 + '<div style="font-size:9px;color:#7c3aed">każda wpłata z własną datą</div>';
+        }
         if (!mkDataEdyt(j)) return esc(j.date || '—');
         const zrodlo = j.dateSrc || '';
         const zmieniona = !!zrodlo && zrodlo !== j.date;
@@ -19901,6 +19915,7 @@
         const znaneB = (bill && !bill.err) ? bill.znane : null;
 
         const ord = Object.create(null), ordTyp = Object.create(null), ordData = Object.create(null);
+        const ordVat = Object.create(null);
         const ref = Object.create(null), refNote = Object.create(null), refData = Object.create(null);
         const wOrd = [], brakMap = [], brakKlasy = [], pominiete = Object.create(null);
         const odjete = [];
@@ -19935,13 +19950,17 @@
             }
             // Regula 6 zl: doliczona przez Allegro oplata za dostawe nie nalezy do
             // zamowienia. Wyjatkiem jest Paczkomat — tam 6 zl jest czescia zamowienia.
-            let kwota = kwotaSur;
+            let kwota = kwotaSur, uwaga = '';
             const dm = dost[idPl] || dost[nr] || '';
             if (Math.abs(Math.abs(alleNum(r[iDost])) - 6) < 0.005){
                 if (ALLE_INPOST.test(dm)){
+                    // Przy Paczkomacie 6 zl nalezy do zamowienia — nie odejmujemy, ale
+                    // zostawiamy slad, dokladnie jak dzisiejsza aplikacja.
+                    uwaga = 'Allegro InPost';
                     odjete.push({ nr: nr, powod: 'Paczkomat — 6 zł zostaje', dostawa: dm });
                 } else {
                     kwota = r2(kwota - (kwota < 0 ? -6 : 6));
+                    uwaga = 'Odjęto 6';
                     odjete.push({ nr: nr, powod: 'odjęto 6 zł', dostawa: dm || '(nie znam sposobu dostawy)' });
                 }
             }
@@ -19955,7 +19974,30 @@
                 nWpl++; sumaWpl = r2(sumaWpl + kwota);
                 ord[nr] = r2((ord[nr] || 0) + kwota);
                 if (typ) ordTyp[nr] = typ;
+                // Konto sprzedazy, ktorego dla tego zamowienia oczekujemy. Kontrola typu
+                // klienta porownuje je z „Selling Account" na auftragu — bez tego pola
+                // umialaby sprawdzic sam typ, ale nie konto, na ktorym stoi sprzedaz.
+                if (typ && MK_ALLE_VAT[typ]) ordVat[nr] = MK_ALLE_VAT[typ].vat;
                 if (!ordData[nr]) ordData[nr] = data;
+                // Wiersz importu jest WIERSZEM ZRODLOWYM z pliku operacji (kolumny A-K)
+                // uzupelnionym o piec kolumn, ktore dopisywala dzisiejsza aplikacja:
+                // L Fulfillment, M Typ transakcji, N Account, O Vat Account,
+                // P Alternative VAT Account. Ustawienie importu w prologistics jest
+                // dopasowane do TYCH kolumn — kwota stoi w I, numer zamowienia w L —
+                // wiec ukladu nie wymyslamy od nowa. Jedyna zmiana wobec starej aplikacji:
+                // B2B i B2C ida w JEDNYM pliku, bo konta i tak stoja w N i O przy kazdym
+                // wierszu; dwa importy braly sie z podzialu na zakladki, nie z formatu.
+                const kv = MK_ALLE_VAT[typ] || null;
+                const w = [];
+                for (let k = 0; k < 11; k++) w.push(String(r[k] == null ? '' : r[k]).trim());
+                w[8]  = f2(kwota);                    // I — kwota bez „zl", po regule 6 zl
+                if (uwaga) w[10] = uwaga;             // K — „Odjęto 6" albo „Allegro InPost"
+                w[11] = nr;                           // L — Fulfillment
+                w[12] = typ;                          // M — Typ transakcji
+                w[13] = konto;                        // N — Account
+                w[14] = kv ? kv.vat : '';             // O — Vat Account
+                w[15] = kv ? (kv.alt || 'Brak') : ''; // P — Alternative VAT Account
+                wOrd.push({ r: w, nr: nr, typ: typ, kwota: kwota });
             } else {
                 // Zwroty NIE ida do pliku importu — ksieguje sie je na auftragu, a KAZDY
                 // ma wlasna date, wiec modul ticketow bierze date z wiersza. Kwota idzie
@@ -19969,17 +20011,6 @@
                 refNote[nr] = refNote[nr] ? (refNote[nr] + '\n\n' + o) : o;
             }
         }
-        // Wiersze importu: JEDEN plik na oba typy klienta, konto i konto VAT per wiersz.
-        // Dotad robilo sie dwa importy, bo konta wpisywalo sie zbiorczo na zakladke.
-        Object.keys(ord).sort().forEach(function (nr){
-            const typ = ordTyp[nr] || '';
-            const kv = MK_ALLE_VAT[typ] || null;
-            const c = new Array(35).fill('');
-            c[6] = 'Order'; c[7] = nr;
-            c[24] = f2(ord[nr]);
-            c[25] = typ; c[26] = konto; c[27] = kv ? kv.vat : '';
-            wOrd.push({ r: c, nr: nr, typ: typ, kwota: ord[nr] });
-        });
         // Zakres dat sluzy za klucz zlecenia: jeden plik operacji = jedno zlecenie.
         // Daty w pliku sa w postaci „16.08.2026 23:01"; do klucza chcemy RRRR-MM-DD,
         // bo tylko taki sortuje sie zgodnie z kalendarzem.
@@ -20002,7 +20033,7 @@
 
         return {
             konto: konto, kontoZrodlo: kontoZ, sprzedawca: sprzedawca, loginy: loginy,
-            ord: ord, typOrd: ordTyp, dataOrd: ordData,
+            ord: ord, typOrd: ordTyp, vatOrd: ordVat, dataOrd: ordData,
             ref: ref, refNote: refNote, refData: refData,
             wOrd: wOrd, nWpl: nWpl, nZwr: nZwr, nInne: nInne,
             sumaWpl: sumaWpl, sumaZwr: sumaZwr,
@@ -20010,12 +20041,18 @@
             brakMap: brakMap, brakKlasy: brakKlasy, pominiete: pominiete, odjete: odjete,
             bezTypu: bezTypu, bezKonta: bezKonta, nZam: nZam,
             billing: bill && !bill.err ? { nVat: bill.nVat, nZnane: bill.nZnane } : null,
+            // Naglowek: oryginalne nazwy kolumn A-K plus piec dopisanych. Dzisiejsza
+            // aplikacja zapisywala arkusz z naglowkiem, wiec plik ma go zachowac.
+            naglowek: (function (){
+                const h = [];
+                for (let k = 0; k < 11; k++) h.push(String((ops[0] || [])[k] == null ? '' : (ops[0] || [])[k]).trim());
+                return h.concat(['Fulfillment', 'Typ transakcji', 'Account', 'Vat Account', 'Alternative VAT Account']);
+            })(),
             od: zakres.od, doo: zakres.doo,
             wzorNr: '\\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\b',
             cur: 'PLN'
         };
     }
-    // Plik importu — ten sam uklad co Amazon: 35 kolumn, srednik, BOM, bez naglowka.
     const MK_ALLE_HOST = 'salescenter.allegro.com';
     // Raporty zamowien przychodza w archiwach ZIP (jedno na miesiac). galxUnzip jest
     // uniwersalnym czytnikiem ZIP-a — nazwa mowi „xlsx", bo powstal dla Galaxusa, ale
@@ -20046,10 +20083,19 @@
         const h = w.map(function (x){ return String(x || '').trim(); });
         return h.indexOf('OrderId') >= 0 && h.indexOf('PaymentId') >= 0 && h.indexOf('SellerLogin') >= 0;
     }
+    // Plik importu Allegro: uklad kolumn jak w dzisiejszej aplikacji (A-K ze zrodla plus
+    // L..P), srednik, BOM, z naglowkiem. Wierszy bez dopasowanego zamowienia tu NIE MA —
+    // ida na osobna liste, bo import ma dostawac wylacznie to, co ma gdzie sie zaksiegowac
+    // (decyzja z 17.08.2026). Zwrotow tez nie ma: ksieguje sie je na ticketach, kazdy
+    // z wlasna data.
     function mkCsvAlle(p){
-        const linie = ((p && p.wOrd) || []).map(function (x){
-            return (x.r || []).map(function (c){ return (c == null) ? '' : String(c); }).join(';');
-        });
+        const pole = function (c){
+            const v = String(c == null ? '' : c);
+            return /[";\r\n]/.test(v) ? ('"' + v.replace(/"/g, '""') + '"') : v;
+        };
+        const linie = [];
+        if (p && p.naglowek && p.naglowek.length) linie.push(p.naglowek.map(pole).join(';'));
+        ((p && p.wOrd) || []).forEach(function (x){ linie.push((x.r || []).map(pole).join(';')); });
         return '\ufeff' + linie.join('\r\n') + '\r\n';
     }
     // Bramka przed wygenerowaniem pliku — ta sama zasada co przy Amazonie: lepiej nie dac
@@ -27948,7 +27994,10 @@
     // odczyt auftragu, porownanie, poprawianie — jest identyczna, wiec stoi w jednym miejscu.
     function typDane(job){
         const d = job && job.data;
-        return (d && (d.amz || d.mano)) || null;
+        // Allegro dolaczylo 17.08.2026. Wymagania sa te same co u Amazona i ManoMano:
+        // typ klienta per zamowienie (typOrd), oczekiwane konto sprzedazy (vatOrd)
+        // i wzorzec numeru zamowienia (wzorNr) — reszta kontroli jest wspolna.
+        return (d && (d.amz || d.mano || d.alle)) || null;
     }
     async function amzTypZPaczki(job, d, btn){
         const p = typDane(job);
@@ -28616,7 +28665,10 @@
         // grzebaniem w zaksiegowanych pozycjach — dlatego kontrola stoi PRZED, a nie obok.
         // Bramka obejmuje teraz takze ManoMano: typ decyduje o koncie VAT, a po
         // zaksiegowaniu jego poprawienie to juz grzebanie w zaksiegowanych pozycjach.
-        const jestAmz = !!(job.data && (job.data.amz || job.data.mano));
+        // Allegro dokladamy tu z tego samego powodu co ManoMano: typ klienta decyduje
+        // o koncie VAT (3209 albo 3292), a po zaksiegowaniu jego poprawienie to juz
+        // grzebanie w zaksiegowanych pozycjach. Kontrola ma stac PRZED ksiegowaniem.
+        const jestAmz = !!(job.data && (job.data.amz || job.data.mano || job.data.alle));
         const typOk = !jestAmz || !!jbNow.typChecked;
         const canBook = ok.length > 0 && !jbNow.booked && typOk;
         h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
@@ -28901,7 +28953,14 @@
         const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
         if (!d) return 'nie umiem odczytać daty wypłaty';
         if (j.kind === 'amz'){ const blok = amzBrakKont(j); if (blok) return blok; }
-        const dateIso = d[1] + '-' + d[2] + '-' + d[3];
+        if (j.kind === 'alle'){ const blok = alleBrakKont(j); if (blok) return blok; }
+        // Allegro nie ma JEDNEJ daty wyplaty: kazda wplata przychodzi w innym dniu, a data
+        // stoi przy KAZDYM wierszu pliku (kolumna „data"). Nadpisanie jedna data — pole
+        // „overwrite_original_date" w prologistics — zaksiegowaloby cala paczke na jeden
+        // dzien, czyli w tym przypadku wszystko na 16.08. Dlatego przy Allegro pole zostaje
+        // PUSTE i prologistics bierze date z wiersza. Przy pozostalych marketplace jedna
+        // data jest poprawna, bo tam jedna wyplata to jeden dzien.
+        const dateIso = (j.kind === 'alle') ? '' : (d[1] + '-' + d[2] + '-' + d[3]);
         const pairs = pairsOf(j);
         try {
             const fd = new FormData();
