@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.71
+// @version      4.75
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20235,7 +20235,11 @@
     // Kolejnosc sortowania z dzisiejszej aplikacji: B2B 0%, B2B, B2C, reszta na koniec.
     function amzSortKey(typ){ return ({ 'B2B 0%': 0, 'B2B': 1, 'B2C': 2 })[typ] != null ? ({ 'B2B 0%': 0, 'B2B': 1, 'B2C': 2 })[typ] : 999; }
     function mkParseAmz(text){
-        const s = String(text == null ? '' : text).replace(/^﻿/, '');
+        // Plik zrodlowy zostaje przy rozliczeniu — jedna z trzech zakladek Excela to on sam,
+        // wiersz w wiersz. Kilkaset kilobajtow na zlecenie, ale bez tego zakladki „Amazon"
+        // nie da sie odtworzyc po odswiezeniu strony.
+        const surowy = String(text == null ? '' : text).replace(/^﻿/, '');
+        const s = surowy;
         const linie = s.split(/\r?\n/);
         if (!linie.length || !linie[0]) return { err: 'pusty plik' };
         const hdr = linie[0].split('\t');
@@ -20405,6 +20409,12 @@
         // bo caly raport dotyczy jednego kraju; w arkuszu i tak stoi tam „de".
         doWyj.forEach(function (x){ if (!x.kraj) x.kraj = dom; });
 
+        // Zwroty w stanie SUROWYM — zanim doloza sie do nich SAFE-T i rekompensaty.
+        // Zakladka „Refunds" ma pokazywac to samo, co dzisiejsza aplikacja, a ta zna
+        // wylacznie wiersze o typie Refund. Zera zostaja, bo aplikacja tez ich nie usuwa.
+        const refCzyste = {};
+        Object.keys(ref).forEach(function (id){ refCzyste[id] = ref[id]; });
+
         // ---- lista zwrotow (idzie do ticketa, nie do importu) ----
         // Zwroty: w pliku ujemne -> na liste ida jako zwykly zwrot (wartosc bezwzgledna).
         // SAFE-T: w pliku dodatnie -> ksiegujemy ZE ZNAKIEM MINUS (refSign), bo to nie zwrot
@@ -20512,6 +20522,27 @@
                     + 'Zamówienie ' + x.order + ' · ' + f2(Math.abs(x.amt)) + ' ' + (cur || '') });
         });
 
+        // ---- wiersze zakladki „Refunds": ten sam uklad 35 kolumn co „Order" ----
+        // Roznice wzgledem zamowien sa dwie i obie sa w dzisiejszej aplikacji: w kolumnie G
+        // stoi „Refund", a kwota idzie jako WARTOSC BEZWZGLEDNA (w pliku zwroty sa ujemne).
+        const wRef = [];
+        Object.keys(refCzyste).forEach(function (id){
+            const typ = amzTyp(ptRef[id] || {});
+            const kr = ctryR[id] || dom;
+            const c = amzRow(id, Math.abs(refCzyste[id]), typ, kr, false);
+            c[6] = 'Refund';
+            wRef.push({ r: c, t: typ, id: id });
+        });
+        gw.filter(function (x){ return x.ref; }).forEach(function (x){
+            const c = amzRow(x.order, Math.abs(x.amt), '', x.ctry || dom, true);
+            c[6] = 'Refund';
+            wRef.push({ r: c, t: '', id: x.order });
+        });
+        wRef.sort(function (a, b){
+            const d = amzSortKey(a.t) - amzSortKey(b.t);
+            return d !== 0 ? d : String(a.id).localeCompare(String(b.id));
+        });
+
         const netOk = Math.abs(sumAll - total) < 0.01;
         return {
             setId: setId, payDate: payDate, cur: cur || 'EUR', shop: shop,
@@ -20536,7 +20567,7 @@
             doWyj: doWyj, nieznane: nieznane, typOrd: typOrd, vatOrd: vatOrd,
             prinOrd: prinOrd, taxOrd: taxOrd, skuOrd: skuOrd, dataOrd: dataOrd,   // v3.91
             doWyjSum: doWyj.reduce(function (a, x){ return r2(a + x.kwota); }, 0),
-            wOrd: wOrd,
+            wOrd: wOrd, wRef: wRef, raw: surowy,
             n: Object.keys(ord).length + Object.keys(ref).length
         };
     }
@@ -20548,6 +20579,45 @@
             return (x.r || []).map(function (c){ return (c == null) ? '' : String(c); }).join(';');
         });
         return '﻿' + linie.join('\r\n') + '\r\n';
+    }
+    // Skoroszyt z trzema zakladkami — dokladnie jak w dzisiejszej aplikacji:
+    //   „Amazon"  — plik zrodlowy przepisany wiersz w wiersz, bez naglowka od nas,
+    //   „Order"   — jeden wiersz na zamowienie, uklad 35 kolumn, z wierszem naglowka,
+    //   „Refunds" — to samo dla zwrotow, kwoty dodatnie.
+    // Naglowek stoi TYLKO w Excelu; plik „do prolo" CSV zostaje bez niego, tak jak dotad
+    // (aplikacja zapisuje do CSV order_rows[1:], czyli wiersze bez naglowka).
+    const MK_AMZ_NAG = (function (){
+        const h = new Array(35).fill('');
+        h[6] = 'Transaction Type'; h[7] = 'Order Number'; h[24] = 'Sum of Y + AG';
+        h[25] = 'Type'; h[26] = 'Account'; h[27] = 'VAT account';
+        return h;
+    })();
+    // Kwota w Excelu ma byc LICZBA, nie tekstem — inaczej nie da sie jej zsumowac
+    // w arkuszu. W CSV zostaje tekst z dwoma miejscami po przecinku, bo tego oczekuje
+    // prologistics. Zamieniamy wylacznie kolumne 24 i tylko wtedy, gdy naprawde jest liczba.
+    function amzDoArkusza(wiersze){
+        const out = [MK_AMZ_NAG.slice()];
+        (wiersze || []).forEach(function (x){
+            const c = (x.r || []).slice();
+            const v = Number(String(c[24] == null ? '' : c[24]).replace(',', '.'));
+            if (c[24] !== '' && isFinite(v)) c[24] = v;
+            out.push(c);
+        });
+        return out;
+    }
+    function mkXlsxAmz(p){
+        const X = getXLSX();
+        if (!X) return { err: 'brak biblioteki SheetJS — odśwież stronę' };
+        if (!p || !p.raw) return { err: 'to rozliczenie pochodzi ze starszej wersji HUB-a — wczytaj plik jeszcze raz' };
+        const wb = X.utils.book_new();
+        // Zakladka 1: plik zrodlowy. Tabulatory rozbijamy sami, zeby kazda kolumna
+        // wyladowala w swojej — SheetJS nie zgadnie separatora z gotowego tekstu.
+        const aoa = String(p.raw).split(/\r?\n/).map(function (l){ return l.split('\t'); });
+        while (aoa.length && aoa[aoa.length - 1].length === 1 && aoa[aoa.length - 1][0] === '') aoa.pop();
+        X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(aoa), 'Amazon');
+        X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(amzDoArkusza(p.wOrd)), 'Order');
+        X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(amzDoArkusza(p.wRef)), 'Refunds');
+        return { bytes: X.write(wb, { bookType: 'xlsx', type: 'array' }) };
     }
     // v3.84: bramka przed wygenerowaniem pliku. Wolimy nie dac pliku wcale niz dac plik
     // z pusta kolumna konta VAT — prologistics przyjmie taki wiersz i zaksieguje go bylejak,
@@ -21500,7 +21570,7 @@
     async function hdSprawdzJeden(nr){
         const st = hdStan[nr] = { kand: [] };
         const f = await crFind(nr);
-        const nums = f.nums || [];
+        const nums = f.nums || [], skreslone = f.skreslone || {};
         if (!nums.length){ st.stan = 'brak'; st.err = f.err || ''; return; }
         for (let k = 0; k < nums.length; k++){
             let html = '';
@@ -21516,6 +21586,7 @@
             });
             st.kand.push({ num: nums[k], open: crOpen(d), tickety: tick,
                            deleted: !!d.querySelector('.auftrag-status--deleted'),
+                           skreslony: !!skreslone[nums[k]],
                            err: d.querySelector('form#book') ? '' : 'brak formularza płatności' });
         }
         st.stan = 'sprawdzone';
@@ -21549,6 +21620,27 @@
     //                       zaksiegowal 26419421, 26424190, 26424777 i 26425055 — co do grosza).
     //   cokolwiek innego  → nie zgadujemy. Nadplaty w auftragu nie cofa sie jednym
     //                       klknieciem, wiec zamowienie idzie do rozstrzygniecia recznego.
+    // Co DOKLADNIE zaksiegowaloby sie, gdyby to wlasnie ten auftrag byl tym wlasciwym.
+    // Bez tego podsumowanie pokazywalo surowa sume zwrotow i rabatow z pliku — dla 26432459
+    // „na ticket 157.99", podczas gdy przy open amount 129.99 zwrot znosi jedna z dwoch
+    // wplat i na ticket idzie sam rabat 28.00. Liczba byla nie tyle nieprecyzyjna, co
+    // po prostu nieprawdziwa dla tego wariantu.
+    function hdCoByZaksiegowal(z, c){
+        if (!z || !c || c.open == null) return '';
+        const maTicket = (c.tickety || []).length > 0;
+        const pelnyTicket = r2((z.zwrPelny || 0) + (z.rabSuma || 0));
+        const nettoTicket = r2((z.reszta || 0) + (z.rabSuma || 0));
+        if (Math.abs(c.open) <= 0.005){
+            if (!maTicket) return '';
+            if (z.znoszaSie) return (z.rabSuma > 0.005) ? ('do ticketu sam rabat ' + f2(z.rabSuma)) : 'nic do zaksięgowania';
+            return 'wszystko do ticketu: wpłaty ' + f2(z.pelna) + ' na minus, zwroty i rabaty ' + f2(pelnyTicket);
+        }
+        if (Math.abs(c.open - z.pelna) <= 0.005)
+            return 'do auftragu ' + f2(z.pelna) + (pelnyTicket > 0.005 ? (', na ticket ' + f2(pelnyTicket)) : '');
+        if (z.netto > 0.005 && Math.abs(c.open - z.netto) <= 0.005)
+            return 'do auftragu ' + f2(z.netto) + (nettoTicket > 0.005 ? (', na ticket ' + f2(nettoTicket)) : '');
+        return '';
+    }
     function hdUstalTryb(p, nr){
         const z = p && p.zam && p.zam[nr];
         if (!z) return { tryb: 'netto', opis: '' };
@@ -21556,9 +21648,15 @@
         if (!st || !st.stan) return { tryb: 'netto', opis: 'nie sprawdzone' };
         if (st.stan === 'brak')
             return { tryb: 'nic', opis: 'nie ma auftragu o tym numerze' + (st.err ? (' (' + st.err + ')') : '') };
-        const zywe = (st.kand || []).filter(function (c){ return !c.deleted && !c.err; });
+        const zywe = (st.kand || []).filter(function (c){ return !c.deleted && !c.skreslony && !c.err; });
+        const skre = (st.kand || []).filter(function (c){ return c.skreslony; }).length;
+        // Ile odpadlo — dopisujemy do opisu, zeby bylo widac, ze cos zostalo pominiete,
+        // a nie ze wyszukiwarka nagle znajduje mniej.
+        const pominiete = skre ? (' (pominięto ' + skre + ' przekreślonych w wyszukiwarce)') : '';
         if (!zywe.length)
-            return { tryb: 'nic', opis: 'auftrag jest, ale skasowany albo bez formularza płatności' };
+            return { tryb: 'nic', opis: skre
+                        ? ('wszystkie ' + skre + ' trafienia są przekreślone w wyszukiwarce — auftrag skasowany')
+                        : 'auftrag jest, ale skasowany albo bez formularza płatności' };
         if (zywe.length > 1){
             // Kilka auftragow pod jednym numerem fulfilmentu. Nie zgadujemy — ale KAZDY z nich
             // zostal juz odczytany, wiec open amount i tickety mamy pod reka. Samo „rozstrzygnij
@@ -21573,14 +21671,13 @@
             };
             const opisy = zywe.map(function (k){
                 const t = (k.tickety || []).length ? ('ticket ' + k.tickety.join('/')) : 'bez ticketu';
-                const pas = pasuje(k);
+                const co = pasuje(k) ? hdCoByZaksiegowal(z, k) : '';
                 return k.num + ' (open ' + (k.open == null ? '?' : f2(k.open)) + ', ' + t + ')'
-                     + (pas === 'pelny' ? ' ← pasuje do wpłat ' + f2(z.pelna)
-                     : (pas === 'netto' ? ' ← pasuje do wpłat po skompensowaniu ' + f2(z.netto) : ''));
+                     + (co ? (' ← pasuje: ' + co) : '');
             });
             const trafne = zywe.filter(function (k){ return !!pasuje(k); });
             return { tryb: 'recznie', kand: zywe, trafne: trafne,
-                     opis: zywe.length + ' auftragi o tym numerze: ' + opisy.join(' · ')
+                     opis: zywe.length + ' auftragi o tym numerze' + pominiete + ': ' + opisy.join(' · ')
                          + (trafne.length === 1
                              ? ' — kwotowo pasuje tylko ' + trafne[0].num + ', ale nie księguję bez Twojej decyzji'
                              : ' — rozstrzygnij ręcznie') };
@@ -21613,11 +21710,11 @@
             ? ' — UWAGA: nie ma ticketu, zwroty ' + f2(naTicket) + ' nie mają gdzie się zaksięgować' : '';
         if (Math.abs(open - z.pelna) <= 0.005)
             return { tryb: 'pelny', num: c.num, tickety: c.tickety,
-                     opis: 'open amount ' + f2(open) + ' = wszystkie wpłaty — wpłaty do auftragu ' + c.num
+                     opis: pominiete + 'open amount ' + f2(open) + ' = wszystkie wpłaty — wpłaty do auftragu ' + c.num
                          + (naTicket > 0.005 ? (', zwroty i rabaty ' + f2(naTicket) + ' do ticketu ' + tick) : '') + bezTicketu };
         if (Math.abs(open - z.netto) <= 0.005 && z.netto > 0.005)
             return { tryb: 'netto', num: c.num, tickety: c.tickety,
-                     opis: 'open amount ' + f2(open) + ' = wpłaty po skompensowaniu — do auftragu ' + c.num + ' idzie ' + f2(z.netto)
+                     opis: pominiete + 'open amount ' + f2(open) + ' = wpłaty po skompensowaniu — do auftragu ' + c.num + ' idzie ' + f2(z.netto)
                          + (z.reszta > 0.005 ? (', na ticket ' + f2(z.reszta)) : '')
                          + (z.rabSuma > 0.005 ? (', rabat ' + f2(z.rabSuma) + ' osobno') : '') + bezTicketu };
         return { tryb: 'recznie', num: c.num, tickety: c.tickety, kand: zywe,
@@ -21691,22 +21788,19 @@
         const wiersze = lst.map(function (x){
             const z = (p.zam && p.zam[x.nr]) || {};
             const w = (p.werdykt && p.werdykt[x.nr]) || {};
-            const naTicket = r2((z.zwrPelny || 0) + (z.rabSuma || 0));
-            const kwoty = 'wpłaty ' + f2(z.pelna || 0)
-                        + ((z.netto != null && Math.abs(z.netto - (z.pelna || 0)) > 0.005)
-                            ? (' → po skompensowaniu ' + f2(z.netto)) : '')
-                        + (naTicket > 0.005 ? (' · na ticket ' + f2(naTicket)) : '');
+            // W naglowku sam OPIS PLIKU — bez liczby „na ticket", bo ile na ticket pojdzie,
+            // zalezy od tego, ktory auftrag okaze sie wlasciwy. Kwota stoi wiec przy kandydacie.
             const kand = (w.kand || []).map(function (k){
-                const pas = (w.trafne || []).some(function (t){ return t.num === k.num; });
+                const co = hdCoByZaksiegowal(z, k);
                 return '<div style="margin-left:14px">'
                      + '<a href="/auction.php?number=' + encodeURIComponent(k.num) + '&txnid=3" target="_blank"'
                      + ' style="font-family:monospace;color:#2563eb">' + esc(k.num) + '</a>'
                      + ' · open ' + (k.open == null ? '?' : f2(k.open))
                      + ' · ' + ((k.tickety || []).length ? ('ticket ' + esc(k.tickety.join('/'))) : 'bez ticketu')
-                     + (pas ? ' <b style="color:#0a7a2f">← pasuje kwotowo</b>' : '')
+                     + (co ? (' <b style="color:#0a7a2f">← ' + esc(co) + '</b>') : '')
                      + '</div>';
             }).join('');
-            return '<div style="margin-top:4px"><b>' + esc(x.nr) + '</b> — ' + kwoty + '</div>'
+            return '<div style="margin-top:4px"><b>' + esc(x.nr) + '</b> — ' + esc(hdPowod(p, x.nr)) + '</div>'
                  + (kand || ('<div style="margin-left:14px;color:#666">' + esc(x.powod || '') + '</div>'));
         }).join('');
         return '<div style="margin-top:6px;padding-top:5px;border-top:1px dashed #d9d2c4">'
@@ -25276,6 +25370,9 @@
                   +  ((j.kind === 'hd' && j.data.hd && hdDoSprawdzenia(j.data.hd).length)
                         ? '<button class="mk-hdauf" data-ref="' + esc(j.ref) + '" title="Dla zamówień, których nie da się rozstrzygnąć z pliku, sprawdza auftrag: czy jest, czy ma open amount i czy wisi na nim ticket" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udd0d Sprawdź auftragi (' + hdDoSprawdzenia(j.data.hd).length + ')</button>'
                         : '')
+                  +  ((j.kind === 'amz' && j.data.amz && j.data.amz.raw)
+                        ? '<button class="mk-amzxls" data-ref="' + esc(j.ref) + '" title="Skoroszyt z trzema zakładkami: plik źródłowy, Order i Refunds — układ jak w dotychczasowej aplikacji" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udcd7 Excel (3 zakładki)</button>'
+                        : '')
                   +  ((j.data.amz && j.data.amz.doWyj && j.data.amz.doWyj.length)
                         ? '<button class="mk-cpw" data-ref="' + esc(j.ref) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + j.data.amz.doWyj.length + ')</button> '
                         : '')
@@ -25299,6 +25396,7 @@
         }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-amzxls').forEach(function (b){ b.onclick = function(){ doAmzXlsx(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-wfraw').forEach(function (b){ b.onclick = function(){ doWayfRaw(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-hdnz').forEach(function (b){ b.onclick = function(){ doHdNieZaks(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-hdauf').forEach(function (b){ b.onclick = function(){ doHdAuftragi(b.getAttribute('data-ref'), b); }; });
@@ -27011,6 +27109,46 @@
     }
     // Paycomment to zwykly <input>, wiec wielolinijkowy opis trzeba splaszczyc.
     function crFlat(t){ return String(t || '').replace(/\s+/g, ' ').trim().slice(0, 250); }
+    // Wiersz wyniku wyszukiwania bywa PRZEKRESLONY — tak prologistics pokazuje auftragi,
+    // ktorych juz nie ma. Przy numerze fulfilmentu 26432459 wyszukiwarka oddaje cztery
+    // trafienia, ale trzy to skasowane zamowienia z 2019 roku (Beliani USA), przekreslone
+    // w tabeli; zywy jest jeden (14999003, Beliani NL). Strona auftragu w surowym HTML
+    // tego nie zdradza — klasa „auftrag-status--deleted" pojawia sie dopiero po wykonaniu
+    // skryptow strony, a my czytamy HTML prosto z fetch. Czytamy wiec z wiersza wyszukiwarki.
+    //
+    // Przekreslenie rozpoznajemy na trzy sposoby, bo nie wiadomo, ktorym je zrobiono:
+    // znacznikiem <s>/<strike>/<del>, stylem line-through albo nazwa klasy. Kazdy z nich
+    // znaczy w tabeli wynikow to samo — „ten wiersz juz nie liczy sie". Gdyby prologistics
+    // robil to jeszcze inaczej, nie rozpoznamy niczego i zostaje zachowanie sprzed zmiany:
+    // wszystkie trafienia ida dalej i zamowienie czeka na reczne rozstrzygniecie.
+    function crSkreslony(a){
+        const stylOk = function (el){
+            const st = (el.getAttribute && el.getAttribute('style')) || '';
+            if (/line-through/i.test(st)) return true;
+            const kl = (el.getAttribute && el.getAttribute('class')) || '';
+            return /delet|strike|skresl|cancel/i.test(kl);
+        };
+        let el = a;
+        for (let i = 0; i < 8 && el; i++){
+            const nm = String(el.localName || '').toLowerCase();
+            if (nm === 's' || nm === 'strike' || nm === 'del') return true;
+            if (stylOk(el)) return true;
+            if (nm === 'tr') return false;
+            el = el.parentElement;
+        }
+        return false;
+    }
+    // Przekreslenie bywa zalozone nie nad linkiem, tylko gdzies indziej w wierszu —
+    // wtedy patrzymy na caly wiersz. Osobno, bo tu wystarczy JEDEN przekreslony element.
+    function crSkreslonyWiersz(a){
+        const tr = (a.closest && a.closest('tr')) || null;
+        if (!tr) return false;
+        if (tr.querySelector('s, strike, del')) return true;
+        const st = tr.getAttribute('style') || '';
+        if (/line-through/i.test(st)) return true;
+        const kl = tr.getAttribute('class') || '';
+        return /delet|strike|skresl|cancel/i.test(kl);
+    }
     async function crFind(ff){
         // Tak samo jak „Ksiegowanie w auftragu": search.php po numerze FF. Przy jednym
         // trafieniu serwer przekierowuje prosto na auftrag, przy kilku oddaje liste.
@@ -27019,18 +27157,24 @@
             res = await fetch('/search.php?what=ff_number&ff_number=' + encodeURIComponent(ff), { credentials: 'same-origin' });
             html = await res.text();
         } catch (e){ return { nums: [], err: 'brak połączenia z prologistics' }; }
-        const nums = [], m = String((res && res.url) || '').match(/auction\.php\?number=(\d+)/i);
-        if (m) nums.push(m[1]);
+        const nums = [], skreslone = {};
+        const m = String((res && res.url) || '').match(/auction\.php\?number=(\d+)/i);
+        if (m) nums.push(m[1]);                       // jedno trafienie: serwer przekierowal
         if (!nums.length){
             const doc = new DOMParser().parseFromString(html, 'text/html');
             doc.querySelectorAll('a[href*="auction.php?number="]').forEach(function (a){
                 const h = a.getAttribute('href') || '';
                 if (h.indexOf('shipping_auction.php') >= 0) return;
                 const mm = h.match(/number=(\d+)/);
-                if (mm && nums.indexOf(mm[1]) < 0) nums.push(mm[1]);
+                if (!mm || nums.indexOf(mm[1]) >= 0) return;
+                nums.push(mm[1]);
+                if (crSkreslony(a) || crSkreslonyWiersz(a)) skreslone[mm[1]] = 1;
             });
         }
-        return { nums: nums, err: nums.length ? '' : 'nie znajduję auftragu dla ' + ff };
+        // Kto pyta o same numery, dostaje je jak dotad — „skreslone" jest dodatkiem
+        // i zaden z pozostalych modulow nie musi o nim wiedziec.
+        return { nums: nums, skreslone: skreslone,
+                 err: nums.length ? '' : 'nie znajduję auftragu dla ' + ff };
     }
     // „Auftrag value - Total of Payments" stoi na stronie DWA razy: w podsumowaniu tabeli
     // Payments (w <b>) i jako zwykly tekst w komentarzu wczesniejszego ksiegowania.
@@ -29847,6 +29991,23 @@
     // Zapis rozliczenia Wayfaira tak, jak przyszlo z portalu — bajt w bajt, bez naszych
     // przeliczen. Przy zleceniu zatrzymanym na kontroli numeru to jedyny sposob, zeby
     // zobaczyc, co Wayfair faktycznie przyslal.
+    function doAmzXlsx(ref){
+        const j = jobsLoad()[ref];
+        const p = j && j.data && j.data.amz;
+        if (!p){ say('To nie jest rozliczenie Amazona.', '#c47f00'); return; }
+        const w = mkXlsxAmz(p);
+        if (w.err){ say(w.err, '#c00'); return; }
+        // Nazwa jak przy pozostalych plikach tego modulu: data wyplaty i sklep.
+        const nazwa = (p.payDate || '') + ' ' + (p.shop || 'Amazon') + ' ' + f2(p.net) + ' ' + (p.cur || '') + '.xlsx';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([w.bytes],
+            { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+        a.download = nazwa.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim();
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+        say('Zapisano ' + a.download + ' — zakładki: Amazon (' + (String(p.raw).split(/\r?\n/).length - 1)
+            + ' wierszy), Order (' + (p.wOrd || []).length + '), Refunds (' + (p.wRef || []).length + ').');
+    }
     function doWayfRaw(ref){
         const j = jobsLoad()[ref];
         const p = j && j.data && j.data.wayf;
@@ -30687,12 +30848,33 @@
         // zwrocone w calosci, wiec auftragu moze juz nie byc i nie ma czego ksiegowac.
         const refs = (job.data && job.data.ref) || {};
 
+        // Grosze roznicy to zaokraglenie, a nie blad — takie wiersze mozna wyrownac hurtem.
+        const tol = tolGet();
+        const near = chk.filter(function (x){
+            const o = impNum(x.open_amount);
+            return o != null && Math.abs(o) <= tol && String(x.auction_number || '').trim();
+        });
+        // Wiersze, w ktorych na auftragu NIE MA juz nic do zaplaty. Prologistics oznacza je
+        // jako CHECK, bo wplata nie zgadza sie z zerem — ale to nie jest rozbieznosc do
+        // wyjasnienia, tylko normalny skutek drugiej wplaty do tego samego auftragu.
+        // Nie znikaja, przestaja tylko krzyczec: przy jednym uruchomieniu dziewiec z dziesieciu
+        // wierszy CHECK to byly wlasnie zera i jedyny prawdziwy rozjazd gubil sie miedzy nimi.
+        const zeroOpen = chk.filter(function (x){
+            const o = impNum(x.open_amount);
+            return o != null && Math.abs(o) <= tol;
+        });
+        const doWyj = chk.filter(function (x){ return zeroOpen.indexOf(x) < 0; });
+
         let h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
               + '<b style="font-size:11px;color:#5b21b6">Paczka importu ' + esc(job.impId) + '</b>'
               + '<a href="/react/settings_page/import_payments/' + esc(job.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
               + '<span style="font-size:11px;color:#666">wierszy ' + rows.length + '</span>';
         Object.keys(by).sort().forEach(function (s){
-            h += '<span style="font-size:11px;color:' + esc(col[s] || '#374151') + ';font-weight:700">' + esc(s) + ': ' + by[s].length + '</span>';
+            // Przy CHECK dopisujemy, ile z tego zostaje naprawde do wyjasnienia — inaczej
+            // licznik u gory mowilby „10", a sekcja nizej „1", i nie wiadomo, ktore prawdziwe.
+            const doda = (s === 'CHECK' && zeroOpen.length) ? (' (do wyjaśnienia ' + doWyj.length + ')') : '';
+            h += '<span style="font-size:11px;color:' + esc(col[s] || '#374151') + ';font-weight:700">'
+              +  esc(s) + ': ' + by[s].length + esc(doda) + '</span>';
         });
         h += '</div>';
 
@@ -30702,24 +30884,16 @@
               +  '<div style="font-size:10px;color:#7c2d12;margin-top:2px">Były wczytane wcześniej — sprawdź, czy nie księgujesz drugi raz: '
               +  esc(seen.slice(0, 12).map(function (x){ return x.payment_descr; }).join(', ')) + (seen.length > 12 ? ' … +' + (seen.length - 12) : '') + '</div></div>';
         }
-        // Grosze roznicy to zaokraglenie, a nie blad — takie wiersze mozna wyrownac
-        // hurtem. Wieksza roznica zostaje do wyjasnienia i nikt jej nie rusza.
-        const tol = tolGet();
-        const near = chk.filter(function (x){
-            const o = impNum(x.open_amount);
-            return o != null && Math.abs(o) <= tol && String(x.auction_number || '').trim();
-        });
-        if (chk.length){
-            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c47f00">CHECK — kwota nie zgadza się z open amount (' + chk.length + ')</b>'
-              +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
-              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Zamówienie</td><td style="padding:1px 6px;text-align:right">Wpłata</td>'
-              +  '<td style="padding:1px 6px;text-align:right">Open amount</td><td style="padding:1px 6px;text-align:right">Różnica</td><td style="padding:1px 6px">Auftrag</td></tr>';
-            chk.forEach(function (x){
+        const chkTabela = function (lista){
+            let t = '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+                  + '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Zamówienie</td><td style="padding:1px 6px;text-align:right">Wpłata</td>'
+                  + '<td style="padding:1px 6px;text-align:right">Open amount</td><td style="padding:1px 6px;text-align:right">Różnica</td><td style="padding:1px 6px">Auftrag</td></tr>';
+            lista.forEach(function (x){
                 const a = impNum(x.amount), o = impNum(x.open_amount);
                 const df = (a != null && o != null) ? r2(a - o) : null;
                 const au = impAuction(x);
                 const small = o != null && Math.abs(o) <= tol;
-                h += '<tr style="border-top:1px solid #f1f5f9' + (small ? ';background:#f0fdf4' : '') + '"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
+                t += '<tr style="border-top:1px solid #f1f5f9' + (small ? ';background:#f0fdf4' : '') + '"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + (small ? '#0a7a2f' : '#c00') + '">'
@@ -30727,8 +30901,26 @@
                   +  '<td style="padding:2px 6px">' + (au
                         ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td></tr>';
             });
-            h += '</table>'
-              +  '<div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+            return t + '</table>';
+        };
+        if (chk.length){
+            h += '<div style="margin:6px 0">';
+            // Prawdziwe rozjazdy — tylko one na czerwono i tylko one w naglowku.
+            if (doWyj.length){
+                h += '<b style="font-size:11px;color:#c47f00">CHECK — kwota nie zgadza się z open amount ('
+                  +  doWyj.length + ')</b>' + chkTabela(doWyj);
+            }
+            // Zera zwiniete pod jedna linijke — sa pod reka, ale nie zajmuja uwagi.
+            if (zeroOpen.length){
+                h += '<details' + (doWyj.length ? ' style="margin-top:6px"' : '') + '>'
+                  +  '<summary style="font-size:11px;color:#0a7a2f;cursor:pointer;font-weight:700">'
+                  +  'Open amount 0 — auftrag nie ma już nic do zapłaty (' + zeroOpen.length + ')</summary>'
+                  +  '<div style="font-size:10px;color:#888;margin-top:2px">Prologistics oznacza je jako CHECK, bo wpłata '
+                  +  'nie zgadza się z zerem. Tak wygląda druga wpłata do tego samego auftragu — nie ma tu czego wyjaśniać.</div>'
+                  +  chkTabela(zeroOpen)
+                  +  '</details>';
+            }
+            h += '<div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
               +  '<span style="font-size:10px;color:#666">grosze do wyrównania: do</span>'
               +  '<input id="mk-tol" value="' + tol.toFixed(2) + '" style="width:46px;font-size:10px;text-align:right">'
               +  '<button id="mk-tol-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
