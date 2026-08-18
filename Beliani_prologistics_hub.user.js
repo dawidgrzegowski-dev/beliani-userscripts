@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.70
+// @version      4.71
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21589,7 +21589,9 @@
         const tick = (c.tickety || []).join(', ');
         const naTicket = r2(z.zwrPelny + z.rabSuma);
         if (open == null)
-            return { tryb: 'recznie', num: c.num, tickety: c.tickety,
+            // Kandydata zapamietujemy nawet przy jednym auftragu — podsumowanie pokazuje
+            // z niego numer i link, a bez tego zostawalo samo zdanie bez punktu zaczepienia.
+            return { tryb: 'recznie', num: c.num, tickety: c.tickety, kand: zywe,
                      opis: 'nie odczytałem open amount z auftragu ' + c.num + ' — rozstrzygnij ręcznie' };
         if (Math.abs(open) <= 0.005){
             if (!maTicket)
@@ -21618,7 +21620,7 @@
                      opis: 'open amount ' + f2(open) + ' = wpłaty po skompensowaniu — do auftragu ' + c.num + ' idzie ' + f2(z.netto)
                          + (z.reszta > 0.005 ? (', na ticket ' + f2(z.reszta)) : '')
                          + (z.rabSuma > 0.005 ? (', rabat ' + f2(z.rabSuma) + ' osobno') : '') + bezTicketu };
-        return { tryb: 'recznie', num: c.num, tickety: c.tickety,
+        return { tryb: 'recznie', num: c.num, tickety: c.tickety, kand: zywe,
                  opis: 'open amount ' + f2(open) + ' nie zgadza się ani z wpłatami ' + f2(z.pelna)
                      + ', ani z ' + f2(z.netto) + ' po skompensowaniu — rozstrzygnij ręcznie' };
     }
@@ -21679,6 +21681,38 @@
             nWplTicket: p.nWplTicket
         };
     }
+    // Rozpiska zamowien do rozstrzygniecia recznie — wprost w panelu, z numerem auftragu,
+    // kwotami i linkiem, w ktory da sie kliknac. Dotad panel mowil tylko „1 zamowien do
+    // rozstrzygniecia recznego", a zeby dowiedziec sie CZEGO i GDZIE, trzeba bylo pobrac
+    // plik nieksiegowanych — w ktorym i tak nie ma linku.
+    function hdRecznieHtml(p){
+        const lst = (p && p.doRecznie) || [];
+        if (!lst.length) return '';
+        const wiersze = lst.map(function (x){
+            const z = (p.zam && p.zam[x.nr]) || {};
+            const w = (p.werdykt && p.werdykt[x.nr]) || {};
+            const naTicket = r2((z.zwrPelny || 0) + (z.rabSuma || 0));
+            const kwoty = 'wpłaty ' + f2(z.pelna || 0)
+                        + ((z.netto != null && Math.abs(z.netto - (z.pelna || 0)) > 0.005)
+                            ? (' → po skompensowaniu ' + f2(z.netto)) : '')
+                        + (naTicket > 0.005 ? (' · na ticket ' + f2(naTicket)) : '');
+            const kand = (w.kand || []).map(function (k){
+                const pas = (w.trafne || []).some(function (t){ return t.num === k.num; });
+                return '<div style="margin-left:14px">'
+                     + '<a href="/auction.php?number=' + encodeURIComponent(k.num) + '&txnid=3" target="_blank"'
+                     + ' style="font-family:monospace;color:#2563eb">' + esc(k.num) + '</a>'
+                     + ' · open ' + (k.open == null ? '?' : f2(k.open))
+                     + ' · ' + ((k.tickety || []).length ? ('ticket ' + esc(k.tickety.join('/'))) : 'bez ticketu')
+                     + (pas ? ' <b style="color:#0a7a2f">← pasuje kwotowo</b>' : '')
+                     + '</div>';
+            }).join('');
+            return '<div style="margin-top:4px"><b>' + esc(x.nr) + '</b> — ' + kwoty + '</div>'
+                 + (kand || ('<div style="margin-left:14px;color:#666">' + esc(x.powod || '') + '</div>'));
+        }).join('');
+        return '<div style="margin-top:6px;padding-top:5px;border-top:1px dashed #d9d2c4">'
+             + '<div style="color:#c47f00;font-weight:700">Do rozstrzygnięcia ręcznie (' + lst.length + '):</div>'
+             + wiersze + '</div>';
+    }
     function hdPodsumowanieHtml(p){
         const s = hdPodsumowanie(p);
         if (!s) return '';
@@ -21710,10 +21744,7 @@
                  ? ('<div style="margin-top:4px;color:#c47f00">' + brakuje
                     + ' zamówień jeszcze nie sprawdzonych w prologistics — użyj „Sprawdź auftragi".</div>')
                  : '')
-             + (s.nRecznie
-                 ? ('<div style="margin-top:4px;color:#c47f00">' + s.nRecznie
-                    + ' zamówień do rozstrzygnięcia ręcznego — są na liście nieksięgowanych z powodem.</div>')
-                 : '')
+             + hdRecznieHtml(p)
              + '</div>';
     }
 
