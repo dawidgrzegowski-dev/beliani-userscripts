@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.57
+// @version      4.62
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21136,11 +21136,16 @@
         const x = parseFloat(t.replace(/\s/g, '').replace(',', '.'));
         return isFinite(x) ? x : null;
     }
+    // Homedeco oddaje plik W JEZYKU INTERFEJSU. Lipiec przyszedl po angielsku, sierpien
+    // z niderlandzkim „Korting" zamiast „Discount" — 11 wierszy, ktore przy samym
+    // angielskim wzorcu wypadlyby jako „nieznany rodzaj operacji" i cicho zniknely
+    // z listy do ticketow. To samo zdarzylo sie kiedys przy Cnovie (francuski i angielski
+    // eksport tego samego panelu), wiec rodzaj rozpoznajemy w obu jezykach.
     function hdRodzaj(opis){
         const t = String(opis == null ? '' : opis).trim().toLowerCase();
         if (t.indexOf('purchase refund') === 0) return 'zwrot';
         if (t.indexOf('purchase') === 0) return 'wplata';
-        if (t.indexOf('discount') === 0) return 'rabat';
+        if (t.indexOf('discount') === 0 || t.indexOf('korting') === 0) return 'rabat';
         return 'inne';
     }
     function hdData(v){
@@ -21187,7 +21192,21 @@
 
         const ord = Object.create(null), ordData = Object.create(null);
         const ref = Object.create(null), refNote = Object.create(null), refData = Object.create(null);
+        // refSign = -1 znaczy: na liscie zwrotow ta pozycja ma isc Z MINUSEM, zeby
+        // w tickecie zaksiegowala sie NA PLUS. Tak wychodza pozycje, po ktorych pieniadze
+        // wracaja do nas — cofniety rabat albo wplata, ktorej nie ma gdzie zaksiegowac
+        // w auftragu. Wspolna lista zwrotow zna to pole od dawna (refPozycje), wiec
+        // wystarczy je wypelnic.
+        const refSign = Object.create(null);
         const wOrd = [], znosza = [], pominiete = [], zostajeZwrot = [];
+        // czesciowe — zamowienia, w ktorych zwrot obejmowal wiecej sztuk niz wplata z tego
+        // pliku; niepelne — takie, gdzie zwrot pokryl wiersz wplaty tylko czesciowo
+        // i celowo NIC z nim nie zrobilismy.
+        const czesciowe = [], niepelne = [];
+        // Kazdy wiersz zrodla, ktory NIE wchodzi do importu, razem z powodem. Z tego
+        // powstaje osobny plik — nie po to, zeby cokolwiek blokowac, tylko zeby dalo sie
+        // sprawdzic, co zostalo poza plikiem i dlaczego.
+        const nieZaks = [];
         let nWpl = 0, nZwr = 0, nRab = 0, sumaWpl = 0, sumaZwr = 0, sumaNetto = 0;
 
         kolejnosc.forEach(function (nr){
@@ -21198,37 +21217,91 @@
             const rab = poz.filter(function (p){ return p.rodzaj === 'rabat'; });
             // Korekty prowizji: „Purchase" bez ceny. Nie ksieguja sie — ale maja byc widoczne.
             poz.forEach(function (p){
-                if (p.rodzaj === 'wplata' && !p.brutto)
+                if (p.rodzaj === 'wplata' && !p.brutto){
                     pominiete.push({ nr: nr, kwota: p.netto, data: p.data, opis: p.opis, powod: 'korekta prowizji — bez kwoty brutto' });
-                else if (p.rodzaj === 'inne')
+                    nieZaks.push({ pola: p.pola, powod: 'korekta prowizji — nie księgujemy' });
+                } else if (p.rodzaj === 'inne'){
                     pominiete.push({ nr: nr, kwota: p.netto, data: p.data, opis: p.opis, powod: 'nieznany rodzaj operacji' });
+                    nieZaks.push({ pola: p.pola, powod: 'nieznany rodzaj operacji' });
+                }
             });
             // Kompensata: zwrot znosi wplate o TEJ SAMEJ kwocie brutto.
-            const woln = wpl.slice(), zwrW = [];
+            const woln = wpl.slice(), zwrW = [], pary = [];
             zwr.forEach(function (z){
                 let i = -1;
                 for (let k = 0; k < woln.length; k++) if (Math.abs(woln[k].brutto - z.brutto) < 0.005){ i = k; break; }
-                if (i >= 0) woln.splice(i, 1); else zwrW.push(z);
+                if (i >= 0){ pary.push({ wplata: woln[i], zwrot: z }); woln.splice(i, 1); }
+                else zwrW.push(z);
+            });
+            // Skompensowana para nie wchodzi do importu — ale ma byc widoczna, bo to
+            // wlasnie tu zapada decyzja „ksiegowac oba czy nic".
+            pary.forEach(function (pr){
+                nieZaks.push({ pola: pr.wplata.pola, powod: 'wpłata skompensowana zwrotem — sprawdź auftrag' });
+                nieZaks.push({ pola: pr.zwrot.pola,  powod: 'zwrot kompensujący wpłatę — sprawdź auftrag' });
             });
             const skompensowane = wpl.length - woln.length;
+            // Po dopasowaniu wiersz-w-wiersz zostaja czasem zwroty, ktore nie pasuja do zadnej
+            // pojedynczej wplaty, bo obejmuja WIECEJ SZTUK niz kupiono w tym rozliczeniu.
+            // Order 26428847 (sierpien): „Purchase (1x BODLA) 79.99" i „Purchase refund
+            // (2x BODLA) 159.98" — druga sztuka zostala oplacona w poprzednim rozliczeniu.
+            // Taki zwrot najpierw GASI wplaty z tego pliku, a dopiero reszta idzie na ticket.
+            // Bez tego wplata szla do importu (a nie ma czego ksiegowac) i caly zwrot na
+            // ticket (a nalezy sie tylko czesc).
+            //
+            // Gasimy wylacznie CALE wiersze: plik importu ma zawierac wiersze zrodlowe
+            // przepisane co do znaku, wiec wpisania tam kwoty czesciowej nie da sie zrobic
+            // uczciwie. Gdy zwrot pokrywa wiersz tylko czesciowo, zostawiamy wszystko tak,
+            // jak jest, i mowimy o tym wprost.
+            let zwrotReszta = r2(zwrW.reduce(function (a, z){ return a + z.brutto; }, 0));
+            const zgaszone = [];
+            while (zwrotReszta > 0.005 && woln.length){
+                const w0 = woln[0];
+                if (w0.brutto - zwrotReszta > 0.005) break;       // nie pokrywa calego wiersza
+                zwrotReszta = r2(zwrotReszta - w0.brutto);
+                zgaszone.push(w0);
+                nieZaks.push({ pola: w0.pola, powod: 'wpłata zgaszona zwrotem obejmującym więcej sztuk — sprawdź auftrag' });
+                woln.shift();
+            }
+            if (zgaszone.length){
+                czesciowe.push({ nr: nr,
+                                 zgaszono: r2(zgaszone.reduce(function (a, x){ return a + x.brutto; }, 0)),
+                                 zwrotem: r2(zwrW.reduce(function (a, z){ return a + z.brutto; }, 0)),
+                                 zostaje: zwrotReszta });
+            }
+            if (zwrotReszta > 0.005 && woln.length){
+                niepelne.push({ nr: nr, zwrot: zwrotReszta, wplata: woln[0].brutto });
+            }
             // Rabat idzie do ticketu ZAWSZE, niezaleznie od kompensaty.
             rab.forEach(function (p){
-                const kw = Math.abs(p.netto || 0);
-                if (!kw) return;
+                const kw = p.netto || 0;
+                if (!kw){ nieZaks.push({ pola: p.pola, powod: 'rabat zerowy — nic do zaksięgowania' }); return; }
+                // Rabat bywa COFANY i wtedy przychodzi z plusem (sierpien, order 26428420:
+                // najpierw -49.00, dwa dni pozniej +49.00). Znak przenosimy do „ref" bez
+                // zmian, a nie przez wartosc bezwzgledna — inaczej cofniecie rabatu
+                // dopisaloby sie do zwrotow zamiast je zmniejszyc.
+                nieZaks.push({ pola: p.pola, powod: 'rabat — idzie do ticketu, nie do importu' });
                 nRab++;
-                ref[nr] = r2((ref[nr] || 0) - kw);
+                ref[nr] = r2((ref[nr] || 0) + kw);
                 refData[nr] = refData[nr] || p.data;
-                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '') + 'rabat ' + f2(kw);
-                sumaZwr = r2(sumaZwr + kw);
+                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '')
+                            + (kw < 0 ? 'rabat ' : 'cofnięcie rabatu ') + f2(Math.abs(kw));
+                sumaZwr = r2(sumaZwr + Math.abs(kw));
             });
+            // Na ticket idzie to, co ZOSTALO ze zwrotow po zgaszeniu wplat — nie cala
+            // ich suma. Notatki i date bierzemy z wierszy zrodlowych, zeby bylo wiadomo,
+            // czego zwrot dotyczy.
             zwrW.forEach(function (p){
-                nZwr++;
-                ref[nr] = r2((ref[nr] || 0) - p.brutto);
-                refData[nr] = refData[nr] || p.data;
-                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '') + hdOpisPozycji(p.opis);
-                sumaZwr = r2(sumaZwr + p.brutto);
-                zostajeZwrot.push({ nr: nr, kwota: p.brutto, data: p.data });
+                nieZaks.push({ pola: p.pola, powod: 'zwrot — idzie do ticketu, nie do importu' });
             });
+            if (zwrotReszta > 0.005){
+                nZwr++;
+                ref[nr] = r2((ref[nr] || 0) - zwrotReszta);
+                refData[nr] = refData[nr] || (zwrW[0] && zwrW[0].data) || '';
+                const opisy = zwrW.map(function (p){ return hdOpisPozycji(p.opis); }).join('; ');
+                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '') + opisy;
+                sumaZwr = r2(sumaZwr + zwrotReszta);
+                zostajeZwrot.push({ nr: nr, kwota: zwrotReszta, data: (zwrW[0] && zwrW[0].data) || '' });
+            }
             woln.forEach(function (p){
                 nWpl++;
                 ord[nr] = r2((ord[nr] || 0) + p.brutto);
@@ -21251,10 +21324,15 @@
             }
         });
 
+        // Pozycja, ktorej saldo wyszlo DODATNIE, to pieniadze wracajace do nas: w tickecie
+        // ma sie zaksiegowac na plus, czyli na liscie zwrotow stoi z minusem.
+        Object.keys(ref).forEach(function (k){ if (ref[k] > 0.005) refSign[k] = -1; });
         return {
             ord: ord, dataOrd: ordData, ref: ref, refNote: refNote, refData: refData,
+            refSign: refSign,
             wOrd: wOrd, znosza: znosza, pominiete: pominiete, zostajeZwrot: zostajeZwrot,
-            naglowek: naglowek,
+            nieZaks: nieZaks, naglowek: naglowek,
+            czesciowe: czesciowe, niepelne: niepelne,
             nWpl: nWpl, nZwr: nZwr, nRab: nRab,
             sumaWpl: sumaWpl, sumaZwr: sumaZwr, sumaNetto: r2(sumaNetto),
             nOrd: Object.keys(ord).length, nZwrOrd: Object.keys(ref).length,
@@ -21275,6 +21353,19 @@
         const L = [];
         if (p && p.naglowek && p.naglowek.length) L.push(p.naglowek.map(pole).join(','));
         ((p && p.wOrd) || []).forEach(function (x){ L.push((x.r || []).map(pole).join(',')); });
+        return L.join('\r\n') + '\r\n';
+    }
+    // Wiersze, ktore NIE weszly do importu — w tym samym ukladzie co zrodlo, z jedna
+    // kolumna wiecej: powodem. To plik do OGLADANIA, nie do wgrywania, wiec dolozenie
+    // kolumny jest bezpieczne i duzo bardziej uzyteczne niz sama lista numerow.
+    function mkCsvHdNieZaks(p){
+        const pole = function (c){
+            const v = String(c == null ? '' : c);
+            return /[",\r\n]/.test(v) ? ('"' + v.replace(/"/g, '""') + '"') : v;
+        };
+        const L = [];
+        if (p && p.naglowek && p.naglowek.length) L.push(p.naglowek.concat(['powod']).map(pole).join(','));
+        ((p && p.nieZaks) || []).forEach(function (x){ L.push((x.pola || []).concat([x.powod || '']).map(pole).join(',')); });
         return L.join('\r\n') + '\r\n';
     }
     // Stan auftragu dla zamowien, w ktorych wplata i zwrot znosza sie dokladnie.
@@ -21312,6 +21403,28 @@
     // Werdykt dla jednego zamowienia. „Ksieguj oba" tylko wtedy, gdy auftrag ma OPEN AMOUNT
     // i wisi na nim ticket — czyli dokladnie warunek, ktory podal uzytkownik. Przy braku
     // ktoregokolwiek z tych dwoch nie ma czego ksiegowac i zamowienie pomijamy.
+    // Zamowienia, przy ktorych trzeba zajrzec do auftragu, bo z samego pliku nie wynika,
+    // gdzie ksiegowac: wplata i zwrot znosza sie co do grosza, zwrot obejmowal wiecej
+    // sztuk niz wplata z tego pliku, albo pokryl wiersz wplaty tylko czesciowo.
+    function hdDoSprawdzenia(p){
+        const out = [];
+        const dodaj = function (nr){ if (nr && out.indexOf(nr) < 0) out.push(nr); };
+        ((p && p.znosza) || []).forEach(function (x){ dodaj(x.nr); });
+        ((p && p.czesciowe) || []).forEach(function (x){ dodaj(x.nr); });
+        ((p && p.niepelne) || []).forEach(function (x){ dodaj(x.nr); });
+        return out;
+    }
+    // Dlaczego dane zamowienie trafilo na liste — zeby przy werdykcie bylo widac, o co szlo.
+    function hdPowod(p, nr){
+        const z = ((p && p.znosza) || []).filter(function (x){ return x.nr === nr; })[0];
+        if (z) return 'wpłata i zwrot znoszą się (' + f2(z.kwota) + ')';
+        const c = ((p && p.czesciowe) || []).filter(function (x){ return x.nr === nr; })[0];
+        if (c) return 'zwrot ' + f2(c.zwrotem) + ' zgasił wpłaty ' + f2(c.zgaszono)
+                    + (c.zostaje > 0.005 ? (', na ticket idzie ' + f2(c.zostaje)) : '');
+        const w = ((p && p.niepelne) || []).filter(function (x){ return x.nr === nr; })[0];
+        if (w) return 'zwrot ' + f2(w.zwrot) + ' pokrywa wpłatę ' + f2(w.wplata) + ' tylko częściowo';
+        return '';
+    }
     function hdWerdykt(nr){
         const st = hdStan[nr];
         if (!st) return { stan: '?', opis: 'nie sprawdzone' };
@@ -23351,6 +23464,7 @@
         if (j.kind === 'mano' && j.data && j.data.mano) return mkCsvMano(j.data.mano);
         if (j.kind === 'cnov' && j.data && j.data.cnov) return mkCsvCnova(j.data.cnov);
         if (j.kind === 'alle' && j.data && j.data.alle) return mkCsvAlle(j.data.alle);
+        if (j.kind === 'hd'   && j.data && j.data.hd)   return mkCsvHd(j.data.hd);
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         return mkCsvText(pairsOf(j), j.mp);
     }
@@ -24831,6 +24945,12 @@
                   // przeniosla sie do widoku PACZKI IMPORTU, gdzie prologistics podaje juz
                   // gotowe przypisanie zamowienie -> auftrag. Nie trzeba niczego szukac,
                   // a przy okazji nie da sie zaksiegowac przed sprawdzeniem typow.
+                  +  ((j.kind === 'hd' && j.data.hd && j.data.hd.nieZaks && j.data.hd.nieZaks.length)
+                        ? '<button class="mk-hdnz" data-ref="' + esc(j.ref) + '" title="Wiersze, które NIE weszły do pliku importu — ten sam układ co źródło plus kolumna z powodem" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Niezaksięgowane (' + j.data.hd.nieZaks.length + ')</button>'
+                        : '')
+                  +  ((j.kind === 'hd' && j.data.hd && hdDoSprawdzenia(j.data.hd).length)
+                        ? '<button class="mk-hdauf" data-ref="' + esc(j.ref) + '" title="Dla zamówień, których nie da się rozstrzygnąć z pliku, sprawdza auftrag: czy jest, czy ma open amount i czy wisi na nim ticket" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udd0d Sprawdź auftragi (' + hdDoSprawdzenia(j.data.hd).length + ')</button>'
+                        : '')
                   +  ((j.data.amz && j.data.amz.doWyj && j.data.amz.doWyj.length)
                         ? '<button class="mk-cpw" data-ref="' + esc(j.ref) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + j.data.amz.doWyj.length + ')</button> '
                         : '')
@@ -24854,6 +24974,8 @@
         }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-hdnz').forEach(function (b){ b.onclick = function(){ doHdNieZaks(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-hdauf').forEach(function (b){ b.onclick = function(){ doHdAuftragi(b.getAttribute('data-ref'), b); }; });
         out.querySelectorAll('.mk-inv').forEach(function (b){ b.onclick = function(){
             const ref = b.getAttribute('data-ref');
             const span = out.querySelector('.mk-invout[data-ref="' + ref + '"]');
@@ -27366,7 +27488,8 @@
         const MK_TYPY_ETYK = { bank: 'wyciąg', amz: 'raport Amazon', mano: 'rozliczenie ManoMano',
             ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair',
             c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova',
-            alleops: 'operacje Allegro', allemap: 'raport zamówień Allegro', allebil: 'billing Allegro' };
+            alleops: 'operacje Allegro', allemap: 'raport zamówień Allegro', allebil: 'billing Allegro',
+            hd: 'rozliczenie Homedeco' };
         const MK_TYPY_NAZWY = Object.keys(MK_TYPY_ETYK);
         function mkTypPliku(txt){
             try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
@@ -27387,6 +27510,9 @@
             // kolumn, ktorych nie ma zaden inny obslugiwany plik.
             try { if (alleCzyBilling(txt)) return 'allebil'; } catch (e){}
             try { if (alleCzyMapa(txt)) return 'allemap'; } catch (e){}
+            // Homedeco: komplet nazw kolumn w naglowku, na przecinku. Nazwa pliku bywa
+            // rozna („07.2026.csv", „20260648_twK11Pzmp7cNXjDq.csv"), tresc nie.
+            try { if (hdCzyPlik(txt)) return 'hd'; } catch (e){}
             return '';
         }
         const anyIn = $('#mk-any');
@@ -27396,7 +27522,7 @@
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
             const kubelki = { bank: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [], cnov: [],
-                              alleops: [], allemap: [], allebil: [] }, nieznane = [];
+                              alleops: [], allemap: [], allebil: [], hd: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -27444,6 +27570,7 @@
             kubelki.amz.forEach(function (f){ amzWczytaj(f); });
             kubelki.mano.forEach(function (f){ manoWczytaj(f); });
             kubelki.cnov.forEach(function (f){ cnovWczytaj(f); });
+            kubelki.hd.forEach(function (f){ hdWczytaj(f); });
             // Allegro: NAJPIERW raporty zamowien i billing, na koncu operacje — wtedy
             // zlecenie sklada sie raz, z kompletem danych, zamiast trzy razy po kawalku.
             for (let i = 0; i < kubelki.allemap.length; i++) await alleWczytajMapy(kubelki.allemap[i]);
@@ -27752,6 +27879,60 @@
                     + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum) + ' — na listę zwrotów') : '')
                     + ostrz + (j.msg ? (' — ' + j.msg) : ''),
                     (j.status === 'ready' && !ostrz) ? '#0a7a2f' : '#c47f00');
+            };
+            rd.readAsArrayBuffer(f);
+        }
+        // Homedeco. Jeden plik, jedno zlecenie. Kluczem jest ZAKRES DAT z pliku, bo nazwa
+        // bywa dowolna: widzielismy „07.2026.csv" i „20260648_twK11Pzmp7cNXjDq.csv" — ten sam
+        // rodzaj rozliczenia pod dwiema zupelnie roznymi nazwami. Po dacie ten sam plik
+        // wrzucony drugi raz trafi w to samo zlecenie, zamiast zakladac drugie.
+        function hdWczytaj(f){
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function (){
+                let p;
+                try { p = mkParseHd(mkDecode(rd.result)); }
+                catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); return; }
+                if (p.err){ say(p.err, '#c00'); return; }
+                const jobs = jobsLoad();
+                const k = 'HOMEDECO-' + (p.od || 'bez-daty') + (p.doo && p.doo !== p.od ? ('..' + p.doo) : '');
+                if (!jobs[k]){
+                    jobs[k] = { ref: k, date: p.doo || p.od || '', dateSrc: p.doo || p.od || '',
+                                amount: null, cur: p.cur,
+                                mp: 'Homedeco', brand: 'Homedeco', short: 'Homedeco',
+                                host: '', kind: 'hd', shop: 'Homedeco NL',
+                                docs: null, payer: '', txId: '', status: 'new', msg: '' };
+                }
+                const j = jobs[k];
+                if (j.status === 'done'){ say('To rozliczenie jest już zaksięgowane.', '#c47f00'); return; }
+                j.data = { hd: p, shop: 'Homedeco NL',
+                           gross: p.sumaWpl, refund: p.sumaZwr, net: p.sumaWpl, netOk: true,
+                           ord: p.ord, ref: p.ref, refNote: p.refNote, refData: p.refData,
+                           refSign: p.refSign,
+                           unknown: {}, skipped: {}, full: true, both: [],
+                           pays: 1, split: false, rows: p.nWpl + p.nZwr + p.nRab,
+                           total: p.nZam, pages: 1, how: 'plik ' + f.name };
+                // Import NIE jest blokowany. Zamowienia, w ktorych wplata i zwrot znosza sie
+                // co do grosza, po prostu nie wchodza do pliku — a to, ze ich tam nie ma, jest
+                // decyzja, nie usterka. Zwroty i rabaty ida na liste do ticketow, czyli tez
+                // sa obsluzone. Wszystko, co zostalo poza plikiem, mozna obejrzec w osobnym
+                // pliku „niezaksięgowane".
+                const uw = [];
+                if (p.znosza.length) uw.push(p.znosza.length + ' zamówień, w których wpłata i zwrot znoszą się — nie wchodzą do importu, sprawdź auftragi');
+                if (p.czesciowe.length) uw.push(p.czesciowe.length + ' zamówień, w których zwrot obejmował więcej sztuk niż wpłata z tego pliku');
+                if (p.niepelne.length) uw.push(p.niepelne.length + ' zamówień ze zwrotem pokrywającym wpłatę tylko częściowo — zostawiam bez zmian, sprawdź ręcznie');
+                if (p.pominiete.length) uw.push(p.pominiete.length + ' wierszy pominiętych (korekty prowizji)');
+                j.status = 'ready';
+                j.msg = uw.join(' · ');
+                jobsSave(jobs); render();
+                say('Homedeco NL · ' + (p.od || '?') + (p.doo && p.doo !== p.od ? ('…' + p.doo) : '')
+                    + ' · zamówień ' + p.nZam
+                    + ' · do auftragów ' + p.nWpl + ' poz. na ' + f2(p.sumaWpl)
+                    + ' · do ticketów ' + (p.nZwr + p.nRab) + ' poz. na ' + f2(p.sumaZwr)
+                    + (p.znosza.length ? (' · znoszą się ' + p.znosza.length) : '')
+                    + (p.pominiete.length ? (' · pominięte ' + p.pominiete.length) : '')
+                    + (j.msg ? (' — ' + j.msg) : ''),
+                    bad.length ? '#c47f00' : '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -29166,6 +29347,62 @@
     function amzTekst(v){
         const s = String(v == null ? '' : v);
         return /^\d{10,}$/.test(s) ? ("'" + s) : s;
+    }
+    // Sprawdzenie auftragow dla zamowien, ktorych z pliku rozstrzygnac sie nie da.
+    // Jedno wejscie na strone auftragu daje OBA sygnaly naraz: open amount i to, czy
+    // wisi na nim ticket — czyli dokladnie warunek, ktory ma decydowac o ksiegowaniu.
+    async function doHdAuftragi(ref, btn){
+        const j = jobsLoad()[ref];
+        const p = j && j.data && j.data.hd;
+        if (!p) return;
+        const lista = hdDoSprawdzenia(p);
+        if (!lista.length){ say('Nie ma czego sprawdzać.', '#c47f00'); return; }
+        if (btn) btn.disabled = true;
+        try {
+            await hdSprawdzStan(lista, function (i, ile, nr){
+                say('Sprawdzam auftrag ' + i + '/' + ile + ' — ' + nr + '…');
+            });
+        } catch (e){
+            say('Błąd sprawdzania: ' + ((e && e.message) || e), '#c00');
+            if (btn) btn.disabled = false;
+            return;
+        }
+        const W = [];
+        W.push('Homedeco · sprawdzenie auftragów (' + lista.length + ')');
+        W.push('');
+        let ksieg = 0, pomin = 0, recz = 0;
+        lista.forEach(function (nr){
+            const w = hdWerdykt(nr);
+            if (w.stan === 'ksieguj') ksieg++;
+            else if (w.stan === 'recznie') recz++;
+            else pomin++;
+            W.push(nr + '  ' + hdPowod(p, nr));
+            W.push('     → ' + (w.opis || w.stan));
+        });
+        W.push('');
+        W.push('do zaksięgowania: ' + ksieg + ' · pomijam: ' + pomin + ' · ręcznie: ' + recz);
+        const txt = W.join(String.fromCharCode(10));
+        try {
+            if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(txt, 'text');
+            else navigator.clipboard.writeText(txt);
+        } catch (e){}
+        say('Sprawdzone: ' + ksieg + ' do zaksięgowania, ' + pomin + ' do pominięcia'
+            + (recz ? (', ' + recz + ' ręcznie') : '') + '. Wynik w schowku.',
+            ksieg ? '#c47f00' : '#0a7a2f');
+        if (btn) btn.disabled = false;
+    }
+    function doHdNieZaks(ref){
+        const j = jobsLoad()[ref];
+        const p = j && j.data && j.data.hd;
+        if (!p || !p.nieZaks || !p.nieZaks.length){ say('Nie ma czego zapisać — wszystko weszło do importu.', '#c47f00'); return; }
+        const txt = mkCsvHdNieZaks(p);
+        const nazwa = 'Homedeco niezaksiegowane ' + (p.od || '') + (p.doo && p.doo !== p.od ? ('..' + p.doo) : '') + '.csv';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([txt], { type: 'text/csv;charset=utf-8' }));
+        a.download = nazwa;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+        say('Zapisano ' + nazwa + ' — ' + p.nieZaks.length + ' wierszy poza importem.');
     }
     function doCopyWyj(ref){
         const j = jobsLoad()[ref];
