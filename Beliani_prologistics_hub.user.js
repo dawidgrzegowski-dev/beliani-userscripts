@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.69
+// @version      4.70
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21559,8 +21559,32 @@
         const zywe = (st.kand || []).filter(function (c){ return !c.deleted && !c.err; });
         if (!zywe.length)
             return { tryb: 'nic', opis: 'auftrag jest, ale skasowany albo bez formularza płatności' };
-        if (zywe.length > 1)
-            return { tryb: 'recznie', kand: zywe, opis: zywe.length + ' auftragi o tym numerze — rozstrzygnij ręcznie' };
+        if (zywe.length > 1){
+            // Kilka auftragow pod jednym numerem fulfilmentu. Nie zgadujemy — ale KAZDY z nich
+            // zostal juz odczytany, wiec open amount i tickety mamy pod reka. Samo „rozstrzygnij
+            // recznie", bez numerow, nie da sie rozstrzygnac: uzytkownik dostawal wiersz na
+            // liscie i zadnego punktu zaczepienia. Wypisujemy wiec, co stoi w kazdym z nich,
+            // i zaznaczamy ten, ktory zgadza sie kwotowo z plikiem.
+            const pasuje = function (k){
+                if (k.open == null) return '';
+                if (Math.abs(k.open - z.pelna) <= 0.005) return 'pelny';
+                if (z.netto > 0.005 && Math.abs(k.open - z.netto) <= 0.005) return 'netto';
+                return '';
+            };
+            const opisy = zywe.map(function (k){
+                const t = (k.tickety || []).length ? ('ticket ' + k.tickety.join('/')) : 'bez ticketu';
+                const pas = pasuje(k);
+                return k.num + ' (open ' + (k.open == null ? '?' : f2(k.open)) + ', ' + t + ')'
+                     + (pas === 'pelny' ? ' ← pasuje do wpłat ' + f2(z.pelna)
+                     : (pas === 'netto' ? ' ← pasuje do wpłat po skompensowaniu ' + f2(z.netto) : ''));
+            });
+            const trafne = zywe.filter(function (k){ return !!pasuje(k); });
+            return { tryb: 'recznie', kand: zywe, trafne: trafne,
+                     opis: zywe.length + ' auftragi o tym numerze: ' + opisy.join(' · ')
+                         + (trafne.length === 1
+                             ? ' — kwotowo pasuje tylko ' + trafne[0].num + ', ale nie księguję bez Twojej decyzji'
+                             : ' — rozstrzygnij ręcznie') };
+        }
         const c = zywe[0], open = c.open, maTicket = (c.tickety || []).length > 0;
         const tick = (c.tickety || []).join(', ');
         const naTicket = r2(z.zwrPelny + z.rabSuma);
@@ -29697,6 +29721,12 @@
             const st = hdStan[nr], k = (st && st.kand && st.kand[0]) || null;
             return k ? k.num : '';
         };
+        // Przy kilku auftragach jeden link nie wystarczy — trzeba obejrzec wszystkie.
+        const aufWszystkie = function (nr){
+            const w = p.werdykt[nr];
+            const lst = (w && w.kand) || (hdStan[nr] && hdStan[nr].kand) || [];
+            return lst.map(function (k){ return k.num; }).filter(Boolean);
+        };
         const grupy = { pelny: [], netto: [], ticket: [], nic: [], recznie: [] };
         const W = [];
         W.push('Homedeco · sprawdzenie auftragów (' + lista.length + ')');
@@ -29706,8 +29736,9 @@
             (grupy[w.tryb] || grupy.netto).push(nr);
             W.push(nr + '  ' + hdPowod(p, nr));
             W.push('     → ' + (w.opis || w.tryb));
-            const num = aufNum(nr);
-            if (num) W.push('       ' + lnk(num));
+            const wszystkie = aufWszystkie(nr);
+            if (wszystkie.length > 1) wszystkie.forEach(function (x){ W.push('       ' + lnk(x)); });
+            else if (aufNum(nr)) W.push('       ' + lnk(aufNum(nr)));
         });
 
         // Podsumowanie tak, zeby dalo sie sprawdzic, czy WSZYSTKIE wplaty i zwroty sa ujete:
@@ -29739,6 +29770,19 @@
         });
         blok('Do rozstrzygnięcia ręcznie', grupy.recznie, function (z){
             return 'wpłaty ' + f2(z.pelna) + ', zwroty i rabaty ' + f2(r2(z.zwrPelny + z.rabSuma));
+        });
+        // Przy kilku auftragach wypisujemy je jeszcze raz, kazdy w osobnej linii z linkiem —
+        // w tabelce wyzej mieszcza sie tylko w jednym ciagu i nie da sie w nie kliknac.
+        grupy.recznie.forEach(function (nr){
+            const wsz = aufWszystkie(nr);
+            if (wsz.length < 2) return;
+            W.push('');
+            W.push('   ' + nr + ' — ' + wsz.length + ' auftragów do obejrzenia:');
+            ((p.werdykt[nr] && p.werdykt[nr].kand) || []).forEach(function (k){
+                W.push('      ' + k.num + '   open ' + (k.open == null ? '?' : f2(k.open))
+                     + '   ' + ((k.tickety || []).length ? ('ticket ' + k.tickety.join('/')) : 'bez ticketu')
+                     + '   ' + lnk(k.num));
+            });
         });
 
         const s = hdPodsumowanie(p);
