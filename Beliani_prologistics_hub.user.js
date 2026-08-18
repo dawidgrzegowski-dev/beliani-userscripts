@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.75
+// @version      4.76
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20605,8 +20605,18 @@
         });
         return out;
     }
+    // SheetJS trzeba znalezc SAMEMU. Istniejace getXLSX() siedzi w innym domknieciu
+    // (init_rec) i stad jest niewidoczne — wolanie go konczylo sie ReferenceError-em
+    // w obsludze klikniecia, czyli cisza: ani pliku, ani komunikatu. Trzy proby, bo
+    // biblioteka laduje w roznych miejscach zaleznie od menedzera skryptow.
+    function mktXLSX(){
+        try { if (typeof XLSX !== 'undefined') return XLSX; } catch (e){}
+        try { if (window.XLSX) return window.XLSX; } catch (e){}
+        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX) return unsafeWindow.XLSX; } catch (e){}
+        return null;
+    }
     function mkXlsxAmz(p){
-        const X = getXLSX();
+        const X = mktXLSX();
         if (!X) return { err: 'brak biblioteki SheetJS — odśwież stronę' };
         if (!p || !p.raw) return { err: 'to rozliczenie pochodzi ze starszej wersji HUB-a — wczytaj plik jeszcze raz' };
         const wb = X.utils.book_new();
@@ -29992,9 +30002,13 @@
     // przeliczen. Przy zleceniu zatrzymanym na kontroli numeru to jedyny sposob, zeby
     // zobaczyc, co Wayfair faktycznie przyslal.
     function doAmzXlsx(ref){
+      // Cokolwiek pojdzie nie tak, ma to powiedziec. Bez tej klamry blad w srodku konczyl
+      // sie tym, ze guzik po prostu nie reagowal i nie bylo od czego zaczac szukania.
+      try {
         const j = jobsLoad()[ref];
         const p = j && j.data && j.data.amz;
         if (!p){ say('To nie jest rozliczenie Amazona.', '#c47f00'); return; }
+        if (!p.raw){ say('To rozliczenie wczytano starszą wersją HUB-a — wczytaj plik jeszcze raz.', '#c47f00'); return; }
         const w = mkXlsxAmz(p);
         if (w.err){ say(w.err, '#c00'); return; }
         // Nazwa jak przy pozostalych plikach tego modulu: data wyplaty i sklep.
@@ -30007,6 +30021,9 @@
         setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
         say('Zapisano ' + a.download + ' — zakładki: Amazon (' + (String(p.raw).split(/\r?\n/).length - 1)
             + ' wierszy), Order (' + (p.wOrd || []).length + '), Refunds (' + (p.wRef || []).length + ').');
+      } catch (e){
+        say('Nie udało się zbudować pliku Excel: ' + ((e && e.message) || e), '#c00');
+      }
     }
     function doWayfRaw(ref){
         const j = jobsLoad()[ref];
