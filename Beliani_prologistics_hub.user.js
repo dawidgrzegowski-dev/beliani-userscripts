@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.76
+// @version      4.77
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -26291,6 +26291,10 @@
     // jakie konta sa poprawne i co z czym porownac. Bajtow pliku .xls ten modul nie widzi.
     window.__TM_AMZ_KONTROLA = {
         raport: function (tekst){ return mkParseAmz(tekst); },
+        // Skoroszyt Amazon / Order / Refunds. Salda maja go pod reka zaraz po wgraniu
+        // raportu — ten sam plik co w module marketplace'ow, liczony tym samym kodem.
+        // Przez most, bo Salda to osobne domkniecie i mkXlsxAmz jest tam niewidoczne.
+        xlsx: function (p){ return mkXlsxAmz(p); },
         wiersze: mkExpZAoa,
         sprawdz: mkKontrolaAmz,
         render: knRender,
@@ -34512,6 +34516,7 @@
             + '<label style="font-size:11px;display:block">plik „Settlement Report V2" (.txt) '
             + '<input type="file" id="sal-famz" accept=".txt,text/plain" style="font-size:11px"></label>'
             + '<div id="sal-amzinfo" style="font-size:11px;color:#888;margin-top:4px">Plik: nie wskazany.</div>'
+            + '<button id="sal-axlsx" title="Skoroszyt z trzema zakładkami: plik źródłowy, Order i Refunds — ten sam co przy księgowaniu" style="display:none;margin-top:6px;padding:4px 10px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px">📗 Excel (3 zakładki)</button>'
             + '</div>'
 
             + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
@@ -34525,6 +34530,7 @@
         p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
         p.querySelector('#sal-apobierz').onclick = function (){ salPobierzAmzExp(this); };
         p.querySelector('#sal-famz').onchange = function (){ salWczytajAmz(this.files); };
+        p.querySelector('#sal-axlsx').onclick = function (){ salAmzXlsx(); };
         p.querySelector('#sal-aporownaj').onclick = function (){ salPorownajAmz(this); };
         p.querySelector('#sal-akopiuj').onclick = function (){
             try { GM_setClipboard(SAL_AWYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
@@ -34532,9 +34538,38 @@
         };
         salAmzInfo();
     }
+    // Zapis skoroszytu z poziomu Sald. Ten sam plik co przy ksiegowaniu — trzy zakladki,
+    // uklad jak w dotychczasowej aplikacji. Tutaj przydaje sie o tyle, ze raport jest juz
+    // wgrany do sprawdzania salda i nie trzeba go wczytywac drugi raz gdzie indziej.
+    function salAmzXlsx(){
+        try {
+            const most = salAmzMost();
+            if (!most || typeof most.xlsx !== 'function'){
+                salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony albo pochodzi ze starszej wersji.', '#c00');
+                return;
+            }
+            if (!SAL_AMZ){ salSay('Najpierw wgraj raport Amazona.', '#c47f00'); return; }
+            const w = most.xlsx(SAL_AMZ);
+            if (!w || w.err){ salSay((w && w.err) || 'nie udało się zbudować pliku', '#c00'); return; }
+            const nazwa = ((SAL_AMZ.payDate || '') + ' ' + (SAL_AMZ.shop || 'Amazon') + ' '
+                         + (SAL_AMZ.setId || '') + '.xlsx').replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim();
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([w.bytes],
+                { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+            a.download = nazwa;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+            salSay('Zapisano ' + nazwa + ' — zakładki Amazon, Order i Refunds.', '#0a7a2f');
+        } catch (e){
+            salSay('Nie udało się zbudować pliku Excel: ' + ((e && e.message) || e), '#c00');
+        }
+    }
     function salAmzInfo(){
         const p = salPanel();
         const a = p.querySelector('#sal-amzinfo'), e = p.querySelector('#sal-aexpinfo');
+        // Guzik pokazuje sie dopiero, gdy jest z czego budowac — czyli po wgraniu raportu.
+        const gx = p.querySelector('#sal-axlsx');
+        if (gx) gx.style.display = (SAL_AMZ && SAL_AMZ.raw) ? '' : 'none';
         if (a) a.textContent = SAL_AMZ
             ? ('Rozliczenie ' + SAL_AMZ.setId + ' · wypłata ' + (SAL_AMZ.payDate || '—')
                + ' · ' + SAL_AMZ.shop + ' · zamówień ' + Object.keys(SAL_AMZ.ord).length
