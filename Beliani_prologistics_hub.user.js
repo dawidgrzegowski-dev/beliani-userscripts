@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.62
+// @version      4.69
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21157,6 +21157,38 @@
         const m = String(opis == null ? '' : opis).match(/\(([^)]*)\)\s*$/);
         return m ? m[1].trim() : String(opis == null ? '' : opis).trim();
     }
+    // Kompensata liczona RAZ, przy wczytaniu pliku: zwrot znosi wplate o tej samej kwocie
+    // brutto, a to, co ze zwrotow zostanie, gasi CALE wiersze wplat (zwrot obejmujacy
+    // wiecej sztuk, niz kupiono w tym rozliczeniu). Wynik jest tylko OPISEM zamowienia —
+    // decyzja, ktorego wariantu uzyc, zapada dopiero po zajrzeniu do auftragu.
+    function hdZlicz(z){
+        const woln = z.wpl.slice(), zwrW = [], pary = [];
+        z.zwr.forEach(function (zz){
+            let i = -1;
+            for (let k = 0; k < woln.length; k++) if (Math.abs(woln[k].brutto - zz.brutto) < 0.005){ i = k; break; }
+            if (i >= 0){ pary.push({ wplata: woln[i], zwrot: zz }); woln.splice(i, 1); }
+            else zwrW.push(zz);
+        });
+        // Gasimy wylacznie CALE wiersze: plik importu ma zawierac wiersze zrodlowe
+        // przepisane co do znaku, wiec kwoty czesciowej nie da sie tam wpisac uczciwie.
+        let reszta = r2(zwrW.reduce(function (a, x){ return a + x.brutto; }, 0));
+        const zgaszone = [];
+        while (reszta > 0.005 && woln.length){
+            if (woln[0].brutto - reszta > 0.005) break;
+            reszta = r2(reszta - woln[0].brutto);
+            zgaszone.push(woln.shift());
+        }
+        z.pary = pary; z.woln = woln; z.zwrW = zwrW; z.zgaszone = zgaszone; z.reszta = reszta;
+        z.pelna    = r2(z.wpl.reduce(function (a, x){ return a + x.brutto; }, 0));
+        z.netto    = r2(woln.reduce(function (a, x){ return a + x.brutto; }, 0));
+        z.zwrPelny = r2(z.zwr.reduce(function (a, x){ return a + x.brutto; }, 0));
+        z.rabSuma  = r2(z.rab.reduce(function (a, x){ return a + Math.abs(x.netto || 0); }, 0));
+        // „Znosza sie" znaczy: po obu stronach nie zostaje NIC. Tylko wtedy wolno nic
+        // nie zaksiegowac — gdy cokolwiek zostaje, kazdy wiersz musi gdzies trafic.
+        z.znoszaSie = !woln.length && reszta <= 0.005 && (pary.length > 0 || zgaszone.length > 0);
+        z.niepelny  = reszta > 0.005 && woln.length > 0;
+        return z;
+    }
     function mkParseHd(tekst){
         const rows = mkCsvRowsPrzecinek(tekst);
         if (!rows.length) return { err: 'pusty plik rozliczenia' };
@@ -21167,7 +21199,10 @@
         if (brak.length) return { err: 'to nie wygląda na rozliczenie Homedeco — brak kolumn: ' + brak.join(', ') };
 
         const naglowek = (rows[0] || []).slice();
-        const poZam = Object.create(null), kolejnosc = [];
+        const zam = Object.create(null), kolejnosc = [];
+        // Kwoty ZRODLOWE, przed jakakolwiek kompensata — bez nich nie da sie pokazac sumy
+        // kontrolnej, a o to wlasnie chodzi: czy wszystko z rozliczenia gdzies trafilo.
+        let bruttoWpl = 0, bruttoZwr = 0, bruttoRab = 0, nWierszy = 0, sumaNetto = 0;
         let odd = '', dod = '';
         for (let i = 1; i < rows.length; i++){
             const r = rows[i];
@@ -21185,166 +21220,216 @@
                 kraj: String(r[ix['country']] || '').trim()
             };
             if (poz.data){ if (!odd || poz.data < odd) odd = poz.data; if (!dod || poz.data > dod) dod = poz.data; }
-            if (!poZam[nr]){ poZam[nr] = []; kolejnosc.push(nr); }
-            poZam[nr].push(poz);
+            if (!zam[nr]){ zam[nr] = { nr: nr, wpl: [], zwr: [], rab: [], inne: [], bezCeny: [] }; kolejnosc.push(nr); }
+            const z = zam[nr];
+            if (poz.netto != null) sumaNetto = r2(sumaNetto + poz.netto);
+            nWierszy++;
+            if (rodzaj === 'wplata' && poz.brutto){ z.wpl.push(poz); bruttoWpl = r2(bruttoWpl + poz.brutto); }
+            else if (rodzaj === 'zwrot' && poz.brutto){ z.zwr.push(poz); bruttoZwr = r2(bruttoZwr + poz.brutto); }
+            else if (rodzaj === 'rabat'){ z.rab.push(poz); bruttoRab = r2(bruttoRab + Math.abs(poz.netto || 0)); }
+            else if (rodzaj === 'wplata') z.bezCeny.push(poz);   // korekta prowizji: „Purchase" bez ceny
+            else z.inne.push(poz);
         }
         if (!kolejnosc.length) return { err: 'rozliczenie nie ma ani jednego wiersza z numerem zamówienia' };
+        kolejnosc.forEach(function (nr){ hdZlicz(zam[nr]); });
 
+        const p = { zam: zam, kolejnosc: kolejnosc, naglowek: naglowek,
+                    tryb: Object.create(null), powody: Object.create(null), werdykt: Object.create(null),
+                    bruttoWpl: bruttoWpl, bruttoZwr: bruttoZwr, bruttoRab: bruttoRab,
+                    nWierszy: nWierszy, sumaNetto: r2(sumaNetto),
+                    nZam: kolejnosc.length, konto: MK_HD_ROZL,
+                    od: odd, doo: dod, cur: 'EUR' };
+        hdPrzelicz(p);
+        return p;
+    }
+    // Caly wynik — plik importu, lista zwrotow, lista niezaksiegowanych i sumy — liczy sie
+    // OD ZERA z rozlozonych zamowien i przypisanych im trybow. Przeliczenie od zera zamiast
+    // poprawiania w miejscu ma jeden konkretny powod: ponowne sprawdzenie auftragow nie
+    // potrafi wtedy niczego policzyc dwa razy ani zostawic sladu po poprzedniej decyzji.
+    //
+    // Tryby biora sie ze stanu auftragu (hdUstalTryb):
+    //   'pelny'  — open amount = suma WSZYSTKICH wplat: wszystkie wplaty do auftragu,
+    //              wszystkie zwroty i rabaty do ticketu.
+    //   'netto'  — open amount = wplaty PO skompensowaniu: do auftragu idzie tylko to,
+    //              co zostalo, na ticket reszta zwrotow. To domyslny tryb przed sprawdzeniem.
+    //   'ticket' — open amount zerowy, ale wisi ticket: w auftragu nie ma czego ksiegowac,
+    //              wiec KAZDY wiersz dostaje wlasna pozycje w tickecie — wplata na minus,
+    //              zwrot i rabat na plus. Nic nie znika po cichu.
+    //   'nic'    — nie ma czego ksiegowac: brak auftragu, brak ticketu przy zerowym open
+    //              amount, albo wplata i zwrot znosza sie do zera.
+    //   'recznie'— stanu nie da sie rozstrzygnac automatycznie; nie ksiegujemy nic i mowimy,
+    //              dlaczego.
+    function hdPrzelicz(p){
         const ord = Object.create(null), ordData = Object.create(null);
         const ref = Object.create(null), refNote = Object.create(null), refData = Object.create(null);
-        // refSign = -1 znaczy: na liscie zwrotow ta pozycja ma isc Z MINUSEM, zeby
-        // w tickecie zaksiegowala sie NA PLUS. Tak wychodza pozycje, po ktorych pieniadze
-        // wracaja do nas — cofniety rabat albo wplata, ktorej nie ma gdzie zaksiegowac
-        // w auftragu. Wspolna lista zwrotow zna to pole od dawna (refPozycje), wiec
-        // wystarczy je wypelnic.
-        const refSign = Object.create(null);
-        const wOrd = [], znosza = [], pominiete = [], zostajeZwrot = [];
-        // czesciowe — zamowienia, w ktorych zwrot obejmowal wiecej sztuk niz wplata z tego
-        // pliku; niepelne — takie, gdzie zwrot pokryl wiersz wplaty tylko czesciowo
-        // i celowo NIC z nim nie zrobilismy.
-        const czesciowe = [], niepelne = [];
-        // Kazdy wiersz zrodla, ktory NIE wchodzi do importu, razem z powodem. Z tego
-        // powstaje osobny plik — nie po to, zeby cokolwiek blokowac, tylko zeby dalo sie
-        // sprawdzic, co zostalo poza plikiem i dlaczego.
-        const nieZaks = [];
-        let nWpl = 0, nZwr = 0, nRab = 0, sumaWpl = 0, sumaZwr = 0, sumaNetto = 0;
+        const refSign = Object.create(null), refExtra = [];
+        const wOrd = [], nieZaks = [], pominiete = [];
+        const znosza = [], czesciowe = [], niepelne = [], zostajeWplata = [];
+        const doTicketu = [], doRecznie = [], pelne = [], nicNie = [];
+        let sumaWpl = 0, sumaZwr = 0, nWpl = 0, nZwr = 0, nRab = 0;
+        let wplDoTicketu = 0, nWplTicket = 0, wplNic = 0, zwrNic = 0;
+        const zTicketem = Object.create(null);
 
-        kolejnosc.forEach(function (nr){
-            const poz = poZam[nr];
-            poz.forEach(function (p){ if (p.netto != null) sumaNetto = r2(sumaNetto + p.netto); });
-            const wpl = poz.filter(function (p){ return p.rodzaj === 'wplata' && p.brutto; });
-            const zwr = poz.filter(function (p){ return p.rodzaj === 'zwrot' && p.brutto; });
-            const rab = poz.filter(function (p){ return p.rodzaj === 'rabat'; });
-            // Korekty prowizji: „Purchase" bez ceny. Nie ksieguja sie — ale maja byc widoczne.
-            poz.forEach(function (p){
-                if (p.rodzaj === 'wplata' && !p.brutto){
-                    pominiete.push({ nr: nr, kwota: p.netto, data: p.data, opis: p.opis, powod: 'korekta prowizji — bez kwoty brutto' });
-                    nieZaks.push({ pola: p.pola, powod: 'korekta prowizji — nie księgujemy' });
-                } else if (p.rodzaj === 'inne'){
-                    pominiete.push({ nr: nr, kwota: p.netto, data: p.data, opis: p.opis, powod: 'nieznany rodzaj operacji' });
-                    nieZaks.push({ pola: p.pola, powod: 'nieznany rodzaj operacji' });
-                }
-            });
-            // Kompensata: zwrot znosi wplate o TEJ SAMEJ kwocie brutto.
-            const woln = wpl.slice(), zwrW = [], pary = [];
-            zwr.forEach(function (z){
-                let i = -1;
-                for (let k = 0; k < woln.length; k++) if (Math.abs(woln[k].brutto - z.brutto) < 0.005){ i = k; break; }
-                if (i >= 0){ pary.push({ wplata: woln[i], zwrot: z }); woln.splice(i, 1); }
-                else zwrW.push(z);
-            });
-            // Skompensowana para nie wchodzi do importu — ale ma byc widoczna, bo to
-            // wlasnie tu zapada decyzja „ksiegowac oba czy nic".
-            pary.forEach(function (pr){
-                nieZaks.push({ pola: pr.wplata.pola, powod: 'wpłata skompensowana zwrotem — sprawdź auftrag' });
-                nieZaks.push({ pola: pr.zwrot.pola,  powod: 'zwrot kompensujący wpłatę — sprawdź auftrag' });
-            });
-            const skompensowane = wpl.length - woln.length;
-            // Po dopasowaniu wiersz-w-wiersz zostaja czasem zwroty, ktore nie pasuja do zadnej
-            // pojedynczej wplaty, bo obejmuja WIECEJ SZTUK niz kupiono w tym rozliczeniu.
-            // Order 26428847 (sierpien): „Purchase (1x BODLA) 79.99" i „Purchase refund
-            // (2x BODLA) 159.98" — druga sztuka zostala oplacona w poprzednim rozliczeniu.
-            // Taki zwrot najpierw GASI wplaty z tego pliku, a dopiero reszta idzie na ticket.
-            // Bez tego wplata szla do importu (a nie ma czego ksiegowac) i caly zwrot na
-            // ticket (a nalezy sie tylko czesc).
-            //
-            // Gasimy wylacznie CALE wiersze: plik importu ma zawierac wiersze zrodlowe
-            // przepisane co do znaku, wiec wpisania tam kwoty czesciowej nie da sie zrobic
-            // uczciwie. Gdy zwrot pokrywa wiersz tylko czesciowo, zostawiamy wszystko tak,
-            // jak jest, i mowimy o tym wprost.
-            let zwrotReszta = r2(zwrW.reduce(function (a, z){ return a + z.brutto; }, 0));
-            const zgaszone = [];
-            while (zwrotReszta > 0.005 && woln.length){
-                const w0 = woln[0];
-                if (w0.brutto - zwrotReszta > 0.005) break;       // nie pokrywa calego wiersza
-                zwrotReszta = r2(zwrotReszta - w0.brutto);
-                zgaszone.push(w0);
-                nieZaks.push({ pola: w0.pola, powod: 'wpłata zgaszona zwrotem obejmującym więcej sztuk — sprawdź auftrag' });
-                woln.shift();
-            }
-            if (zgaszone.length){
-                czesciowe.push({ nr: nr,
-                                 zgaszono: r2(zgaszone.reduce(function (a, x){ return a + x.brutto; }, 0)),
-                                 zwrotem: r2(zwrW.reduce(function (a, z){ return a + z.brutto; }, 0)),
-                                 zostaje: zwrotReszta });
-            }
-            if (zwrotReszta > 0.005 && woln.length){
-                niepelne.push({ nr: nr, zwrot: zwrotReszta, wplata: woln[0].brutto });
-            }
-            // Rabat idzie do ticketu ZAWSZE, niezaleznie od kompensaty.
-            rab.forEach(function (p){
-                const kw = p.netto || 0;
-                if (!kw){ nieZaks.push({ pola: p.pola, powod: 'rabat zerowy — nic do zaksięgowania' }); return; }
-                // Rabat bywa COFANY i wtedy przychodzi z plusem (sierpien, order 26428420:
-                // najpierw -49.00, dwa dni pozniej +49.00). Znak przenosimy do „ref" bez
-                // zmian, a nie przez wartosc bezwzgledna — inaczej cofniecie rabatu
-                // dopisaloby sie do zwrotow zamiast je zmniejszyc.
-                nieZaks.push({ pola: p.pola, powod: 'rabat — idzie do ticketu, nie do importu' });
+        // Wiersz, ktory nie wchodzi do PLIKU IMPORTU. „gdzie" mowi, czy mimo to gdzies sie
+        // ksieguje: 'ticket' znaczy „zaksiegowany, tylko w tickecie", 'nic' — „nigdzie".
+        // Rozdzielenie tych dwóch jest potrzebne, bo plik „niezaksięgowane" ma zawierac
+        // WYLACZNIE to drugie; wrzucanie tam zwrotow i rabatow, ktore normalnie ida na
+        // tickety, robilo z niego liste 79 wierszy, z ktorych 46 bylo zaksiegowanych.
+        const poza = function (pola, powod, gdzie){
+            nieZaks.push({ pola: pola, powod: powod, gdzie: gdzie || 'nic' });
+        };
+        // Osobna pozycja na liscie zwrotow. znak +1 to zwrot (pieniadze do klienta),
+        // znak -1 to pieniadze wracajace do nas — w tickecie ksieguje sie na plus.
+        const osobno = function (nr, kwota, znak, nota, data){
+            if (!kwota) return;
+            refExtra.push({ id: nr, amt: Math.abs(kwota), sign: znak, note: nota || '', data: data || '' });
+            zTicketem[nr] = 1;
+        };
+        // Pozycja zbiorcza zamowienia — tak lista wygladala od poczatku i tak zostaje
+        // wszedzie poza trybem „wszystko do ticketu".
+        const zbiorczo = function (nr, kwota, nota, data){
+            ref[nr] = r2((ref[nr] || 0) + kwota);
+            if (!refData[nr] && data) refData[nr] = data;
+            if (nota) refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '') + nota;
+            zTicketem[nr] = 1;
+        };
+        const rabatNaTicket = function (nr, z, osobne){
+            z.rab.forEach(function (x){
+                const kw = x.netto || 0;
+                if (!kw){ poza(x.pola, 'rabat zerowy — nic do zaksięgowania', 'nic'); return; }
+                poza(x.pola, 'rabat — idzie do ticketu, nie do importu', 'ticket');
                 nRab++;
-                ref[nr] = r2((ref[nr] || 0) + kw);
-                refData[nr] = refData[nr] || p.data;
-                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '')
-                            + (kw < 0 ? 'rabat ' : 'cofnięcie rabatu ') + f2(Math.abs(kw));
+                // Rabat bywa COFANY i wtedy przychodzi z plusem (sierpien, 26428420: najpierw
+                // -49.00, dwa dni pozniej +49.00). Znak przenosimy bez zmian, a nie przez
+                // wartosc bezwzgledna — inaczej cofniecie dopisaloby sie do zwrotow.
+                const nota = (kw < 0 ? 'rabat ' : 'cofnięcie rabatu ') + f2(Math.abs(kw));
+                if (osobne) osobno(nr, kw, kw < 0 ? 1 : -1, nota, x.data);
+                else zbiorczo(nr, kw, nota, x.data);
                 sumaZwr = r2(sumaZwr + Math.abs(kw));
             });
-            // Na ticket idzie to, co ZOSTALO ze zwrotow po zgaszeniu wplat — nie cala
-            // ich suma. Notatki i date bierzemy z wierszy zrodlowych, zeby bylo wiadomo,
-            // czego zwrot dotyczy.
-            zwrW.forEach(function (p){
-                nieZaks.push({ pola: p.pola, powod: 'zwrot — idzie do ticketu, nie do importu' });
+        };
+
+        p.kolejnosc.forEach(function (nr){
+            const z = p.zam[nr];
+            const tryb = p.tryb[nr] || 'netto';
+            const powod = p.powody[nr] || '';
+
+            // Wiersze, ktore nie ksieguja sie NIGDY, niezaleznie od stanu auftragu.
+            z.bezCeny.forEach(function (x){
+                pominiete.push({ nr: nr, kwota: x.netto, data: x.data, opis: x.opis, powod: 'korekta prowizji — bez kwoty brutto' });
+                poza(x.pola, 'korekta prowizji — nie księgujemy', 'nic');
             });
-            if (zwrotReszta > 0.005){
-                nZwr++;
-                ref[nr] = r2((ref[nr] || 0) - zwrotReszta);
-                refData[nr] = refData[nr] || (zwrW[0] && zwrW[0].data) || '';
-                const opisy = zwrW.map(function (p){ return hdOpisPozycji(p.opis); }).join('; ');
-                refNote[nr] = (refNote[nr] ? refNote[nr] + '; ' : '') + opisy;
-                sumaZwr = r2(sumaZwr + zwrotReszta);
-                zostajeZwrot.push({ nr: nr, kwota: zwrotReszta, data: (zwrW[0] && zwrW[0].data) || '' });
+            z.inne.forEach(function (x){
+                pominiete.push({ nr: nr, kwota: x.netto, data: x.data, opis: x.opis, powod: 'nieznany rodzaj operacji' });
+                poza(x.pola, 'nieznany rodzaj operacji', 'nic');
+            });
+
+            // 'nic' — nie ksiegujemy niczego. 'rabat' — wplata i zwrot znosza sie do zera,
+            // ale RABAT i tak idzie do ticketu: rabat nigdy nie podlega kompensacie, bo to
+            // osobna kwota, ktora Homedeco potracilo niezaleznie od zwrotu towaru.
+            if (tryb === 'nic' || tryb === 'recznie' || tryb === 'rabat'){
+                const d = powod || (tryb === 'recznie' ? 'do rozstrzygnięcia ręcznego' : 'nie ma czego księgować');
+                z.wpl.forEach(function (x){ poza(x.pola, 'wpłata — ' + d, 'nic'); wplNic = r2(wplNic + x.brutto); });
+                z.zwr.forEach(function (x){ poza(x.pola, 'zwrot — ' + d, 'nic');  zwrNic = r2(zwrNic + x.brutto); });
+                if (tryb === 'rabat') rabatNaTicket(nr, z, false);
+                else z.rab.forEach(function (x){ poza(x.pola, 'rabat — ' + d, 'nic'); zwrNic = r2(zwrNic + Math.abs(x.netto || 0)); });
+                (tryb === 'recznie' ? doRecznie : nicNie).push({ nr: nr, powod: d, znosza: !!z.znoszaSie });
+                if (z.znoszaSie) znosza.push({ nr: nr, kwota: z.pelna, pozycji: z.pary.length,
+                                               data: (z.wpl[0] && z.wpl[0].data) || '',
+                                               dataZwrot: (z.zwr[0] && z.zwr[0].data) || '' });
+                return;
             }
-            woln.forEach(function (p){
+
+            if (tryb === 'ticket'){
+                z.wpl.forEach(function (x){
+                    poza(x.pola, 'wpłata do ticketu na minus (auftrag bez open amount)', 'ticket');
+                    osobno(nr, x.brutto, -1, 'wpłata ' + f2(x.brutto) + ' — w tickecie na minus', x.data);
+                    wplDoTicketu = r2(wplDoTicketu + x.brutto); nWplTicket++;
+                });
+                z.zwr.forEach(function (x){
+                    poza(x.pola, 'zwrot — idzie do ticketu, nie do importu', 'ticket');
+                    osobno(nr, x.brutto, 1, hdOpisPozycji(x.opis), x.data);
+                    sumaZwr = r2(sumaZwr + x.brutto); nZwr++;
+                });
+                rabatNaTicket(nr, z, true);
+                doTicketu.push({ nr: nr, wplata: z.pelna, zwrot: r2(z.zwrPelny + z.rabSuma),
+                                 pozycji: z.wpl.length + z.zwr.length + z.rab.length });
+                return;
+            }
+
+            // 'pelny' albo 'netto' — cos idzie do auftragu.
+            const pelny = (tryb === 'pelny');
+            const doAuf = pelny ? z.wpl : z.woln;
+            if (!pelny){
+                z.pary.forEach(function (pr){
+                    poza(pr.wplata.pola, 'wpłata skompensowana zwrotem — nie wchodzi do importu', 'nic');
+                    poza(pr.zwrot.pola,  'zwrot kompensujący wpłatę — nie księgujemy osobno', 'nic');
+                    wplNic = r2(wplNic + pr.wplata.brutto);
+                    zwrNic = r2(zwrNic + pr.zwrot.brutto);
+                });
+                z.zgaszone.forEach(function (x){
+                    poza(x.pola, 'wpłata zgaszona zwrotem obejmującym więcej sztuk', 'nic');
+                    wplNic = r2(wplNic + x.brutto);
+                    zwrNic = r2(zwrNic + x.brutto);      // tyle ze zwrotow poszlo na zgaszenie wplat
+                });
+            }
+            doAuf.forEach(function (x){
                 nWpl++;
-                ord[nr] = r2((ord[nr] || 0) + p.brutto);
-                if (!ordData[nr]) ordData[nr] = p.data;
-                sumaWpl = r2(sumaWpl + p.brutto);
+                ord[nr] = r2((ord[nr] || 0) + x.brutto);
+                if (!ordData[nr]) ordData[nr] = x.data;
+                sumaWpl = r2(sumaWpl + x.brutto);
                 // Plik importu ma UKLAD PLIKU ZRODLOWEGO — prologistics importuje rozliczenie
-                // Homedeco wprost, wiec nie przepisujemy go na wspolny uklad 35 kolumn.
-                // Do pliku ida DOKLADNIE te wiersze, ktore maja sie zaksiegowac w auftragach:
-                // to, co zostalo z wplat po skompensowaniu zwrotow. Wiersz przepisujemy
-                // w calosci, bez ruszania jakiejkolwiek kolumny.
-                wOrd.push({ r: p.pola, nr: nr, kwota: p.brutto, data: p.data });
+                // Homedeco wprost. Wiersz przepisujemy w calosci, bez ruszania kolumn.
+                wOrd.push({ r: x.pola, nr: nr, kwota: x.brutto, data: x.data });
             });
-            // Wplata i zwrot znosza sie CO DO GROSZA i nic nie zostaje: z pliku nie wynika,
-            // czy ksiegowac oba, czy nic. Odkladamy do sprawdzenia w prologistics.
-            if (skompensowane > 0 && !woln.length && !zwrW.length){
-                znosza.push({ nr: nr, kwota: r2(wpl.reduce(function (a, p){ return a + p.brutto; }, 0)),
-                              pozycji: skompensowane,
-                              data: (wpl[0] && wpl[0].data) || '',
-                              dataZwrot: (zwr[0] && zwr[0].data) || '' });
+            rabatNaTicket(nr, z, false);
+            const zwrRows = pelny ? z.zwr : z.zwrW;
+            const zwrKwota = pelny ? z.zwrPelny : z.reszta;
+            // Gdy z niesparowanych zwrotow nic nie zostaje (poszly w calosci na zgaszenie
+            // wplat), taki wiersz nie ksieguje sie nigdzie — i wtedy ma prawo byc na liscie.
+            zwrRows.forEach(function (x){
+                poza(x.pola, 'zwrot — idzie do ticketu, nie do importu', zwrKwota > 0.005 ? 'ticket' : 'nic');
+            });
+            if (zwrKwota > 0.005){
+                nZwr++;
+                zbiorczo(nr, -zwrKwota, zwrRows.map(function (x){ return hdOpisPozycji(x.opis); }).join('; '),
+                         (zwrRows[0] && zwrRows[0].data) || '');
+                sumaZwr = r2(sumaZwr + zwrKwota);
+            }
+            if (pelny) pelne.push({ nr: nr, wplata: z.pelna, zwrot: r2(z.zwrPelny + z.rabSuma) });
+            else {
+                if (z.zgaszone.length) czesciowe.push({ nr: nr,
+                    zgaszono: r2(z.zgaszone.reduce(function (a, x){ return a + x.brutto; }, 0)),
+                    zwrotem: r2(z.zwrW.reduce(function (a, x){ return a + x.brutto; }, 0)), zostaje: z.reszta });
+                if (z.niepelny) niepelne.push({ nr: nr, zwrot: z.reszta, wplata: z.woln[0].brutto });
+                if (z.pary.length && z.woln.length) zostajeWplata.push({ nr: nr, kwota: z.netto,
+                    zgaszono: z.pary.length, wierszy: z.woln.length });
+                if (z.znoszaSie) znosza.push({ nr: nr, kwota: z.pelna, pozycji: z.pary.length,
+                    data: (z.wpl[0] && z.wpl[0].data) || '', dataZwrot: (z.zwr[0] && z.zwr[0].data) || '' });
             }
         });
 
-        // Pozycja, ktorej saldo wyszlo DODATNIE, to pieniadze wracajace do nas: w tickecie
-        // ma sie zaksiegowac na plus, czyli na liscie zwrotow stoi z minusem.
+        // Pozycja o saldzie DODATNIM to pieniadze wracajace do nas: w tickecie ksieguje sie
+        // na plus, czyli na liscie zwrotow stoi z minusem.
         Object.keys(ref).forEach(function (k){ if (ref[k] > 0.005) refSign[k] = -1; });
-        return {
-            ord: ord, dataOrd: ordData, ref: ref, refNote: refNote, refData: refData,
-            refSign: refSign,
-            wOrd: wOrd, znosza: znosza, pominiete: pominiete, zostajeZwrot: zostajeZwrot,
-            nieZaks: nieZaks, naglowek: naglowek,
-            czesciowe: czesciowe, niepelne: niepelne,
-            nWpl: nWpl, nZwr: nZwr, nRab: nRab,
-            sumaWpl: sumaWpl, sumaZwr: sumaZwr, sumaNetto: r2(sumaNetto),
-            nOrd: Object.keys(ord).length, nZwrOrd: Object.keys(ref).length,
-            nZam: kolejnosc.length, konto: MK_HD_ROZL,
-            od: odd, doo: dod, cur: 'EUR'
-        };
+        p.ord = ord; p.dataOrd = ordData;
+        p.ref = ref; p.refNote = refNote; p.refData = refData; p.refSign = refSign; p.refExtra = refExtra;
+        p.wOrd = wOrd; p.nieZaks = nieZaks; p.pominiete = pominiete;
+        p.znosza = znosza; p.czesciowe = czesciowe; p.niepelne = niepelne; p.zostajeWplata = zostajeWplata;
+        p.doTicketu = doTicketu; p.doRecznie = doRecznie; p.pelne = pelne; p.nicNie = nicNie;
+        p.sumaWpl = sumaWpl; p.sumaZwr = sumaZwr;
+        p.nWpl = nWpl; p.nZwr = nZwr; p.nRab = nRab;
+        p.wplDoTicketu = wplDoTicketu; p.nWplTicket = nWplTicket;
+        p.wplNic = wplNic; p.zwrNic = zwrNic;
+        p.nPozaTicket = nieZaks.filter(function (x){ return x.gdzie === 'ticket'; }).length;
+        p.nPozaNic = nieZaks.length - p.nPozaTicket;
+        p.nOrd = Object.keys(ord).length; p.nZwrOrd = Object.keys(zTicketem).length;
+        return p;
     }
     // Plik wyjsciowy jest zgodny ze ZRODLEM: bez BOM, przecinek, CRLF, z naglowkiem
     // i zakonczony nowa linia — dokladnie tak wyglada rozliczenie z Homedeco i taki
     // plik idzie do importu. Cudzyslowy stawiamy wedlug zwyklej zasady CSV: tylko
-    // wokol pol z przecinkiem, cudzyslowem albo zlamaniem wiersza (w lipcowym pliku
-    // takie pole jest jedno).
+    // wokol pol z przecinkiem, cudzyslowem albo zlamaniem wiersza.
     function mkCsvHd(p){
         const pole = function (c){
             const v = String(c == null ? '' : c);
@@ -21358,6 +21443,10 @@
     // Wiersze, ktore NIE weszly do importu — w tym samym ukladzie co zrodlo, z jedna
     // kolumna wiecej: powodem. To plik do OGLADANIA, nie do wgrywania, wiec dolozenie
     // kolumny jest bezpieczne i duzo bardziej uzyteczne niz sama lista numerow.
+    // Wiersze, ktore NIGDZIE sie nie ksieguja — ani w auftragu, ani w tickecie. Zwroty
+    // i rabaty idace na tickety sa ZAKSIEGOWANE, tylko gdzie indziej, wiec ich tu nie ma:
+    // plik ma odpowiadac na pytanie „czego nie zaksieguje nikt", a nie „czego nie ma
+    // w pliku importu". Uklad jak w zrodle plus jedna kolumna z powodem.
     function mkCsvHdNieZaks(p){
         const pole = function (c){
             const v = String(c == null ? '' : c);
@@ -21365,83 +21454,245 @@
         };
         const L = [];
         if (p && p.naglowek && p.naglowek.length) L.push(p.naglowek.concat(['powod']).map(pole).join(','));
-        ((p && p.nieZaks) || []).forEach(function (x){ L.push((x.pola || []).concat([x.powod || '']).map(pole).join(',')); });
+        hdNieKsiegowane(p).forEach(function (x){ L.push((x.pola || []).concat([x.powod || '']).map(pole).join(',')); });
         return L.join('\r\n') + '\r\n';
     }
-    // Stan auftragu dla zamowien, w ktorych wplata i zwrot znosza sie dokladnie.
-    // Jedno wejscie na strone auftragu daje OBA potrzebne sygnaly: open amount
-    // („Auftrag value - Total of Payments") i to, czy wisi na nim ticket.
-    const hdStan = {};              // nr -> { auf, open, tickety, stan, err }
-    async function hdSprawdzStan(lista, postep){
-        for (let i = 0; i < (lista || []).length; i++){
-            const nr = lista[i];
-            if (postep) postep(i + 1, lista.length, nr);
-            const st = hdStan[nr] = { kand: [] };
-            const f = await crFind(nr);
-            const nums = f.nums || [];
-            if (!nums.length){ st.stan = 'brak'; st.err = f.err || ''; continue; }
-            for (let k = 0; k < nums.length; k++){
-                let html = '';
-                try {
-                    const res = await fetch('/auction.php?number=' + encodeURIComponent(nums[k]) + '&txnid=3', { credentials: 'same-origin' });
-                    html = await res.text();
-                } catch (e){ st.kand.push({ num: nums[k], err: 'nie otwarto auftragu' }); continue; }
-                const d = new DOMParser().parseFromString(html, 'text/html');
-                const tick = [];
-                d.querySelectorAll('a[href*="rma.php"][href*="rma_id="]').forEach(function (a){
-                    const m = (a.getAttribute('href') || '').match(/[?&]rma_id=(\d+)/i);
-                    if (m && tick.indexOf(m[1]) < 0) tick.push(m[1]);
-                });
-                st.kand.push({ num: nums[k], open: crOpen(d), tickety: tick,
-                               deleted: !!d.querySelector('.auftrag-status--deleted'),
-                               err: d.querySelector('form#book') ? '' : 'brak formularza płatności' });
-            }
-            st.stan = 'sprawdzone';
-        }
-        return hdStan;
+    function hdNieKsiegowane(p){
+        return ((p && p.nieZaks) || []).filter(function (x){ return x.gdzie !== 'ticket'; });
     }
-    // Werdykt dla jednego zamowienia. „Ksieguj oba" tylko wtedy, gdy auftrag ma OPEN AMOUNT
-    // i wisi na nim ticket — czyli dokladnie warunek, ktory podal uzytkownik. Przy braku
-    // ktoregokolwiek z tych dwoch nie ma czego ksiegowac i zamowienie pomijamy.
-    // Zamowienia, przy ktorych trzeba zajrzec do auftragu, bo z samego pliku nie wynika,
-    // gdzie ksiegowac: wplata i zwrot znosza sie co do grosza, zwrot obejmowal wiecej
-    // sztuk niz wplata z tego pliku, albo pokryl wiersz wplaty tylko czesciowo.
+    // Zamowienia, przy ktorych stan auftragu ZMIENIA wynik: te, ktore maja w pliku i wplate,
+    // i cokolwiek na ticket (zwrot albo rabat). Zwykla sprzedaz — sama wplata — idzie do
+    // auftragu bez pytania, a sam zwrot bez wplaty na ticket; ani jednego, ani drugiego nie
+    // ma sensu sprawdzac, a wejscie na auftrag kosztuje. Na trzech miesiacach daje to okolo
+    // stu zamowien z 1207, czyli jakies 33 na miesiac.
     function hdDoSprawdzenia(p){
         const out = [];
-        const dodaj = function (nr){ if (nr && out.indexOf(nr) < 0) out.push(nr); };
-        ((p && p.znosza) || []).forEach(function (x){ dodaj(x.nr); });
-        ((p && p.czesciowe) || []).forEach(function (x){ dodaj(x.nr); });
-        ((p && p.niepelne) || []).forEach(function (x){ dodaj(x.nr); });
+        ((p && p.kolejnosc) || []).forEach(function (nr){
+            const z = p.zam[nr];
+            if (!z || !z.wpl.length) return;
+            if (!z.zwr.length && !z.rab.length) return;
+            out.push(nr);
+        });
         return out;
     }
-    // Dlaczego dane zamowienie trafilo na liste — zeby przy werdykcie bylo widac, o co szlo.
+    // Co widac w samym pliku — do wypisania obok werdyktu, zeby bylo wiadomo, o co szlo.
     function hdPowod(p, nr){
-        const z = ((p && p.znosza) || []).filter(function (x){ return x.nr === nr; })[0];
-        if (z) return 'wpłata i zwrot znoszą się (' + f2(z.kwota) + ')';
-        const c = ((p && p.czesciowe) || []).filter(function (x){ return x.nr === nr; })[0];
-        if (c) return 'zwrot ' + f2(c.zwrotem) + ' zgasił wpłaty ' + f2(c.zgaszono)
-                    + (c.zostaje > 0.005 ? (', na ticket idzie ' + f2(c.zostaje)) : '');
-        const w = ((p && p.niepelne) || []).filter(function (x){ return x.nr === nr; })[0];
-        if (w) return 'zwrot ' + f2(w.zwrot) + ' pokrywa wpłatę ' + f2(w.wplata) + ' tylko częściowo';
-        return '';
+        const z = p && p.zam && p.zam[nr];
+        if (!z) return '';
+        const cz = [];
+        cz.push('wpłaty ' + f2(z.pelna) + (z.wpl.length > 1 ? (' w ' + z.wpl.length + ' wierszach') : ''));
+        if (z.zwr.length) cz.push('zwroty ' + f2(z.zwrPelny) + (z.zwr.length > 1 ? (' w ' + z.zwr.length + ' wierszach') : ''));
+        if (z.rab.length) cz.push('rabat ' + f2(z.rabSuma));
+        if (z.znoszaSie) cz.push('znoszą się do zera');
+        else if (z.pary.length || z.zgaszone.length)
+            cz.push('po skompensowaniu zostaje ' + f2(z.netto) + ' wpłaty i ' + f2(z.reszta) + ' zwrotu');
+        return cz.join(', ');
     }
-    function hdWerdykt(nr){
+    // Stan auftragu dla zamowien, ktorych z samego pliku rozstrzygnac sie nie da.
+    // Jedno wejscie na strone auftragu daje OBA potrzebne sygnaly: open amount
+    // („Auftrag value - Total of Payments") i to, czy wisi na nim ticket.
+    const hdStan = {};
+    // Ile zamowien sprawdzamy naraz. Kazde to okolo dwoch zapytan (szukanie po numerze
+    // fulfilmentu plus odczyt auftragu), a przegladarka i tak trzyma okolo szesciu
+    // rownoleglych polaczen na jeden serwer — powyzej tego dokladamy juz tylko kolejki.
+    const HD_WATKI = 5;
+    // Sprawdzenie JEDNEGO zamowienia. Wydzielone, zeby pula mogla je wolac rownolegle.
+    async function hdSprawdzJeden(nr){
+        const st = hdStan[nr] = { kand: [] };
+        const f = await crFind(nr);
+        const nums = f.nums || [];
+        if (!nums.length){ st.stan = 'brak'; st.err = f.err || ''; return; }
+        for (let k = 0; k < nums.length; k++){
+            let html = '';
+            try {
+                const res = await fetch('/auction.php?number=' + encodeURIComponent(nums[k]) + '&txnid=3', { credentials: 'same-origin' });
+                html = await res.text();
+            } catch (e){ st.kand.push({ num: nums[k], err: 'nie otwarto auftragu' }); continue; }
+            const d = new DOMParser().parseFromString(html, 'text/html');
+            const tick = [];
+            d.querySelectorAll('a[href*="rma.php"][href*="rma_id="]').forEach(function (a){
+                const m = (a.getAttribute('href') || '').match(/[?&]rma_id=(\d+)/i);
+                if (m && tick.indexOf(m[1]) < 0) tick.push(m[1]);
+            });
+            st.kand.push({ num: nums[k], open: crOpen(d), tickety: tick,
+                           deleted: !!d.querySelector('.auftrag-status--deleted'),
+                           err: d.querySelector('form#book') ? '' : 'brak formularza płatności' });
+        }
+        st.stan = 'sprawdzone';
+    }
+    // Rownolegle, ta sama pula co przy poprawianiu typow klienta w Amazonie (amzPula):
+    // jedna implementacja zamiast drugiej wlasnej. Wyniki ida do hdStan po NUMERZE
+    // zamowienia, wiec kolejnosc konczenia nie ma znaczenia i nic sie nie nadpisuje.
+    async function hdSprawdzStan(lista, postep){
+        const wsz = (lista || []).slice();
+        let zrobione = 0;
+        await amzPula(wsz, async function (nr){
+            try { await hdSprawdzJeden(nr); }
+            finally {
+                zrobione++;
+                if (postep) postep(zrobione, wsz.length, nr);
+            }
+        }, HD_WATKI);
+        return hdStan;
+    }
+    // Werdykt dla jednego zamowienia — cala regula ksiegowania w jednym miejscu.
+    //
+    // Zasada nadrzedna brzmi: w auftragu nie moze zostac open amount, a jesli wisi ticket,
+    // to wszystko, czego w auftragu zaksiegowac sie nie da, idzie do ticketu. Stad kolejnosc:
+    //
+    //   open amount = 0   → w auftragu nie ma czego ksiegowac.
+    //                       Gdy wplaty i zwroty znosza sie DO ZERA — nie ksiegujemy nic.
+    //                       Gdy cokolwiek zostaje — wszystko idzie do ticketu, kazdy wiersz
+    //                       osobno: wplata na minus, zwrot i rabat na plus.
+    //   open = suma wszystkich wplat → wszystkie wplaty do auftragu, zwroty do ticketu.
+    //   open = wplaty po skompensowaniu → do auftragu tyle, ile zostalo (tak prologistics
+    //                       zaksiegowal 26419421, 26424190, 26424777 i 26425055 — co do grosza).
+    //   cokolwiek innego  → nie zgadujemy. Nadplaty w auftragu nie cofa sie jednym
+    //                       klknieciem, wiec zamowienie idzie do rozstrzygniecia recznego.
+    function hdUstalTryb(p, nr){
+        const z = p && p.zam && p.zam[nr];
+        if (!z) return { tryb: 'netto', opis: '' };
         const st = hdStan[nr];
-        if (!st) return { stan: '?', opis: 'nie sprawdzone' };
-        if (st.stan === 'brak') return { stan: 'brak', opis: 'nie ma auftragu o tym numerze — nie ma czego księgować' };
+        if (!st || !st.stan) return { tryb: 'netto', opis: 'nie sprawdzone' };
+        if (st.stan === 'brak')
+            return { tryb: 'nic', opis: 'nie ma auftragu o tym numerze' + (st.err ? (' (' + st.err + ')') : '') };
         const zywe = (st.kand || []).filter(function (c){ return !c.deleted && !c.err; });
-        if (!zywe.length) return { stan: 'pomin', opis: 'auftrag jest, ale skasowany albo bez formularza płatności' };
-        if (zywe.length > 1) return { stan: 'recznie', opis: zywe.length + ' auftragi — rozstrzygnij ręcznie', kand: zywe };
-        const c = zywe[0];
-        const maOpen = c.open != null && Math.abs(c.open) > 0.005;
-        const maTicket = (c.tickety || []).length > 0;
-        if (maOpen && maTicket)
-            return { stan: 'ksieguj', num: c.num, open: c.open, tickety: c.tickety,
-                     opis: 'open amount ' + f2(c.open) + ' i ticket ' + c.tickety.join(', ') + ' — wpłata do auftragu, zwrot do ticketu' };
-        return { stan: 'pomin', num: c.num, open: c.open, tickety: c.tickety,
-                 opis: (maOpen ? 'jest open amount, ale nie ma ticketu' : 'auftrag bez open amount')
-                     + ' — nic do zaksięgowania' };
+        if (!zywe.length)
+            return { tryb: 'nic', opis: 'auftrag jest, ale skasowany albo bez formularza płatności' };
+        if (zywe.length > 1)
+            return { tryb: 'recznie', kand: zywe, opis: zywe.length + ' auftragi o tym numerze — rozstrzygnij ręcznie' };
+        const c = zywe[0], open = c.open, maTicket = (c.tickety || []).length > 0;
+        const tick = (c.tickety || []).join(', ');
+        const naTicket = r2(z.zwrPelny + z.rabSuma);
+        if (open == null)
+            return { tryb: 'recznie', num: c.num, tickety: c.tickety,
+                     opis: 'nie odczytałem open amount z auftragu ' + c.num + ' — rozstrzygnij ręcznie' };
+        if (Math.abs(open) <= 0.005){
+            if (!maTicket)
+                return { tryb: 'nic', num: c.num,
+                         opis: 'auftrag ' + c.num + ' bez open amount i bez ticketu — nie ma gdzie księgować' };
+            // Wplata i zwrot znosza sie do zera — ale RABAT nie podlega kompensacie i tak
+            // czy inaczej idzie do ticketu. To osobna kwota, ktora Homedeco potracilo
+            // niezaleznie od zwrotu towaru; zgubienie jej to zgubienie pieniedzy.
+            if (z.znoszaSie)
+                return { tryb: z.rabSuma > 0.005 ? 'rabat' : 'nic', num: c.num, tickety: c.tickety,
+                         opis: 'auftrag ' + c.num + ' bez open amount, wpłata i zwrot znoszą się do zera'
+                             + (z.rabSuma > 0.005 ? (' — księgujemy tylko rabat ' + f2(z.rabSuma) + ' w tickecie ' + tick)
+                                                  : ' — nic nie księgujemy') };
+            return { tryb: 'ticket', num: c.num, tickety: c.tickety,
+                     opis: 'auftrag ' + c.num + ' bez open amount, ticket ' + tick
+                         + ' — wszystko do ticketu: wpłaty ' + f2(z.pelna) + ' na minus, zwroty i rabaty ' + f2(naTicket) };
+        }
+        const bezTicketu = (naTicket > 0.005 && !maTicket)
+            ? ' — UWAGA: nie ma ticketu, zwroty ' + f2(naTicket) + ' nie mają gdzie się zaksięgować' : '';
+        if (Math.abs(open - z.pelna) <= 0.005)
+            return { tryb: 'pelny', num: c.num, tickety: c.tickety,
+                     opis: 'open amount ' + f2(open) + ' = wszystkie wpłaty — wpłaty do auftragu ' + c.num
+                         + (naTicket > 0.005 ? (', zwroty i rabaty ' + f2(naTicket) + ' do ticketu ' + tick) : '') + bezTicketu };
+        if (Math.abs(open - z.netto) <= 0.005 && z.netto > 0.005)
+            return { tryb: 'netto', num: c.num, tickety: c.tickety,
+                     opis: 'open amount ' + f2(open) + ' = wpłaty po skompensowaniu — do auftragu ' + c.num + ' idzie ' + f2(z.netto)
+                         + (z.reszta > 0.005 ? (', na ticket ' + f2(z.reszta)) : '')
+                         + (z.rabSuma > 0.005 ? (', rabat ' + f2(z.rabSuma) + ' osobno') : '') + bezTicketu };
+        return { tryb: 'recznie', num: c.num, tickety: c.tickety,
+                 opis: 'open amount ' + f2(open) + ' nie zgadza się ani z wpłatami ' + f2(z.pelna)
+                     + ', ani z ' + f2(z.netto) + ' po skompensowaniu — rozstrzygnij ręcznie' };
     }
+    // Przypisanie trybow i przeliczenie calosci od zera.
+    function hdZastosuj(p, lista){
+        ((lista && lista.length) ? lista : hdDoSprawdzenia(p)).forEach(function (nr){
+            const w = hdUstalTryb(p, nr);
+            p.tryb[nr] = w.tryb;
+            p.powody[nr] = w.opis || '';
+            p.werdykt[nr] = w;
+        });
+        hdPrzelicz(p);
+        return p;
+    }
+    async function hdSprawdzIZastosuj(p, postep){
+        const lista = hdDoSprawdzenia(p);
+        if (!lista.length) return [];
+        await hdSprawdzStan(lista, postep);
+        hdZastosuj(p, lista);
+        return lista;
+    }
+    // Podsumowanie z SUMA KONTROLNA. Odpowiada na jedno pytanie: czy kazdy wiersz i kazde
+    // euro z rozliczenia gdzies trafily. Pokazujemy je PRZED ksiegowaniem, bo po
+    // zaksiegowaniu sprawdzanie tego nie ma juz sensu.
+    //
+    // Trzy tozsamosci, ktore musza sie domknac:
+    //   wiersze: wszystkie wiersze pliku = import + niezaksiegowane
+    //   wplaty:  brutto wplat = do auftragow + do ticketow na minus + nieksiegowane
+    //   zwroty:  brutto zwrotow i rabatow = na tickety + nieksiegowane
+    // Podsumowanie z SUMA KONTROLNA. Odpowiada na jedno pytanie: czy kazdy wiersz i kazde
+    // euro z rozliczenia gdzies trafily. Pokazujemy je PRZED ksiegowaniem, bo po
+    // zaksiegowaniu sprawdzanie tego nie ma juz sensu.
+    //
+    // Trzy tozsamosci, ktore musza sie domknac:
+    //   wiersze: wszystkie wiersze pliku = import + tickety + nieksiegowane
+    //   wplaty:  brutto wplat = do auftragow + do ticketow na minus + nieksiegowane
+    //   zwroty:  brutto zwrotow i rabatow = na tickety + nieksiegowane
+    function hdPodsumowanie(p){
+        if (!p || !p.zam) return null;
+        const wImporcie = (p.wOrd || []).length;
+        const wTicket = p.nPozaTicket || 0, wNic = p.nPozaNic || 0;
+        const wplPrawa = r2(r2(p.sumaWpl + p.wplDoTicketu) + p.wplNic);
+        const zwrLewa = r2(p.bruttoZwr + p.bruttoRab);
+        const zwrPrawa = r2(p.sumaZwr + p.zwrNic);
+        const doSpr = hdDoSprawdzenia(p);
+        let sprawdzonych = 0;
+        doSpr.forEach(function (nr){ if (p.tryb[nr]) sprawdzonych++; });
+        return {
+            nWierszy: p.nWierszy, wImporcie: wImporcie, wTicket: wTicket, wNic: wNic,
+            wierszeOk: (wImporcie + wTicket + wNic) === p.nWierszy,
+            bruttoWpl: p.bruttoWpl, doImportu: p.sumaWpl, doTicketu: p.wplDoTicketu, wplNic: p.wplNic,
+            wplatyOk: Math.abs(p.bruttoWpl - wplPrawa) < 0.02, wplPrawa: wplPrawa,
+            zwrLewa: zwrLewa, naTickety: p.sumaZwr, zwrNic: p.zwrNic,
+            zwrotyOk: Math.abs(zwrLewa - zwrPrawa) < 0.02, zwrPrawa: zwrPrawa,
+            nDoSprawdzenia: doSpr.length, nSprawdzonych: sprawdzonych,
+            nTicket: (p.doTicketu || []).length, nRecznie: (p.doRecznie || []).length,
+            nPelne: (p.pelne || []).length, nZnosza: (p.znosza || []).length,
+            nWplTicket: p.nWplTicket
+        };
+    }
+    function hdPodsumowanieHtml(p){
+        const s = hdPodsumowanie(p);
+        if (!s) return '';
+        const wiersz = function (etyk, tresc, ok){
+            return '<tr><td style="padding:1px 8px 1px 0;color:#666">' + etyk + '</td>'
+                 + '<td style="padding:1px 0;font-family:monospace">' + tresc + '</td>'
+                 + '<td style="padding:1px 0 1px 8px">' + (ok === undefined ? ''
+                     : (ok ? '<span style="color:#0a7a2f;font-weight:700">✓</span>'
+                           : '<span style="color:#c00;font-weight:700">✗ nie domyka się</span>')) + '</td></tr>';
+        };
+        const wszystkoOk = s.wierszeOk && s.wplatyOk && s.zwrotyOk;
+        const brakuje = s.nDoSprawdzenia - s.nSprawdzonych;
+        return '<div style="border:1px solid ' + (wszystkoOk ? '#badbcc' : '#f5c2c7')
+             + ';background:' + (wszystkoOk ? '#f3fbf6' : '#fff5f5')
+             + ';border-radius:8px;padding:8px;margin:4px 0;font-size:11px">'
+             + '<div style="font-weight:700;margin-bottom:4px">Podsumowanie — sprawdź przed zaksięgowaniem</div>'
+             + '<table style="border-collapse:collapse;font-size:11px">'
+             + wiersz('wiersze rozliczenia', s.nWierszy + ' = ' + s.wImporcie + ' do importu + '
+                      + s.wTicket + ' do ticketów + ' + s.wNic + ' nieksięgowanych', s.wierszeOk)
+             + wiersz('wpłaty (brutto)', f2(s.bruttoWpl) + ' = ' + f2(s.doImportu) + ' do auftragów + '
+                      + f2(s.doTicketu) + ' do ticketów na minus + ' + f2(s.wplNic) + ' nieksięgowane', s.wplatyOk)
+             + wiersz('zwroty i rabaty', f2(s.zwrLewa) + ' = ' + f2(s.naTickety) + ' na tickety + '
+                      + f2(s.zwrNic) + ' nieksięgowane', s.zwrotyOk)
+             + '</table>'
+             + '<div style="margin-top:4px;color:#666">sprawdzone auftragi: ' + s.nSprawdzonych + ' z ' + s.nDoSprawdzenia
+             + ' · wszystko do ticketu: ' + s.nTicket + ' · znoszą się: ' + s.nZnosza
+             + ' · ręcznie: ' + s.nRecznie + '</div>'
+             + (brakuje > 0
+                 ? ('<div style="margin-top:4px;color:#c47f00">' + brakuje
+                    + ' zamówień jeszcze nie sprawdzonych w prologistics — użyj „Sprawdź auftragi".</div>')
+                 : '')
+             + (s.nRecznie
+                 ? ('<div style="margin-top:4px;color:#c47f00">' + s.nRecznie
+                    + ' zamówień do rozstrzygnięcia ręcznego — są na liście nieksięgowanych z powodem.</div>')
+                 : '')
+             + '</div>';
+    }
+
     // ================= CNOVA FR (CDISCOUNT, PANEL OCTOPIA) =================
     // Zestawienie z Octopii ma TRZY wiersze naglowka:
     //   0 - puste kolumny, a od K: „Total HT;Total TVA;Total TTC;Devise"
@@ -23143,6 +23394,10 @@
         return /^-?\d+(?:\.\d+)?$/.test(t) || /^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(t);
     }
     function mkParseWayf(src){
+        // Plik zrodlowy zostaje przy rozliczeniu. Gdy HUB sciaga go sam z portalu, nie ma
+        // go nigdzie na dysku — a wlasnie wtedy jest najbardziej potrzebny, bo zatrzymane
+        // zlecenie trzeba czyms sprawdzic. Kilka kilobajtow na zlecenie.
+        const raw = (typeof src === 'string') ? src : '';
         const rows = (Array.isArray(src) ? src : wayfRows(src)).filter(function (r){ return r && r.length; });
         if (!rows.length) return { err: 'pusty plik' };
         let hi = -1;
@@ -23222,7 +23477,7 @@
             } else { credits.push(d); creditSum = r2(creditSum + d.amt); }
         });
         const net = r2(sumPay + dedSum);
-        return { hdr: hdr, c: c, pre: rows.slice(0, hi), dat: dat, tail: tail, ded: ded,
+        return { hdr: hdr, c: c, pre: rows.slice(0, hi), dat: dat, tail: tail, ded: ded, raw: raw,
                  ord: ord, ref: ref, refNote: refNote, ids: ids, credits: credits,
                  remit: remit, pdate: pdate, total: total, net: net, gross: gross,
                  refund: refund, creditSum: creditSum, nPos: nPos,
@@ -23410,13 +23665,20 @@
         if (p.total != null && !eq(p.total, p.net)) bad.push('„Total" w pliku ' + f2(p.total) + ' ≠ policzone ' + f2(p.net));
         // Numer z tytulu przelewu musi wystapic w rozliczeniu. To jedyna twarda kontrola,
         // ze po kwocie trafilismy we WLASCIWA wyplate, a nie w inna o tej samej wartosci.
-        if (j.ref && !p.ids[j.ref]) bad.push('numeru ' + j.ref + ' z przelewu nie ma w tym rozliczeniu');
+        // Numeru z tytulu przelewu NIE sprawdzamy. Wayfair wpisuje tam numer faktury, ktora
+        // do danej wyplaty nie musi nalezec — w przelewie 2514.17 z 17.08.2026 stalo
+        // UK661373329, a w rozliczeniu numery szly od 659683893 do 668301190 i tego jednego
+        // wsrod nich nie bylo. Zlecenie stalo zablokowane, choc kwota, „Total" z pliku i data
+        // zgadzaly sie co do grosza. Rozliczenie nazywamy jego wlasnym numerem (Remittance #),
+        // a nie tytulem przelewu — decyzja uzytkownika z 18.08.2026.
         if (!p.nPos) bad.push('rozliczenie nie ma pozycji do importu — całą kwotę stanowią potrącenia'
                             + (p.credits.length ? ' · oddane potrącenia księgujesz niżej, wprost na auftragu' : ''));
         j.status = bad.length ? 'partial' : 'ready';
         j.msg = bad.join('; ');
+        if (p.remit) j.remit = p.remit;
         j.note = 'brutto = Product Amount + Tax/VAT'
                + (p.remit ? (' · remittance ' + p.remit) : '')
+               + (j.ref && !p.ids[j.ref] ? (' · w tytule przelewu stoi ' + j.ref + ', numer spoza tego rozliczenia — nie ma znaczenia') : '')
                + (p.refund ? (' · zwroty ' + Object.keys(p.ref).length + ' na ' + f2(p.refund) + ' — idą na listę zwrotów') : '')
                + (p.credits.length ? (' · oddane potrącenia ' + p.credits.length + ' na ' + f2(p.creditSum)
                                       + ' — to nie zwrot, nic z nich nie księguję') : '');
@@ -24892,7 +25154,11 @@
                  // marke z koncowka kraju ze sklepu — to ta sama nazwa, ktora idzie
                  // do arkusza, wiec lista i arkusz mowia teraz tak samo.
               +  '<td style="padding:3px 5px;white-space:nowrap">' + esc(mkShort(j) || j.mp || '—') + '</td>'
-              +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.ref || '—')
+              +  '<td style="padding:3px 5px;font-family:monospace">' + esc(j.remit || j.ref || '—')
+                 // Wayfair: rozliczenie nazywamy jego wlasnym numerem, a numer z tytulu
+                 // przelewu schodzi pod spod — bywa numerem faktury z zupelnie innej wyplaty.
+                 + (j.remit && j.ref && j.remit !== j.ref
+                     ? ('<div style="font-family:system-ui;font-size:9px;color:#94a3b8">z przelewu: ' + esc(j.ref) + '</div>') : '')
                  // Skad sie wzielo zlecenie. Przy nieudanym dopasowaniu to pierwsza rzecz,
                  // ktora trzeba wiedziec: reczne nie ma referencji z przelewu.
                  + (j.manual ? '<div style="font-family:system-ui;font-size:9px;color:#7c3aed;font-weight:700">dodane ręcznie</div>' : '')
@@ -24939,14 +25205,18 @@
                 // Ksiegowanie idzie wylacznie przez zaznaczenie i guzik zbiorczy nad tabela.
                 // Osobny przycisk przy kazdym wierszu tylko dublowalby te sama droge.
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
+                  +  ((j.kind === 'hd' && j.data.hd) ? hdPodsumowanieHtml(j.data.hd) : '')
                   +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span> ' : '')
                   +  (refIle(j) ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
                   // v3.82: osobnego guzika „Sprawdź typy klienta" juz nie ma. Kontrola
                   // przeniosla sie do widoku PACZKI IMPORTU, gdzie prologistics podaje juz
                   // gotowe przypisanie zamowienie -> auftrag. Nie trzeba niczego szukac,
                   // a przy okazji nie da sie zaksiegowac przed sprawdzeniem typow.
-                  +  ((j.kind === 'hd' && j.data.hd && j.data.hd.nieZaks && j.data.hd.nieZaks.length)
-                        ? '<button class="mk-hdnz" data-ref="' + esc(j.ref) + '" title="Wiersze, które NIE weszły do pliku importu — ten sam układ co źródło plus kolumna z powodem" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Niezaksięgowane (' + j.data.hd.nieZaks.length + ')</button>'
+                  +  ((j.kind === 'wayf' && j.data.wayf && j.data.wayf.raw)
+                        ? '<button class="mk-wfraw" data-ref="' + esc(j.ref) + '" title="Rozliczenie dokładnie tak, jak przyszło z Wayfaira — do sprawdzenia, gdy zlecenie zostało zatrzymane" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Rozliczenie z Wayfaira</button>'
+                        : '')
+                  +  ((j.kind === 'hd' && j.data.hd && j.data.hd.nPozaNic)
+                        ? '<button class="mk-hdnz" data-ref="' + esc(j.ref) + '" title="Wiersze, których nie księguje nikt — ani w auftragu, ani w tickecie. Ten sam układ co źródło plus kolumna z powodem" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Nieksięgowane (' + j.data.hd.nPozaNic + ')</button>'
                         : '')
                   +  ((j.kind === 'hd' && j.data.hd && hdDoSprawdzenia(j.data.hd).length)
                         ? '<button class="mk-hdauf" data-ref="' + esc(j.ref) + '" title="Dla zamówień, których nie da się rozstrzygnąć z pliku, sprawdza auftrag: czy jest, czy ma open amount i czy wisi na nim ticket" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udd0d Sprawdź auftragi (' + hdDoSprawdzenia(j.data.hd).length + ')</button>'
@@ -24974,6 +25244,7 @@
         }; });
         out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-wfraw').forEach(function (b){ b.onclick = function(){ doWayfRaw(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-hdnz').forEach(function (b){ b.onclick = function(){ doHdNieZaks(b.getAttribute('data-ref')); }; });
         out.querySelectorAll('.mk-hdauf').forEach(function (b){ b.onclick = function(){ doHdAuftragi(b.getAttribute('data-ref'), b); }; });
         out.querySelectorAll('.mk-inv').forEach(function (b){ b.onclick = function(){
@@ -26716,7 +26987,13 @@
         if (!node) return null;
         const box = (node.closest && node.closest('td')) || node.parentNode;
         const t = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
-        const m = t.match(/-?\s*\d[\d'’\s]*(?:[.,]\d{1,2})?/);
+        // Separator tysiecy MUSI wejsc do wzorca. Prologistics pisze te kwote po
+        // angielsku, z przecinkiem — „€ 1,149.97" — a wzorzec bez przecinka lapal
+        // z tego samo „1,14" i open amount 1149.97 czytal jako 1.14. Dopoki sluzylo to
+        // tylko do pytania „jest czy nie ma", nie bylo widac; przy porownywaniu kwot
+        // to juz zla decyzja ksiegowa. Rozdzielanie kropki od przecinka zostawiamy
+        // mkNum, ktory rozpoznaje oba zapisy — i szwajcarski 1'149.97 przy okazji.
+        const m = t.match(/-?\s*\d[\d'’\s,.]*/);
         return m ? mkNum(m[0]) : null;
     }
     async function crRead(num){
@@ -27889,7 +28166,7 @@
         function hdWczytaj(f){
             if (!f) return;
             const rd = new FileReader();
-            rd.onload = function (){
+            rd.onload = async function (){
                 let p;
                 try { p = mkParseHd(mkDecode(rd.result)); }
                 catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); return; }
@@ -27905,34 +28182,48 @@
                 }
                 const j = jobs[k];
                 if (j.status === 'done'){ say('To rozliczenie jest już zaksięgowane.', '#c47f00'); return; }
-                j.data = { hd: p, shop: 'Homedeco NL',
-                           gross: p.sumaWpl, refund: p.sumaZwr, net: p.sumaWpl, netOk: true,
-                           ord: p.ord, ref: p.ref, refNote: p.refNote, refData: p.refData,
-                           refSign: p.refSign,
-                           unknown: {}, skipped: {}, full: true, both: [],
-                           pays: 1, split: false, rows: p.nWpl + p.nZwr + p.nRab,
-                           total: p.nZam, pages: 1, how: 'plik ' + f.name };
-                // Import NIE jest blokowany. Zamowienia, w ktorych wplata i zwrot znosza sie
-                // co do grosza, po prostu nie wchodza do pliku — a to, ze ich tam nie ma, jest
-                // decyzja, nie usterka. Zwroty i rabaty ida na liste do ticketow, czyli tez
-                // sa obsluzone. Wszystko, co zostalo poza plikiem, mozna obejrzec w osobnym
-                // pliku „niezaksięgowane".
-                const uw = [];
-                if (p.znosza.length) uw.push(p.znosza.length + ' zamówień, w których wpłata i zwrot znoszą się — nie wchodzą do importu, sprawdź auftragi');
-                if (p.czesciowe.length) uw.push(p.czesciowe.length + ' zamówień, w których zwrot obejmował więcej sztuk niż wpłata z tego pliku');
-                if (p.niepelne.length) uw.push(p.niepelne.length + ' zamówień ze zwrotem pokrywającym wpłatę tylko częściowo — zostawiam bez zmian, sprawdź ręcznie');
-                if (p.pominiete.length) uw.push(p.pominiete.length + ' wierszy pominiętych (korekty prowizji)');
+                const zakres = (p.od || '?') + (p.doo && p.doo !== p.od ? ('…' + p.doo) : '');
+                hdDoJob(j, p, 'plik ' + f.name);
                 j.status = 'ready';
-                j.msg = uw.join(' · ');
+                j.msg = '';
                 jobsSave(jobs); render();
-                say('Homedeco NL · ' + (p.od || '?') + (p.doo && p.doo !== p.od ? ('…' + p.doo) : '')
-                    + ' · zamówień ' + p.nZam
+                // Sprawdzenie auftragow rusza SAMO, zaraz po wczytaniu. Bez niego wynik jest
+                // tylko wstepny: o tym, czy wplata idzie do auftragu, czy do ticketu na minus,
+                // decyduje open amount, a tego z pliku nie widac. Czekanie na klikniecie
+                // znaczylo tyle, ze przez chwile widac bylo liczby, ktore i tak sie zmienia.
+                const lista = hdDoSprawdzenia(p);
+                if (lista.length){
+                    say('Homedeco NL · ' + zakres + ' · zamówień ' + p.nZam
+                        + ' · sprawdzam ' + lista.length + ' auftragów…', '#c47f00');
+                    try {
+                        await hdSprawdzIZastosuj(p, function (i, ile, nrx){
+                            say('Homedeco: auftragi ' + i + ' z ' + ile + ' (ostatni ' + nrx + ')…', '#c47f00');
+                        });
+                    } catch (e){
+                        say('Homedeco: nie udało się sprawdzić auftragów (' + ((e && e.message) || e)
+                            + '). Wynik jest wstępny — użyj „Sprawdź auftragi".', '#c00');
+                    }
+                    hdDoJob(j, p, 'plik ' + f.name);
+                }
+                // Import NIE jest blokowany. To, ze czesc zamowien nie wchodzi do pliku, jest
+                // decyzja podjeta na podstawie auftragu, nie usterka — a wszystko, co zostalo
+                // poza importem, widac w osobnym pliku „niezaksięgowane" razem z powodem.
+                const s = hdPodsumowanie(p);
+                const uw = [];
+                if (s.nRecznie) uw.push(s.nRecznie + ' zamówień do rozstrzygnięcia ręcznie');
+                if (s.nDoSprawdzenia > s.nSprawdzonych)
+                    uw.push((s.nDoSprawdzenia - s.nSprawdzonych) + ' zamówień bez sprawdzonego auftragu');
+                if (p.pominiete.length) uw.push(p.pominiete.length + ' wierszy pominiętych (korekty prowizji)');
+                j.msg = uw.join(' · ');
+                const jz = jobsLoad(); jz[k] = j; jobsSave(jz); render();
+                say('Homedeco NL · ' + zakres + ' · zamówień ' + p.nZam
                     + ' · do auftragów ' + p.nWpl + ' poz. na ' + f2(p.sumaWpl)
-                    + ' · do ticketów ' + (p.nZwr + p.nRab) + ' poz. na ' + f2(p.sumaZwr)
-                    + (p.znosza.length ? (' · znoszą się ' + p.znosza.length) : '')
-                    + (p.pominiete.length ? (' · pominięte ' + p.pominiete.length) : '')
-                    + (j.msg ? (' — ' + j.msg) : ''),
-                    bad.length ? '#c47f00' : '#0a7a2f');
+                    + ' · do ticketów ' + (p.nZwr + p.nRab + p.nWplTicket) + ' poz. na ' + f2(p.sumaZwr)
+                    + (p.nWplTicket ? (' (w tym ' + p.nWplTicket + ' wpłat na minus na ' + f2(p.wplDoTicketu) + ')') : '')
+                    + (s.nZnosza ? (' · znoszą się ' + s.nZnosza) : '')
+                    + (p.pominiete.length ? (' · pominięte ' + p.pominiete.length) : ''),
+                    (j.msg || !s.wierszeOk || !s.wplatyOk || !s.zwrotyOk) ? '#c47f00' : '#0a7a2f');
+                if (j.msg) say('Homedeco: ' + j.msg, '#c47f00');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -29351,58 +29642,165 @@
     // Sprawdzenie auftragow dla zamowien, ktorych z pliku rozstrzygnac sie nie da.
     // Jedno wejscie na strone auftragu daje OBA sygnaly naraz: open amount i to, czy
     // wisi na nim ticket — czyli dokladnie warunek, ktory ma decydowac o ksiegowaniu.
+    // Przepisanie wyniku parsera do zlecenia. Wolane po wczytaniu pliku i JESZCZE RAZ po
+    // sprawdzeniu auftragow: przeliczenie tworzy nowe obiekty, wiec zlecenie musi dostac
+    // wskazania na nie — inaczej panel pokazywalby stan sprzed sprawdzenia.
+    function hdDoJob(j, p, how){
+        j.data = { hd: p, shop: 'Homedeco NL',
+                   gross: p.sumaWpl, refund: p.sumaZwr, net: p.sumaWpl, netOk: true,
+                   ord: p.ord, ref: p.ref, refNote: p.refNote, refData: p.refData,
+                   refSign: p.refSign, refExtra: p.refExtra || [],
+                   unknown: {}, skipped: {}, full: true, both: [],
+                   pays: 1, split: false, rows: p.nWpl + p.nZwr + p.nRab,
+                   total: p.nZam, pages: 1,
+                   how: how || (j.data && j.data.how) || '' };
+        return j;
+    }
+    // Sprawdzenie auftragow z guzika. Po wczytaniu pliku dzieje sie to samo,
+    // wiec tutaj chodzi juz tylko o powtorzenie — po zmianie czegos w prologistics
+    // albo gdy za pierwszym razem nie bylo polaczenia.
     async function doHdAuftragi(ref, btn){
         const j = jobsLoad()[ref];
         const p = j && j.data && j.data.hd;
         if (!p) return;
+        if (!p.zam){
+            say('To zlecenie pochodzi ze starszej wersji HUB-a — wczytaj plik rozliczenia jeszcze raz.', '#c47f00');
+            return;
+        }
         const lista = hdDoSprawdzenia(p);
         if (!lista.length){ say('Nie ma czego sprawdzać.', '#c47f00'); return; }
         if (btn) btn.disabled = true;
         try {
-            await hdSprawdzStan(lista, function (i, ile, nr){
-                say('Sprawdzam auftrag ' + i + '/' + ile + ' — ' + nr + '…');
+            await hdSprawdzIZastosuj(p, function (i, ile, nr){
+                // Przy pracy rownoleglej numer nie jest „tym w kolejce", tylko tym, ktory
+                // wlasnie sie skonczyl — piszemy wiec „gotowe", a nie „sprawdzam".
+                say('Auftragi: gotowe ' + i + ' z ' + ile + ' (ostatni ' + nr + ')…');
             });
         } catch (e){
             say('Błąd sprawdzania: ' + ((e && e.message) || e), '#c00');
             if (btn) btn.disabled = false;
             return;
         }
+        hdDoJob(j, p);
+        const jj = jobsLoad(); jj[ref] = j; jobsSave(jj);
+        try { render(); } catch (e){}
+
+        const lnk = function (num){
+            if (!num) return '';
+            let baza = '';
+            try { baza = location.origin; } catch (e){}
+            return baza + '/auction.php?number=' + num + '&txnid=3';
+        };
+        const aufNum = function (nr){
+            const w = p.werdykt[nr];
+            if (w && w.num) return w.num;
+            const st = hdStan[nr], k = (st && st.kand && st.kand[0]) || null;
+            return k ? k.num : '';
+        };
+        const grupy = { pelny: [], netto: [], ticket: [], nic: [], recznie: [] };
         const W = [];
         W.push('Homedeco · sprawdzenie auftragów (' + lista.length + ')');
         W.push('');
-        let ksieg = 0, pomin = 0, recz = 0;
         lista.forEach(function (nr){
-            const w = hdWerdykt(nr);
-            if (w.stan === 'ksieguj') ksieg++;
-            else if (w.stan === 'recznie') recz++;
-            else pomin++;
+            const w = p.werdykt[nr] || { tryb: 'netto', opis: 'nie sprawdzone' };
+            (grupy[w.tryb] || grupy.netto).push(nr);
             W.push(nr + '  ' + hdPowod(p, nr));
-            W.push('     → ' + (w.opis || w.stan));
+            W.push('     → ' + (w.opis || w.tryb));
+            const num = aufNum(nr);
+            if (num) W.push('       ' + lnk(num));
         });
+
+        // Podsumowanie tak, zeby dalo sie sprawdzic, czy WSZYSTKIE wplaty i zwroty sa ujete:
+        // kazda grupa z kwotami i numerem auftragu, a na koncu suma kontrolna calego pliku.
+        const suma = function (lst, pole){
+            return r2(lst.reduce(function (a, nr){ return a + (p.zam[nr] ? p.zam[nr][pole] : 0); }, 0));
+        };
+        const blok = function (tytul, lst, opisz){
+            W.push('');
+            W.push(tytul + ': ' + lst.length + ' zamówień');
+            lst.forEach(function (nr){
+                const num = aufNum(nr);
+                W.push('   ' + nr + '   ' + opisz(p.zam[nr])
+                     + (num ? ('   auftrag ' + num + '   ' + lnk(num)) : '   (nie ma auftragu)'));
+            });
+        };
         W.push('');
-        W.push('do zaksięgowania: ' + ksieg + ' · pomijam: ' + pomin + ' · ręcznie: ' + recz);
+        W.push('===== PODSUMOWANIE =====');
+        blok('Wpłaty do auftragu, zwroty do ticketu', grupy.pelny.concat(grupy.netto), function (z){
+            return 'do auftragu ' + f2(z.pelna) + ', na ticket ' + f2(r2(z.zwrPelny + z.rabSuma));
+        });
+        blok('Wszystko do ticketu (auftrag bez open amount)', grupy.ticket, function (z){
+            return 'wpłaty -' + f2(z.pelna) + ', zwroty i rabaty ' + f2(r2(z.zwrPelny + z.rabSuma))
+                 + ' — razem ' + (z.wpl.length + z.zwr.length + z.rab.length) + ' pozycji';
+        });
+        blok('Nic nie księgujemy', grupy.nic, function (z){
+            return z.znoszaSie ? ('wpłata i zwrot znoszą się: ' + f2(z.pelna))
+                               : ('wpłaty ' + f2(z.pelna) + ', zwroty ' + f2(r2(z.zwrPelny + z.rabSuma)));
+        });
+        blok('Do rozstrzygnięcia ręcznie', grupy.recznie, function (z){
+            return 'wpłaty ' + f2(z.pelna) + ', zwroty i rabaty ' + f2(r2(z.zwrPelny + z.rabSuma));
+        });
+
+        const s = hdPodsumowanie(p);
+        W.push('');
+        W.push('===== SUMA KONTROLNA CAŁEGO PLIKU =====');
+        W.push('wiersze rozliczenia: ' + s.nWierszy + ' = ' + s.wImporcie + ' do importu + '
+             + s.wNieZaks + ' poza importem   ' + (s.wierszeOk ? 'OK' : '!! NIE DOMYKA SIĘ'));
+        W.push('wpłaty (brutto):     ' + f2(s.bruttoWpl) + ' = ' + f2(s.doImportu) + ' do auftragów + '
+             + f2(s.doTicketu) + ' do ticketów na minus + ' + f2(s.wplNic) + ' nieksięgowane   '
+             + (s.wplatyOk ? 'OK' : '!! NIE DOMYKA SIĘ'));
+        W.push('zwroty i rabaty:     ' + f2(s.zwrLewa) + ' = ' + f2(s.naTickety) + ' na tickety + '
+             + f2(s.zwrNic) + ' nieksięgowane   ' + (s.zwrotyOk ? 'OK' : '!! NIE DOMYKA SIĘ'));
+        if (grupy.ticket.length || grupy.pelny.length)
+            W.push('');
+        W.push('Po zmianie decyzji plik importu i lista zwrotów są już przeliczone —');
+        W.push('jeśli paczka była pobrana wcześniej, pobierz ją jeszcze raz.');
+
         const txt = W.join(String.fromCharCode(10));
         try {
             if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(txt, 'text');
             else navigator.clipboard.writeText(txt);
         } catch (e){}
-        say('Sprawdzone: ' + ksieg + ' do zaksięgowania, ' + pomin + ' do pominięcia'
-            + (recz ? (', ' + recz + ' ręcznie') : '') + '. Wynik w schowku.',
-            ksieg ? '#c47f00' : '#0a7a2f');
+        say('Sprawdzone ' + lista.length + ': do auftragu ' + (grupy.pelny.length + grupy.netto.length)
+            + ', wszystko do ticketu ' + grupy.ticket.length
+            + ', nic ' + grupy.nic.length
+            + (grupy.recznie.length ? (', ręcznie ' + grupy.recznie.length) : '')
+            + ' — plik importu i lista zwrotów przeliczone. Wynik w schowku.',
+            grupy.recznie.length ? '#c47f00' : '#0a7a2f');
         if (btn) btn.disabled = false;
+    }
+    // Zapis rozliczenia Wayfaira tak, jak przyszlo z portalu — bajt w bajt, bez naszych
+    // przeliczen. Przy zleceniu zatrzymanym na kontroli numeru to jedyny sposob, zeby
+    // zobaczyc, co Wayfair faktycznie przyslal.
+    function doWayfRaw(ref){
+        const j = jobsLoad()[ref];
+        const p = j && j.data && j.data.wayf;
+        if (!p || !p.raw){
+            say('To rozliczenie pochodzi ze starszej wersji HUB-a — pobierz je jeszcze raz z portalu.', '#c47f00');
+            return;
+        }
+        const nazwa = 'Wayfair_Remittance_' + (p.remit || ref || 'bez-numeru') + '.csv';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([p.raw], { type: 'text/csv;charset=utf-8' }));
+        a.download = nazwa;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+        say('Zapisano ' + nazwa + ' — rozliczenie dokładnie tak, jak przyszło z Wayfaira.');
     }
     function doHdNieZaks(ref){
         const j = jobsLoad()[ref];
         const p = j && j.data && j.data.hd;
-        if (!p || !p.nieZaks || !p.nieZaks.length){ say('Nie ma czego zapisać — wszystko weszło do importu.', '#c47f00'); return; }
+        const ile = hdNieKsiegowane(p).length;
+        if (!ile){ say('Nie ma czego zapisać — każdy wiersz gdzieś się księguje.', '#c47f00'); return; }
         const txt = mkCsvHdNieZaks(p);
-        const nazwa = 'Homedeco niezaksiegowane ' + (p.od || '') + (p.doo && p.doo !== p.od ? ('..' + p.doo) : '') + '.csv';
+        const nazwa = 'Homedeco nieksiegowane ' + (p.od || '') + (p.doo && p.doo !== p.od ? ('..' + p.doo) : '') + '.csv';
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([txt], { type: 'text/csv;charset=utf-8' }));
         a.download = nazwa;
         document.body.appendChild(a); a.click(); a.remove();
         setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
-        say('Zapisano ' + nazwa + ' — ' + p.nieZaks.length + ' wierszy poza importem.');
+        say('Zapisano ' + nazwa + ' — ' + ile + ' wierszy, których nie księguje nikt'
+            + (p.nPozaTicket ? ('. Pozostałe ' + p.nPozaTicket + ' spoza importu idą na tickety.') : '.'));
     }
     function doCopyWyj(ref){
         const j = jobsLoad()[ref];
