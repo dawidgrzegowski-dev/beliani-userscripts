@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.80
+// @version      4.81
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -29078,9 +29078,37 @@
                     return p.wyplata != null && eq(p.wyplata, j0.amount);
                 });
                 if (!kand.length){
-                    say('To ' + opis + ', ale nie czeka na nie żadna wpłata — wgraj najpierw wyciąg bankowy. '
-                        + 'Samego rozliczenia nie zaksięguję, bo nie miałbym z czym porównać kwoty.', '#c47f00');
-                    return;
+                    // Brak wplaty z wyciagu nie konczy sprawy: pytamy o DATE PRZELEWU
+                    // i zakladamy zlecenie z samego pliku. Domyslnie dzisiejsza, bo tak
+                    // zwykle wyglada praca — plik sciaga sie w dniu, w ktorym pieniadze
+                    // wpadly na konto.
+                    const dzis = new Date();
+                    const domysl = dzis.getFullYear() + '-' + pad2(dzis.getMonth() + 1) + '-' + pad2(dzis.getDate());
+                    let podana = null;
+                    try {
+                        podana = window.prompt(
+                            'To ' + opis + ', ale nie czeka na nie żadna wpłata z wyciągu.\n\n'
+                            + 'Podaj datę przelewu (RRRR-MM-DD), a założę zlecenie z tego pliku.\n\n'
+                            + 'Kwotę wezmę z rozliczenia: ' + f2(p.wyplata) + ' ' + p.cur
+                            + '.\nUWAGA: przy Empiku przelew bywa NIŻSZY o pobrania.', domysl);
+                    } catch (e){ podana = null; }
+                    if (podana == null){ say('Nie zakładam zlecenia — plik został bez zmian.', '#c47f00'); return; }
+                    const dataP = String(podana).trim();
+                    if (!/^\d{4}-\d{2}-\d{2}$/.test(dataP)){
+                        say('Data musi być w postaci RRRR-MM-DD („' + esc(dataP) + '” nią nie jest) — nie założyłem zlecenia.', '#c00');
+                        return;
+                    }
+                    // Klucz po CYKLU, nie po dacie. Ten sam cykl wgrany drugi raz ma
+                    // trafic w TO SAMO zlecenie, a nie zalozyc blizniacze obok.
+                    const kl = 'CYKL-' + String(p.cycle).slice(0, 8);
+                    if (jobs[kl] && jobs[kl].status === 'done'){ say('Ten cykl jest już zaksięgowany.', '#c47f00'); return; }
+                    if (!jobs[kl]){
+                        jobs[kl] = { ref: kl, date: dataP, amount: p.wyplata, cur: p.cur,
+                                     mp: p.mp, brand: p.brand, short: p.short, host: p.host,
+                                     kind: 'mirakl', shop: p.shop, docs: null, payer: '', txId: '',
+                                     status: 'new', msg: '', zPliku: true };
+                    } else { jobs[kl].date = dataP; jobs[kl].amount = p.wyplata; jobs[kl].zPliku = true; }
+                    kand.push(kl);
                 }
                 // Dwa pasujace zlecenia to nie jest cos do zgadniecia.
                 if (kand.length > 1){
@@ -29103,7 +29131,9 @@
                         + ' — nie przypisałem go do tego zlecenia.', '#c00');
                     return;
                 }
-                j.note = 'rozliczenie z pliku ' + f.name + (j.note ? ('; ' + j.note) : '');
+                j.note = 'rozliczenie z pliku ' + f.name
+                       + (j.zPliku ? ' · zlecenie założone z tego pliku, BEZ potwierdzenia z wyciągu — kwota to wypłata z cyklu, nie przelew' : '')
+                       + (j.note ? ('; ' + j.note) : '');
                 jobsSave(jobs); render();
                 say((p.short || 'Mirakl') + ': wczytałem ' + opis + ' — '
                     + (j.status === 'ready' ? 'gotowe do importu.' : ('wymaga sprawdzenia: ' + j.msg)),
@@ -33304,8 +33334,8 @@
                  }).join('')
            +   '</div>'
            +   '<input id="exp-sq" value="' + esc(uiSellerQ) + '" placeholder="szukaj sprzedawcy…" style="width:100%;font-size:11px;padding:3px 5px;border:1px solid #ddd;border-radius:5px;margin-bottom:4px">'
-           +   '<div style="margin-bottom:4px"><button id="exp-son" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz widoczne</button> '
-           +     '<button id="exp-soff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz widoczne</button></div>'
+           +   '<div style="margin-bottom:4px"><button id="exp-son" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz wszystkie</button> '
+           +     '<button id="exp-soff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz wszystkie</button></div>'
            +   '<div id="exp-slist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px'
            +     (p.allUsers ? ';opacity:.45;pointer-events:none' : '') + '">'
            +     sellers.map(function (s){
@@ -33319,8 +33349,8 @@
         h += '<div style="flex:1;min-width:0">'
            +   '<div style="font-weight:700;margin-bottom:4px">Konta <span id="exp-acount" style="color:#888;font-weight:400">(' + (p.accounts || []).length + ')</span><span style="color:#888;font-weight:400"> — przelot po kolei</span></div>'
            +   '<input id="exp-aq" value="' + esc(uiAccQ) + '" placeholder="szukaj konta, np. B2B Intra-comm…" style="width:100%;font-size:11px;padding:3px 5px;border:1px solid #ddd;border-radius:5px;margin-bottom:4px">'
-           +   '<div style="margin-bottom:4px"><button id="exp-aon" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz widoczne</button> '
-           +     '<button id="exp-aoff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz widoczne</button></div>'
+           +   '<div style="margin-bottom:4px"><button id="exp-aon" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">zaznacz wszystkie</button> '
+           +     '<button id="exp-aoff" style="font-size:10px;padding:2px 7px;border:1px solid #ccc;border-radius:5px;background:#f9fafb;cursor:pointer">odznacz wszystkie</button></div>'
            +   '<div id="exp-alist" style="max-height:190px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:4px">'
            +     accounts.map(function (a){
                      return '<label data-txt="' + esc(a.txt.toLowerCase()) + '" style="display:block;font-size:11px;line-height:1.6">'
@@ -33391,7 +33421,11 @@
 
         const bulk = function (cls, key, on){
             return function (){
-                const vis = expVisible(cls);
+                // WSZYSTKIE pozycje, nie tylko te przepuszczone przez pole szukania.
+                // Przy dlugiej liscie kont filtrowanie przed kazdym zaznaczeniem bylo
+                // samo w sobie robota — a to guzik od tego, zeby jej nie bylo.
+                // expVisible zostaje nietkniete: liczy „widoczne" w podsumowaniu.
+                const vis = [].slice.call(panel.querySelectorAll('.' + cls));
                 patch(function (p){
                     const cur = {}; (p[key] || []).forEach(function (x){ cur[x] = 1; });
                     vis.forEach(function (c){ if (on) cur[c.value] = 1; else delete cur[c.value]; });
