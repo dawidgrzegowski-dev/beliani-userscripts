@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.84
+// @version      4.85
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -14948,10 +14948,21 @@
         // W dalszych liniach bloku szukamy DOKLADNIE SWIFT-u z P/I. Nie zgadujemy,
         // ktory ciag jest BIC-iem: „COMMERCE" ma ksztalt BIC-u i zgadywanie samo
         // produkowaloby rozjazdy.
-        function bcSwiftPotw(piSwift, q){
+        function bcSwiftPotw(piSwift, q, piSwiftRaw){
             var y = (q && q.bic) || '';
             var w = bcSwiftEq(piSwift || '', y);
             w.pokaz = y || '—';
+            // P/I bywa podane jako alternatywa: „SWIFT: CITIHKHX or CITIHKHXXXX".
+            // piSwiftPick bierze pierwszy poprawny (osmioznakowy), a bank pisze
+            // jedenastoznakowy — wychodzilo „rozni sie koncowka oddzialu". Skoro P/I
+            // podaje OBA i jeden zgadza sie co do znaku, nie ma o czym mowic.
+            if (w.ok && w.oddzial && piSwiftRaw){
+                var alt = String(piSwiftRaw).toUpperCase().match(/[A-Z0-9]{8,11}/g) || [];
+                for (var a = 0; a < alt.length; a++){
+                    if (bcSwiftNorm(alt[a]) === bcSwiftNorm(y))
+                        return { ok: true, pokaz: y, msg: '', warianty: true };
+                }
+            }
             if (w.ok || !piSwift) return w;
             var dalsze = (q && q.bankLines) || [];
             for (var i = 0; i < dalsze.length; i++){
@@ -15069,6 +15080,36 @@
             });
             return (naj != null) ? naj : lista[0];
         }
+        // Czy komentarz MOWI O ZAPLACIE, a nie tylko wspomina liczbe.
+        function bcMowiOZaplacie(t){
+            return /\b(?:we\s+will\s+pay|will\s+be\s+paid|to\s+be\s+paid|to\s+pay|please,?\s+pay|pay\s+(?:the\s+)?(?:balance|rest|remaining|depo\w*)|payment\s+of|do\s+zap[lł]aty|zap[lł]a\w+)\b/i
+                .test(String(t == null ? '' : t));
+        }
+        // Czy komentarz jest SAMA KWOTA. „35437.08 USD" albo „balance 12345.67 USD" —
+        // tak wyglada wiekszosc pozycji balansowych. Wycinamy kwoty, cyfry i slowa
+        // techniczne; jesli zostaje zdanie, to nie jest pozycja, tylko dyskusja.
+        function bcSamaKwota(t, amts){
+            var x = String(t == null ? '' : t);
+            (amts || []).forEach(function (a){
+                if (a == null || !isFinite(a)) return;
+                var c = Number(a).toFixed(2);
+                [c, c.replace('.', ','), c.replace(/\.00$/, '')].forEach(function (v){
+                    if (!v) return;
+                    var gwar = 0;
+                    while (x.indexOf(v) >= 0 && gwar++ < 20) x = x.replace(v, ' ');
+                });
+            });
+            x = x.replace(/\d/g, ' ')
+                 .replace(/\b(?:usd|eur|cny|rmb|chf|pln|balance|total|amount|kwota|saldo|for|to|the|of|and)\b/gi, ' ')
+                 .replace(/[^A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]+/g, '');
+            return x.length <= 15;
+        }
+        // Kara/roszczenie to NIE naleznosc — kary licza sie osobno (pcPenStan).
+        // „…then we will apply 1000usd penalty" to zapowiedz w dyskusji.
+        function bcTylkoOKarze(t){
+            var x = String(t == null ? '' : t);
+            return /\bpenalt|\bclaim\b|\bfine\b|\bkar[aęy]\b/i.test(x) && !bcMowiOZaplacie(x);
+        }
         function bcDniMiedzy(a, b){
             function d(x){
                 var m = String(x == null ? '' : x).match(/(\d{4})-(\d{2})-(\d{2})/);
@@ -15101,7 +15142,7 @@
         // pcBalCands z zalozenia pomija komentarze depozytowe i penalty, wiec zrodla sie
         // nie nakladaja.
         function bcPartiaKwot(cs){
-            var lista = cs || [], poz = [], wzieteJakoDepo = {};
+            var lista = cs || [], poz = [], wzieteJakoDepo = {}, pominiete = [];
             // Najpierw DEPOZYTY — zeby ten sam komentarz nie wszedl drugi raz jako balance.
             // pcBalCands odsiewa tylko to, co przepuszcza pcIsDepoText, a my rozpoznajemy
             // takze „advance payment" i „prepayment".
@@ -15125,13 +15166,23 @@
                     // zaplacona — wpuszczony do partii dokladal ja drugi raz, a przy okazji
                     // stawal sie jej koncem, wiec petla szukajaca granicy przechodzila obok.
                     if (bcPotwKom(c.text || '')) return;
-                    poz.push({ i: c.i, cont: bcContKey(c.contRaw || c.cont || ''), contRaw: c.contRaw || '',
+                    var kk = bcContKey(c.contRaw || c.cont || '');
+                    // Sama liczba w komentarzu to za malo. Pozycja do zaplaty ma kontener,
+                    // mowi o zaplacie wprost albo jest po prostu kwota. Zdanie z dyskusji
+                    // („…we will apply 1000usd penalty") nie jest naleznoscia.
+                    if (bcTylkoOKarze(c.text || '')
+                        || !(kk || bcMowiOZaplacie(c.text || '') || bcSamaKwota(c.text || '', c.amts))){
+                        pominiete.push({ i: c.i, kwota: bcKwotaZTekstu(c.text || '', c.amts),
+                                         data: c.date || '', tekst: c.text || '' });
+                        return;
+                    }
+                    poz.push({ i: c.i, cont: kk, contRaw: c.contRaw || '',
                                kwota: bcKwotaZTekstu(c.text || '', c.amts), ile: c.amts.length,
                                typ: 'balance', pct: null, data: c.date || '', tekst: c.text || '' });
                 });
             } catch (e){}
             poz.sort(function (a, b){ return a.i - b.i; });
-            if (!poz.length) return { kwota: null, poz: [], uwaga: '' };
+            if (!poz.length) return { kwota: null, poz: [], pominiete: pominiete, uwaga: '', start: 0 };
             var koniec = poz[poz.length - 1].i, start = 0, granica = false;
             for (var k = koniec - 1; k >= 0; k--){
                 if (bcPotwKom(lista[k] && lista[k].text)){ start = k + 1; granica = true; break; }
@@ -15165,16 +15216,35 @@
             var rozp = (wyb.length > 1) ? bcDniMiedzy(wyb[0].data, wyb[wyb.length - 1].data) : null;
             if (rozp != null && rozp > 45)
                 u.push('kwoty tej partii dzieli ' + rozp + ' dni — zwykle idą jedna po drugiej, sprawdź');
-            return { kwota: suma, poz: wyb, uwaga: u.join('; ') };
+            // Odrzucone liczymy tylko z ZAKRESU partii — starsze i tak nie naleza do tej
+            // platnosci, wiec wspominanie o nich byloby halasem.
+            return { kwota: suma, poz: wyb, uwaga: u.join('; '), start: start,
+                     pominiete: pominiete.filter(function (p){ return p.i >= start; }) };
         }
         // Rozjazd kwoty rowny DOKLADNIE ktorejs pozycji to najczestszy uklad: z partii
         // placi sie dzis czesc, a reszte za tydzien. Sama liczba tego nie mowi.
         function bcRoznicaToPozycja(zrodla, moje, roznica){
             var cel = Math.round(Math.abs(roznica) * 100), tr = [];
             (moje || []).forEach(function (o){
-                (((zrodla || {})[o] || {}).poz || []).forEach(function (p){
+                var z = (zrodla || {})[o] || {};
+                (z.poz || []).forEach(function (p){
                     if (p && p.kwota != null && Math.round(p.kwota * 100) === cel)
                         tr.push(o + (p.contRaw ? (' / ' + p.contRaw) : '') + ' — ' + Number(p.kwota).toFixed(2));
+                });
+                // Komentarz, ktorego NIE policzylismy, bo nie wyglada na naleznosc. Gdy
+                // roznica rowna sie akurat jemu, trzeba to powiedziec — inaczej pominiecie
+                // jest ciche i nie da sie rozstrzygnac, kto ma racje.
+                (z.pominiete || []).forEach(function (p){
+                    if (p && p.kwota != null && Math.round(p.kwota * 100) === cel)
+                        tr.push(o + ' — ' + Number(p.kwota).toFixed(2) + ' z komentarza, którego nie policzyłem: „'
+                              + String(p.tekst || '').slice(0, 60) + '”');
+                });
+                // ROSZCZENIE potracone z przelewu. „overpayment 19" w tytule i przelew
+                // mniejszy o 1000 — sama liczba tego nie tlumaczy, numer roszczenia tak.
+                (z.pen || []).forEach(function (p){
+                    if (!p || p.amt == null || Math.round(Math.abs(p.amt) * 100) !== cel) return;
+                    tr.push(o + ' — roszczenie ' + ((p.nos && p.nos.length) ? p.nos.join(', ') : 'bez numeru')
+                          + ' na ' + Number(Math.abs(p.amt)).toFixed(2) + ' (potrącone z przelewu)');
                 });
             });
             return tr;
@@ -15227,7 +15297,26 @@
                 var cs = [];
                 try { var html = await pcOrderHtml(o); cs = html ? pcComments(html) : []; }
                 catch (e){ cs = []; }
-                out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: bcPartiaKwot(cs) };
+                // Roszczenia czytamy tym samym pcPenComments, co Wprowadzanie — naliczone
+                // i cofniete juz sie tam znosza. Sluza WYLACZNIE do wytlumaczenia roznicy;
+                // do sumy nie wchodza, bo o tym, ile potracono, decyduje przelew.
+                var pen = [];
+                try { pen = pcPenComments(cs) || []; } catch (e){ pen = []; }
+                var part = bcPartiaKwot(cs);
+                // Komentarze do RECZNEGO przejrzenia, gdy kwota sie nie spina. Trzymamy
+                // tekst przyciety — panel ma byc czytelny, a nie wierna kopia strony.
+                var wz = {}, pm = {};
+                (part.poz || []).forEach(function (p){ wz[p.i] = 1; });
+                (part.pominiete || []).forEach(function (p){ pm[p.i] = 1; });
+                var kom = (cs || []).map(function (c, i){
+                    var a = [];
+                    try { a = pcMoneyTokens((c && c.text) || '') || []; } catch (e){ a = []; }
+                    return { i: i, d: (c && c.date) || '', c: String((c && c.cont) || '').trim(),
+                             t: String((c && c.text) || '').slice(0, 300), a: a,
+                             w: wz[i] ? 1 : (pm[i] ? 2 : 0),
+                             gr: (i === part.start && part.start > 0) ? 1 : 0 };
+                });
+                out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: part, pen: pen, kom: kom };
                 zrobione++;
                 if (say) say('Sprawdzam zamówienia: ' + zrobione + '/' + wszystkie.length + '…', '#666');
                 return true;
@@ -15241,7 +15330,8 @@
                 var obce = Object.keys(wTyt).filter(function (o){ return lista.indexOf(o) < 0; });
                 var w = { plik: q.file || '', tytul: q.msg || '', kwota: q.amt, ccy: q.ccy || '',
                           acct: q.acct || '', bic: q.bic || '', nazwa: q.name || '',
-                          orders: moje, obce: obce, bledy: [], uwagi: [], suma: null, laczony: moje.length > 1 };
+                          orders: moje, obce: obce, bledy: [], uwagi: [], suma: null, laczony: moje.length > 1,
+                          cent: bcCents(q.amt), rozjazd: false };
                 if (!moje.length){
                     w.bledy.push('w tytule nie ma żadnego zamówienia z wklejki');
                     out.wiersze.push(w); return;
@@ -15259,7 +15349,8 @@
                     var typ = poz.length
                         ? (poz.some(function (p){ return p.typ === 'balance'; }) ? 'balance' : 'depozyt')
                         : (a != null ? 'depozyt z P/I' : '');
-                    zrodla[o] = { kwota: a, typ: typ, poz: poz, uwaga: naj.uwaga || '' };
+                    zrodla[o] = { kwota: a, typ: typ, poz: poz, uwaga: naj.uwaga || '',
+                                  pominiete: naj.pominiete || [], pen: dd.pen || [] };
                     // Procent tylko od zamowien, ktore depozyt PLACA w tym przelewie.
                     // Wczesniej szedl z kazdego zamowienia, wiec przelew „Deposit 10%"
                     // dostawal blad „brak procentu (10/15%)" przez zamowienia balansowe,
@@ -15320,6 +15411,7 @@
                     // NIE blad: to nie przelew jest zly, tylko ja nie umiem policzyc
                     // pelnej sumy. Blad zglaszalby rozjazd, ktorego nikt nie wykazal —
                     // a taki falszywy alarm juz raz wyszedl na przebiegu u uzytkownika.
+                    w.rozjazd = true;
                     w.uwagi.push('nie znam kwoty dla: ' + brakKwot.join(', ')
                         + ' — nie sprawdziłem kwoty tego przelewu');
                     kon('', 'kwota przelewu ↔ suma z komentarzy', String(q.amt || '—'),
@@ -15327,6 +15419,7 @@
                 } else {
                     var cz = bcCents(q.amt), cs2 = Math.round(suma * 100);
                     if (cz == null){
+                        w.rozjazd = true;
                         w.bledy.push('nie odczytałem kwoty z potwierdzenia');
                         kon('', 'kwota przelewu ↔ suma z komentarzy', 'nieczytelna', suma.toFixed(2), 'zle');
                     } else if (cz !== cs2){
@@ -15339,6 +15432,7 @@
                             return z.kwota != null && z.typ !== 'balance';
                         });
                         var opis = suma.toFixed(2) + ' (różnica ' + ((cz - cs2) / 100).toFixed(2) + ')';
+                        w.rozjazd = true;
                         if (w.rodzaj === 'balance' && stare.length === (moje || []).length){
                             w.uwagi.push('kwota ' + (cz / 100).toFixed(2) + ' ≠ suma z komentarzy '
                                 + opis + ' — to przelew balansowy, a w komentarzach mam tylko kwoty '
@@ -15378,7 +15472,7 @@
                     kon(o, 'konto z P/I ↔ konto na potwierdzeniu', piAcc || '—', q.acct || '—', k2.ok ? 'ok' : 'zle');
                     if (!k2.ok) w.bledy.push(o + ': konto z P/I „' + (piAcc || '—') + '” ≠ konto z potwierdzenia „'
                         + (q.acct || '—') + '”' + (k2.msg ? (' — ' + k2.msg) : ''));
-                    var sw = bcSwiftPotw(bank.swift || '', q);
+                    var sw = bcSwiftPotw(bank.swift || '', q, bank.swiftRaw || '');
                     kon(o, 'SWIFT z P/I ↔ SWIFT na potwierdzeniu', bank.swift || '—',
                         sw.pokaz + (sw.ok && sw.msg ? (' — ' + sw.msg) : ''),
                         sw.ok ? ((sw.oddzial || sw.dalej) ? 'uwaga' : 'ok') : 'zle');
@@ -15415,6 +15509,63 @@
         function bcOrdLink(o){
             return '<a href="/op_order.php?id=' + encodeURIComponent(o) + '" target="_blank"'
                  + ' style="color:#7c3aed;text-decoration:none;font-family:monospace">' + esc(o) + '</a>';
+        }
+        // Lista komentarzy do RECZNEGO przejrzenia. Pokazujemy WSZYSTKIE — te z kwota
+        // z checkboxem, reszte szaro — bo roznice najczesciej tlumaczy kontekst wokol
+        // kwoty, a nie sama kwota. Zaznaczone sumuja sie na biezaco.
+        function bcKomHtml(r, w){
+            var dane = (r && r.dane) || {};
+            var cel = (w.cent != null) ? (w.cent / 100) : NaN;
+            var h = '<div class="bc-kom-box" data-cel="' + (isFinite(cel) ? cel.toFixed(2) : '')
+                  + '" style="display:none;margin-top:6px;border-top:1px dashed #ddd;padding-top:6px">'
+                  + '<div class="bc-kom-suma" style="font-size:11px;font-weight:700;margin-bottom:4px"></div>';
+            (w.orders || []).forEach(function (o){
+                var d = dane[o] || {}, kom = d.kom || [];
+                h += '<div style="margin-top:4px"><div style="font-size:11px;font-weight:700;color:#444">'
+                   + bcOrdLink(o) + ' <span style="color:#888;font-weight:400">'
+                   + (kom.length ? (kom.length + ' komentarzy') : 'nie odczytałem komentarzy') + '</span></div>';
+                if (!kom.length){ h += '</div>'; return; }
+                h += '<ul style="margin:2px 0 0;padding-left:16px;font-size:11px;line-height:1.5">';
+                kom.forEach(function (k){
+                    var ma = (k.a || []).length > 0;
+                    var kol = (k.w === 1) ? '#0a7a2f' : ((k.w === 2) ? '#c47f00' : '#999');
+                    h += '<li style="color:' + kol + '">';
+                    if (ma){
+                        h += '<label style="cursor:pointer" title="Odhacz, żeby doliczyć tę kwotę do sumy">'
+                           + '<input type="checkbox" class="bc-kom-chk" data-kwota="' + Number(k.a[0]).toFixed(2) + '"'
+                           + ((k.w === 1) ? ' checked' : '') + '> <b>' + Number(k.a[0]).toFixed(2) + '</b>'
+                           + ((k.a.length > 1) ? (' <span style="color:#c47f00">(' + k.a.length + ' liczby w komentarzu)</span>') : '')
+                           + '</label> ';
+                        if (k.w === 2) h += '<span style="color:#c47f00" title="Nie policzyłem — to nie wygląda na należność">✗ nie liczone</span> ';
+                    } else h += '<span style="color:#ccc">·</span> ';
+                    h += '<span style="color:#777">' + esc(k.d || '') + (k.c ? (' · ' + esc(k.c)) : '') + '</span> '
+                       + '<span style="color:#333">' + esc(k.t || '') + '</span>';
+                    if (k.gr) h += ' <span style="color:#0a58ca;font-weight:700">← granica partii</span>';
+                    h += '</li>';
+                });
+                h += '</ul></div>';
+            });
+            return h + '</div>';
+        }
+        // Przeliczenie zaznaczonych. Wolane po kazdym kliknieciu i przy rozwinieciu.
+        function bcPrzeliczKom(box){
+            if (!box) return;
+            var suma = 0;
+            box.querySelectorAll('.bc-kom-chk').forEach(function (c){
+                if (c.checked) suma += parseFloat(c.getAttribute('data-kwota')) || 0;
+            });
+            suma = Math.round(suma * 100) / 100;
+            var cel = parseFloat(box.getAttribute('data-cel'));
+            var el = box.querySelector('.bc-kom-suma');
+            if (!el) return;
+            var zgadza = isFinite(cel) && Math.abs(suma - cel) < 0.005;
+            el.innerHTML = 'zaznaczone: <b>' + suma.toFixed(2) + '</b>'
+                + (isFinite(cel)
+                    ? (' · przelew: <b>' + cel.toFixed(2) + '</b> · różnica: <b>'
+                       + (Math.round((cel - suma) * 100) / 100).toFixed(2) + '</b>'
+                       + (zgadza ? ' ✓ zgadza się' : ''))
+                    : ' · kwoty przelewu nie odczytałem');
+            el.style.color = zgadza ? '#0a7a2f' : '#c00';
         }
         function bcWklejkaHtml(r){
             if (!r) return '';
@@ -15480,6 +15631,15 @@
                         });
                         h += '</ul></div>';
                     });
+                }
+                // Guzik tylko tam, gdzie kwota sie NIE spina — przy zgodnej sumie nie ma
+                // czego przegladac recznie.
+                if (w.rozjazd){
+                    h += '<div style="margin-top:5px">'
+                       + '<button class="chn-btn ghost bc-kom-btn" style="padding:2px 8px;font-size:11px"'
+                       + ' title="Pokaż wszystkie komentarze tych zamówień. Odhaczanie kwot przelicza sumę na bieżąco.">'
+                       + '💬 Wyświetl komentarze</button></div>'
+                       + bcKomHtml(r, w);
                 }
                 w.bledy.forEach(function (b){ h += '<div style="font-size:11px;color:#c00;margin-top:2px">✗ ' + esc(b) + '</div>'; });
                 w.uwagi.forEach(function (u){ h += '<div style="font-size:11px;color:#c47f00;margin-top:2px">⚠ ' + esc(u) + '</div>'; });
@@ -17238,6 +17398,14 @@
             if (new RegExp('^(?:' + B + ' )?(?:SWIFT|BIC)(?: (?:NO|NUMBER|CODE))?$').test(t)) return 'swift';
             if (new RegExp('^(?:' + B + ' )?SWIFT BIC(?: CODE)?$').test(t)) return 'swift';
             if (new RegExp('^' + B + ' NAME$').test(t)) return 'name';
+            // Samo „Beneficiary bank:" — bez slowa NAME. Tak pisze czesc dostawcow
+            // i do 4.85 taka linia byla niewidoczna.
+            if (new RegExp('^' + B + ' BANK$').test(t)) return 'bankName';
+            // Samo „Beneficiary:" to nazwa beneficjenta. Bez tego nazwa nie byla
+            // odczytana, a scanPIbank wyrzucal CALY blok bankowy jako niekompletny —
+            // i sprawdzanie pokazywalo „SWIFT z P/I —" przy wypelnionym pliku.
+            // Wartosc i tak musi przejsc want(): goly numer do nazwy nie wejdzie.
+            if (new RegExp('^' + B + '$').test(t)) return 'name';
             if (new RegExp('^' + B + ' (?:ADDRESS|ADDR)$').test(t)) return 'addr';
             return '';
         }
@@ -19110,6 +19278,30 @@
             }
             sp.querySelector('#sp-grab').onclick = function(){ doGrab(); };
             sp.querySelector('#sp-paste-run').onclick = function(){ doPaste(); };
+            // Sluchacz stoi na PUDLE wynikow, nie na guzikach: tresc pudla wymienia sie
+            // przy kazdym przebiegu, wiec handlery przypiete do guzikow ginely by razem
+            // z nia. Samo pudlo zostaje.
+            (function (){
+                var kb = sp.querySelector('#sp-paste-box');
+                if (!kb) return;
+                kb.addEventListener('click', function (e){
+                    var b = e.target && e.target.closest ? e.target.closest('.bc-kom-btn') : null;
+                    if (!b) return;
+                    var wiersz = b.parentNode && b.parentNode.parentNode;
+                    var box = wiersz ? wiersz.querySelector('.bc-kom-box') : null;
+                    if (!box) return;
+                    var pokaz = (box.style.display === 'none');
+                    box.style.display = pokaz ? '' : 'none';
+                    b.textContent = pokaz ? '💬 Ukryj komentarze' : '💬 Wyświetl komentarze';
+                    if (pokaz) bcPrzeliczKom(box);
+                });
+                kb.addEventListener('change', function (e){
+                    var c = e.target;
+                    if (!c || !c.className || String(c.className).indexOf('bc-kom-chk') < 0) return;
+                    var box = c.closest ? c.closest('.bc-kom-box') : null;
+                    if (box) bcPrzeliczKom(box);
+                });
+            })();
             sp.querySelector('#sp-paste-dzis').onclick = function(){
                 // pcToday, NIE pad2: pad2 mieszka w init_mkt, czyli w cudzym domknieciu —
                 // wolanie go stad byloby cichym ReferenceError widocznym dopiero po
@@ -21810,17 +22002,24 @@
         // potrafi miec kilka takich wierszy (sprawdzone: 377102020614 ma 5 wierszy
         // SAFE-T na 4 numerach). Znak wg reguly wyzej.
         let rekompSum = 0;
+        const rekompPoz = [];
         Object.keys(rekomp).forEach(function (id){
             const e = rekomp[id];
             if (!e.suma) return;
             rekompSum = r2(rekompSum + e.suma);
-            ref[id] = r2((ref[id] || 0) + e.suma);
-            if (e.suma > 0) refSign[id] = -1;          // dodatnia w raporcie -> ksieguj z minusem
+            // OSOBNA pozycja, nie doliczenie do zwrotu. Doliczanie dawalo jedna kwote
+            // netto (zwrot −93,99 + SAFE-T +61,99 = −32,00) i to po stronie SAFE-T,
+            // choc zwrot ksieguje sie na plus, a SAFE-T na minus. Roszczenie to osobna
+            // decyzja Amazona — dokladnie jak Goodwill od 4.36.
             const nazwy = Object.keys(e.typy).sort().join(' + ');
-            refNote[id] = (refNote[id] ? refNote[id] + '\n\n' : '')
-                + nazwy + ' — ' + opisWspolny + '\n'
-                + 'Zamówienie ' + id + ' · ' + (e.suma > 0 ? '+' : '') + f2(e.suma) + ' ' + (cur || '')
-                + (e.data ? (' · ' + e.data) : '');
+            rekompPoz.push({ id: id, amt: Math.abs(e.suma),
+                sign: (e.suma > 0 ? -1 : 1),           // dodatnia w raporcie -> ksieguj z minusem
+                rodzaj: nazwy || 'SAFE-T',
+                data: e.data || '',
+                note: nazwy + ' — ' + opisWspolny + '\n'
+                    + 'Zamówienie ' + id + ' · ' + (e.suma > 0 ? '+' : '') + f2(e.suma) + ' ' + (cur || '')
+                    + (e.data ? (' · ' + e.data) : '')
+                    + '\nPozycja osobna — nie sumuje się ze zwrotem tego zamówienia.' });
         });
 
         // ---- wiersze do pliku importu: DOKLADNIE arkusz „Order" dzisiejszej aplikacji ----
@@ -21889,6 +22088,7 @@
         // wiersz o wlasnej kwocie. Modul ticketow radzi sobie z dwiema pozycjami tego
         // samego zamowienia od v3.43.
         const refExtra = [];
+        rekompPoz.forEach(function (x){ refExtra.push(x); });
         gw.filter(function (x){ return x.ref; }).forEach(function (x){
             refExtra.push({ id: x.order, amt: Math.abs(x.amt), rodzaj: 'Goodwill',
                 note: 'Goodwill (Refund) — ' + opisWspolny + '\n'
@@ -21968,6 +22168,41 @@
     // Kwota w Excelu ma byc LICZBA, nie tekstem — inaczej nie da sie jej zsumowac
     // w arkuszu. W CSV zostaje tekst z dwoma miejscami po przecinku, bo tego oczekuje
     // prologistics. Zamieniamy wylacznie kolumne 24 i tylko wtedy, gdy naprawde jest liczba.
+    // Liczba TYLKO z zapisu, ktory naprawde jest liczba. „2026-08-05T22:20:47+00:00"
+    // i „406-9083790-9240364" maja cyfry, ale liczbami nie sa — musza zostac tekstem.
+    function amzLiczba(v){
+        const t = String(v == null ? '' : v).trim();
+        if (!t) return null;
+        if (/^-?\d+(?:\.\d+)?$/.test(t)) return Number(t);
+        if (/^-?\d+(?:,\d+)?$/.test(t)) return Number(t.replace(',', '.'));
+        return null;
+    }
+    // Ktore kolumny surowego raportu sa liczbowe — PO NAGLOWKU. Amazon przestawia
+    // i dokłada kolumny miedzy raportami, wiec stala lista numerow rozjechalaby sie
+    // po cichu i akurat ta jedna kolumna zostalaby tekstem.
+    function amzKolLiczbowe(naglowek){
+        const out = {};
+        (naglowek || []).forEach(function (h, i){
+            const t = String(h == null ? '' : h).trim().toLowerCase();
+            if (/-amount$/.test(t)) out[i] = 'kwota';
+            else if (t === 'quantity-purchased') out[i] = 'ilosc';
+        });
+        return out;
+    }
+    // Format wyswietlania 0.00 na kolumnach kwotowych. Sama wartosc zostaje liczba —
+    // to jest wylacznie to, co widac w komorce.
+    function amzFormatKwot(X, ws, kol){
+        if (!ws || !ws['!ref']) return;
+        let z;
+        try { z = X.utils.decode_range(ws['!ref']); } catch (e){ return; }
+        Object.keys(kol || {}).forEach(function (k){
+            if (kol[k] !== 'kwota') return;
+            for (let r = z.s.r + 1; r <= z.e.r; r++){
+                const c = ws[X.utils.encode_cell({ r: r, c: +k })];
+                if (c && c.t === 'n') c.z = '0.00';
+            }
+        });
+    }
     function amzDoArkusza(wiersze){
         const out = [MK_AMZ_NAG.slice()];
         (wiersze || []).forEach(function (x){
@@ -21997,9 +22232,28 @@
         // wyladowala w swojej — SheetJS nie zgadnie separatora z gotowego tekstu.
         const aoa = String(p.raw).split(/\r?\n/).map(function (l){ return l.split('\t'); });
         while (aoa.length && aoa[aoa.length - 1].length === 1 && aoa[aoa.length - 1][0] === '') aoa.pop();
-        X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(aoa), 'Amazon');
-        X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(amzDoArkusza(p.wOrd)), 'Order');
-        X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(amzDoArkusza(p.wRef)), 'Refunds');
+        // Kwoty na LICZBY — inaczej w tej zakladce nie da sie niczego zsumowac,
+        // a to jest jedyny powod, dla ktorego ktos ja otwiera.
+        const kolA = amzKolLiczbowe(aoa[0] || []);
+        for (let i = 1; i < aoa.length; i++){
+            const w = aoa[i];
+            Object.keys(kolA).forEach(function (k){
+                const v = amzLiczba(w[+k]);
+                if (v != null) w[+k] = v;
+            });
+        }
+        const wsA = X.utils.aoa_to_sheet(aoa);
+        amzFormatKwot(X, wsA, kolA);
+        X.utils.book_append_sheet(wb, wsA, 'Amazon');
+        // Zakladki wynikowe: kwota stoi w kolumnie 24 i jest liczba juz od 4.75 —
+        // dokladamy tylko ten sam format wyswietlania, zeby caly plik czytalo sie tak samo.
+        const KOL24 = { 24: 'kwota' };
+        const wsO = X.utils.aoa_to_sheet(amzDoArkusza(p.wOrd));
+        amzFormatKwot(X, wsO, KOL24);
+        X.utils.book_append_sheet(wb, wsO, 'Order');
+        const wsR = X.utils.aoa_to_sheet(amzDoArkusza(p.wRef));
+        amzFormatKwot(X, wsR, KOL24);
+        X.utils.book_append_sheet(wb, wsR, 'Refunds');
         return { bytes: X.write(wb, { bookType: 'xlsx', type: 'array' }) };
     }
     // v3.84: bramka przed wygenerowaniem pliku. Wolimy nie dac pliku wcale niz dac plik
@@ -28099,9 +28353,12 @@
     function refGroups(){
         const g = {}, sets = setLoad(), acc = mkAcctLoad();
         jobList().forEach(function (j){
-            if (!j.data || !j.data.ref) return;
-            const ids = Object.keys(j.data.ref);
-            if (!ids.length) return;
+            if (!j.data) return;
+            // Nie samo ref[]: rozliczenie potrafi miec WYLACZNIE pozycje dodatkowe
+            // (same SAFE-T albo sam Goodwill, bez ani jednego zwyklego zwrotu).
+            // Warunek na samym ref[] wyrzucalby wtedy cale zlecenie z listy zwrotow.
+            const ids = Object.keys(j.data.ref || {});
+            if (!ids.length && !((j.data.refExtra || []).length)) return;
             const c = sets[setKey(j.mp, j.data.shop)] || {};
             const key = String(j.date) + '|' + (c.acct || ('? ' + j.data.shop));
             if (!g[key]){
