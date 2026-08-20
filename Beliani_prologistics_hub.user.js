@@ -13219,12 +13219,25 @@
         var PENALTY_DAYS = 7;
         // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
         function pcParsePenalties(text){
-            var out = [], re = /(overpayment|underpayment|penalty|discount|other\s*[+-])\s*(?:no\.?\s*)?(\d+)/gi, m;
-            while ((m = re.exec(String(text || ''))) !== null){
+            var s0 = String(text || ''), out = [];
+            var re = /(overpayment|underpayment|penalty|discount|other\s*[+-])\s*(?:no\.?\s*)?(\d+)/gi, m;
+            while ((m = re.exec(s0)) !== null){
                 var ty = m[1].toLowerCase().replace(/\s+/g, '');
                 if (ty === 'other+') ty = 'other +'; else if (ty === 'other-') ty = 'other -';
-                var v = ty + ' ' + m[2];
-                if (out.indexOf(v) === -1) out.push(v);
+                function dodaj(nr){ var v = ty + ' ' + nr; if (out.indexOf(v) === -1) out.push(v); }
+                dodaj(m[2]);
+                // Po jednym slowie kluczowym stoi czasem CALA LISTA numerow:
+                // „overpayment 1078, 1084, 1137, 1184". Kazdy z nich to roszczenie, a nie
+                // zamowienie — bez tego szly do sprawdzania jako cudze zamowienia.
+                // Ciagniemy liste tylko dopoki numery nie sa DLUZSZE od pierwszego i maja
+                // najwyzej cztery cyfry: „penalty 1270, 15395" nie moze polknac zamowienia.
+                var ogon = s0.slice(m.index + m[0].length), maks = Math.min(4, m[2].length);
+                var lst = /^\s*(?:,|\/|;|\band\b|\bi\b)\s*(?:no\.?\s*)?(\d+)/i, x;
+                while ((x = lst.exec(ogon)) !== null){
+                    if (x[1].length > maks) break;
+                    dodaj(x[1]);
+                    ogon = ogon.slice(x[0].length);
+                }
             }
             return out;
         }
@@ -15264,6 +15277,22 @@
                 }
             }
             var partia = poz.filter(function (p){ return p.i >= start; });
+            // TA SAMA KWOTA raz jako zapowiedz w dyskusji, raz jako formalne roszczenie.
+            // „…we will pay these 1759.59 USD" i „Penalty: applied … Open amount: 1759.59
+            // … Claim: underpayment no. 1236" to jedna naleznosc. Rozstrzyga ROSZCZENIE:
+            // ono ma numer i to ono idzie do systemu.
+            var kwotyR = {};
+            partia.forEach(function (p){
+                if (p.typ === 'roszczenie') kwotyR[Math.round(Math.abs(p.kwota) * 100)] = p;
+            });
+            partia = partia.filter(function (p){
+                if (p.typ === 'roszczenie') return true;
+                var r = kwotyR[Math.round(Math.abs(p.kwota) * 100)];
+                if (!r) return true;
+                pominiete.push({ i: p.i, kwota: p.kwota, data: p.data,
+                    tekst: p.tekst, powod: 'ta sama kwota stoi jako roszczenie ' + (r.nos || '') });
+                return false;
+            });
             // Jedna pozycja na KONTENER: ten sam kontener drugi raz to poprawka, wiec
             // zostaje wpis nowszy. DEPOZYT ma wlasna przestrzen kluczy — naglowek
             // „Container:" nalezy do WIERSZA komentarza, nie do tresci, wiec komentarz
@@ -15423,10 +15452,31 @@
                 return true;
             });
 
+            // Numery, ktore w komentarzach ktoregokolwiek zamowienia wystepuja jako numer
+            // ROSZCZENIA. Tytul potrafi wymienic je tak, ze wygladaja na zamowienia —
+            // a wtedy sprawdzanie ciagnie cudze konta i beneficjentow.
+            var nrRoszczen = {};
+            Object.keys(out.dane).forEach(function (o){
+                ((out.dane[o] || {}).pen || []).forEach(function (p){
+                    (p.nos || []).forEach(function (v){
+                        var nr = String(v).replace(/\D+/g, '');
+                        if (nr) nrRoszczen[nr] = 1;
+                    });
+                });
+            });
+            // Wyrzucamy TYLKO takie, ktore same nie maja ani jednego komentarza — czyli
+            // strony zamowienia o tym numerze po prostu nie ma. Prawdziwe zamowienie
+            // o numerze zbieznym z roszczeniem zostaje.
+            var podszywacze = Object.keys(nrRoszczen).filter(function (nr){
+                var d = out.dane[nr];
+                return d && (!d.kom || !d.kom.length);
+            });
+
             (g.pdfs || []).forEach(function (q){
                 // Zamowienia TEGO przelewu bierzemy z jego tytulu — tak dziala tez
                 // dopasowanie przy Excelu i tylko tak da sie obsluzyc przelew laczony.
                 var wTyt = bcOrderyZTytulu(q.msg || '');
+                podszywacze.forEach(function (nr){ delete wTyt[nr]; });
                 var moje = wszystkie.filter(function (o){ return wTyt[o]; });
                 var obce = Object.keys(wTyt).filter(function (o){ return lista.indexOf(o) < 0; });
                 var w = { plik: q.file || '', tytul: q.msg || '', kwota: q.amt, ccy: q.ccy || '',
@@ -15640,6 +15690,9 @@
                 }
                 if (obce.length) w.uwagi.push('w tytule są też zamówienia spoza wklejki: ' + obce.join(', ')
                     + ' — doliczyłem je do sumy, bo należą do tego samego przelewu');
+                if (podszywacze.length)
+                    kon('', 'numery roszczeń pominięte w tytule', podszywacze.join(', '),
+                        'to numery roszczeń z komentarzy, nie zamówienia', 'ok');
                 out.wiersze.push(w);
             });
 
@@ -15717,6 +15770,23 @@
                        + (zgadza ? ' ✓ zgadza się' : ''))
                     : ' · kwoty przelewu nie odczytałem');
             el.style.color = zgadza ? '#0a7a2f' : '#c00';
+            // CALY wiersz na zielono. Sama linijka w srodku panelu nie wystarcza — z gory
+            // wiersz dalej mowil „zle", a to on jest tym, na co sie patrzy.
+            var wiersz = el.closest ? el.closest('.bc-wiersz') : null;
+            if (!wiersz) return;
+            var kol0 = wiersz.getAttribute('data-kol') || '#c00';
+            var zn0 = wiersz.getAttribute('data-znak') || '✗';
+            wiersz.style.borderLeftColor = zgadza ? '#0a7a2f' : kol0;
+            var zn = wiersz.querySelector('.bc-znak');
+            if (zn){
+                zn.textContent = zgadza ? '✓' : zn0;
+                zn.style.color = zgadza ? '#0a7a2f' : kol0;
+            }
+            // Zaznaczone z gory sa WYLACZNIE wiersze bez zastrzezen, wiec zielony wiersz
+            // bez zaznaczenia przeczylby tej regule. Guzik komentarza i tak trzeba
+            // nacisnac osobno — samo zaznaczenie niczego nie wysyla.
+            var chk = wiersz.querySelector('.bc-wk-chk');
+            if (chk) chk.checked = zgadza;
         }
         function bcWklejkaHtml(r){
             if (!r) return '';
@@ -15735,12 +15805,15 @@
                 // Zaznaczone z gory sa TYLKO wiersze bez bledow. Uwagi (np. skrocona
                 // nazwa beneficjenta) nie blokuja, wiec takie tez wchodza.
                 var dobry = !w.bledy.length;
-                h += '<div style="border:1px solid #eee;border-left:3px solid ' + kol + ';border-radius:6px;padding:6px 8px;margin-bottom:6px">'
+                // Klasa i zapamietany kolor/znak — po recznym zlozeniu kwot wiersz musi dac
+                // sie przemalowac na zielono i wrocic do stanu wyjsciowego po odznaczeniu.
+                h += '<div class="bc-wiersz" data-kol="' + kol + '" data-znak="' + znak + '"'
+                   + ' style="border:1px solid #eee;border-left:3px solid ' + kol + ';border-radius:6px;padding:6px 8px;margin-bottom:6px">'
                    + '<div style="font-size:12px;display:flex;align-items:flex-start;gap:6px">'
                    + '<label style="cursor:pointer" title="Zaznacz, żeby dopisać komentarz do zamówień z tego przelewu">'
                    + '<input type="checkbox" class="bc-wk-chk" data-orders="' + esc((w.orders || []).join(',')) + '"'
                    + (dobry ? ' checked' : '') + '></label>'
-                   + '<span><b style="color:' + kol + '">' + znak + '</b> '
+                   + '<span><b class="bc-znak" style="color:' + kol + '">' + znak + '</b> '
                    + esc(w.kwota || '')
                    // Nazwa dostawcy przy kwocie — beneficjent z potwierdzenia. Bez niej
                    // przy kilkunastu wierszach nie widac, komu placimy, bez wchodzenia
@@ -21871,7 +21944,12 @@
         // zapisano to jako uwage, bo przy 7 rozliczeniach PL sprawdzone bylo tylko PLN.
         // W tych plikach z trzech typow wystapily dwa: B2C 61 zam. i B2B 0% jedno
         // (403-8257787-0335553). B2B czeka na pierwsze zamowienie.
-        pl: { acc: '1082', vat: { 'B2C': '3292', 'B2B': '3209', 'B2B 0%': '3294' } }
+        pl: { acc: '1082', vat: { 'B2C': '3292', 'B2B': '3209', 'B2B 0%': '3294' } },
+        // v4.86: Szwecja. Numery podane wprost (20.08.2026). B2B 19% dla SE NIE ISTNIEJE
+        // i to jest stan swiadomy — tak samo jak przy FR i NL nie zgadujemy numeru konta.
+        // Gdyby szwedzkie B2B kiedys sie pojawilo, amzBrakKont zatrzyma plik i powie,
+        // czego brakuje. Drugi kraj spoza strefy euro: rozliczenia przychodza w SEK.
+        se: { acc: '1083', vat: { 'B2C': '3284', 'B2B 0%': '3214' } }
     };
     // ===== v3.73: pozycje „do wyjaśnienia" =====
     // Czesc wierszy raportu nie ma jak trafic na auftrag: albo w ogole nie ma numeru
@@ -21931,6 +22009,7 @@
         if (c.indexOf('amazon.it') >= 0 || c === 'it') return 'it';
         if (c.indexOf('amazon.nl') >= 0 || c === 'nl') return 'nl';
         if (c.indexOf('amazon.pl') >= 0 || c === 'pl') return 'pl';
+        if (c.indexOf('amazon.se') >= 0 || c === 'se') return 'se';
         return '';
     }
     // Typ transakcji 1:1 z determine_type: bez PRINCIPAL nie ma typu, TAX + VAT pobrany
