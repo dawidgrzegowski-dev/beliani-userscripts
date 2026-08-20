@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.87
+// @version      4.88
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12647,15 +12647,21 @@
         document.body.appendChild(wp);
         wp.querySelector('#wp-close').onclick = function(){ wp.style.display = 'none'; };
 
-        // ===== Chinskie / Sprawdzanie: osobne okno (Excel do banku <-> potwierdzenia PDF) =====
+        // ===== Chinskie / Sprawdzanie: osobne okno =====
+        // SP_EXCEL — stara sciezka „Excel do banku ↔ potwierdzenia PDF". Wylaczona na
+        // zyczenie uzytkownika (20.08.2026): „bedzie tylko jeden sposob — tylko wklejka
+        // aktualnie". Kod zostaje nietkniety, bo dzieli z wklejka flage busy, pobieranie
+        // potwierdzen i render wyniku; ustawienie tej flagi na true przywraca panel
+        // dokladnie taki, jaki byl.
+        var SP_EXCEL = false;
         var sp = document.createElement('div');
         sp.id = 'chinskie-sprawdz';
         sp.style.cssText = wp.style.cssText;
         sp.style.display = 'none';
         sp.innerHTML =
-            '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Sprawdzanie (Excel do banku ↔ potwierdzenia z e-finance) <span style="font-weight:400;font-size:11px;opacity:.6">v' + VER + '</span></div><button id="sp-close" class="chn-btn ghost" style="padding:4px 12px">✕</button></div>'
+            '<div style="display:flex;justify-content:space-between;align-items:center;background:#F6E7E6;padding:12px 16px;border-bottom:1px solid #FFCCB7"><div style="font-weight:700;color:#750000">Chińskie — Sprawdzanie' + (SP_EXCEL ? ' (Excel do banku ↔ potwierdzenia z e-finance)' : '') + ' <span style="font-weight:400;font-size:11px;opacity:.6">v' + VER + '</span></div><button id="sp-close" class="chn-btn ghost" style="padding:4px 12px">✕</button></div>'
           + '<div style="padding:16px;overflow-y:auto">'
-          + '<div id="sp-drop" style="border:2px dashed #FFCCB7;border-radius:10px;padding:22px 14px;text-align:center;color:#666;font-size:13px;cursor:pointer;background:#fffdfc">'
+          + (SP_EXCEL ? ('<div id="sp-drop" style="border:2px dashed #FFCCB7;border-radius:10px;padding:22px 14px;text-align:center;color:#666;font-size:13px;cursor:pointer;background:#fffdfc">'
           +   '<div style="font-size:22px;line-height:1">📄</div>'
           +   '<div style="margin-top:6px"><b style="color:#8B0000">Przeciągnij tu pliki</b> albo kliknij, żeby wybrać</div>'
           +   '<div style="margin-top:4px;font-size:12px">jeden plik <b>.xlsx</b> („Excel do banku” z Wprowadzania) + dowolna liczba <b>.pdf</b> — potwierdzeń przelewów</div>'
@@ -12663,9 +12669,9 @@
           +   '<div style="margin-top:4px;font-size:11px;color:#0a58ca">Potwierdzeń nie musisz mieć u siebie — mogę je dociągnąć wprost z zamówień (guzik niżej).</div>'
           + '</div>'
           + '<input type="file" id="sp-file" accept=".pdf,.xlsx" multiple style="display:none">'
-          + '<div id="sp-list" style="margin-top:10px"></div>'
-          + '<div style="margin-top:14px;padding-top:10px;border-top:1px dashed #FFCCB7">'
-          +   '<div style="font-size:12px;font-weight:700;color:#750000">Sprawdzenie z wklejki — bez Excela</div>'
+          + '<div id="sp-list" style="margin-top:10px"></div>') : '')
+          + '<div style="margin-top:' + (SP_EXCEL ? '14px;padding-top:10px;border-top:1px dashed #FFCCB7' : '0') + '">'
+          +   '<div style="font-size:12px;font-weight:700;color:#750000">Sprawdzenie z wklejki</div>'
           +   '<div style="font-size:11px;color:#666;margin:3px 0 5px">Wklej listę zamówień w dowolnym układzie kolumn (np. dostawca, numer, kwota). Potrzebne są tylko <b>numery zamówień</b> — kwotę depozytu, konto i SWIFT wezmę z systemu i z P/I, a potwierdzenia ściągnę wprost z zamówień.</div>'
           +   '<div id="sp-paste" contenteditable="true" spellcheck="false" style="width:100%;height:110px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff"></div>'
           +   '<div style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
@@ -12678,14 +12684,14 @@
           +   '</div>'
           +   '<div id="sp-paste-box" style="display:none;margin-top:10px"></div>'
           + '</div>'
-          + '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          + (SP_EXCEL ? ('<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           +   '<button id="sp-run" class="chn-btn red" title="Porównuje Excel z potwierdzeniami z banku: dopasowuje po numerach zamówień z tytułu przelewu, sprawdza kwotę, walutę, konto, BIC, nazwę i tytuł. Brak miasta lub kodu pocztowego beneficjenta nie jest błędem. Gdy nie ma ani jednego pliku PDF — najpierw sam dociągnie potwierdzenia z zamówień.">🔍 Sprawdź z bankiem</button>'
           +   '<button id="sp-grab" class="chn-btn ghost" title="Wchodzi na strony zamówień z Excela, znajduje sekcję „Payment conformation”, czyta załączniki z podanego dnia prosto do pamięci i dokłada je do sprawdzenia. Nic nie zapisuje się na dysku.">⬇ Dociągnij potwierdzenia z zamówień</button>'
           +   '<label style="font-size:11px;color:#666;display:inline-flex;align-items:center;gap:4px" title="Bierzemy tylko załączniki dodane tego dnia. Domyślnie dzień, z którego pochodzi Excel. Puste pole = bez ograniczenia daty.">z dnia <input type="date" id="sp-day" style="font-size:11px;padding:2px 4px;border:1px solid #FFCCB7;border-radius:4px"></label>'
           +   '<button id="sp-clear" class="chn-btn ghost" title="Usuń wszystkie wczytane pliki, dociągnięte potwierdzenia i wynik">↺ Wyczyść</button>'
           +   '<span id="sp-status" style="font-size:12px;color:#666"></span>'
           + '</div>'
-          + '<div id="sp-box" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
+          + '<div id="sp-box" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #FFCCB7"></div>') : '')
           + '</div>';
         document.body.appendChild(sp);
         sp.querySelector('#sp-close').onclick = function(){ sp.style.display = 'none'; };
@@ -15616,22 +15622,58 @@
                     }
                 }
                 moje.forEach(function (o){
-                    var d = out.dane[o] || {}, pi = d.pi || {}, bank = pi.piBank || {};
+                    var d = out.dane[o] || {}, pi = d.pi || {};
+                    // Blok NIEPELNY tez jest do czegos: porownujemy pole po polu, a przy
+                    // brakujacym mowimy dlaczego go nie ma. Wyrzucanie calosci przez jedno
+                    // zle pole kosztowalo porownanie konta i beneficjenta przy P/I, ktore
+                    // mialy jedno i drugie.
+                    var bank = pi.piBank || pi.piBankRaw || {};
+                    var pelny = !!(pi.piBank);
                     var piAcc = bank.acc || pi.piAcc || '';
-                    // Zamowienia, ktorego nie udalo sie odczytac, NIE porownujemy —
-                    // inaczej kazde puste pole wychodzi jako „konto ≠ konto" i wiersz
-                    // czerwienieje bez powodu. Mowimy raz, ze go nie sprawdzilismy.
-                    if (!piAcc && pi.comAmount == null && !bank.swift){
+                    // O tym, czy jest co porownywac, decyduje BLOK BANKOWY z P/I — nic
+                    // innego. Poprzedni warunek wymagal LACZNIE braku konta, braku SWIFT-u
+                    // i braku kwoty z komentarza; zamowienia z komentarzem depozytowym
+                    // sprzed miesiecy go nie spelnialy, wiec porownania szly przeciwko
+                    // pustce i dawaly trzy czerwone bledy z niczego.
+                    var maPI = !!(piAcc || bank.swift || bank.name);
+                    if (!maPI){
                         // POWOD wprost z checkOnePI. Bez niego nie dalo sie odroznic pliku,
                         // ktorego NIE MA („brak P/I"), od takiego, ktorego nie umiem
                         // przeczytac („P/I – sprawdz recznie") albo od strony zamowienia,
                         // ktora sie nie otworzyla — a to trzy zupelnie rozne sprawy.
                         var czemu = String(pi.msg || '').trim() || 'nie wiem dlaczego';
-                        kon(o, 'dane zamówienia', 'nie odczytałem P/I ani komentarza', czemu, 'uwaga');
-                        var uw = 'nie odczytałem danych zamówienia ' + o + ' — ' + czemu;
+                        kon(o, 'dane bankowe z P/I', 'nie odczytałem — nie porównuję konta, SWIFT-u ani beneficjenta',
+                            czemu, 'uwaga');
+                        // Zrzut sekcji „P/I" ze strony zamowienia — widac po nim, czy sekcji
+                        // nie ma, czy jest pusta, czy plik wisi pod inna etykieta.
+                        if (pi.piRaw)
+                            kon(o, 'sekcja P/I na stronie zamówienia', String(pi.piRaw).slice(0, 200), '—', 'uwaga');
+                        var uw = 'nie odczytałem P/I zamówienia ' + o + ' — ' + czemu
+                               + ' (konta, SWIFT-u i beneficjenta nie porównałem)';
                         if (w.uwagi.indexOf(uw) < 0) w.uwagi.push(uw);
-                        return;
                     }
+                    if (maPI){
+                    // Blok niepelny — mowimy o tym RAZ, zeby bylo wiadomo, ze czesc
+                    // porownan opiera sie na tym, co udalo sie odczytac.
+                    if (!pelny)
+                        kon(o, 'blok bankowy w P/I', 'niekompletny — porównuję pole po polu',
+                            String(pi.msg || '').trim() || 'brakuje nazwy, konta albo poprawnego SWIFT-u', 'uwaga');
+                    // Skad wziete P/I: nazwa arkusza albo „PDF". Bez tego nie da sie
+                    // rozstrzygnac, ktory plik wisi na zamowieniu — a to najczestsza
+                    // przyczyna „w P/I tego nie ma", gdy w pliku na dysku to JEST.
+                    if (pi.piSheet || pi.piUrl){
+                        var docId = String(pi.piUrl || '').match(/doc_id=(\d+)/);
+                        kon(o, 'P/I odczytane z', String(pi.piSheet || '—'),
+                            docId ? ('dokument nr ' + docId[1]) : (String(pi.piUrl || '—').slice(0, 60)), 'ok');
+                    }
+                    // BRAK pojedynczego pola to nie rozjazd, tylko brak danych. Porownanie
+                    // prawdziwego numeru z pustka dawalo dwa czerwone bledy z niczego.
+                    if (!piAcc){
+                        kon(o, 'konto z P/I', '—', 'nie ma go w odczytanym P/I — nie porównuję', 'uwaga');
+                        var uwk = o + ': w odczytanym P/I nie ma numeru konta'
+                                + (pi.piSheet ? (' (' + pi.piSheet + ')') : '') + ' — konta nie porównałem';
+                        if (w.uwagi.indexOf(uwk) < 0) w.uwagi.push(uwk);
+                    } else {
                     var k1 = bcKontoEq(d.accSys, piAcc);
                     kon(o, 'konto dostawcy ↔ konto z P/I', d.accSys || '—', piAcc || '—', k1.ok ? 'ok' : 'zle');
                     if (!k1.ok) w.bledy.push(o + ': konto dostawcy „' + (d.accSys || '—') + '” ≠ konto z P/I „'
@@ -15640,14 +15682,49 @@
                     kon(o, 'konto z P/I ↔ konto na potwierdzeniu', piAcc || '—', q.acct || '—', k2.ok ? 'ok' : 'zle');
                     if (!k2.ok) w.bledy.push(o + ': konto z P/I „' + (piAcc || '—') + '” ≠ konto z potwierdzenia „'
                         + (q.acct || '—') + '”' + (k2.msg ? (' — ' + k2.msg) : ''));
+                    }
+                    // SWIFT o zlym ksztalcie (np. dziesiecioznakowy „BKCHCNBJ72") nie jest
+                    // rozjazdem z bankiem, tylko literowka w P/I. Mowimy to wprost i nie
+                    // czerwienimy wiersza, o ile poczatek sie zgadza.
+                    // „Rozni sie tylko koncowka oddzialu" to ZGODNOSC: osmioznakowy BIC
+                    // i jedenastoznakowy o tym samym poczatku wskazuja ten sam bank, a
+                    // koncowke banki wpisuja niekonsekwentnie. Zielone, nie zolte.
                     var sw = bcSwiftPotw(bank.swift || '', q, bank.swiftRaw || '');
+                    if (bank.swiftBad){
+                        var poczatek = bcSwiftNorm(bank.swift).slice(0, 8) === bcSwiftNorm(q.bic).slice(0, 8);
+                        kon(o, 'SWIFT z P/I ↔ SWIFT na potwierdzeniu', bank.swift || '—',
+                            (q.bic || '—') + ' — w P/I zły format (' + bcSwiftNorm(bank.swift).length
+                              + ' znaków, BIC ma 8 albo 11)' + (poczatek ? ', ale początek się zgadza' : ''),
+                            poczatek ? 'uwaga' : 'zle');
+                        if (poczatek) w.uwagi.push(o + ': SWIFT w P/I ma zły format („' + (bank.swift || '—')
+                            + '") — pierwsze 8 znaków zgadza się z potwierdzeniem');
+                        else w.bledy.push(o + ': SWIFT z P/I „' + (bank.swift || '—') + '” ≠ z potwierdzenia „' + (q.bic || '—') + '”');
+                    } else if (!bank.swift){
+                        kon(o, 'SWIFT z P/I ↔ SWIFT na potwierdzeniu', '—', (q.bic || '—'),
+                            'nie ma go w P/I — nie porównuję', 'uwaga');
+                    } else {
                     kon(o, 'SWIFT z P/I ↔ SWIFT na potwierdzeniu', bank.swift || '—',
                         sw.pokaz + (sw.ok && sw.msg ? (' — ' + sw.msg) : ''),
-                        sw.ok ? ((sw.oddzial || sw.dalej) ? 'uwaga' : 'ok') : 'zle');
+                        sw.ok ? (sw.dalej ? 'uwaga' : 'ok') : 'zle');
                     if (!sw.ok) w.bledy.push(o + ': SWIFT z P/I „' + (bank.swift || '—') + '” ≠ z potwierdzenia „' + (q.bic || '—') + '”');
-                    // Bank posredniczacy (sw.posrednik) NIE idzie do uwag: podstawia sie
-                    // przy kazdym przelewie do USA, wiec wiersz zolklby zawsze i bez powodu.
-                    else if (sw.oddzial || sw.dalej) w.uwagi.push(o + ': SWIFT ' + sw.msg);
+                    // Ani koncowka oddzialu, ani bank posredniczacy NIE ida do uwag —
+                    // jedno i drugie to zgodnosc, a wiersz zolklby przy kazdym przelewie.
+                    // Zostaje tylko BIC znaleziony w dalszej linii bloku: tam warto
+                    // spojrzec, bo w pierwszej stal ktos inny.
+                    else if (sw.dalej) w.uwagi.push(o + ': SWIFT ' + sw.msg);
+                    }
+                    }
+                    // Gdy P/I nie podaje konta, zostaje porownanie konta DOSTAWCY z tym,
+                    // na ktore poszedl przelew. To slabsze zrodlo niz P/I, ale lepsze niz nic —
+                    // i to ono wylapie przelew na cudzy numer.
+                    if (!piAcc && d.accSys){
+                        var kd = bcKontoEq(d.accSys, q.acct);
+                        kon(o, 'konto dostawcy ↔ konto na potwierdzeniu', d.accSys || '—', q.acct || '—',
+                            kd.ok ? 'ok' : 'zle');
+                        if (!kd.ok) w.bledy.push(o + ': konto dostawcy „' + (d.accSys || '—')
+                            + '” ≠ konto z potwierdzenia „' + (q.acct || '—') + '”'
+                            + (kd.msg ? (' — ' + kd.msg) : ''));
+                    }
                     // ZMIANA NUMERU KONTA. Przelew na konto, ktore u dostawcy zdazylo sie
                     // zmienic, to jedyny blad z tej listy, ktory kosztuje pieniadze — wiec
                     // patrzymy na to nawet wtedy, gdy wszystkie numery sie zgadzaja.
@@ -15698,6 +15775,14 @@
                         kon(o, 'załącznik z danymi bankowymi',
                             dokB.map(function (x){ return x.nazwa; }).join(', '),
                             dokB.map(function (x){ return x.data || 'bez daty wgrania'; }).join(', '), 'uwaga');
+                    }
+                    if (!maPI) return;
+                    // Brak samej NAZWY w bloku nie jest rozjazdem — mowimy, ze jej nie ma.
+                    if (!bank.name){
+                        kon(o, 'beneficjent z P/I ↔ z potwierdzenia', '—', (q.name || '—'),
+                            'nie ma go w P/I — nie porównuję', 'uwaga');
+                        if (!pelny) return;
+                        return;
                     }
                     // Nazwa jest DRUGORZEDNA — nigdy nie blokuje, najwyzej zwraca uwage.
                     var nz = bcNazwaEq(bank.name || '', q.name);
@@ -15950,7 +16035,9 @@
             // ktore ja wyznacza, wstawia Wprowadzanie przy wgrywaniu pliku potwierdzenia.
             h += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #eee;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
                + '<input type="text" id="bc-wk-kom" value="ok" title="Trafi do KAŻDEGO zamówienia z zaznaczonych przelewów. Treść możesz zmienić przed wysłaniem." style="font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:4px;min-width:220px">'
-               + '<button id="bc-wk-add" class="chn-btn maroon" style="padding:3px 10px;font-size:12px" title="Dopisze ten komentarz do KAŻDEGO zamówienia z zaznaczonych przelewów">💬 Dodaj komentarz do zaznaczonych</button>'
+               + '<button id="bc-wk-add" class="chn-btn maroon" style="padding:3px 10px;font-size:12px" title="Dopisze ten komentarz do KAŻDEGO zamówienia z zaznaczonych przelewów, a potem sprawdzi na zamówieniu, czy naprawdę wszedł">💬 Dodaj komentarz do zaznaczonych</button>'
+               + '<button id="bc-wk-all" class="chn-btn ghost" style="padding:3px 8px;font-size:11px" title="Zaznacz wszystkie przelewy — także te z zastrzeżeniami">\u2611 Zaznacz wszystkie</button>'
+               + '<button id="bc-wk-none" class="chn-btn ghost" style="padding:3px 8px;font-size:11px" title="Odznacz wszystkie przelewy">\u2610 Odznacz wszystkie</button>'
                + '<span id="bc-wk-kom-st" style="font-size:11px;color:#666"></span>'
                + '</div>';
             return h;
@@ -17582,9 +17669,16 @@
             var hi = html.search(/<(?:b|strong)[^>]*>(?:\s|&nbsp;)*P(?:\s|&nbsp;)*\/?(?:\s|&nbsp;)*I(?:\s|&nbsp;)*:?(?:\s|&nbsp;)*<\/(?:b|strong)>/i);
             if (hi < 0) return null;
             var after = html.slice(hi);
-            var addNew = after.search(/load_docs\.php\?[^"']*type=/i);
-            var bound = after.length;
-            if (addNew >= 0) { var rest = after.slice(addNew + 5); var nxt = rest.search(/load_docs\.php\?[^"']*type=/i); if (nxt >= 0) bound = addNew + 5 + nxt; }
+            // Granica sekcji: nastepny odnosnik load_docs o INNYM typie, czyli „(add new)"
+            // kolejnej sekcji. Wczesniej brany byl po prostu DRUGI odnosnik load_docs —
+            // a przy kazdym dokumencie stoi jeszcze ikona podmiany (⟳), ktora prowadzi
+            // tam samo i ma TEN SAM typ. Sekcja urywala sie wiec na pierwszej ikonie
+            // i widac bylo tylko PIERWSZY, najstarszy plik z listy.
+            var re = /load_docs\.php\?[^"']*type=(\d+)/gi, m, typ = null, bound = after.length;
+            while ((m = re.exec(after)) !== null){
+                if (typ === null){ typ = m[1]; continue; }
+                if (m[1] !== typ){ bound = m.index; break; }
+            }
             return after.slice(0, bound);
         }
         function extractLatestPI(html){
@@ -17600,9 +17694,17 @@
             while ((m = re.exec(sec)) !== null){
                 var href = m[1], id = parseInt(m[2], 10) || 0;
                 if (/[?&](?:del|delete|remove)\b/i.test(href) || /action=(?:del|remove)/i.test(href)) continue;
-                // Ogonek za linkiem, ucinany przed kolejnym <a>, zeby nie podkradac cudzej daty.
-                var tail = sec.slice(re.lastIndex, re.lastIndex + 400);
-                var cut = tail.search(/<a[\s>]/i); if (cut >= 0) tail = tail.slice(0, cut);
+                // Ogonek za linkiem. Ucinamy go na KONCU WIERSZA tabeli albo na nastepnym
+                // linku do DOKUMENTU — co padnie wczesniej. Wczesniej cieto na pierwszym
+                // <a>, a w tym samym wierszu stoi ikona podmiany dokumentu, ktora tez jest
+                // odnosnikiem — wiec ogon urywal sie PRZED data i to przy kazdym pliku.
+                // Z pustymi datami o wyborze decydowal sam doc_id, a on nie musi rosnac
+                // zgodnie z kolejnoscia wgrywania: podmiana w miejscu zostawia stary numer.
+                var tail = sec.slice(re.lastIndex, re.lastIndex + 600);
+                var kon1 = tail.search(/<\/tr>/i);
+                var kon2 = tail.search(/<a[^>]*doc\.php\?[^>]*doc_id=/i);
+                var cut = (kon1 >= 0 && (kon2 < 0 || kon1 < kon2)) ? kon1 : kon2;
+                if (cut >= 0) tail = tail.slice(0, cut);
                 var dm = tail.match(/\bon\s+(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/i);
                 // Sekundy bywaja pominiete — normalizujemy, zeby porownanie tekstowe dzialalo.
                 var d = dm ? (dm[1] + ' ' + (dm[2] ? (dm[2].length === 5 ? dm[2] + ':00' : dm[2]) : '00:00:00')) : '';
@@ -17732,6 +17834,26 @@
             var dg = c.replace(/\D+/g, ''), lt = (c.replace(/\(?usd\)?/ig, '').match(/[A-Za-z]/g) || []).length;
             return dg.length >= 8 && dg.length <= 24 && lt <= 4;
         }
+        // Numer konta wyciagniety z komorki, w ktorej stoi RAZEM z tekstem. Dostawcy
+        // wpisuja pod etykieta konta cala instrukcje dla banku posredniczacego:
+        //   „IBAN: BR8811703662000190000038492C1 Intermediary Bank: JP MORGAN Swift: …"
+        // piAccShape slusznie mowi, ze to nie jest numer — ale numer W NIM JEST, a etykieta
+        // mowi wprost, ze to konto. Szukamy WYLACZNIE pod etykieta konta; nigdzie indziej
+        // takiego zgadywania nie ma.
+        function piAccZTekstu(v){
+            var s = piAccBezUwagi(v).toUpperCase();
+            if (!s) return '';
+            // Najpierw IBAN — ma wlasny, rozpoznawalny ksztalt.
+            var m = s.match(/\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/);
+            if (m) return m[0];
+            // Potem zwykly numer: 8-24 cyfr, rozdzielone najwyzej spacja albo myslnikiem.
+            m = s.match(/\b\d[\d\s-]{6,32}\d\b/);
+            if (m){
+                var c = m[0].replace(/[\s-]+/g, '');
+                if (c.length >= 8 && c.length <= 24) return c;
+            }
+            return '';
+        }
         function piBareNum(v){
             var s = String(v == null ? '' : v).trim();
             return /^[0-9][0-9\s.–—\-]*$/.test(s) && s.replace(/\D+/g, '').length >= 8;
@@ -17814,6 +17936,18 @@
                     // komorka jest widoczna. W ukrytej kolumnie podpis wolno przeczytac,
                     // ale stojaca przy nim liczbe juz nie — to jest cala tresc ochrony.
                     var wlasna = (row[j] != null) ? piBankCell(row[j]) : null;
+                    // Kolumna z etykietami bywa UKRYTA — w P/I Anhui Zhilibao ukryta jest
+                    // cala kolumna A, a to w niej stoi „BENEFICIARY'S ACCOUNT NO.: 3405…",
+                    // czyli etykieta i numer w jednej komorce. Ochrona przed czytaniem liczb
+                    // z ukrytych kolumn ma sens dla liczby stojacej SAMA: tam moze wisiec
+                    // stary numer konta. Gdy wartosc jest PRZYKLEJONA DO WLASNEJ ETYKIETY,
+                    // nalezy do niej i nie ma czego pomylic — wiec ja bierzemy i oznaczamy.
+                    if (!(wlasna && wlasna.val)){
+                        var zEt = piBankCell(rowEt[j]);
+                        if (zEt && zEt.val && zEt.key === hit.key && want(hit.key, zEt.val)){
+                            wlasna = zEt; out.zUkrytej = true;
+                        }
+                    }
                     if (wlasna && wlasna.val && want(hit.key, wlasna.val)) v = wlasna.val;
                     else {
                         if (wlasna && wlasna.val) { note(hit.key, wlasna.val); rej++; }
@@ -17831,7 +17965,13 @@
             out.swiftRaw = String(out.swift == null ? '' : out.swift).replace(/\s+/g, ' ').trim();
             out.swift = piSwiftPick(out.swift);
             if (!PI_BIC_RE.test(out.swift)) out.swiftBad = out.swift ? true : false;
-            // Ratunek: w slocie konta stalo cos innego, ale w bloku jest dokladnie jeden
+            // Ratunek pierwszy: pod etykieta konta stal numer RAZEM z tekstem („IBAN: …
+            // Intermediary Bank: …"). Etykieta mowi, ze to konto, wiec wyciagamy je z tresci.
+            if (!out.acc && out.accBad){
+                var zt = piAccZTekstu(out.accBad);
+                if (zt){ out.acc = zt; out.accZTekstu = true; }
+            }
+            // Ratunek drugi: w slocie konta stalo cos innego, ale w bloku jest dokladnie jeden
             // numer wygladajacy na konto (stal pod inna etykieta) — bierzemy go i oznaczamy.
             if (!out.acc && nums.length === 1){ out.acc = nums[0]; out.accFix = true; }
             out.accNums = nums;
@@ -19040,9 +19180,12 @@
             _ordConf[String(order)] = pcScanBankComments(cs, 'zamówienie ' + order);
             var com = extractDepoComment(h, cs), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
             dg.cs = pcDiagCs(cs); dg.com = com; dg.banks = banks; dg.piUrl = piUrl || '';
-            if (!piUrl) dg.piRaw = pcPiSecDump(h);
-            var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', piBank: null, depOk: extractDepoOk(cs, com ? com.idx : -1) };
-            function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; o.piSheet = base.piSheet; o.piBank = base.piBank; o.depOk = base.depOk; return o; }
+            if (!piUrl){ dg.piRaw = pcPiSecDump(h); base.piRaw = dg.piRaw; }
+            var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', piBank: null, piRaw: '', depOk: extractDepoOk(cs, com ? com.idx : -1) };
+            // piRaw — zrzut sekcji „P/I" ze strony zamowienia. Liczony byl od dawna do
+            // diagnostyki; oddajemy go takze wolajacemu, bo bez niego „brak P/I" nie mowi,
+            // czy sekcji nie ma, czy jest pusta, czy plik wisi pod inna etykieta.
+            function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; o.piSheet = base.piSheet; o.piBank = base.piBank; o.piBankRaw = base.piBankRaw; o.piRaw = base.piRaw; o.piUrl = base.piUrl; o.depOk = base.depOk; return o; }
             // bezDepo: sciezka sprawdzania z wklejki. Przy zamowieniach „Deposit: 0%"
             // komentarza depozytowego NIE MA, a blok bankowy z P/I jest tam potrzebny tak
             // samo — bez niego znika porownanie konta, SWIFT-u i beneficjenta.
@@ -19056,6 +19199,13 @@
             base.piAcc = (pi && pi.acc) ? pi.acc : null;
             base.piSheet = (pi && pi.sheet) ? (pi.sheet + (pi.hidden ? ' [ukryty]' : '')) : '';
             base.piBank = (pi && pi.bank && pi.bank.ok) ? pi.bank : null;
+            // To, co udalo sie odczytac, NAWET gdy blok jest niekompletny. piBank zostaje
+            // bez zmian („komplet albo nic" — na tym stoi Wprowadzanie), a sprawdzanie
+            // z wklejki porownuje po POLU i przy brakujacym mowi, czego zabraklo.
+            base.piBankRaw = (pi && pi.bank) ? pi.bank : null;
+            // Ktory plik z sekcji P/I zostal wziety. Bez tego „czemu nie przeczytalo tego
+            // P/I" nie ma jak sie rozstrzygnac — na zamowieniu wisi ich po kilka.
+            base.piUrl = piUrl || '';
             if (pi.manual) return ret({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie' });
             if (pi.err) return ret({ ok: false, msg: pi.err });
             // Bez komentarza depozytowego nie ma czego porownywac — ale dane bankowe
@@ -19346,7 +19496,9 @@
             var box = sp.querySelector('#sp-box'), inp = sp.querySelector('#sp-file'),
                 drop = sp.querySelector('#sp-drop'), listEl = sp.querySelector('#sp-list'),
                 FILES = [], busy = false, LAST = null, GRAB = null, SEL = {};
-            function say(t, c){ var st = sp.querySelector('#sp-status'); st.textContent = t; st.style.color = c || '#666'; }
+            // Elementy starej sciezki moga nie istniec (SP_EXCEL = false) — bez tej
+            // ostroznosci otwarcie okna konczyloby sie cichym TypeError.
+            function say(t, c){ var st = sp.querySelector('#sp-status'); if (!st) return; st.textContent = t; st.style.color = c || '#666'; }
             function kb(n){ return n < 1024 ? (n + ' B') : (Math.round(n / 1024) + ' kB'); }
             function kind(f){
                 var n = String(f.name || '').toLowerCase();
@@ -19368,6 +19520,7 @@
                     + '<div style="color:#888;margin-top:2px">Czytane prosto do pamięci — nic nie zapisuje się na dysku.</div></div>';
             }
             function renderList(){
+                if (!listEl) return;
                 if (!FILES.length){ listEl.innerHTML = grabHtml(); return; }
                 var h = '<div style="font-size:11px;color:#750000;font-weight:600;margin-bottom:4px">Wczytane pliki: '
                     + FILES.length + ' (Excel ' + nXls() + ', potwierdze\u0144 ' + nPdf() + ')</div>'
@@ -19445,6 +19598,7 @@
                     say(r ? ('Zapisano: ' + r.name + ' \u2014 sprawd\u017a folder Pobrane.') : 'Nie uda\u0142o si\u0119 zapisa\u0107 pliku.', r ? '#0a0' : '#c00');
                 };
             }
+            if (drop && inp){
             drop.onclick = function(){ if (!busy) inp.click(); };
             drop.addEventListener('dragover', function(e){ e.preventDefault(); drop.style.background = '#fff3ee'; drop.style.borderColor = '#8B0000'; });
             drop.addEventListener('dragleave', function(){ drop.style.background = '#fffdfc'; drop.style.borderColor = '#FFCCB7'; });
@@ -19459,7 +19613,9 @@
                 inp.value = '';
                 if (fl.length) add(fl);
             };
-            sp.querySelector('#sp-clear').onclick = function(){
+            }
+            var gClr = sp.querySelector('#sp-clear');
+            if (gClr) gClr.onclick = function(){
                 if (busy) return;
                 FILES = []; LAST = null; GRAB = null; SEL = {}; renderList(); box.style.display = 'none'; box.innerHTML = '';
                 say('Wyczyszczone. Wrzu\u0107 pliki jeszcze raz.', '#666');
@@ -19503,15 +19659,23 @@
                            + ord.join(', ') + '\n\nTego nie da się cofnąć z poziomu skryptu.')) return;
                 busy = true;
                 try {
-                    var ok = 0, zle = [];
+                    var ok = 0, zle = [], niepewne = [];
                     for (var i = 0; i < ord.length; i++){
                         mow('Dopisuję: ' + (i + 1) + '/' + ord.length + '…');
                         var r = await pcPostComment(ord[i], tekst);
-                        if (r && r.ok) ok++; else zle.push(ord[i]);
+                        if (!(r && r.ok)){ zle.push(ord[i]); continue; }
+                        // Sprawdzamy, czy komentarz JEST na zamowieniu. Bez tego „dopisano"
+                        // opiera sie na samym kodzie odpowiedzi, a ten potrafi klamac.
+                        mow('Sprawdzam: ' + (i + 1) + '/' + ord.length + '…');
+                        var jest = await pcKomentarzWszedl(ord[i], tekst);
+                        if (jest === true) ok++;
+                        else if (jest === false) zle.push(ord[i] + ' (wysłane, ale nie ma go na zamówieniu)');
+                        else niepewne.push(ord[i]);
                     }
-                    mow('Dopisano do ' + ok + '/' + ord.length + ' zamówień'
-                        + (zle.length ? (' — nie udało się: ' + zle.join(', ')) : '.'),
-                        zle.length ? '#c00' : '#0a7a2f');
+                    var cz = ['potwierdzone: ' + ok + '/' + ord.length];
+                    if (niepewne.length) cz.push('niesprawdzone (nie otworzyłem zamówienia): ' + niepewne.join(', '));
+                    if (zle.length) cz.push('nie udało się: ' + zle.join(', '));
+                    mow(cz.join(' · '), zle.length ? '#c00' : (niepewne.length ? '#c47f00' : '#0a7a2f'));
                 } finally { busy = false; }
             }
             async function doPaste(){
@@ -19577,8 +19741,20 @@
                     st.pdfs ? (st.noConf ? '#c47f00' : '#0a0') : '#c47f00');
                 return st.pdfs;
             }
-            sp.querySelector('#sp-grab').onclick = function(){ doGrab(); };
+            var gGrab = sp.querySelector('#sp-grab');
+            if (gGrab) gGrab.onclick = function(){ doGrab(); };
             sp.querySelector('#sp-paste-run').onclick = function(){ doPaste(); };
+            // Zaznaczanie hurtem. Kolor wiersza idzie za zaznaczeniem — zaznaczony,
+            // ale czerwony wiersz przeczylby regule „zaznaczone znaczy sprawdzone".
+            // Ustawienie .checked z kodu NIE wywoluje zdarzenia change, wiec malujemy sami.
+            function bcZaznaczWszystkie(stan){
+                var kb = sp.querySelector('#sp-paste-box');
+                if (!kb) return;
+                kb.querySelectorAll('.bc-wk-chk').forEach(function (c){
+                    c.checked = stan;
+                    bcMalujWiersz(c.closest ? c.closest('.bc-wiersz') : null, stan);
+                });
+            }
             // Zaczynanie od nowa bez odswiezania strony. Czyscimy WYLACZNIE te sekcje —
             // wgrane pliki i wyniki sciezki excelowej zostaja tam, gdzie byly.
             sp.querySelector('#sp-paste-clr').onclick = function(){
@@ -19642,10 +19818,13 @@
             // delegacje — inaczej trzeba by go szukac po kazdym przerysowaniu.
             sp.addEventListener('click', function (e){
                 var t = e.target;
-                if (!t || t.id !== 'bc-wk-add') return;
-                doKomentarz();
+                if (!t || !t.id) return;
+                if (t.id === 'bc-wk-add') doKomentarz();
+                else if (t.id === 'bc-wk-all') bcZaznaczWszystkie(true);
+                else if (t.id === 'bc-wk-none') bcZaznaczWszystkie(false);
             });
-            sp.querySelector('#sp-run').onclick = async function(){
+            var gRun = sp.querySelector('#sp-run');
+            if (gRun) gRun.onclick = async function(){
                 if (busy) return;
                 // busy PRZED bcProcess(). Wczesniej flaga stawala sie dopiero w doGrab,
                 // wiec przy WLASNYCH pdf-ach (gdy doGrab w ogole nie jest wolany) drugie
@@ -19747,6 +19926,25 @@
                     body: 'fn=addComment&text=' + encodeURIComponent(text) + '&obj=op_order&obj_id=' + encodeURIComponent(orderId) });
                 return { ok: !!(res && res.ok) };
             } catch (e){ return { ok:false, error:e.message }; }
+        }
+        // Czy komentarz NAPRAWDE wszedl. Samo 200 z js_backend.php tego nie dowodzi —
+        // prologistics potrafi odpowiedziec poprawnie i nie zapisac nic. Patrzymy na
+        // NAJNOWSZE komentarze zamowienia: swiezo dopisany stoi na koncu listy.
+        // Zwracamy true / false / null (nie udalo sie pobrac strony — nie wiem).
+        async function pcKomentarzWszedl(order, tekst){
+            var html = '';
+            try { html = await pcOrderHtml(order); } catch (e){ html = ''; }
+            if (!html) return null;
+            var cs = [];
+            try { cs = pcComments(html) || []; } catch (e){ return null; }
+            if (!cs.length) return false;
+            var szuk = pcTxt(tekst).toLowerCase();
+            // Dwa ostatnie, a nie tylko jeden: miedzy zapisem a odczytem ktos inny
+            // moze zdazyc dopisac swoj komentarz.
+            for (var i = cs.length - 1; i >= 0 && i >= cs.length - 2; i--){
+                if (pcTxt(cs[i].text || '').toLowerCase() === szuk) return true;
+            }
+            return false;
         }
         async function pcOrderHtml(o){ try { return (await fetchT('/op_order.php?id=' + encodeURIComponent(o))) || ''; } catch (e){ return ''; } }
         // delegacja zmian: checkbox dostawcy -> zaznacz grupe; radio kwoty -> przelicz sumy
