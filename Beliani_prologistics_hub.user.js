@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.88
+// @version      4.89
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20080,6 +20080,699 @@
     //
     // Wszystkie endpointy i formaty ustalone na zywych danych (wyciag UBS 20.07-03.08.2026,
     // cykl VEN290820 = 694.52 EUR, 111 plikow archiwalnych z szesciu sklepow Vente).
+    // ===== Ksiegowanie INS (v4.89) =====
+    // Wklejka z wyciagu bankowego: jeden przelew = jeden wiersz, a za nim lista linkow do
+    // spraw ubezpieczeniowych z kwotami. Modul robi trzy rzeczy i kazda z nich SPRAWDZA:
+    //   1. czy kwota przelewu rowna sie sumie kwot z linkow (nie spina sie -> caly przelew
+    //      jest zablokowany, bo skoro nie wiadomo co sie nie zgadza, to nie wiadomo tez,
+    //      ktora pozycja jest zla),
+    //   2. czy platnosc naprawde weszla — po zapisie czytamy tabele Payments na sprawie,
+    //   3. czy komentarz „Booked" naprawde sie dopisal — z tej samej strony, jednym
+    //      pobraniem.
+    // Konta bierzemy z <select name="account"> ZE STRONY, a nie z wlasnego slownika —
+    // slownik zdazylby sie rozjechac z ERP. Dopasowanie nazwy banku z wyciagu do konta
+    // jest ostrozne: uznajemy je tylko wtedy, gdy pasuje DOKLADNIE JEDNO konto. Przy
+    // kilku albo zadnym wierszy dostaje liste do wyboru, a wybor zapamietujemy na stale.
+    function init_ins() {
+    (function () {
+        'use strict';
+
+        const BASE = 'https://www.prologistics.info';
+        const INS_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+                      ? GM_info.script.version : '?';
+        const INS_MAP_KEY = 'beliani_hub_ins_banki';
+
+        // Pamiec „nazwa banku z wyciagu -> numer konta". Raz wskazane zostaje na stale;
+        // dzieki temu recznego wyboru nie trzeba powtarzac przy kazdym wyciagu.
+        function insMapaWczytaj(){
+            try { return JSON.parse(GM_getValue(INS_MAP_KEY, '{}')) || {}; } catch (e) { return {}; }
+        }
+        function insMapaZapisz(m){
+            try { GM_setValue(INS_MAP_KEY, JSON.stringify(m)); } catch (e) {}
+        }
+        let INS_MAPA = insMapaWczytaj();
+
+        let insBusy = false;
+        let INS_GRUPY = [];
+
+        // ---------- drobiazgi ----------
+        function insTxt(h){
+            return String(h == null ? '' : h)
+                .replace(/<br\s*\/?>/gi, ' ')
+                .replace(/<[^>]*>/g, '')
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/&amp;/gi, '&')
+                .replace(/&lt;/gi, '<')
+                .replace(/&gt;/gi, '>')
+                .replace(/&quot;/gi, '"')
+                .replace(/&#0?39;/gi, "'");
+        }
+        function insEsc(s){
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+        // Kwoty z wyciagu i z ERP bywaja pisane na oba sposoby: „488.26", „1 149,97".
+        // O tym, ktory znak jest przecinkiem dziesietnym, decyduje OSTATNI separator
+        // i liczba cyfr po nim — bez tego „1 149,97" czyta sie jako 1,14.
+        function insKwota(v){
+            var s = String(v == null ? '' : v).replace(/[ \s]/g, '').replace(/[A-Za-z€$£]/g, '');
+            if (!s) return null;
+            var neg = /^-/.test(s) || /\)$/.test(s);
+            s = s.replace(/[()+\-]/g, '');
+            if (!/\d/.test(s)) return null;
+            var ost = Math.max(s.lastIndexOf(','), s.lastIndexOf('.'));
+            if (ost >= 0){
+                var po = s.length - ost - 1;
+                if (po >= 1 && po <= 2) s = s.slice(0, ost).replace(/[.,]/g, '') + '.' + s.slice(ost + 1);
+                else s = s.replace(/[.,]/g, '');
+            }
+            var n = parseFloat(s);
+            if (!isFinite(n)) return null;
+            return neg ? -n : n;
+        }
+        function insFmt(n){ return (Math.round((Number(n) || 0) * 100) / 100).toFixed(2); }
+        // Wyciag pisze date po polsku: DZIEN.MIESIAC.ROK. ERP chce ROK-MIESIAC-DZIEN.
+        // Kolejnosc jest tu cala trescia funkcji — zamiana miejscami znaczy ksiegowanie
+        // na zlej dacie, wiec pilnuje jej osobny test.
+        function insDataYmd(t){
+            var m = /(\d{4})-(\d{2})-(\d{2})/.exec(String(t || ''));
+            if (m) return m[0];
+            m = /(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})/.exec(String(t || ''));
+            if (!m) return '';
+            var d = parseInt(m[1], 10), mc = parseInt(m[2], 10);
+            if (!(d >= 1 && d <= 31 && mc >= 1 && mc <= 12)) return '';
+            return m[3] + '-' + ('0' + mc).slice(-2) + '-' + ('0' + d).slice(-2);
+        }
+        function insSleep(ms){ return new Promise(function (r){ setTimeout(r, ms); }); }
+
+        // ---------- wklejka ----------
+        // Kolumny nazywamy po tym, CO w nich stoi, a nie po numerze: wyciagi roznia sie
+        // liczba pustych kolumn miedzy kwota a linkami.
+        function insParsujWklejke(raw){
+            var out = [];
+            String(raw || '').split(/\r?\n/).forEach(function (linia, nr){
+                if (!/insurance\.php\?id=/i.test(linia)) return;
+                var kom = linia.split('\t');
+                var iLink = -1, iData = -1, k;
+                for (k = 0; k < kom.length; k++){
+                    if (iLink < 0 && /insurance\.php\?id=/i.test(kom[k])) iLink = k;
+                    if (iData < 0 && /^\s*\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}\s*$/.test(kom[k])) iData = k;
+                }
+                if (iLink < 0) return;
+                var kwota = null;
+                for (k = iLink - 1; k >= 0; k--){
+                    var kk = insKwota(kom[k]);
+                    if (kk !== null && String(kom[k]).trim() !== ''){ kwota = kk; break; }
+                }
+                var poz = [], re = /insurance\.php\?id=(\d+)[^0-9]{0,6}?([0-9][0-9  .,]*)\s*([A-Za-z]{3})?/gi, m;
+                var blob = kom.slice(iLink).join(' ');
+                while ((m = re.exec(blob)) !== null){
+                    var kw = insKwota(m[2]);
+                    if (kw === null) continue;
+                    poz.push({
+                        id: m[1], kwota: kw, waluta: (m[3] || '').toUpperCase(),
+                        konto: '', kontoZrodlo: '', konta: [], data: '',
+                        kto: '', ktoZrodlo: '', status: '', stan: 'nowy', wybrany: true,
+                        juzJest: null, uwagi: []
+                    });
+                }
+                if (!poz.length) return;
+                var suma = poz.reduce(function (a, p){ return a + p.kwota; }, 0);
+                var dYmd = iData >= 0 ? insDataYmd(kom[iData]) : '';
+                poz.forEach(function (p){ p.data = dYmd; });
+                out.push({
+                    nr: nr + 1,
+                    data: dYmd,
+                    bank: iData >= 0 && kom[iData + 1] ? String(kom[iData + 1]).trim() : '',
+                    kontr: iData >= 0 && kom[iData + 2] ? String(kom[iData + 2]).trim() : '',
+                    kwota: kwota,
+                    suma: suma,
+                    spina: kwota !== null && Math.abs(kwota - suma) < 0.005,
+                    poz: poz
+                });
+            });
+            return out;
+        }
+
+        // ---------- strona sprawy ----------
+        async function insPobierz(url){
+            var r = await fetch(url, { credentials: 'include' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return await r.text();
+        }
+        function insKontaZeStrony(html){
+            var m = /<select[^>]*name=["']account["'][^>]*>([\s\S]*?)<\/select>/i.exec(html);
+            if (!m) return [];
+            var out = [], re = /<option[^>]*value=["'](\d+)["'][^>]*>([\s\S]*?)<\/option>/gi, o;
+            while ((o = re.exec(m[1])) !== null){
+                out.push({ nr: o[1], opis: insTxt(o[2]).replace(/\s+/g, ' ').trim() });
+            }
+            return out;
+        }
+        function insPlatnosci(html){
+            var i = html.search(/<h3[^>]*>\s*Payments\s*<\/h3>/i);
+            if (i < 0) return { wiersze: [], open: null };
+            var t0 = html.lastIndexOf('<table', i), t1 = html.indexOf('</table>', i);
+            var tab = html.slice(t0 < 0 ? i : t0, t1 < 0 ? html.length : t1);
+            var wiersze = [], re = /<tr[^>]*>([\s\S]*?)<\/tr>/gi, r;
+            while ((r = re.exec(tab)) !== null){
+                var tds = [], rt = /<td[^>]*>([\s\S]*?)<\/td>/gi, d;
+                while ((d = rt.exec(r[1])) !== null) tds.push(insTxt(d[1]).replace(/\s+/g, ' ').trim());
+                if (tds.length < 8) continue;
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(tds[0])) continue;
+                wiersze.push({ data: tds[0], konto: tds[1], kwota: insKwota(tds[2]), user: tds[7] });
+            }
+            var mo = /Open amount[^:]*:\s*([A-Z]{3})?\s*([\-0-9., ]+)/i.exec(insTxt(tab));
+            return { wiersze: wiersze, open: mo ? insKwota(mo[2]) : null };
+        }
+        function insKomentarze(html){
+            var out = [];
+            var re = /<tr[^>]*class=["'][^"']*comment-row[^"']*["'][\s\S]*?<td[^>]*>\s*(\d{4}-\d{2}-\d{2}[^<]*)<\/td>[\s\S]*?data-user=["']([^"']+)["']([\s\S]*?)<\/tr>/gi, m;
+            while ((m = re.exec(html)) !== null){
+                var t = /class=["']commentText["']>([\s\S]*?)<\/span>/i.exec(m[3]);
+                out.push({ data: m[1].trim(), user: m[2], text: t ? insTxt(t[1]) : '' });
+            }
+            return out;
+        }
+        function insResponsible(html){
+            var m = /data-id=["']responsible_uname["'][^>]*data-value=["']([^"']*)["']/i.exec(html);
+            return m ? m[1] : '';
+        }
+        function insWalutaStrony(html){
+            var m = /([A-Z]{3})\s*<input[^>]*name=["']amount["']/i.exec(html);
+            return m ? m[1].toUpperCase() : '';
+        }
+        function insZalogowany(html){
+            var m = /loggedUsername\s*=\s*"([^"]+)"/.exec(html) || /<body[^>]*data-user=["']([^"']+)["']/i.exec(html);
+            return m ? m[1] : '';
+        }
+        // Kto zapowiedzial te kwote. Szukamy od NAJNOWSZEGO komentarza, bo ostatnie
+        // ustalenie jest tym wiazacym.
+        //
+        // Nie porownujemy NAPISOW, tylko liczby: z komentarza wycinamy cale liczby razem
+        // z separatorem tysiecy i kazda przeliczamy. Porownanie napisow gubi zapis
+        // „488,26” wobec „488.26”, a jeszcze gorzej — znajduje 88.26 w srodku 488,26
+        // i podstawia nie te osobe.
+        const INS_LICZBA = /\d{1,3}(?:[  .,]\d{3})*[.,]\d{2}|\d+[.,]\d{2}|\d+/g;
+        function insKtoOKwocie(koment, kwota){
+            for (var i = koment.length - 1; i >= 0; i--){
+                var t = String(koment[i].text || '');
+                var re = new RegExp(INS_LICZBA.source, 'g'), m;
+                while ((m = re.exec(t)) !== null){
+                    var v = insKwota(m[0]);
+                    if (v !== null && Math.abs(v - kwota) < 0.005) return koment[i].user;
+                }
+            }
+            return '';
+        }
+
+        // ---------- dopasowanie konta ----------
+        function insNorm(s){
+            return String(s || '').toLowerCase()
+                .replace(/[Ąą]/g, 'a').replace(/[Ćć]/g, 'c')
+                .replace(/[Ęę]/g, 'e').replace(/[Łł]/g, 'l')
+                .replace(/[Óó]/g, 'o').replace(/[Śś]/g, 's')
+                .replace(/[ŻżŹź]/g, 'z').replace(/[äüö]/g, function (c){
+                    return c === 'ä' ? 'a' : (c === 'ü' ? 'u' : 'o');
+                })
+                .replace(/[^a-z0-9]+/g, ' ').trim();
+        }
+        // Nazwy z wyciagu sa skrotami, w ERP stoja pelne. Zamieniamy TYLKO to, co
+        // jednoznaczne; reszte zostawiamy i niech rozstrzygnie liczba trafien.
+        const INS_ALIAS = [
+            [/\bhvb\b/g, 'hypoveriensbank'],
+            [/\bcredit\s+swiss\b/g, 'cs'],
+            [/\bcredit\s+suisse\b/g, 'cs'],
+            [/\braiff\b/g, 'raiffeisen'],
+            [/\bmillennium\b/g, 'millenium'],
+            [/\bpost\s+finance\b/g, 'postfinance']
+        ];
+        function insTokeny(bank){
+            var s = insNorm(bank);
+            INS_ALIAS.forEach(function (a){ s = s.replace(a[0], a[1]); });
+            return s.split(' ').filter(function (t){ return t.length > 1; });
+        }
+        function insDopasujKonto(bank, konta){
+            var zap = INS_MAPA[insNorm(bank)];
+            if (zap && konta.some(function (k){ return k.nr === zap; })) return { nr: zap, zrodlo: 'pamiec' };
+            var tok = insTokeny(bank);
+            if (!tok.length) return { nr: '', zrodlo: '' };
+            var traf = konta.filter(function (k){
+                var op = insNorm(k.opis);
+                return tok.every(function (t){
+                    return new RegExp('(^| )' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '( |$)').test(op);
+                });
+            });
+            if (traf.length === 1) return { nr: traf[0].nr, zrodlo: 'auto' };
+            return { nr: '', zrodlo: '', ile: traf.length };
+        }
+
+        // ---------- ramka do zapisu ----------
+        // Zapis idzie przez PRAWDZIWY formularz w ramce, nie przez recznie sklecony POST.
+        // Powod jest konkretny: czesc pol (m.in. sh[...] w „Monitoring shipping cost")
+        // dorabia dopiero JavaScript strony. Recznie zlozony POST wyslalby formularz bez
+        // nich, a serwer potraktowalby to jako skasowanie tych wierszy.
+        function insRamka(){
+            var f = document.createElement('iframe');
+            f.style.cssText = 'position:fixed;left:-3000px;top:-3000px;width:1200px;height:900px;opacity:0;pointer-events:none;z-index:-1';
+            document.body.appendChild(f);
+            return { iframe: f };
+        }
+        function insRamkaUsun(ctx){
+            try { if (ctx && ctx.iframe && ctx.iframe.parentNode) ctx.iframe.parentNode.removeChild(ctx.iframe); } catch (e) {}
+        }
+        function insLoadFrame(ctx, url, ms){
+            return new Promise(function (res, rej){
+                var done = false;
+                var t = setTimeout(function (){ if (!done){ done = true; rej(new Error('Timeout: ' + url)); } }, ms || 60000);
+                ctx.iframe.onload = function (){ if (!done){ done = true; clearTimeout(t); res(); } };
+                ctx.iframe.src = url;
+            });
+        }
+        function insCzekajLoad(ctx, ms){
+            return new Promise(function (res, rej){
+                var done = false;
+                var t = setTimeout(function (){ if (!done){ done = true; rej(new Error('Timeout zapisu')); } }, ms || 60000);
+                ctx.iframe.onload = function (){ if (!done){ done = true; clearTimeout(t); res(); } };
+            });
+        }
+        async function insZaksieguj(ctx, id, ymd, konto, kwota){
+            await insLoadFrame(ctx, BASE + '/insurance.php?id=' + encodeURIComponent(id), 90000);
+            await insSleep(600);
+            var doc = ctx.iframe.contentDocument, win = ctx.iframe.contentWindow;
+            if (!doc) return { ok: false, blad: 'Brak dostepu do ramki' };
+            var form = doc.querySelector('form#insurance-form') || doc.forms[0];
+            if (!form) return { ok: false, blad: 'Brak formularza sprawy' };
+            var m = /(\d{4})-(\d{2})-(\d{2})/.exec(ymd || '');
+            if (!m) return { ok: false, blad: 'Zla data: ' + ymd };
+            var sM = form.querySelector('select[name="Date_Month"]');
+            var sD = form.querySelector('select[name="Date_Day"]');
+            var sY = form.querySelector('select[name="Date_Year"]');
+            if (!sM || !sD || !sY) return { ok: false, blad: 'Brak pol daty ksiegowania' };
+            sM.value = m[2];
+            sD.value = String(parseInt(m[3], 10));
+            sY.value = m[1];
+            var sA = form.querySelector('select[name="account"]');
+            if (!sA) return { ok: false, blad: 'Brak listy kont' };
+            var opt = Array.prototype.slice.call(sA.options).filter(function (o){ return o.value === String(konto); })[0];
+            if (!opt) return { ok: false, blad: 'Konto ' + konto + ' nie istnieje na liscie' };
+            sA.value = opt.value;
+            var amt = form.querySelector('input[name="amount"]');
+            if (!amt) return { ok: false, blad: 'Brak pola kwoty' };
+            amt.value = insFmt(kwota);
+            var pay = Array.prototype.slice.call(form.querySelectorAll('input[type="submit"]'))
+                .filter(function (b){ return /make\s*payment/i.test(b.value || ''); })[0];
+            if (!pay) return { ok: false, blad: 'Brak guzika Make payment' };
+            var czek = insCzekajLoad(ctx, 90000).catch(function (){ return null; });
+            pay.click();
+            await czek;
+            await insSleep(500);
+            return { ok: true };
+        }
+
+        // ---------- komentarz ----------
+        async function insDopiszKomentarz(id, kto){
+            var body = 'fn=reassignComment'
+                     + '&username=' + encodeURIComponent(kto)
+                     + '&obj=ins&obj_id=' + encodeURIComponent(id)
+                     + '&comment=' + encodeURIComponent('Booked')
+                     + '&field=responsible';
+            var r = await fetch(BASE + '/js_backend.php', {
+                method: 'POST', credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: body
+            });
+            return !!(r && r.ok);
+        }
+
+        // ---------- pula workerow ----------
+        async function insPula(zadania, ile, postep){
+            var i = 0, wyn = new Array(zadania.length);
+            async function worker(){
+                var ctx = null;
+                try {
+                    while (true){
+                        var k = i++;
+                        if (k >= zadania.length) break;
+                        if (!ctx) ctx = insRamka();
+                        try { wyn[k] = await zadania[k](ctx); }
+                        catch (e){ wyn[k] = { ok: false, blad: String(e && e.message || e) }; }
+                        if (postep) postep();
+                    }
+                } finally { insRamkaUsun(ctx); }
+            }
+            var ws = [];
+            for (var w = 0; w < Math.max(1, ile); w++) ws.push(worker());
+            await Promise.all(ws);
+            return wyn;
+        }
+
+        // ---------- panel ----------
+        const btn = document.createElement('button');
+        btn.id = 'ins-btn';
+        btn.textContent = '🛡️ Ksiegowanie INS';
+        btn.style.cssText = 'position:fixed;top:250px;right:20px;z-index:999999;padding:10px 15px;'
+            + 'background:#FF2F00;color:white;border:none;border-radius:8px;cursor:pointer;'
+            + 'font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.2)';
+
+        const panel = document.createElement('div');
+        panel.id = 'ins-panel';
+        panel.style.cssText = 'display:none;position:fixed;top:296px;right:20px;z-index:999999;'
+            + 'background:white;border:1px solid #ccc;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.15);'
+            + 'padding:16px;width:min(1180px,calc(100vw - 40px));font-family:sans-serif;'
+            + 'max-height:calc(100vh - 316px);overflow-y:auto';
+        panel.innerHTML = ''
+          + '<div style="font-weight:bold;margin-bottom:8px;color:#111;font-size:15px">🛡️ Księgowanie INS '
+          +   '<span style="font-weight:normal;font-size:11px;color:#750000">HUB v' + INS_VER + '</span></div>'
+          + '<div style="font-size:11px;color:#666;margin-bottom:8px">'
+          +   'Wklej wiersze z wyciągu: data, bank, kontrahent, tytuł, kwota, a dalej linki '
+          +   '<code>insurance.php?id=… - kwota EUR</code>. Każdy przelew musi się spinać '
+          +   'z sumą kwot z linków — inaczej nie da się go zaksięgować.</div>'
+          + '<textarea id="ins-input" placeholder="Wklej wiersze z wyciągu…" style="width:100%;height:90px;padding:8px;'
+          +   'border:1px solid #ccc;border-radius:6px;font-size:12px;resize:vertical;box-sizing:border-box;font-family:monospace"></textarea>'
+          + '<div id="ins-parse" style="margin-top:4px;font-size:11px;color:#555;min-height:16px"></div>'
+          + '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+          +   '<button id="ins-check" style="flex:1;min-width:180px;padding:9px;background:#332524;color:white;border:none;'
+          +     'border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">🔍 Sprawdź</button>'
+          +   '<button id="ins-clear" style="width:120px;padding:9px;background:#750000;color:white;border:none;'
+          +     'border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">🧹 Wyczyść</button>'
+          + '</div>'
+          + '<div style="margin-top:8px;padding:8px;background:#F6E7E6;border:1px solid #FFCCB7;border-radius:6px;'
+          +   'display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +   '<span style="font-size:12px;color:#750000;font-weight:bold">⚙️ Księgowanie równoległe:</span>'
+          +   '<label style="font-size:11px;color:#750000">workerów:</label>'
+          +   '<input id="ins-workers" type="number" min="1" max="10" value="5" style="width:55px;padding:4px 6px;'
+          +     'border:1px solid #750000;border-radius:4px;font-size:12px;text-align:center">'
+          +   '<button id="ins-run" style="flex:1;min-width:260px;padding:7px;background:#FF2F00;color:white;border:none;'
+          +     'border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold">🚀 Zaksięguj zaznaczone i sprawdź</button>'
+          +   '<span style="font-size:10px;color:#750000;font-style:italic;width:100%">Po każdym zapisie moduł wchodzi na sprawę '
+          +     'i sprawdza, czy płatność jest w tabeli Payments i czy komentarz „Booked" naprawdę się dopisał.</span>'
+          + '</div>'
+          + '<div id="ins-box" style="display:none;margin-top:12px"></div>'
+          + '<div id="ins-sum" style="margin-top:8px;font-size:13px;font-weight:bold"></div>';
+
+        document.body.appendChild(btn);
+        document.body.appendChild(panel);
+        btn.onclick = function (){ panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; };
+
+        function insMow(t, kolor){
+            var el = panel.querySelector('#ins-sum');
+            if (el){ el.textContent = t || ''; el.style.color = kolor || '#333'; }
+        }
+        function insPodgladTekst(){
+            var g = insParsujWklejke(panel.querySelector('#ins-input').value);
+            var poz = g.reduce(function (a, x){ return a + x.poz.length; }, 0);
+            var zle = g.filter(function (x){ return !x.spina; }).length;
+            panel.querySelector('#ins-parse').textContent = g.length
+                ? ('Przelewów: ' + g.length + ' · INS: ' + poz + (zle ? (' · nie spina się: ' + zle) : ' · wszystkie się spinają'))
+                : '';
+        }
+
+        // ---------- render listy ----------
+        function insRysuj(){
+            var box = panel.querySelector('#ins-box');
+            if (!INS_GRUPY.length){ box.style.display = 'none'; box.innerHTML = ''; return; }
+            var h = '<div style="overflow-x:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:6px">'
+                  + '<table style="width:100%;min-width:1040px;border-collapse:collapse;font-size:12px">'
+                  + '<thead><tr style="background:#f3f4f6">'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;width:34px">✓</th>'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">INS</th>'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right">Kwota</th>'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Konto</th>'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Data</th>'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Komentarz na</th>'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Status</th>'
+                  + '</tr></thead><tbody>';
+            INS_GRUPY.forEach(function (g, gi){
+                var tlo = g.spina ? '#eef7ee' : '#fdecec';
+                var opis = (g.data || '—') + ' · ' + insEsc(g.bank || '?') + ' · ' + insEsc(g.kontr || '');
+                var kontrola = g.spina
+                    ? ('✓ ' + insFmt(g.kwota) + ' = suma linków')
+                    : ('✗ przelew ' + (g.kwota === null ? '?' : insFmt(g.kwota)) + ', suma linków ' + insFmt(g.suma)
+                       + ' — różnica ' + insFmt((g.kwota || 0) - g.suma));
+                h += '<tr style="background:' + tlo + '"><td colspan="7" style="padding:6px;border:1px solid #e5e7eb">'
+                   + '<b>' + opis + '</b> &nbsp; <span style="color:' + (g.spina ? '#0a7a2f' : '#c00') + '">' + kontrola + '</span>'
+                   + '</td></tr>';
+                g.poz.forEach(function (p, pi){
+                    var kolor = p.stan === 'ok' ? '#0a7a2f' : (p.stan === 'blad' ? '#c00' : (p.stan === 'uwaga' ? '#c47f00' : '#555'));
+                    var kontoHtml;
+                    if (p.konta && p.konta.length && !p.konto){
+                        kontoHtml = '<select class="ins-konto" data-g="' + gi + '" data-p="' + pi + '" style="max-width:280px;font-size:11px">'
+                                  + '<option value="">— wybierz konto —</option>'
+                                  + p.konta.map(function (k){ return '<option value="' + k.nr + '">' + insEsc(k.opis) + '</option>'; }).join('')
+                                  + '</select>';
+                    } else if (p.konto){
+                        var op = (p.konta || []).filter(function (k){ return k.nr === p.konto; })[0];
+                        kontoHtml = '<b>' + insEsc(p.konto) + '</b> <span style="color:#666">' + insEsc(op ? op.opis : '') + '</span>'
+                                  + (p.kontoZrodlo ? (' <span style="font-size:10px;color:#888">(' + p.kontoZrodlo + ')</span>') : '')
+                                  + ' <a href="#" class="ins-konto-zmien" data-g="' + gi + '" data-p="' + pi + '" style="font-size:10px">zmień</a>';
+                    } else {
+                        kontoHtml = '<span style="color:#888">—</span>';
+                    }
+                    var dataHtml = p.data
+                        ? insEsc(p.data)
+                        : '<input type="date" class="ins-data" data-g="' + gi + '" data-p="' + pi + '" style="font-size:11px">';
+                    h += '<tr class="ins-wiersz" data-g="' + gi + '" data-p="' + pi + '">'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:center">'
+                       +   '<input type="checkbox" class="ins-chk" data-g="' + gi + '" data-p="' + pi + '"'
+                       +   (p.wybrany ? ' checked' : '') + (g.spina ? '' : ' disabled') + '></td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb"><a href="' + BASE + '/insurance.php?id=' + p.id
+                       +   '" target="_blank">' + p.id + '</a></td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right">' + insFmt(p.kwota)
+                       +   ' ' + insEsc(p.waluta) + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + kontoHtml + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + dataHtml + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + insEsc(p.kto || '—')
+                       +   (p.ktoZrodlo ? (' <span style="font-size:10px;color:#888">(' + p.ktoZrodlo + ')</span>') : '') + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;color:' + kolor + '">' + insEsc(p.status || '') + '</td>'
+                       + '</tr>';
+                });
+            });
+            h += '</tbody></table></div>';
+            box.innerHTML = h;
+            box.style.display = 'block';
+        }
+
+        // ---------- sprawdzanie ----------
+        async function insSprawdzJedna(p, g){
+            var html = await insPobierz(BASE + '/insurance.php?id=' + encodeURIComponent(p.id));
+            var konta = insKontaZeStrony(html);
+            p.konta = konta;
+            if (!konta.length){ p.stan = 'blad'; p.status = 'nie widzę listy kont — czy jesteś zalogowany?'; return; }
+            var dop = insDopasujKonto(g.bank, konta);
+            p.konto = dop.nr;
+            p.kontoZrodlo = dop.zrodlo;
+            var kom = insKomentarze(html);
+            var kto = insKtoOKwocie(kom, p.kwota);
+            if (kto){ p.kto = kto; p.ktoZrodlo = 'z komentarza'; }
+            else {
+                p.kto = insResponsible(html);
+                p.ktoZrodlo = p.kto ? 'Responsible' : '';
+            }
+            var pl = insPlatnosci(html);
+            var juz = pl.wiersze.filter(function (w){
+                return Math.abs((w.kwota || 0) - p.kwota) < 0.005 && (!p.konto || String(w.konto) === String(p.konto));
+            })[0];
+            p.juzJest = juz || null;
+            var wal = insWalutaStrony(html);
+            p.uwagi = [];
+            if (p.waluta && wal && p.waluta !== wal) p.uwagi.push('waluta z wyciągu ' + p.waluta + ', na sprawie ' + wal);
+            if (juz){
+                p.stan = 'uwaga';
+                p.wybrany = false;
+                p.status = 'już zaksięgowane ' + juz.data + ' na ' + juz.konto + ' (' + (juz.user || '?') + ')';
+                return;
+            }
+            if (!p.konto){
+                p.stan = 'uwaga';
+                p.status = dop.ile ? ('pasuje ' + dop.ile + ' kont — wybierz') : 'nie dopasowałem konta — wybierz';
+            } else if (!p.kto){
+                p.stan = 'uwaga';
+                p.status = 'nie wiem, na kogo odbić komentarz';
+            } else {
+                p.stan = 'gotowy';
+                p.status = 'gotowe do księgowania' + (p.uwagi.length ? (' · ' + p.uwagi.join('; ')) : '');
+            }
+        }
+
+        async function insSprawdz(){
+            if (insBusy) return;
+            INS_GRUPY = insParsujWklejke(panel.querySelector('#ins-input').value);
+            if (!INS_GRUPY.length){ insMow('Nie znalazłem żadnego wiersza z linkiem do sprawy.', '#c00'); return; }
+            insBusy = true;
+            insRysuj();
+            var zad = [], mapa = [];
+            INS_GRUPY.forEach(function (g){
+                g.poz.forEach(function (p){
+                    mapa.push({ g: g, p: p });
+                    zad.push(async function (){
+                        p.status = 'sprawdzam…';
+                        try { await insSprawdzJedna(p, g); }
+                        catch (e){ p.stan = 'blad'; p.status = 'błąd odczytu: ' + String(e && e.message || e); }
+                        return null;
+                    });
+                });
+            });
+            var zrobione = 0;
+            insMow('Sprawdzam 0/' + zad.length + '…');
+            await insPula(zad, 5, function (){
+                zrobione++;
+                insMow('Sprawdzam ' + zrobione + '/' + zad.length + '…');
+                insRysuj();
+            });
+            insRysuj();
+            var gotowe = mapa.filter(function (x){ return x.p.stan === 'gotowy' && x.g.spina; }).length;
+            var blokada = INS_GRUPY.filter(function (g){ return !g.spina; }).length;
+            insMow('Sprawdzone. Gotowych do księgowania: ' + gotowe + '/' + mapa.length
+                 + (blokada ? (' · przelewów zablokowanych (nie spina się suma): ' + blokada) : ''),
+                 blokada ? '#c00' : '#0a7a2f');
+            insBusy = false;
+        }
+
+        // ---------- ksiegowanie ----------
+        async function insKsiegujJedna(ctx, p, g){
+            p.status = 'księguję…';
+            insRysuj();
+            var w = await insZaksieguj(ctx, p.id, p.data, p.konto, p.kwota);
+            if (!w.ok){ p.stan = 'blad'; p.status = 'nie zaksięgowało: ' + w.blad; return; }
+            var komOk = false;
+            if (p.kto){
+                p.status = 'dopisuję komentarz…';
+                insRysuj();
+                try { komOk = await insDopiszKomentarz(p.id, p.kto); } catch (e){ komOk = false; }
+            }
+            p.status = 'sprawdzam zapis…';
+            insRysuj();
+            var html = '';
+            try { html = await insPobierz(BASE + '/insurance.php?id=' + encodeURIComponent(p.id)); } catch (e){ html = ''; }
+            if (!html){
+                p.stan = 'uwaga';
+                p.status = 'wysłane, ale nie udało się otworzyć sprawy do sprawdzenia';
+                return;
+            }
+            var pl = insPlatnosci(html);
+            var wpis = pl.wiersze.filter(function (r){
+                return r.data === p.data && String(r.konto) === String(p.konto)
+                    && Math.abs((r.kwota || 0) - p.kwota) < 0.005;
+            })[0];
+            var ja = insZalogowany(html);
+            var kom = insKomentarze(html);
+            var ostatnie = kom.slice(-3);
+            var maKom = ostatnie.some(function (c){
+                return /^booked$/i.test(String(c.text || '').trim()) && (!ja || c.user === ja);
+            });
+            var czesci = [];
+            czesci.push(wpis ? 'płatność ✓' : 'płatności NIE MA ✗');
+            if (p.kto) czesci.push(maKom ? 'komentarz ✓' : 'komentarza NIE MA ✗');
+            else czesci.push('komentarz pominięty (brak osoby)');
+            if (pl.open !== null) czesci.push('open amount ' + insFmt(pl.open));
+            p.stan = (wpis && (maKom || !p.kto)) ? 'ok' : 'blad';
+            p.status = czesci.join(' · ');
+        }
+
+        async function insKsieguj(){
+            if (insBusy) return;
+            var doZrobienia = [];
+            INS_GRUPY.forEach(function (g){
+                if (!g.spina) return;
+                g.poz.forEach(function (p){
+                    if (!p.wybrany) return;
+                    if (p.juzJest) return;
+                    if (!p.konto || !p.data || !p.kwota) return;
+                    doZrobienia.push({ g: g, p: p });
+                });
+            });
+            if (!doZrobienia.length){
+                insMow('Nie ma czego księgować: brakuje konta, daty albo suma się nie spina.', '#c00');
+                return;
+            }
+            var ile = parseInt(panel.querySelector('#ins-workers').value, 10) || 5;
+            insBusy = true;
+            var zrobione = 0;
+            insMow('Księguję 0/' + doZrobienia.length + '…');
+            await insPula(doZrobienia.map(function (x){
+                return function (ctx){ return insKsiegujJedna(ctx, x.p, x.g); };
+            }), ile, function (){
+                zrobione++;
+                insMow('Księguję ' + zrobione + '/' + doZrobienia.length + '…');
+                insRysuj();
+            });
+            insRysuj();
+            var ok = doZrobienia.filter(function (x){ return x.p.stan === 'ok'; }).length;
+            var zle = doZrobienia.filter(function (x){ return x.p.stan === 'blad'; }).length;
+            insMow('Zaksięgowane i potwierdzone: ' + ok + '/' + doZrobienia.length
+                 + (zle ? (' · do sprawdzenia ręcznie: ' + zle) : ''), zle ? '#c00' : '#0a7a2f');
+            insBusy = false;
+        }
+
+        // ---------- zdarzenia ----------
+        panel.querySelector('#ins-input').addEventListener('input', insPodgladTekst);
+        panel.querySelector('#ins-check').onclick = function (){ insSprawdz(); };
+        panel.querySelector('#ins-run').onclick = function (){ insKsieguj(); };
+        panel.querySelector('#ins-clear').onclick = function (){
+            if (insBusy) return;
+            INS_GRUPY = [];
+            panel.querySelector('#ins-input').value = '';
+            panel.querySelector('#ins-parse').textContent = '';
+            insRysuj();
+            insMow('');
+        };
+        // Wybory w tabeli lapiemy przez delegacje, bo tabela przerysowuje sie po kazdym
+        // kroku workera — wiazanie po id zginaloby przy pierwszym odswiezeniu.
+        panel.addEventListener('change', function (e){
+            var t = e.target;
+            if (!t || !t.classList) return;
+            var g = INS_GRUPY[parseInt(t.getAttribute('data-g'), 10)];
+            var p = g && g.poz[parseInt(t.getAttribute('data-p'), 10)];
+            if (!p) return;
+            if (t.classList.contains('ins-chk')){ p.wybrany = t.checked; return; }
+            if (t.classList.contains('ins-data')){ p.data = t.value; insRysuj(); return; }
+            if (t.classList.contains('ins-konto')){
+                p.konto = t.value;
+                p.kontoZrodlo = 'wybrane ręcznie';
+                if (p.konto && g.bank){
+                    INS_MAPA[insNorm(g.bank)] = p.konto;
+                    insMapaZapisz(INS_MAPA);
+                    // Ten sam bank w pozostalych wierszach dostaje konto od razu.
+                    INS_GRUPY.forEach(function (gg){
+                        if (insNorm(gg.bank) !== insNorm(g.bank)) return;
+                        gg.poz.forEach(function (pp){
+                            if (!pp.konto && pp.konta && pp.konta.length){
+                                pp.konto = p.konto;
+                                pp.kontoZrodlo = 'pamięć';
+                                if (pp.stan === 'uwaga' && /konta/.test(pp.status || '')){
+                                    pp.stan = pp.kto ? 'gotowy' : 'uwaga';
+                                    pp.status = pp.kto ? 'gotowe do księgowania' : 'nie wiem, na kogo odbić komentarz';
+                                }
+                            }
+                        });
+                    });
+                }
+                if (p.stan === 'uwaga' && /konta/.test(p.status || '')){
+                    p.stan = p.kto ? 'gotowy' : 'uwaga';
+                    p.status = p.kto ? 'gotowe do księgowania' : 'nie wiem, na kogo odbić komentarz';
+                }
+                insRysuj();
+            }
+        });
+        panel.addEventListener('click', function (e){
+            var t = e.target;
+            if (!t || !t.classList || !t.classList.contains('ins-konto-zmien')) return;
+            e.preventDefault();
+            var g = INS_GRUPY[parseInt(t.getAttribute('data-g'), 10)];
+            var p = g && g.poz[parseInt(t.getAttribute('data-p'), 10)];
+            if (!p) return;
+            p.konto = '';
+            p.kontoZrodlo = '';
+            insRysuj();
+        });
+    })();
+    }
+
     function init_mkt() {
 (function () {
     'use strict';
@@ -38851,6 +39544,7 @@
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
+        { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
         { id: 'refund',   name: 'Refund Checker',            test: onProlo,   init: init_refund },
         { id: 'vatcalc',  name: 'Kalkulator VAT',            test: onProlo,   init: init_vatcalc },
@@ -39073,6 +39767,7 @@
             { id:'ksieg',    icon:svgIco('<path d="M15 5v2"/><path d="M15 11v2"/><path d="M15 17v2"/><path d="M5 5h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-3a2 2 0 0 0 0 -4v-3a2 2 0 0 1 2 -2"/>'), label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
             { id:'auftrag',  icon:svgIco('<path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie w auftragu', sel:'#auftrag-btn' },
             { id:'mkt',      icon:svgIco('<path d="M3 21h18"/><path d="M5 21v-10l7 -5l7 5v10"/><path d="M9 21v-6h6v6"/>'), label:"Ksiegowanie Marketplace's", sel:'#mkt-btn' },
+            { id:'ins',      icon:svgIco('<path d="M12 3a12 12 0 0 0 8.5 3a12 12 0 0 1 -8.5 14.85a12 12 0 0 1 -8.5 -14.85a12 12 0 0 0 8.5 -3"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie INS', sel:'#ins-btn' },
             { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
             { id:'vies',     icon:svgIco('<path d="M17.2 7a6 7 0 1 0 0 10"/><path d="M4 10h9"/><path d="M4 14h9"/>'), label:'Kurs walut', sel:'#oandaKursBtn' },
             { id:'vies',     icon:svgIco('<path d="M11.46 20.85a12 12 0 0 1 -7.96 -14.85a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3a12 12 0 0 1 -.09 7.06"/><path d="M15 19l2 2l4 -4"/>'), label:'VIES / KRS / GUS', sel:'#viesBtn' },
@@ -39098,6 +39793,7 @@
             { sel: '#ksieg-panel',      needX: true },
             { sel: '#auftrag-panel',    needX: false },
             { sel: '#mkt-panel',        needX: false },
+            { sel: '#ins-panel',        needX: true },
             { sel: '#refund-panel',     needX: true },
             { sel: '#klient-panel',     needX: true },
             { sel: '#allegro-panel',    needX: true },
