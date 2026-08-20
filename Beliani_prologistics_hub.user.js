@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.85
+// @version      4.86
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13023,6 +13023,24 @@
             var m = h.match(/op_suppliers\.php\?company_id=(\d+)/), v = m ? m[1] : null;
             _cid[o] = v; saveCache(); return v;
         }
+        // Zalaczniki z bloku „Supplier documents". Prologistics nie trzyma tam kolumny
+        // z data wgrania, wiec date czytamy tylko wtedy, gdy stoi przy linku — a gdy jej
+        // nie ma, powiemy to wprost. Milczenie sugerowaloby, ze dokument jest swiezy.
+        function pcSupDocs(html){
+            var m = String(html == null ? '' : html).match(/Supplier\s+documents\s*:[\s\S]{0,20000}?<\/table>/i);
+            if (!m) return [];
+            var out = [], re = /<a[^>]*href="[^"]*doc\.php\?[^"]*doc_id=(\d+)[^"]*"[^>]*>([\s\S]*?)<\/a>([\s\S]{0,160}?)<\/td>/gi, x;
+            while ((x = re.exec(m[0])) !== null){
+                var nazwa = pcTxt(x[2]), ogon = pcTxt(x[3] || '');
+                var d = ogon.match(/(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?)/);
+                if (nazwa) out.push({ id: x[1], nazwa: nazwa, data: d ? d[1] : '' });
+            }
+            return out;
+        }
+        // Ktory zalacznik moze niesc dane bankowe.
+        function pcDocBankowy(nazwa){
+            return /bank|account|swift|iban|beneficiar|supplier\s*details|dane\s*bankow/i.test(String(nazwa || ''));
+        }
         async function fetchCompany(c){
             if (_sup[c] !== undefined) return _sup[c];
             var acc = null, info = '';
@@ -13030,7 +13048,7 @@
             if (h == null) return { acc: null, info: '', conf: null, failed: true };
             var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); acc = m ? m[1].trim() : null;
             var mi = h.match(/name="document_information"[^>]*>([\s\S]*?)<\/textarea>/i); info = mi ? mi[1].trim() : '';
-            _sup[c] = { acc: acc, info: info, conf: pcBankConf(h) }; return _sup[c];
+            _sup[c] = { acc: acc, info: info, conf: pcBankConf(h), docs: pcSupDocs(h) }; return _sup[c];
         }
         async function companyToAcc(c){
             if (!c) return null;
@@ -13051,6 +13069,11 @@
         // (_acc leci przez GM_setValue), wiec companyToAcc potrafi wrocic bez pobierania strony —
         // wtedy dopiero to wywolanie ja sciaga. fetchCompany trzyma strone w _sup, wiec przy
         // companyToInfo/companyToAcc w tym samym przebiegu to juz nie jest drugi fetch.
+        async function companyToDocs(c){
+            if (!c) return [];
+            var r = await fetchCompany(c);
+            return (r && !r.failed && r.docs) ? r.docs : [];
+        }
         async function companyToConf(c){
             if (!c) return null;
             if (_conf[c] !== undefined) return _conf[c];
@@ -14940,6 +14963,22 @@
                 return { ok: true, oddzial: true, msg: 'zgodny, różni się tylko końcówką oddziału' };
             return { ok: false, msg: 'różne SWIFT' };
         }
+        // Slady zmiany numeru konta dla JEDNEGO zamowienia. Zrodla sa trzy i wszystkie
+        // sa juz pobrane: log konta u dostawcy (rozstrzygajacy, ma date), komentarz
+        // o zmianie danych bankowych — u dostawcy albo przy samym zamowieniu — oraz
+        // komentarz wskazujacy konkretny numer do zaplaty („pay to the OLD account: …").
+        function bcSladyKonta(order, cid){
+            var sup = cid ? (_conf[cid] || null) : null;
+            var ord = _ordConf[String(order)] || null;
+            var conf = sup ? sup.conf : null, chg = sup ? sup.chg : null;
+            var acc = sup ? sup.acc : null, hint = sup ? sup.hint : null;
+            if (ord){
+                if (ord.conf && (!conf || pcNewer(ord.conf.ts, conf.ts))) conf = ord.conf;
+                if (ord.chg && (!chg || pcNewer(ord.chg.ts, chg.ts))) chg = ord.chg;
+                if (ord.hint && (!hint || pcNewer(ord.hint.ts, hint.ts))) hint = ord.hint;
+            }
+            return { conf: conf, chg: chg, acc: acc, hint: hint, znane: !!(sup || ord) };
+        }
         // Porownanie SWIFT-u z P/I z tym, co stoi na potwierdzeniu. Pierwsza linia
         // „Recipient bank" bywa numerem rozliczeniowym banku POSREDNICZACEGO
         // („026073008" = ABA/Fedwire), a nie BIC-iem beneficjenta — bank podstawia go
@@ -15110,6 +15149,16 @@
             var x = String(t == null ? '' : t);
             return /\bpenalt|\bclaim\b|\bfine\b|\bkar[aęy]\b/i.test(x) && !bcMowiOZaplacie(x);
         }
+        // Dzien w postaci RRRR-MM-DD z dowolnego zapisu, jaki chodzi po tym module:
+        // komentarze maja „2026-08-14 08:41:54", a potwierdzenie z banku „14.08.2026".
+        function bcDzien(x){
+            var t = String(x == null ? '' : x);
+            var m = t.match(/(\d{4})-(\d{2})-(\d{2})/);
+            if (m) return m[1] + '-' + m[2] + '-' + m[3];
+            m = t.match(/(\d{2})[.\/](\d{2})[.\/](\d{4})/);
+            if (m) return m[3] + '-' + m[2] + '-' + m[1];
+            return '';
+        }
         function bcDniMiedzy(a, b){
             function d(x){
                 var m = String(x == null ? '' : x).match(/(\d{4})-(\d{2})-(\d{2})/);
@@ -15141,8 +15190,9 @@
         //
         // pcBalCands z zalozenia pomija komentarze depozytowe i penalty, wiec zrodla sie
         // nie nakladaja.
-        function bcPartiaKwot(cs){
+        function bcPartiaKwot(cs, dataPrzelewu, pen){
             var lista = cs || [], poz = [], wzieteJakoDepo = {}, pominiete = [];
+            var dzienP = bcDzien(dataPrzelewu);
             // Najpierw DEPOZYTY — zeby ten sam komentarz nie wszedl drugi raz jako balance.
             // pcBalCands odsiewa tylko to, co przepuszcza pcIsDepoText, a my rozpoznajemy
             // takze „advance payment" i „prepayment".
@@ -15167,11 +15217,13 @@
                     // stawal sie jej koncem, wiec petla szukajaca granicy przechodzila obok.
                     if (bcPotwKom(c.text || '')) return;
                     var kk = bcContKey(c.contRaw || c.cont || '');
-                    // Sama liczba w komentarzu to za malo. Pozycja do zaplaty ma kontener,
-                    // mowi o zaplacie wprost albo jest po prostu kwota. Zdanie z dyskusji
-                    // („…we will apply 1000usd penalty") nie jest naleznoscia.
+                    // Sama liczba w komentarzu to za malo, i SAM KONTENER tez. „No sailing
+                    // schedule available; the ETD has been updated to the most likely date
+                    // of 20.06" ma naglowek kontenera i liczbe 20.06 — czyli date. Kontener
+                    // zostaje kluczem grupowania, ale o tym, czy to naleznosc, decyduje TRESC:
+                    // komentarz mowi o zaplacie albo jest po prostu kwota.
                     if (bcTylkoOKarze(c.text || '')
-                        || !(kk || bcMowiOZaplacie(c.text || '') || bcSamaKwota(c.text || '', c.amts))){
+                        || !(bcMowiOZaplacie(c.text || '') || bcSamaKwota(c.text || '', c.amts))){
                         pominiete.push({ i: c.i, kwota: bcKwotaZTekstu(c.text || '', c.amts),
                                          data: c.date || '', tekst: c.text || '' });
                         return;
@@ -15181,11 +15233,35 @@
                                typ: 'balance', pct: null, data: c.date || '', tekst: c.text || '' });
                 });
             } catch (e){}
+            // ROSZCZENIA sa czescia kwoty przelewu, nie tylko wyjasnieniem roznicy:
+            // penalty −433,19 i underpayment +7,93 wchodza do sumy ZE ZNAKIEM. Kwote
+            // niesie pcPenComments (naliczone i cofniete juz sie tam znosza).
+            (pen || []).forEach(function (p){
+                if (!p || p.amt == null || !isFinite(p.amt) || p.i == null) return;
+                poz.push({ i: p.i, cont: bcContKey(p.contRaw || p.cont || ''), contRaw: p.contRaw || '',
+                           kwota: p.amt, ile: 1, typ: 'roszczenie', pct: null,
+                           nos: (p.nos && p.nos.length) ? p.nos.join(', ') : '',
+                           data: p.date || '', tekst: p.text || '' });
+            });
             poz.sort(function (a, b){ return a.i - b.i; });
             if (!poz.length) return { kwota: null, poz: [], pominiete: pominiete, uwaga: '', start: 0 };
-            var koniec = poz[poz.length - 1].i, start = 0, granica = false;
-            for (var k = koniec - 1; k >= 0; k--){
-                if (bcPotwKom(lista[k] && lista[k].text)){ start = k + 1; granica = true; break; }
+            var start = 0, granica = false;
+            if (dzienP){
+                // Granica to ostatnie potwierdzenie SPRZED dnia tego przelewu. Potwierdzenie
+                // z dnia przelewu (albo pozniejsze) dotyczy jego samego — wziete za granice
+                // ucinaloby wlasnie te kwoty, ktore sprawdzamy.
+                for (var k = lista.length - 1; k >= 0; k--){
+                    var c0 = lista[k];
+                    if (!c0 || !bcPotwKom(c0.text)) continue;
+                    var d0 = bcDzien(c0.date);
+                    if (d0 && d0 < dzienP){ start = k + 1; granica = true; break; }
+                }
+            } else {
+                // Daty przelewu nie znam — idziemy wstecz od najnowszej kwoty, jak dotad.
+                var koniec = poz[poz.length - 1].i;
+                for (var k2 = koniec - 1; k2 >= 0; k2--){
+                    if (bcPotwKom(lista[k2] && lista[k2].text)){ start = k2 + 1; granica = true; break; }
+                }
             }
             var partia = poz.filter(function (p){ return p.i >= start; });
             // Jedna pozycja na KONTENER: ten sam kontener drugi raz to poprawka, wiec
@@ -15194,14 +15270,17 @@
             // depozytowy tez go miewa i wspolny kubelek kasowal balans tego kontenera.
             var wg = {}, klucze = [];
             partia.forEach(function (p){
-                var k = (p.typ === 'depozyt') ? 'D' : (p.cont ? ('K:' + p.cont) : 'B');
+                // ROSZCZENIE ma wlasny klucz — po numerze. Penalty 1270 siedzi na tym samym
+                // kontenerze co kwota 18 911,80 i przy wspolnym kubelku jedno kasowaloby drugie.
+                var k = (p.typ === 'roszczenie') ? ('R:' + (p.nos || ('i' + p.i)))
+                      : ((p.typ === 'depozyt') ? 'D' : (p.cont ? ('K:' + p.cont) : 'B'));
                 if (!wg[k]) klucze.push(k);
                 if (!wg[k] || p.i > wg[k].i) wg[k] = p;
             });
             var wyb = klucze.map(function (k){ return wg[k]; }).sort(function (a, b){ return a.i - b.i; });
             var suma = 0;
             wyb.forEach(function (p){ suma = Math.round((suma + p.kwota) * 100) / 100; });
-            var bezK = partia.filter(function (p){ return !p.cont && p.typ !== 'depozyt'; });
+            var bezK = partia.filter(function (p){ return !p.cont && p.typ === 'balance'; });
             var wiele = wyb.filter(function (p){ return p.ile > 1; });
             var u = [];
             if (bezK.length > 1) u.push('w tej partii jest ' + bezK.length
@@ -15225,11 +15304,16 @@
         // placi sie dzis czesc, a reszte za tydzien. Sama liczba tego nie mowi.
         function bcRoznicaToPozycja(zrodla, moje, roznica){
             var cel = Math.round(Math.abs(roznica) * 100), tr = [];
+            // Kazde wyjasnienie niesie WLASNY dopisek. Wspolny dopisek dokladany przez
+            // wolajacego trafial takze na roszczenie — a roszczenie jest POTRACONE,
+            // nie „jeszcze nieoplacone".
+            var mniej = (roznica < 0);
             (moje || []).forEach(function (o){
                 var z = (zrodla || {})[o] || {};
                 (z.poz || []).forEach(function (p){
                     if (p && p.kwota != null && Math.round(p.kwota * 100) === cel)
-                        tr.push(o + (p.contRaw ? (' / ' + p.contRaw) : '') + ' — ' + Number(p.kwota).toFixed(2));
+                        tr.push(o + (p.contRaw ? (' / ' + p.contRaw) : '') + ' — ' + Number(p.kwota).toFixed(2)
+                              + (mniej ? ' (chyba jeszcze nieopłacona)' : ' (chyba doliczona spoza komentarzy)'));
                 });
                 // Komentarz, ktorego NIE policzylismy, bo nie wyglada na naleznosc. Gdy
                 // roznica rowna sie akurat jemu, trzeba to powiedziec — inaczej pominiecie
@@ -15284,10 +15368,15 @@
 
             // Dane z systemu. checkOnePI robi dokladnie to, co przy Wprowadzaniu:
             // czyta komentarze, wybiera komentarz z depozytem, sciaga P/I i porownuje.
+            // Dzien TEGO przelewu — po nim ustawiamy granice partii. Bierzemy go z
+            // potwierdzenia (Execution date), a gdy go nie ma, z pola daty w panelu.
+            var dataPl = '';
+            (g.pdfs || []).forEach(function (q){ if (!dataPl && q && q.exec) dataPl = q.exec; });
+            if (!dataPl) dataPl = day || '';
             var zrobione = 0;
             await bcPool(wszystkie, 4, async function (o){
                 var pi = null;
-                try { pi = await checkOnePI(o); } catch (e){ pi = { ok: false, msg: String((e && e.message) || e) }; }
+                try { pi = await checkOnePI(o, true); } catch (e){ pi = { ok: false, msg: String((e && e.message) || e) }; }
                 var cid = null, accSys = '';
                 try { cid = await orderToCompany(o); } catch (e){ cid = null; }
                 if (cid){ try { accSys = (await companyToAcc(cid)) || ''; } catch (e){ accSys = ''; } }
@@ -15302,21 +15391,33 @@
                 // do sumy nie wchodza, bo o tym, ile potracono, decyduje przelew.
                 var pen = [];
                 try { pen = pcPenComments(cs) || []; } catch (e){ pen = []; }
-                var part = bcPartiaKwot(cs);
+                var part = bcPartiaKwot(cs, dataPl, pen);
                 // Komentarze do RECZNEGO przejrzenia, gdy kwota sie nie spina. Trzymamy
                 // tekst przyciety — panel ma byc czytelny, a nie wierna kopia strony.
-                var wz = {}, pm = {};
+                var wz = {}, pm = {}, kar = {};
                 (part.poz || []).forEach(function (p){ wz[p.i] = 1; });
                 (part.pominiete || []).forEach(function (p){ pm[p.i] = 1; });
+                // Roszczenia: kwota ZE ZNAKIEM. pcMoneyTokens oddaje same wartosci
+                // dodatnie, wiec „Open amount: -427.40" pokazywalo sie jako 427.40.
+                // Znak niesie pcPenComments i tylko stamtad wolno go brac.
+                (pen || []).forEach(function (p){ if (p && p.i != null) kar[p.i] = p; });
                 var kom = (cs || []).map(function (c, i){
                     var a = [];
                     try { a = pcMoneyTokens((c && c.text) || '') || []; } catch (e){ a = []; }
+                    var k = kar[i] || null;
                     return { i: i, d: (c && c.date) || '', c: String((c && c.cont) || '').trim(),
                              t: String((c && c.text) || '').slice(0, 300), a: a,
-                             w: wz[i] ? 1 : (pm[i] ? 2 : 0),
+                             kara: k ? k.amt : null,
+                             nos: (k && k.nos && k.nos.length) ? k.nos.join(', ') : '',
+                             w: wz[i] ? 1 : (pm[i] ? 2 : (k ? 3 : 0)),
                              gr: (i === part.start && part.start > 0) ? 1 : 0 };
                 });
-                out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: part, pen: pen, kom: kom };
+                // Zalaczniki dostawcy — strona jest juz pobrana i trzymana w pamieci,
+                // wiec to nie jest kolejne zapytanie.
+                var docs = [];
+                if (cid){ try { docs = await companyToDocs(cid); } catch (e){ docs = []; } }
+                out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: part, pen: pen, kom: kom,
+                                cid: cid || '', slady: bcSladyKonta(o, cid), docs: docs };
                 zrobione++;
                 if (say) say('Sprawdzam zamówienia: ' + zrobione + '/' + wszystkie.length + '…', '#666');
                 return true;
@@ -15396,9 +15497,11 @@
                         // sama suma nie mowi, co sie na nia zlozylo, a to wlasnie tam
                         // gubily sie kwoty.
                         poz.forEach(function (p){
-                            kon(o, 'kwota z komentarza (' + p.typ + (p.contRaw ? (', ' + p.contRaw) : '')
+                            kon(o, 'kwota z komentarza (' + p.typ + (p.nos ? (' ' + p.nos) : '')
+                                 + (p.contRaw ? (', ' + p.contRaw) : '')
                                  + (p.data ? (', ' + p.data) : '') + ')',
-                                Number(p.kwota).toFixed(2), (p.tekst || '').slice(0, 70) || '—', 'ok');
+                                (p.kwota > 0 ? '+' : '') + Number(p.kwota).toFixed(2),
+                                (p.tekst || '').slice(0, 70) || '—', 'ok');
                         });
                         if (poz.length > 1)
                             kon(o, 'razem z komentarzy (' + poz.length + ' pozycje)',
@@ -15441,10 +15544,7 @@
                                 opis + ' — same depozyty, balansu nikt nie skomentował', 'uwaga');
                         } else {
                             var pas = bcRoznicaToPozycja(zrodla, moje, (cz - cs2) / 100);
-                            var czemu = pas.length
-                                ? (' — różnica równa się pozycji: ' + pas.join(' / ')
-                                   + (cz < cs2 ? ' (chyba jeszcze nieopłacona)' : ' (chyba doliczona spoza komentarzy)'))
-                                : '';
+                            var czemu = pas.length ? (' — różnicę tłumaczy: ' + pas.join(' / ')) : '';
                             w.bledy.push('kwota ' + (cz / 100).toFixed(2) + ' ≠ suma z komentarzy ' + opis + czemu);
                             kon('', 'kwota przelewu ↔ suma z komentarzy', (cz / 100).toFixed(2), opis + czemu, 'zle');
                         }
@@ -15480,6 +15580,48 @@
                     // Bank posredniczacy (sw.posrednik) NIE idzie do uwag: podstawia sie
                     // przy kazdym przelewie do USA, wiec wiersz zolklby zawsze i bez powodu.
                     else if (sw.oddzial || sw.dalej) w.uwagi.push(o + ': SWIFT ' + sw.msg);
+                    // ZMIANA NUMERU KONTA. Przelew na konto, ktore u dostawcy zdazylo sie
+                    // zmienic, to jedyny blad z tej listy, ktory kosztuje pieniadze — wiec
+                    // patrzymy na to nawet wtedy, gdy wszystkie numery sie zgadzaja.
+                    var sl = d.slady || {};
+                    if (sl.acc){
+                        var doNowego = bcKontoEq(sl.acc.to, q.acct).ok;
+                        var doStarego = bcKontoEq(sl.acc.from, q.acct).ok;
+                        kon(o, 'zmiana konta u dostawcy (log)',
+                            piAccBezUwagi(sl.acc.from) + ' → ' + piAccBezUwagi(sl.acc.to),
+                            sl.acc.date + (sl.acc.by ? (' · ' + sl.acc.by) : '')
+                              + (doStarego ? ' — PRZELEW POSZEDŁ NA STARE KONTO' : (doNowego ? ' — przelew na nowe konto' : '')),
+                            doStarego ? 'zle' : (doNowego ? 'ok' : 'uwaga'));
+                        if (doStarego) w.bledy.push(o + ': konto zmienione ' + sl.acc.date
+                            + ', a przelew poszedł na STARE (' + piAccBezUwagi(sl.acc.from) + ')');
+                        else if (!doNowego) w.uwagi.push(o + ': konto u dostawcy zmieniono ' + sl.acc.date
+                            + ' — przelew nie idzie ani na stare, ani na nowe');
+                    }
+                    if (sl.chg){
+                        kon(o, 'komentarz o zmianie danych bankowych',
+                            (sl.chg.date || '—') + (sl.chg.author ? (' · ' + sl.chg.author) : ''),
+                            String(sl.chg.text || '').slice(0, 90) + (sl.chg.src ? (' [' + sl.chg.src + ']') : ''),
+                            'uwaga');
+                        w.uwagi.push(o + ': jest komentarz o zmianie danych bankowych ('
+                            + (sl.chg.date || 'bez daty') + ') — sprawdź, czy przelew idzie na aktualne konto');
+                    }
+                    // Komentarz wskazujacy KONKRETNY numer do zaplaty. Przy balansie bywa
+                    // jedynym sladem, ze pieniadze maja pojsc gdzie indziej niz mowi karta.
+                    if (sl.hint && !pcHintMatches(sl.hint, q.acct)){
+                        kon(o, 'komentarz wskazuje inne konto', (sl.hint.accs || []).join(' / '),
+                            (sl.hint.date || '—') + ' · ' + String(sl.hint.text || '').slice(0, 70), 'zle');
+                        w.bledy.push(o + ': komentarz z ' + (sl.hint.date || 'bez daty') + ' wskazuje konto '
+                            + (sl.hint.accs || []).join(' / ') + ', a przelew poszedł na ' + (q.acct || '—'));
+                    }
+                    // Zalacznik z danymi bankowymi — sam w sobie nie jest bledem, ale gdy
+                    // konto sie zmienialo, to on jest dowodem. Data wgrania bywa nie do
+                    // odczytania i wtedy mowimy to wprost.
+                    var dokB = (d.docs || []).filter(function (x){ return pcDocBankowy(x.nazwa); });
+                    if (dokB.length && (sl.acc || sl.chg)){
+                        kon(o, 'załącznik z danymi bankowymi',
+                            dokB.map(function (x){ return x.nazwa; }).join(', '),
+                            dokB.map(function (x){ return x.data || 'bez daty wgrania'; }).join(', '), 'uwaga');
+                    }
                     // Nazwa jest DRUGORZEDNA — nigdy nie blokuje, najwyzej zwraca uwage.
                     var nz = bcNazwaEq(bank.name || '', q.name);
                     kon(o, 'beneficjent z P/I ↔ z potwierdzenia', bank.name || '—', q.name || '—',
@@ -15527,16 +15669,25 @@
                 if (!kom.length){ h += '</div>'; return; }
                 h += '<ul style="margin:2px 0 0;padding-left:16px;font-size:11px;line-height:1.5">';
                 kom.forEach(function (k){
-                    var ma = (k.a || []).length > 0;
-                    var kol = (k.w === 1) ? '#0a7a2f' : ((k.w === 2) ? '#c47f00' : '#999');
+                    // Roszczenie ma WLASNA kwote — ze znakiem. Bez tego „Open amount: -427.40"
+                    // pokazywalo sie jako dodatnie 427.40 i odhaczenie DODAWALO potracenie
+                    // zamiast je odjac.
+                    var kara = (k.kara != null && isFinite(k.kara));
+                    var kwota = kara ? Number(k.kara) : ((k.a || []).length ? Number(k.a[0]) : null);
+                    var ma = (kwota != null && isFinite(kwota));
+                    var kol = (k.w === 1) ? '#0a7a2f' : ((k.w === 2) ? '#c47f00' : ((k.w === 3) ? '#7c3aed' : '#999'));
                     h += '<li style="color:' + kol + '">';
                     if (ma){
-                        h += '<label style="cursor:pointer" title="Odhacz, żeby doliczyć tę kwotę do sumy">'
-                           + '<input type="checkbox" class="bc-kom-chk" data-kwota="' + Number(k.a[0]).toFixed(2) + '"'
-                           + ((k.w === 1) ? ' checked' : '') + '> <b>' + Number(k.a[0]).toFixed(2) + '</b>'
-                           + ((k.a.length > 1) ? (' <span style="color:#c47f00">(' + k.a.length + ' liczby w komentarzu)</span>') : '')
+                        h += '<label style="cursor:pointer" title="'
+                           + (kara ? 'Odhacz, żeby POTRĄCIĆ tę kwotę od sumy' : 'Odhacz, żeby doliczyć tę kwotę do sumy')
+                           + '"><input type="checkbox" class="bc-kom-chk" data-kwota="' + kwota.toFixed(2) + '"'
+                           + ((k.w === 1) ? ' checked' : '') + '> <b>'
+                           + (kwota > 0 ? '+' : '') + kwota.toFixed(2) + '</b>'
+                           + ((!kara && (k.a || []).length > 1) ? (' <span style="color:#c47f00">(' + k.a.length + ' liczby w komentarzu)</span>') : '')
                            + '</label> ';
                         if (k.w === 2) h += '<span style="color:#c47f00" title="Nie policzyłem — to nie wygląda na należność">✗ nie liczone</span> ';
+                        if (k.w === 3) h += '<span style="color:#7c3aed" title="Roszczenie — potrącenie, nie należność">roszczenie'
+                                          + (k.nos ? (' ' + esc(k.nos)) : '') + '</span> ';
                     } else h += '<span style="color:#ccc">·</span> ';
                     h += '<span style="color:#777">' + esc(k.d || '') + (k.c ? (' · ' + esc(k.c)) : '') + '</span> '
                        + '<span style="color:#333">' + esc(k.t || '') + '</span>';
@@ -18734,7 +18885,7 @@
                 if (st) st.textContent = 'przerywam — kończę zaczęte pobrania i zapiszę to, co zebrane…';
             }
         });
-        async function checkOnePI(order){
+        async function checkOnePI(order, bezDepo){
             // Slad do logu: co skrypt zobaczyl w tym zamowieniu (komentarze, konta, P/I).
             var dg = state.diag.dep[order] = { cs: [], com: null, banks: [], piUrl: '', pi: null };
             var h = await fetchT('/op_order.php?id=' + encodeURIComponent(order));
@@ -18748,7 +18899,10 @@
             if (!piUrl) dg.piRaw = pcPiSecDump(h);
             var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', piBank: null, depOk: extractDepoOk(cs, com ? com.idx : -1) };
             function ret(o){ o.comAmount = base.comAmount; o.comPct = base.comPct; o.piAmount = base.piAmount; o.piAcc = base.piAcc; o.piSheet = base.piSheet; o.piBank = base.piBank; o.depOk = base.depOk; return o; }
-            if (!com) { dlog('DEPO ' + order + ': brak komentarza deposit (komentarzy: ' + cs.length + ')'); return ret({ ok: false, msg: 'brak komentarza deposit' }); }
+            // bezDepo: sciezka sprawdzania z wklejki. Przy zamowieniach „Deposit: 0%"
+            // komentarza depozytowego NIE MA, a blok bankowy z P/I jest tam potrzebny tak
+            // samo — bez niego znika porownanie konta, SWIFT-u i beneficjenta.
+            if (!com && !bezDepo) { dlog('DEPO ' + order + ': brak komentarza deposit (komentarzy: ' + cs.length + ')'); return ret({ ok: false, msg: 'brak komentarza deposit' }); }
             if (!piUrl) { dlog('DEPO ' + order + ': brak pliku P/I'); return ret({ ok: false, msg: 'brak P/I' }); }
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
             if (!buf) { dlog('DEPO ' + order + ': nie pobrano P/I (' + piUrl + ')'); return ret({ ok: false, msg: 'nie pobrano P/I' }); }
@@ -18760,6 +18914,9 @@
             base.piBank = (pi && pi.bank && pi.bank.ok) ? pi.bank : null;
             if (pi.manual) return ret({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie' });
             if (pi.err) return ret({ ok: false, msg: pi.err });
+            // Bez komentarza depozytowego nie ma czego porownywac — ale dane bankowe
+            // z P/I sa juz odczytane i o nie tu chodzilo.
+            if (!com) return ret({ ok: false, warn: true, msg: 'brak komentarza depozytowego — z P/I wziąłem dane bankowe' });
             // Komentarz bez % — do tytulu przelewu bierzemy procent z P/I, a samego % nie porownujemy.
             if (com.pct == null && pi.pct != null) base.comPct = pi.pct;
             var bad = [], sfx = (pi && pi.hidden) ? ' [tylko ukryty arkusz: ' + pi.sheet + ']' : '';
