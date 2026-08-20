@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.81
+// @version      4.84
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12664,6 +12664,19 @@
           + '</div>'
           + '<input type="file" id="sp-file" accept=".pdf,.xlsx" multiple style="display:none">'
           + '<div id="sp-list" style="margin-top:10px"></div>'
+          + '<div style="margin-top:14px;padding-top:10px;border-top:1px dashed #FFCCB7">'
+          +   '<div style="font-size:12px;font-weight:700;color:#750000">Sprawdzenie z wklejki — bez Excela</div>'
+          +   '<div style="font-size:11px;color:#666;margin:3px 0 5px">Wklej listę zamówień w dowolnym układzie kolumn (np. dostawca, numer, kwota). Potrzebne są tylko <b>numery zamówień</b> — kwotę depozytu, konto i SWIFT wezmę z systemu i z P/I, a potwierdzenia ściągnę wprost z zamówień.</div>'
+          +   '<div id="sp-paste" contenteditable="true" spellcheck="false" style="width:100%;height:110px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff"></div>'
+          +   '<div style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +     '<button id="sp-paste-run" class="chn-btn red" title="Znajduje numery zamówień we wklejce, ściąga z nich potwierdzenia przelewów i porównuje: kwotę z sumą kwot z NAJŚWIEŻSZYCH komentarzy (depozytowych albo balansowych, pamiętając o przelewach łączonych), konto dostawcy z kontem z P/I, konto z P/I z kontem na potwierdzeniu, SWIFT z P/I z tym na potwierdzeniu (numer rozliczeniowy banku pośredniczącego nie jest błędem) oraz tytuł przelewu — czy zawiera właściwe numery zamówień i procent depozytu.">🔍 Sprawdź wklejkę</button>'
+          +     '<label style="font-size:11px;color:#666;display:inline-flex;align-items:center;gap:4px" title="Bierze tylko potwierdzenia dodane tego dnia. PUSTE POLE = bez filtra: wezmę wszystkie z sekcji „Payment conformation”, pomijając te bez daty.">potwierdzenia z dnia <input type="date" id="sp-paste-day" style="font-size:11px;padding:2px 4px;border:1px solid #FFCCB7;border-radius:4px"></label>'
+          +     '<button id="sp-paste-dzis" class="chn-btn ghost" style="padding:2px 8px;font-size:11px" title="Wstaw dzisiejszą datę">dziś</button>'
+          +     '<button id="sp-paste-bez" class="chn-btn ghost" style="padding:2px 8px;font-size:11px" title="Wyczyść datę — wtedy wezmę wszystkie potwierdzenia, niezależnie od dnia">bez daty</button>'
+          +     '<span id="sp-paste-status" style="font-size:12px;color:#666"></span>'
+          +   '</div>'
+          +   '<div id="sp-paste-box" style="display:none;margin-top:10px"></div>'
+          + '</div>'
           + '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           +   '<button id="sp-run" class="chn-btn red" title="Porównuje Excel z potwierdzeniami z banku: dopasowuje po numerach zamówień z tytułu przelewu, sprawdza kwotę, walutę, konto, BIC, nazwę i tytuł. Brak miasta lub kodu pocztowego beneficjenta nie jest błędem. Gdy nie ma ani jednego pliku PDF — najpierw sam dociągnie potwierdzenia z zamówień.">🔍 Sprawdź z bankiem</button>'
           +   '<button id="sp-grab" class="chn-btn ghost" title="Wchodzi na strony zamówień z Excela, znajduje sekcję „Payment conformation”, czyta załączniki z podanego dnia prosto do pamięci i dokłada je do sprawdzenia. Nic nie zapisuje się na dysku.">⬇ Dociągnij potwierdzenia z zamówień</button>'
@@ -12776,12 +12789,47 @@
             var cid = (supU.match(/company_id=(\d+)/) || [])[1] || null;
             return { supplier: c[0].t, supplierUrl: supU, container: c[1].t, seq: c[2].t, order: c[3].t, orderUrl: ordU, amount: c[4].t, note: c[5].t, cid: cid, bg: bg };
         }
+        // ===== gola wklejka tekstowa: dostawca / numer zamowienia / kwota =====
+        // Kolejnosc kolumn NIE jest ustalona — jedni maja numer pierwszy (wklejka
+        // z systemu), inni drugi (lista zestawiona recznie). Dlatego rozpoznajemy
+        // po TRESCI, a nie po pozycji.
+        // Numer zamowienia: 4-7 cyfr i nic wiecej. Ciasno CELOWO — luzniejszy wzorzec
+        // lapalby numery kontenerow i kwoty bez groszy.
+        function pcTekstOrder(txt){
+            var s = String(txt == null ? '' : txt).trim();
+            return /^\d{4,7}$/.test(s) ? s : '';
+        }
+        function pcZWklejki(cells){
+            var lista = (cells || []).map(function (x){ return String(x == null ? '' : x).trim(); });
+            var order = '', iOrd = -1;
+            for (var i = 0; i < lista.length; i++){
+                if (pcTekstOrder(lista[i])){ order = lista[i]; iOrd = i; break; }
+            }
+            // Dostawca: najdluzszy kawalek tekstu, ktory nie jest sama liczba. Bierzemy
+            // CALA komorke — nazwy chinskich dostawcow bywaja rozbite ukosnikiem na dwie
+            // firmy („FUZHOU DAHUA … / FUZHOU DAWAWU …") i obie naleza do nazwy.
+            var sup = '';
+            for (var k = 0; k < lista.length; k++){
+                if (k === iOrd) continue;
+                var t = lista[k];
+                if (!t || /^[\d\s.,'’-]+$/.test(t)) continue;
+                if (t.length > sup.length) sup = t;
+            }
+            return { order: order, supplier: sup };
+        }
         function mkDep(c, bg){
             var supC = null, ordC = null;
             c.forEach(function(x){ if (/op_suppliers/.test(x.u) && !supC) supC = x; if (/op_order/.test(x.u) && !ordC) ordC = x; });
-            var supplier = supC ? supC.t : (c[0] ? c[0].t : '');
+            var supplier = supC ? supC.t : '';
             var cid = (supC && (supC.u.match(/company_id=(\d+)/) || [])[1]) || null;
             var order = ordC ? ordC.t : '';
+            // Wklejka BEZ linkow — ktos zestawil liste sam albo wkleil ja z arkusza.
+            // Wtedy nie ma po czym poznac kolumn inaczej niz po tresci.
+            if (!order || !supplier){
+                var z = pcZWklejki(c.map(function (x){ return x.t; }));
+                if (!order) order = z.order;
+                if (!supplier) supplier = z.supplier || (c[0] ? c[0].t : '');
+            }
             return { supplier: supplier, cid: cid, order: order, cells: c, bg: bg, supplierUrl: supC ? supC.u : '', orderUrl: ordC ? ordC.u : '' };
         }
         // Wklejka BALANCE z prologistics ma po bloku kazdego dostawcy wiersz sumy:
@@ -12860,7 +12908,12 @@
                     var c = line.split('\t');
                     var cid = (line.match(/company_id=(\d+)/) || [])[1] || null;
                     var order = null, name = '';
-                    if (c.length >= 2 && /^\d+$/.test(c[0].trim())) { order = c[0].trim(); name = c[1].trim(); } else { name = (c[0] || line).trim(); }
+                    // Do 4.81 numer zamowienia liczyl sie WYLACZNIE z pierwszej kolumny.
+                    // Uklad „dostawca, numer, kwota" wchodzil wiec bez numeru i taki wiersz
+                    // nie byl sprawdzany w ogole — ani P/I, ani komentarze, ani konto.
+                    var z = pcZWklejki(c.length > 1 ? c : [line]);
+                    order = z.order;
+                    name = z.supplier || (c[0] || line).trim();
                     rows.push({ supplier: name, cid: cid, order: order || '', cells: c.map(function(x){ return { t: (x || '').trim(), u: '' }; }), bg: '' });
                     names.push(norm(name));
                 });
@@ -14841,6 +14894,611 @@
             var out = bcParseXlsxRows(bcRowsFromSheet(wb.Sheets[wb.SheetNames[0]], X));
             out.file = '(dane wprost z panelu, bez pliku)';
             return out;
+        }
+
+        // ===== reguly porownan: konto, SWIFT, nazwa, tytul =====
+        // Uzywa ich sprawdzanie z wklejki. Trzymane osobno od przelotu, zeby dalo sie
+        // je sprawdzic testem bez sieci i bez UI — to tutaj siedza wszystkie decyzje
+        // o tym, co jest „takie samo", a co nie.
+
+        // Numer konta bywa zapisany na kilka sposobow i wszystkie znacza to samo:
+        // „OSA11007624500501", „Bank Account: OSA11007624500501", „OSA11 0076 2450 0501".
+        // Sprowadzamy do jednej postaci: bez etykiety przed dwukropkiem, bez spacji,
+        // wielkimi literami. MYSLNIKA NIE USUWAMY — patrz bcKontoEq.
+        function bcKontoNorm(v){
+            // Dopisek w nawiasie to KOMENTARZ dostawcy, nie czesc numeru:
+            // „420885293731(USD)" i „420885293731" to jedno konto. Bez tego kazde
+            // zamowienie takiego dostawcy wychodzilo jako „rozne numery".
+            // Ucinamy takze nawiasy pelnej szerokosci — chinskie P/I ich uzywaja.
+            var s = piAccBezUwagi(v).toUpperCase().replace(/\u00a0/g, ' ');
+            // Etykieta konczy sie dwukropkiem. Ucinamy ja tylko wtedy, gdy po dwukropku
+            // zostaje cos, co wyglada na numer — inaczej „ACC: " zjadloby caly numer.
+            var i = s.lastIndexOf(':');
+            if (i >= 0 && /[A-Z0-9]/.test(s.slice(i + 1))) s = s.slice(i + 1);
+            return s.replace(/[^A-Z0-9-]/g, '');
+        }
+        // Zgodnosc numerow. Spacje sa bez znaczenia (usuniete wyzej), ale MYSLNIK
+        // dyskwalifikuje — decyzja uzytkownika: przy czesci bankow to nie jest ta sama
+        // forma zapisu, wiec zamiast po cichu uznac za rowne, mowimy o tym wprost.
+        function bcKontoEq(a, b){
+            var x = bcKontoNorm(a), y = bcKontoNorm(b);
+            if (!x || !y) return { ok: false, brak: true, msg: 'brak numeru' };
+            if (x === y) return { ok: true, msg: '' };
+            if (x.replace(/-/g, '') === y.replace(/-/g, ''))
+                return { ok: false, myslnik: true, msg: 'ten sam numer, ale jeden zapisany z myślnikiem' };
+            return { ok: false, msg: 'różne numery' };
+        }
+        // SWIFT/BIC: 8 albo 11 znakow, wielkoscia liter sie nie przejmujemy. Gdy jeden
+        // ma 11 znakow, a drugi 8, porownujemy pierwsze 8 — koncowka to oddzial i banki
+        // wpisuja ja niekonsekwentnie.
+        function bcSwiftNorm(v){ return String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+        function bcSwiftEq(a, b){
+            var x = bcSwiftNorm(a), y = bcSwiftNorm(b);
+            if (!x || !y) return { ok: false, brak: true, msg: 'brak SWIFT' };
+            if (x === y) return { ok: true, msg: '' };
+            if (x.length >= 8 && y.length >= 8 && x.slice(0, 8) === y.slice(0, 8))
+                return { ok: true, oddzial: true, msg: 'zgodny, różni się tylko końcówką oddziału' };
+            return { ok: false, msg: 'różne SWIFT' };
+        }
+        // Porownanie SWIFT-u z P/I z tym, co stoi na potwierdzeniu. Pierwsza linia
+        // „Recipient bank" bywa numerem rozliczeniowym banku POSREDNICZACEGO
+        // („026073008" = ABA/Fedwire), a nie BIC-iem beneficjenta — bank podstawia go
+        // sam przy kazdym przelewie do USA. Wtedy nie ma czego porownywac i NIE jest
+        // to blad.
+        // W dalszych liniach bloku szukamy DOKLADNIE SWIFT-u z P/I. Nie zgadujemy,
+        // ktory ciag jest BIC-iem: „COMMERCE" ma ksztalt BIC-u i zgadywanie samo
+        // produkowaloby rozjazdy.
+        function bcSwiftPotw(piSwift, q){
+            var y = (q && q.bic) || '';
+            var w = bcSwiftEq(piSwift || '', y);
+            w.pokaz = y || '—';
+            if (w.ok || !piSwift) return w;
+            var dalsze = (q && q.bankLines) || [];
+            for (var i = 0; i < dalsze.length; i++){
+                var toks = String(dalsze[i] || '').toUpperCase().match(/[A-Z0-9]{8,11}/g) || [];
+                for (var k = 0; k < toks.length; k++){
+                    if (bcSwiftEq(piSwift, toks[k]).ok)
+                        return { ok: true, dalej: true, pokaz: toks[k],
+                                 msg: 'BIC beneficjenta stoi w dalszej linii bloku banku, '
+                                    + 'w pierwszej jest bank pośredniczący (' + y + ')' };
+                }
+            }
+            if (bcClearingNo(y))
+                return { ok: true, posrednik: true, pokaz: y,
+                         msg: 'numer rozliczeniowy banku pośredniczącego (ABA/clearing), '
+                            + 'nie BIC — nie ma czego porównać' };
+            return w;
+        }
+        // Nazwa jest DRUGORZEDNA. „JOYE LEISURE INTERNATIONAL CO., LTD. - A." i
+        // „JOYE LEISURE INTERNATIONAL" to ten sam beneficjent, wiec odrzucamy formy
+        // prawne i znaki, a potem wystarczy, ze krotsza nazwa zaczyna dluzsza.
+        function bcNormNazwa(s){
+            // „&" i „AND" to ten sam spojnik — „PROFIT CULTURAL & CREATIVE GROUP" oraz
+            // „PROFIT CULTURAL AND CREATIVE GROUP" to jeden beneficjent. Bez tego kazdy
+            // taki wiersz dostawal uwage, ktora nic nie wnosila.
+            return String(s == null ? '' : s).toUpperCase().replace(/&/g, ' AND ')
+                .replace(/\b(CO|LTD|LIMITED|INC|CORP|CORPORATION|COMPANY|GMBH|PLC|AG|BV|SA|SL|SRL|PTE|LLC)\b/g, ' ')
+                .replace(/[^A-Z0-9]+/g, ' ')
+                .replace(/\s+/g, ' ').trim();
+        }
+        function bcNazwaEq(a, b){
+            var x = bcNormNazwa(a), y = bcNormNazwa(b);
+            if (!x || !y) return { ok: false, brak: true, msg: 'brak nazwy' };
+            if (x === y) return { ok: true, msg: '' };
+            if (x.indexOf(y) === 0 || y.indexOf(x) === 0) return { ok: true, skrot: true, msg: 'nazwa skrócona' };
+            return { ok: false, msg: 'inny beneficjent' };
+        }
+        // Tytul sprawdzamy PO ZAWARTOSCI, nie znak w znak: modul sam skraca dlugie
+        // tytuly (zakresy numerow, brak spacji po przecinku), wiec doslowne porownanie
+        // zglaszaloby blad przy poprawnym przelewie. Musi sie zgadzac to, co niesie
+        // znaczenie: numery zamowien i procent depozytu.
+        // Numery zamowien z tytulu, BEZ numerow roszczen. „penalty 1078" albo
+        // „overpayment 1288" to nie zamowienie, a bcOrders lapie kazdy ciag 4-6 cyfr —
+        // takie numery szly potem do sciagania, do sumy i do listy uwag.
+        function bcOrderyZTytulu(title){
+            var t = String(title || '');
+            var maja = bcOrders(bcTitleToks(t));
+            pcParsePenalties(t).forEach(function (v){
+                var nr = String(v).replace(/\D+/g, '');
+                if (nr) delete maja[nr];
+            });
+            return maja;
+        }
+        // Rodzaj przelewu czytany Z TYTULU, wedlug reguly uzytkownika. Numer kontenera
+        // to cztery litery i siedem cyfr (ONEU4750099) — tak wyglada kazdy, ktory
+        // przechodzi przez ten modul.
+        function bcRodzajPrzelewu(title){
+            var t = String(title || '');
+            var dep = /(?:deposit|advance\s+payment)/i.test(t);
+            var cont = /[A-Z]{4}\s?\d{7}/i.test(t);
+            var pen = pcParsePenalties(t).length > 0;
+            if (dep && cont) return 'łączony';
+            if (!dep && (cont || pen)) return 'balance';
+            if (dep) return 'depozyt';
+            return '';
+        }
+        // Znacznik ROZLICZONEJ platnosci. Ten sam napis wstawia sam HUB przy wgrywaniu
+        // potwierdzenia (pole „Payment confirmation attached." w Wprowadzaniu), wiec
+        // stoi w komentarzach wszedzie tam, gdzie platnosc juz przeszla.
+        function bcPotwKom(t){
+            var x = String(t == null ? '' : t);
+            if (!/payment\s*conf\w*/i.test(x)) return false;
+            // Prosba i oczekiwanie NICZEGO nie rozliczaja: „please send payment
+            // confirmation", „waiting for the payment confirmation", „no payment
+            // confirmation yet". Takie zdanie urywalo partie w srodku i gubilo kwote.
+            if (/\b(?:send|sends|resend|need|needs|needed|waiting|await\w*|missing|request\w*|please|no|without|brak|prosz\w*)\b[^.!?]{0,40}payment\s*conf/i.test(x)) return false;
+            if (/payment\s*conf\w*[^.!?]{0,25}\b(?:yet|missing|required|needed|pending)\b/i.test(x)) return false;
+            return true;
+        }
+        // Klucz kontenera: SAM NUMER, nie caly napis z komorki. „Container: ONEU0852087 [DR]"
+        // i „(ONEU0852087)" to ten sam kontener, a pcNormCont robil z nich „ONEU0852087DR"
+        // i „ONEU0852087" — dwa rozne klucze, wiec ta sama kwota wchodzila do sumy dwa razy.
+        // Wzorzec czteroliterowego prefiksu i siedmiu cyfr stoi juz w bcRodzajPrzelewu.
+        // Komorka bywa wielokontenerowa — wtedy klucz jest jawnie laczony.
+        function bcContKey(s){
+            var m = String(s == null ? '' : s).toUpperCase().match(/[A-Z]{4}\s?\d{7}/g);
+            if (!m) return '';
+            var u = [];
+            m.forEach(function (x){ var v = x.replace(/\s+/g, ''); if (u.indexOf(v) < 0) u.push(v); });
+            return u.sort().join('+');
+        }
+        // Depozyt w komentarzu. pcIsDepoText wymaga doslownie „deposit", a pisze sie takze
+        // „advance payment" i „prepayment" — bcRodzajPrzelewu zna te synonimy z tytulow
+        // przelewow. Poprawiamy to TYLKO na potrzeby partii; pcIsDepoText zostaje nietkniete,
+        // bo siedzi w sciezce Wprowadzania.
+        function bcJestDepo(t){
+            var x = String(t == null ? '' : t);
+            if (pcIsDepoText(x)) return true;
+            if (!/advance\s+payment|pre-?payment/i.test(x)) return false;
+            return /%/.test(x) || /\b(?:pay|payment|paid|prepay)\b/i.test(x);
+        }
+        // Kwota z komentarza, gdy tokenow jest wiecej niz jeden. pcMoneyTokens robi DWA
+        // przejscia — najpierw liczby przy walucie, potem gole z groszami — wiec amts[0]
+        // bywa liczba stojaca w tekscie pozniej. Dla „please pay 9468.15 minus penalty
+        // 201.35 USD" amts[0] to 201.35. Bierzemy ten token, ktory w tekscie stoi pierwszy.
+        function bcKwotaZTekstu(t, amts){
+            var x = String(t == null ? '' : t), lista = amts || [];
+            if (lista.length < 2) return lista.length ? lista[0] : null;
+            var naj = null, poz = -1;
+            lista.forEach(function (a){
+                if (a == null || !isFinite(a)) return;
+                var c = Number(a).toFixed(2), w = [c, c.replace('.', ','), c.replace(/\.00$/, '')];
+                var i = -1;
+                w.forEach(function (v){ var k = x.indexOf(v); if (k >= 0 && (i < 0 || k < i)) i = k; });
+                if (i >= 0 && (poz < 0 || i < poz)){ poz = i; naj = a; }
+            });
+            return (naj != null) ? naj : lista[0];
+        }
+        function bcDniMiedzy(a, b){
+            function d(x){
+                var m = String(x == null ? '' : x).match(/(\d{4})-(\d{2})-(\d{2})/);
+                return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : null;
+            }
+            var p = d(a), q = d(b);
+            return (p == null || q == null) ? null : Math.round((q - p) / 86400000);
+        }
+        function bcDepoPct(t){
+            var m = String(t == null ? '' : t).match(/(\d{1,3}(?:[.,]\d+)?)\s*%/);
+            return m ? parseFloat(String(m[1]).replace(',', '.')) : null;
+        }
+        // PARTIA kwot do zaplaty przy jednym zamowieniu.
+        //
+        // ZAKRES: WYLACZNIE weryfikacja PO FAKCIE — przelew jest zrobiony i znamy jego
+        // kwote z potwierdzenia. Do PLANOWANIA platnosci sluzy pcMatchBalRows, gdzie
+        // obowiazuje „jeden komentarz = jedna platnosc". Uzycie partii do wyliczenia
+        // kwoty DO zaplaty konczyloby sie zaplaceniem tego, co juz poszlo.
+        //
+        // Kilka komentarzy z kwotami stojacych POD RZAD to kilka pozycji JEDNEJ platnosci
+        // — po jednej na kontener — i placone sa WSZYSTKIE. Branie samej najnowszej gubilo
+        // reszte co do grosza: przy przelewie 20 053,63 brakowalo dokladnie 9 468,15
+        // (drugi kontener zamowienia 18950), przy 96 157,60 dokladnie 756,50 (dwa z trzech
+        // kontenerow 18928 i jeden z dwoch 19757).
+        //
+        // Granica partii: ostatni znacznik potwierdzenia PRZED nia — co bylo wczesniej,
+        // zostalo juz zaplacone. Potwierdzenie TEJ platnosci stoi PO kwotach, wiec nie
+        // przeszkadza: idziemy od najnowszej kwoty w tyl, a nie od konca listy.
+        //
+        // pcBalCands z zalozenia pomija komentarze depozytowe i penalty, wiec zrodla sie
+        // nie nakladaja.
+        function bcPartiaKwot(cs){
+            var lista = cs || [], poz = [], wzieteJakoDepo = {};
+            // Najpierw DEPOZYTY — zeby ten sam komentarz nie wszedl drugi raz jako balance.
+            // pcBalCands odsiewa tylko to, co przepuszcza pcIsDepoText, a my rozpoznajemy
+            // takze „advance payment" i „prepayment".
+            lista.forEach(function (c, i){
+                var t = (c && c.text) || '';
+                if (!bcJestDepo(t) || bcPotwKom(t)) return;
+                var a = [];
+                try { a = pcMoneyTokens(t) || []; } catch (e){ a = []; }
+                if (!a.length) return;
+                wzieteJakoDepo[i] = 1;
+                poz.push({ i: i, cont: bcContKey((c && c.cont) || ''), contRaw: String((c && c.cont) || '').trim(),
+                           kwota: bcKwotaZTekstu(t, a), ile: a.length, typ: 'depozyt', pct: bcDepoPct(t),
+                           data: (c && c.date) || '', tekst: t });
+            });
+            try {
+                (pcBalCands(lista) || []).forEach(function (c){
+                    if (!c || !c.amts || !c.amts.length) return;
+                    if (wzieteJakoDepo[c.i]) return;
+                    // SAM ZNACZNIK potwierdzenia nie jest pozycja do zaplaty. Komentarz
+                    // „Payment confirmation attached. 20053.63 USD" niesie kwote JUZ
+                    // zaplacona — wpuszczony do partii dokladal ja drugi raz, a przy okazji
+                    // stawal sie jej koncem, wiec petla szukajaca granicy przechodzila obok.
+                    if (bcPotwKom(c.text || '')) return;
+                    poz.push({ i: c.i, cont: bcContKey(c.contRaw || c.cont || ''), contRaw: c.contRaw || '',
+                               kwota: bcKwotaZTekstu(c.text || '', c.amts), ile: c.amts.length,
+                               typ: 'balance', pct: null, data: c.date || '', tekst: c.text || '' });
+                });
+            } catch (e){}
+            poz.sort(function (a, b){ return a.i - b.i; });
+            if (!poz.length) return { kwota: null, poz: [], uwaga: '' };
+            var koniec = poz[poz.length - 1].i, start = 0, granica = false;
+            for (var k = koniec - 1; k >= 0; k--){
+                if (bcPotwKom(lista[k] && lista[k].text)){ start = k + 1; granica = true; break; }
+            }
+            var partia = poz.filter(function (p){ return p.i >= start; });
+            // Jedna pozycja na KONTENER: ten sam kontener drugi raz to poprawka, wiec
+            // zostaje wpis nowszy. DEPOZYT ma wlasna przestrzen kluczy — naglowek
+            // „Container:" nalezy do WIERSZA komentarza, nie do tresci, wiec komentarz
+            // depozytowy tez go miewa i wspolny kubelek kasowal balans tego kontenera.
+            var wg = {}, klucze = [];
+            partia.forEach(function (p){
+                var k = (p.typ === 'depozyt') ? 'D' : (p.cont ? ('K:' + p.cont) : 'B');
+                if (!wg[k]) klucze.push(k);
+                if (!wg[k] || p.i > wg[k].i) wg[k] = p;
+            });
+            var wyb = klucze.map(function (k){ return wg[k]; }).sort(function (a, b){ return a.i - b.i; });
+            var suma = 0;
+            wyb.forEach(function (p){ suma = Math.round((suma + p.kwota) * 100) / 100; });
+            var bezK = partia.filter(function (p){ return !p.cont && p.typ !== 'depozyt'; });
+            var wiele = wyb.filter(function (p){ return p.ile > 1; });
+            var u = [];
+            if (bezK.length > 1) u.push('w tej partii jest ' + bezK.length
+                + ' kwot bez numeru kontenera — biorę najnowszą');
+            if (wiele.length) u.push('komentarz niesie więcej niż jedną liczbę — biorę tę, która stoi w tekście pierwsza');
+            // Granica partii to komentarz z potwierdzeniem POPRZEDNIEJ platnosci. Gdy go
+            // nie ma, nie wiadomo, gdzie ta poprzednia sie konczy — a komentarz zamykajacy
+            // bywa zwyklym „ok", ktore znacznikiem nie jest. Mowimy to wprost.
+            if (!granica && wyb.length > 1)
+                u.push('nie znam granicy poprzedniej płatności (w komentarzach nie ma potwierdzenia) '
+                     + '— sprawdź, czy któraś z tych kwot nie została już zapłacona');
+            var rozp = (wyb.length > 1) ? bcDniMiedzy(wyb[0].data, wyb[wyb.length - 1].data) : null;
+            if (rozp != null && rozp > 45)
+                u.push('kwoty tej partii dzieli ' + rozp + ' dni — zwykle idą jedna po drugiej, sprawdź');
+            return { kwota: suma, poz: wyb, uwaga: u.join('; ') };
+        }
+        // Rozjazd kwoty rowny DOKLADNIE ktorejs pozycji to najczestszy uklad: z partii
+        // placi sie dzis czesc, a reszte za tydzien. Sama liczba tego nie mowi.
+        function bcRoznicaToPozycja(zrodla, moje, roznica){
+            var cel = Math.round(Math.abs(roznica) * 100), tr = [];
+            (moje || []).forEach(function (o){
+                (((zrodla || {})[o] || {}).poz || []).forEach(function (p){
+                    if (p && p.kwota != null && Math.round(p.kwota * 100) === cel)
+                        tr.push(o + (p.contRaw ? (' / ' + p.contRaw) : '') + ' — ' + Number(p.kwota).toFixed(2));
+                });
+            });
+            return tr;
+        }
+        function bcTytulOk(title, orders, pcts){
+            var t = String(title || '');
+            var maja = bcOrderyZTytulu(t);
+            var brak = (orders || []).filter(function (o){ return !maja[String(o)]; });
+            var lista = (pcts || []).filter(function (p){ return p != null && isFinite(p); });
+            var pctOk = !lista.length || lista.every(function (p){
+                return new RegExp('(^|[^0-9])' + Math.round(p) + '\\s*%').test(t);
+            });
+            return { brak: brak, pctOk: pctOk, maja: Object.keys(maja) };
+        }
+
+        // ===== przelot: wklejka -> potwierdzenia -> porownanie =====
+        // Zwraca gotowe wiersze do wyswietlenia. Bez UI i bez globalnych — dzieki temu
+        // da sie go przetestowac, podstawiajac wylacznie wejscia.
+        async function bcZWklejki(orders, day, say, io){
+            var out = { wiersze: [], stat: null, bezPotw: [], errs: [], dane: {} };
+            var lista = (orders || []).map(String);
+            if (!lista.length) return out;
+
+            var g = await bcGrabConfs(lista, day, io || null, say, 5);
+            out.stat = g.stat; out.errs = g.errs || [];
+
+            // Zamowienia z TYTULOW potwierdzen, ktorych nie ma we wklejce, tez musimy
+            // policzyc. Inaczej przy przelewie laczonym suma jest niepelna i kontrola
+            // kwoty zglasza roznice, ktorej nie ma — dokladnie tak wyszlo na pierwszym
+            // przebiegu: piec zamowien w tytule, dwa we wklejce, „roznica" 49 083,16.
+            var wszystkie = lista.slice();
+            (g.pdfs || []).forEach(function (q){
+                Object.keys(bcOrderyZTytulu(q.msg || '')).forEach(function (o){
+                    if (wszystkie.indexOf(o) < 0) wszystkie.push(o);
+                });
+            });
+
+            // Dane z systemu. checkOnePI robi dokladnie to, co przy Wprowadzaniu:
+            // czyta komentarze, wybiera komentarz z depozytem, sciaga P/I i porownuje.
+            var zrobione = 0;
+            await bcPool(wszystkie, 4, async function (o){
+                var pi = null;
+                try { pi = await checkOnePI(o); } catch (e){ pi = { ok: false, msg: String((e && e.message) || e) }; }
+                var cid = null, accSys = '';
+                try { cid = await orderToCompany(o); } catch (e){ cid = null; }
+                if (cid){ try { accSys = (await companyToAcc(cid)) || ''; } catch (e){ accSys = ''; } }
+                // Komentarze czytamy OSOBNO, zeby wziac CALA partie kwot. checkOnePI oddaje
+                // wylacznie komentarz DEPOZYTOWY — przy balansie to zla liczba, a przy
+                // kilku kontenerach zawsze za mala.
+                var cs = [];
+                try { var html = await pcOrderHtml(o); cs = html ? pcComments(html) : []; }
+                catch (e){ cs = []; }
+                out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: bcPartiaKwot(cs) };
+                zrobione++;
+                if (say) say('Sprawdzam zamówienia: ' + zrobione + '/' + wszystkie.length + '…', '#666');
+                return true;
+            });
+
+            (g.pdfs || []).forEach(function (q){
+                // Zamowienia TEGO przelewu bierzemy z jego tytulu — tak dziala tez
+                // dopasowanie przy Excelu i tylko tak da sie obsluzyc przelew laczony.
+                var wTyt = bcOrderyZTytulu(q.msg || '');
+                var moje = wszystkie.filter(function (o){ return wTyt[o]; });
+                var obce = Object.keys(wTyt).filter(function (o){ return lista.indexOf(o) < 0; });
+                var w = { plik: q.file || '', tytul: q.msg || '', kwota: q.amt, ccy: q.ccy || '',
+                          acct: q.acct || '', bic: q.bic || '', nazwa: q.name || '',
+                          orders: moje, obce: obce, bledy: [], uwagi: [], suma: null, laczony: moje.length > 1 };
+                if (!moje.length){
+                    w.bledy.push('w tytule nie ma żadnego zamówienia z wklejki');
+                    out.wiersze.push(w); return;
+                }
+                var suma = 0, brakKwot = [], pcts = [], zrodla = {};
+                moje.forEach(function (o){
+                    var dd = out.dane[o] || {}, d = dd.pi || {}, naj = dd.naj || {};
+                    var poz = naj.poz || [];
+                    // PARTIA komentarzy ma pierwszenstwo. Dopiero gdy zamowienie nie ma
+                    // ani jednej kwoty w komentarzach, spadamy na to, co wyliczyl
+                    // checkOnePI (depozyt z P/I).
+                    var a = (naj.kwota != null) ? naj.kwota
+                          : ((d.comAmount != null) ? d.comAmount : ((d.piAmount != null) ? d.piAmount : null));
+                    if (a == null) brakKwot.push(o); else suma = Math.round((suma + a) * 100) / 100;
+                    var typ = poz.length
+                        ? (poz.some(function (p){ return p.typ === 'balance'; }) ? 'balance' : 'depozyt')
+                        : (a != null ? 'depozyt z P/I' : '');
+                    zrodla[o] = { kwota: a, typ: typ, poz: poz, uwaga: naj.uwaga || '' };
+                    // Procent tylko od zamowien, ktore depozyt PLACA w tym przelewie.
+                    // Wczesniej szedl z kazdego zamowienia, wiec przelew „Deposit 10%"
+                    // dostawal blad „brak procentu (10/15%)" przez zamowienia balansowe,
+                    // ktore procentu w tytule miec nie moga.
+                    var zdep = poz.filter(function (p){ return p.typ === 'depozyt'; });
+                    var pr = null;
+                    if (zdep.length){
+                        var ost = zdep[zdep.length - 1];
+                        pr = (ost.pct != null) ? Math.round(ost.pct)
+                           : ((d.comPct != null) ? Math.round(d.comPct) : null);
+                    } else if (!poz.length && d.comPct != null) pr = Math.round(d.comPct);
+                    if (pr != null && pcts.indexOf(pr) < 0) pcts.push(pr);
+                });
+                w.suma = suma; w.pcts = pcts; w.kontrole = [];
+                function kon(zam, co, lewo, prawo, wynik){
+                    // wynik: 'ok' | 'uwaga' | 'zle'. Zapisujemy KAZDE porownanie razem
+                    // z obiema wartosciami — zeby bylo widac nie tylko co nie gra,
+                    // ale takze co z czym bylo porownane i ze sie zgadza.
+                    w.kontrole.push({ zam: zam || '', co: co, lewo: lewo, prawo: prawo, wynik: wynik });
+                }
+                // Rodzaj przelewu czytamy z tytulu (regula uzytkownika: „deposit" +
+                // kontener = laczony, sam kontener albo penalty = balance, samo
+                // „deposit" = depozyt). Kwote sprawdzamy ZAWSZE — rodzaj sluzy do
+                // tytulu i do opisu, nie do pomijania kontroli.
+                w.rodzaj = bcRodzajPrzelewu(q.msg || '');
+                var depozytowy = (w.rodzaj === 'depozyt' || w.rodzaj === 'łączony');
+                kon('', 'rodzaj przelewu (z tytułu)', w.rodzaj || 'nie rozpoznaję',
+                    w.rodzaj === 'łączony' ? 'deposit + kontener' :
+                    (w.rodzaj === 'balance' ? 'bez „deposit", jest kontener/penalty' :
+                    (w.rodzaj === 'depozyt' ? 'samo „deposit"' : 'brak przesłanek w tytule')),
+                    w.rodzaj ? 'ok' : 'uwaga');
+                // Kwoty liczymy ZAWSZE — z najswiezszych komentarzy, wiec przy balansie
+                // wchodzi kwota balansowa, a nie depozyt sprzed miesiecy. Rodzaj przelewu
+                // sluzy juz tylko do sprawdzania tytulu i do opisu.
+                (moje || []).forEach(function (o){
+                    var z = zrodla[o] || {}, poz = z.poz || [];
+                    if (z.kwota == null) return;
+                    if (!poz.length){
+                        kon(o, 'kwota z P/I (w komentarzach nie ma kwoty)',
+                            Number(z.kwota).toFixed(2), '—', 'uwaga');
+                    } else {
+                        // Kazda pozycja OSOBNO, z kontenerem i data. Przy kilku kontenerach
+                        // sama suma nie mowi, co sie na nia zlozylo, a to wlasnie tam
+                        // gubily sie kwoty.
+                        poz.forEach(function (p){
+                            kon(o, 'kwota z komentarza (' + p.typ + (p.contRaw ? (', ' + p.contRaw) : '')
+                                 + (p.data ? (', ' + p.data) : '') + ')',
+                                Number(p.kwota).toFixed(2), (p.tekst || '').slice(0, 70) || '—', 'ok');
+                        });
+                        if (poz.length > 1)
+                            kon(o, 'razem z komentarzy (' + poz.length + ' pozycje)',
+                                Number(z.kwota).toFixed(2),
+                                poz.map(function (p){ return p.contRaw || p.typ; }).join(' + '), 'ok');
+                    }
+                    if (z.uwaga) kon(o, 'uwaga do kwot', z.uwaga, '—', 'uwaga');
+                });
+                if (brakKwot.length){
+                    // NIE blad: to nie przelew jest zly, tylko ja nie umiem policzyc
+                    // pelnej sumy. Blad zglaszalby rozjazd, ktorego nikt nie wykazal —
+                    // a taki falszywy alarm juz raz wyszedl na przebiegu u uzytkownika.
+                    w.uwagi.push('nie znam kwoty dla: ' + brakKwot.join(', ')
+                        + ' — nie sprawdziłem kwoty tego przelewu');
+                    kon('', 'kwota przelewu ↔ suma z komentarzy', String(q.amt || '—'),
+                        'nie policzyłem — brak depozytu dla ' + brakKwot.join(', '), 'uwaga');
+                } else {
+                    var cz = bcCents(q.amt), cs2 = Math.round(suma * 100);
+                    if (cz == null){
+                        w.bledy.push('nie odczytałem kwoty z potwierdzenia');
+                        kon('', 'kwota przelewu ↔ suma z komentarzy', 'nieczytelna', suma.toFixed(2), 'zle');
+                    } else if (cz !== cs2){
+                        // Przelew BALANSOWY, a wszystkie kwoty pochodza z komentarzy
+                        // DEPOZYTOWYCH: balansu czasem nikt nie komentuje, wiec zostaje
+                        // stary depozyt i rozjazd jest spodziewany. Liczby pokazujemy
+                        // dalej — obie strony i roznice — ale to uwaga, nie blad.
+                        var stare = (moje || []).filter(function (o){
+                            var z = zrodla[o] || {};
+                            return z.kwota != null && z.typ !== 'balance';
+                        });
+                        var opis = suma.toFixed(2) + ' (różnica ' + ((cz - cs2) / 100).toFixed(2) + ')';
+                        if (w.rodzaj === 'balance' && stare.length === (moje || []).length){
+                            w.uwagi.push('kwota ' + (cz / 100).toFixed(2) + ' ≠ suma z komentarzy '
+                                + opis + ' — to przelew balansowy, a w komentarzach mam tylko kwoty '
+                                + 'depozytowe (' + stare.join(', ') + '), więc kwoty nie potwierdzam');
+                            kon('', 'kwota przelewu ↔ suma z komentarzy', (cz / 100).toFixed(2),
+                                opis + ' — same depozyty, balansu nikt nie skomentował', 'uwaga');
+                        } else {
+                            var pas = bcRoznicaToPozycja(zrodla, moje, (cz - cs2) / 100);
+                            var czemu = pas.length
+                                ? (' — różnica równa się pozycji: ' + pas.join(' / ')
+                                   + (cz < cs2 ? ' (chyba jeszcze nieopłacona)' : ' (chyba doliczona spoza komentarzy)'))
+                                : '';
+                            w.bledy.push('kwota ' + (cz / 100).toFixed(2) + ' ≠ suma z komentarzy ' + opis + czemu);
+                            kon('', 'kwota przelewu ↔ suma z komentarzy', (cz / 100).toFixed(2), opis + czemu, 'zle');
+                        }
+                    } else {
+                        kon('', 'kwota przelewu ↔ suma z komentarzy', (cz / 100).toFixed(2), suma.toFixed(2), 'ok');
+                    }
+                }
+                moje.forEach(function (o){
+                    var d = out.dane[o] || {}, pi = d.pi || {}, bank = pi.piBank || {};
+                    var piAcc = bank.acc || pi.piAcc || '';
+                    // Zamowienia, ktorego nie udalo sie odczytac, NIE porownujemy —
+                    // inaczej kazde puste pole wychodzi jako „konto ≠ konto" i wiersz
+                    // czerwienieje bez powodu. Mowimy raz, ze go nie sprawdzilismy.
+                    if (!piAcc && pi.comAmount == null && !bank.swift){
+                        kon(o, 'dane zamówienia', 'nie odczytałem P/I ani komentarza', '—', 'uwaga');
+                        if (w.uwagi.indexOf('nie odczytałem danych zamówienia ' + o) < 0)
+                            w.uwagi.push('nie odczytałem danych zamówienia ' + o);
+                        return;
+                    }
+                    var k1 = bcKontoEq(d.accSys, piAcc);
+                    kon(o, 'konto dostawcy ↔ konto z P/I', d.accSys || '—', piAcc || '—', k1.ok ? 'ok' : 'zle');
+                    if (!k1.ok) w.bledy.push(o + ': konto dostawcy „' + (d.accSys || '—') + '” ≠ konto z P/I „'
+                        + (piAcc || '—') + '”' + (k1.msg ? (' — ' + k1.msg) : ''));
+                    var k2 = bcKontoEq(piAcc, q.acct);
+                    kon(o, 'konto z P/I ↔ konto na potwierdzeniu', piAcc || '—', q.acct || '—', k2.ok ? 'ok' : 'zle');
+                    if (!k2.ok) w.bledy.push(o + ': konto z P/I „' + (piAcc || '—') + '” ≠ konto z potwierdzenia „'
+                        + (q.acct || '—') + '”' + (k2.msg ? (' — ' + k2.msg) : ''));
+                    var sw = bcSwiftPotw(bank.swift || '', q);
+                    kon(o, 'SWIFT z P/I ↔ SWIFT na potwierdzeniu', bank.swift || '—',
+                        sw.pokaz + (sw.ok && sw.msg ? (' — ' + sw.msg) : ''),
+                        sw.ok ? ((sw.oddzial || sw.dalej) ? 'uwaga' : 'ok') : 'zle');
+                    if (!sw.ok) w.bledy.push(o + ': SWIFT z P/I „' + (bank.swift || '—') + '” ≠ z potwierdzenia „' + (q.bic || '—') + '”');
+                    // Bank posredniczacy (sw.posrednik) NIE idzie do uwag: podstawia sie
+                    // przy kazdym przelewie do USA, wiec wiersz zolklby zawsze i bez powodu.
+                    else if (sw.oddzial || sw.dalej) w.uwagi.push(o + ': SWIFT ' + sw.msg);
+                    // Nazwa jest DRUGORZEDNA — nigdy nie blokuje, najwyzej zwraca uwage.
+                    var nz = bcNazwaEq(bank.name || '', q.name);
+                    kon(o, 'beneficjent z P/I ↔ z potwierdzenia', bank.name || '—', q.name || '—',
+                        nz.ok ? 'ok' : (nz.brak ? 'uwaga' : 'uwaga'));
+                    if (!nz.ok && !nz.brak) w.uwagi.push(o + ': beneficjent „' + (bank.name || '—') + '” vs „' + (q.name || '—') + '”');
+                });
+                var tt = bcTytulOk(q.msg, moje, pcts);
+                kon('', 'tytuł ↔ numery zamówień', (moje || []).join(', ') || '—',
+                    tt.brak.length ? ('brakuje: ' + tt.brak.join(', ')) : 'wszystkie są',
+                    tt.brak.length ? 'zle' : 'ok');
+                if (tt.brak.length) w.bledy.push('w tytule brakuje zamówień: ' + tt.brak.join(', '));
+                if (pcts.length && depozytowy){
+                    kon('', 'tytuł ↔ procent depozytu', pcts.map(function (p){ return p + '%'; }).join(' / '),
+                        tt.pctOk ? 'jest w tytule' : 'brak w tytule', tt.pctOk ? 'ok' : 'zle');
+                    if (!tt.pctOk) w.bledy.push('w tytule nie ma procentu depozytu (' + pcts.join('/') + '%)');
+                }
+                if (obce.length) w.uwagi.push('w tytule są też zamówienia spoza wklejki: ' + obce.join(', ')
+                    + ' — doliczyłem je do sumy, bo należą do tego samego przelewu');
+                out.wiersze.push(w);
+            });
+
+            var pokryte = {};
+            out.wiersze.forEach(function (x){ (x.orders || []).forEach(function (o){ pokryte[o] = 1; }); });
+            out.bezPotw = lista.filter(function (o){ return !pokryte[o]; });   // tylko z Twojej wklejki
+            return out;
+        }
+        function bcOrdLink(o){
+            return '<a href="/op_order.php?id=' + encodeURIComponent(o) + '" target="_blank"'
+                 + ' style="color:#7c3aed;text-decoration:none;font-family:monospace">' + esc(o) + '</a>';
+        }
+        function bcWklejkaHtml(r){
+            if (!r) return '';
+            var h = '';
+            var zle = (r.wiersze || []).filter(function (w){ return w.bledy.length; }).length;
+            h += '<div style="font-size:12px;margin-bottom:8px">'
+               + 'Potwierdzeń: <b>' + (r.wiersze || []).length + '</b>'
+               + ' · bez zastrzeżeń: <b style="color:#0a0">' + ((r.wiersze || []).length - zle) + '</b>'
+               + (zle ? (' · z błędami: <b style="color:#c00">' + zle + '</b>') : '')
+               + ((r.bezPotw || []).length ? (' · bez potwierdzenia: <b style="color:#c47f00">'
+                    + r.bezPotw.length + '</b> (' + r.bezPotw.join(', ') + ')') : '')
+               + '</div>';
+            (r.wiersze || []).forEach(function (w){
+                var kol = w.bledy.length ? '#c00' : (w.uwagi.length ? '#c47f00' : '#0a0');
+                var znak = w.bledy.length ? '✗' : (w.uwagi.length ? '⚠' : '✓');
+                // Zaznaczone z gory sa TYLKO wiersze bez bledow. Uwagi (np. skrocona
+                // nazwa beneficjenta) nie blokuja, wiec takie tez wchodza.
+                var dobry = !w.bledy.length;
+                h += '<div style="border:1px solid #eee;border-left:3px solid ' + kol + ';border-radius:6px;padding:6px 8px;margin-bottom:6px">'
+                   + '<div style="font-size:12px;display:flex;align-items:flex-start;gap:6px">'
+                   + '<label style="cursor:pointer" title="Zaznacz, żeby dopisać komentarz do zamówień z tego przelewu">'
+                   + '<input type="checkbox" class="bc-wk-chk" data-orders="' + esc((w.orders || []).join(',')) + '"'
+                   + (dobry ? ' checked' : '') + '></label>'
+                   + '<span><b style="color:' + kol + '">' + znak + '</b> '
+                   + esc(w.kwota || '')
+                   // Nazwa dostawcy przy kwocie — beneficjent z potwierdzenia. Bez niej
+                   // przy kilkunastu wierszach nie widac, komu placimy, bez wchodzenia
+                   // w liste porownan.
+                   + (w.nazwa ? (' <span style="color:#333;font-weight:600">' + esc(w.nazwa) + '</span>') : '')
+                   + (w.laczony ? ' <span style="color:#0a58ca">(łączony: ' + w.orders.length + ' zamówień)</span>' : '')
+                   + (w.suma != null ? ' <span style="color:#666">· suma z komentarzy ' + w.suma.toFixed(2) + '</span>' : '')
+                   + '<br><span style="font-size:11px;color:#444">'
+                   + (w.orders || []).map(bcOrdLink).join(', ') + '</span>'
+                   + '</span></div>'
+                   + '<div style="font-size:11px;color:#666;margin-top:2px">' + esc(w.tytul) + '</div>';
+                // Pelna lista porownan — takze tych udanych. Bez niej widac bylo tylko
+                // zastrzezenia i nie bylo wiadomo, CO w ogole zostalo sprawdzone.
+                if ((w.kontrole || []).length){
+                    var grupy = [], wg = {};
+                    w.kontrole.forEach(function (k){
+                        var g = k.zam || '';
+                        if (!wg[g]){ wg[g] = []; grupy.push(g); }
+                        wg[g].push(k);
+                    });
+                    grupy.forEach(function (g){
+                        h += '<div style="margin-top:5px">'
+                           + '<div style="font-size:11px;font-weight:700;color:#444">'
+                           + (g ? bcOrdLink(g) : 'cały przelew') + '</div>'
+                           + '<ul style="margin:2px 0 0;padding-left:18px;font-size:11px;line-height:1.5">';
+                        wg[g].forEach(function (k){
+                            var kk = k.wynik === 'zle' ? '#c00' : (k.wynik === 'uwaga' ? '#c47f00' : '#0a0');
+                            var zn = k.wynik === 'zle' ? '✗' : (k.wynik === 'uwaga' ? '⚠' : '✓');
+                            // Identyczne wartosci pokazujemy RAZ — powtarzanie tego samego
+                            // ciagu po obu stronach tylko rozpycha wiersz i nic nie wnosi.
+                            var war = (String(k.lewo) === String(k.prawo))
+                                ? ('<span style="font-family:monospace">' + esc(k.lewo) + '</span>')
+                                : ('<span style="font-family:monospace">' + esc(k.lewo) + '</span>'
+                                   + ' <span style="color:#999">↔</span> '
+                                   + '<span style="font-family:monospace">' + esc(k.prawo) + '</span>');
+                            h += '<li style="color:' + kk + '"><span style="color:#666">' + esc(k.co) + ':</span> '
+                               + '<span style="color:#333">' + war + '</span> '
+                               + '<span style="color:' + kk + '">' + zn + '</span></li>';
+                        });
+                        h += '</ul></div>';
+                    });
+                }
+                w.bledy.forEach(function (b){ h += '<div style="font-size:11px;color:#c00;margin-top:2px">✗ ' + esc(b) + '</div>'; });
+                w.uwagi.forEach(function (u){ h += '<div style="font-size:11px;color:#c47f00;margin-top:2px">⚠ ' + esc(u) + '</div>'; });
+                h += '</div>';
+            });
+            // Tresc komentarza stoi w polu i mozna ja zmienic PRZED wyslaniem — to zapis
+            // do prologistics, wiec nie chcemy, zeby cokolwiek szlo tam bez spojrzenia.
+            //
+            // Domyslnie „Payment confirmation attached." — ta sama tresc, co przy wgrywaniu
+            // potwierdzenia w Wprowadzaniu. To NIE jest kosmetyka: ten napis jest GRANICA
+            // partii kwot (bcPartiaKwot). Wczesniejsze „ok" granica nie bylo, wiec nastepne
+            // sprawdzenie tego zamowienia siegalo wstecz za daleko i wciagalo kwoty juz
+            // oplacone.
+            h += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #eee;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+               + '<input type="text" id="bc-wk-kom" value="Payment confirmation attached." title="Ten napis zamyka partię kwot: przy następnym sprawdzeniu tego zamówienia wszystko sprzed niego liczy się jako zapłacone." style="font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:4px;min-width:220px">'
+               + '<button id="bc-wk-add" class="chn-btn maroon" style="padding:3px 10px;font-size:12px" title="Dopisze ten komentarz do KAŻDEGO zamówienia z zaznaczonych przelewów">💬 Dodaj komentarz do zaznaczonych</button>'
+               + '<span id="bc-wk-kom-st" style="font-size:11px;color:#666"></span>'
+               + '</div>';
+            return h;
         }
 
         // --- dopasowanie platnosc <-> potwierdzenie
@@ -18342,6 +19000,81 @@
             // ten zamek, bo tam flaga stoi juz od wejscia w handler — inaczej doGrab
             // wychodzil na pierwszej linii przez „return 0" i dociaganie po cichu nie
             // ruszalo, a panel mowil, ze nie ma ani jednego potwierdzenia.
+            // Numery zamowien z wklejki. Gdy sa tabulatory (wklejka z arkusza),
+            // idziemy przez pcZWklejki — ono rozpoznaje kolumny po tresci. Gdy ich nie ma
+            // (ktos wkleil zwykly tekst), szukamy samodzielnego ciagu 4-7 cyfr w wierszu.
+            function spOrderyZWklejki(txt){
+                var out = [], seen = {};
+                String(txt || '').split(/\r?\n/).forEach(function (line){
+                    if (!line.trim()) return;
+                    var o = '';
+                    if (line.indexOf('\t') >= 0) o = pcZWklejki(line.split('\t')).order;
+                    if (!o){ var m = line.match(/(?:^|[^\d])(\d{4,7})(?![\d.,])/); o = m ? m[1] : ''; }
+                    if (o && !seen[o]){ seen[o] = 1; out.push(o); }
+                });
+                return out;
+            }
+            async function doKomentarz(){
+                if (busy) return;
+                var st = sp.querySelector('#bc-wk-kom-st');
+                function mow(t, kol){ if (st){ st.textContent = t; st.style.color = kol || '#666'; } }
+                var pole = sp.querySelector('#bc-wk-kom');
+                var tekst = String((pole && pole.value) || '').trim();
+                if (!tekst){ mow('Wpisz treść komentarza.', '#c00'); return; }
+                var ord = [], seen = {};
+                sp.querySelectorAll('.bc-wk-chk').forEach(function (c){
+                    if (!c.checked) return;
+                    String(c.getAttribute('data-orders') || '').split(',').forEach(function (o){
+                        o = o.trim();
+                        if (o && !seen[o]){ seen[o] = 1; ord.push(o); }
+                    });
+                });
+                if (!ord.length){ mow('Nic nie zaznaczone.', '#c47f00'); return; }
+                if (!confirm('Dopisać komentarz „' + tekst + '" do ' + ord.length + ' zamówień?\n\n'
+                           + ord.join(', ') + '\n\nTego nie da się cofnąć z poziomu skryptu.')) return;
+                busy = true;
+                try {
+                    var ok = 0, zle = [];
+                    for (var i = 0; i < ord.length; i++){
+                        mow('Dopisuję: ' + (i + 1) + '/' + ord.length + '…');
+                        var r = await pcPostComment(ord[i], tekst);
+                        if (r && r.ok) ok++; else zle.push(ord[i]);
+                    }
+                    mow('Dopisano do ' + ok + '/' + ord.length + ' zamówień'
+                        + (zle.length ? (' — nie udało się: ' + zle.join(', ')) : '.'),
+                        zle.length ? '#c00' : '#0a7a2f');
+                } finally { busy = false; }
+            }
+            async function doPaste(){
+                if (busy) return;
+                busy = true;
+                var st = sp.querySelector('#sp-paste-status');
+                function mow(t, kol){ if (st){ st.textContent = t; st.style.color = kol || '#666'; } }
+                try {
+                    var el = sp.querySelector('#sp-paste');
+                    var ord = spOrderyZWklejki((el && (el.innerText || el.textContent)) || '');
+                    if (!ord.length){
+                        mow('Nie znalazłem w tej wklejce ani jednego numeru zamówienia (szukam ciągu 4–7 cyfr).', '#c00');
+                        return;
+                    }
+                    // WLASNE pole daty tej sekcji. Puste = bez filtra, czyli wszystkie
+                    // potwierdzenia z sekcji „Payment conformation" (bez tych bez daty).
+                    var dayEl = sp.querySelector('#sp-paste-day');
+                    var day = String((dayEl && dayEl.value) || '').trim();
+                    mow('Zamówień: ' + ord.length
+                        + (day ? (', potwierdzenia z dnia ' + day) : ', wszystkie potwierdzenia (bez filtra daty)')
+                        + '. Zaczynam…');
+                    var r = await bcZWklejki(ord, day, mow, null);
+                    var box = sp.querySelector('#sp-paste-box');
+                    if (box){ box.style.display = ''; box.innerHTML = bcWklejkaHtml(r); }
+                    var zle = (r.wiersze || []).filter(function (w){ return w.bledy.length; }).length;
+                    mow('Gotowe: ' + (r.wiersze || []).length + ' potwierdzeń, '
+                        + (zle ? (zle + ' z zastrzeżeniami') : 'bez zastrzeżeń') + '.',
+                        zle ? '#c00' : '#0a7a2f');
+                } catch (e){
+                    mow('Nie doszło do skutku: ' + String((e && e.message) || e), '#c00');
+                } finally { busy = false; }
+            }
             async function doGrab(){
                 if (busy) return 0;
                 busy = true;
@@ -18376,6 +19109,24 @@
                 return st.pdfs;
             }
             sp.querySelector('#sp-grab').onclick = function(){ doGrab(); };
+            sp.querySelector('#sp-paste-run').onclick = function(){ doPaste(); };
+            sp.querySelector('#sp-paste-dzis').onclick = function(){
+                // pcToday, NIE pad2: pad2 mieszka w init_mkt, czyli w cudzym domknieciu —
+                // wolanie go stad byloby cichym ReferenceError widocznym dopiero po
+                // klknieciu. pcToday jest tutaj i oddaje gotowe RRRR-MM-DD.
+                var el = sp.querySelector('#sp-paste-day');
+                if (el) el.value = pcToday();
+            };
+            sp.querySelector('#sp-paste-bez').onclick = function(){
+                var el = sp.querySelector('#sp-paste-day'); if (el) el.value = '';
+            };
+            // Guzik komentarza powstaje razem z wynikiem, wiec podpinamy sie przez
+            // delegacje — inaczej trzeba by go szukac po kazdym przerysowaniu.
+            sp.addEventListener('click', function (e){
+                var t = e.target;
+                if (!t || t.id !== 'bc-wk-add') return;
+                doKomentarz();
+            });
             sp.querySelector('#sp-run').onclick = async function(){
                 if (busy) return;
                 // busy PRZED bcProcess(). Wczesniej flaga stawala sie dopiero w doGrab,
