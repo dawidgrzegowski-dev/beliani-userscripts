@@ -20267,6 +20267,23 @@
             var m = /loggedUsername\s*=\s*"([^"]+)"/.exec(html) || /<body[^>]*data-user=["']([^"']+)["']/i.exec(html);
             return m ? m[1] : '';
         }
+        // Konta, ktore pisza w sprawach automatem. Odbicie komentarza na bota nikogo nie
+        // zawiadamia, wiec traktujemy je tak, jakby tej osoby nie bylo — i pytamy.
+        const INS_BOTY = { adam_ai: 1 };
+        function insBot(u){ return !!INS_BOTY[String(u || '').toLowerCase()]; }
+
+        // Kto w ogole pisal w tej sprawie — od najnowszego, bez botow i bez powtorzen.
+        // To jest lista do recznego wyboru, gdy automat nie umie wskazac osoby.
+        function insOsoby(koment){
+            var byl = {}, out = [];
+            for (var i = koment.length - 1; i >= 0; i--){
+                var u = koment[i].user;
+                if (!u || insBot(u) || byl[u]) continue;
+                byl[u] = 1; out.push(u);
+            }
+            return out;
+        }
+
         // Kto zapowiedzial te kwote. Szukamy od NAJNOWSZEGO komentarza, bo ostatnie
         // ustalenie jest tym wiazacym.
         //
@@ -20277,6 +20294,7 @@
         const INS_LICZBA = /\d{1,3}(?:[  .,]\d{3})*[.,]\d{2}|\d+[.,]\d{2}|\d+/g;
         function insKtoOKwocie(koment, kwota){
             for (var i = koment.length - 1; i >= 0; i--){
+                if (insBot(koment[i].user)) continue;
                 var t = String(koment[i].text || '');
                 var re = new RegExp(INS_LICZBA.source, 'g'), m;
                 while ((m = re.exec(t)) !== null){
@@ -20298,34 +20316,96 @@
                 })
                 .replace(/[^a-z0-9]+/g, ' ').trim();
         }
-        // Nazwy z wyciagu sa skrotami, w ERP stoja pelne. Zamieniamy TYLKO to, co
-        // jednoznaczne; reszte zostawiamy i niech rozstrzygnie liczba trafien.
+        // Nazwy z wyciagu sa skrotami, w ERP stoja pelne — i bywa odwrotnie: w wyciagu
+        // „Postfinance", na koncie „Post Finance". Dlatego ten sam slownik przykladamy do
+        // OBU stron; inaczej 1167 „Post Finance SEK" nie znajdzie sie nigdy.
         const INS_ALIAS = [
             [/\bhvb\b/g, 'hypoveriensbank'],
             [/\bcredit\s+swiss\b/g, 'cs'],
             [/\bcredit\s+suisse\b/g, 'cs'],
             [/\braiff\b/g, 'raiffeisen'],
             [/\bmillennium\b/g, 'millenium'],
-            [/\bpost\s+finance\b/g, 'postfinance']
+            [/\bpost\s+finance\b/g, 'postfinance'],
+            [/\buni\s+credit\b/g, 'unicredit']
         ];
-        function insTokeny(bank){
-            var s = insNorm(bank);
-            INS_ALIAS.forEach(function (a){ s = s.replace(a[0], a[1]); });
-            return s.split(' ').filter(function (t){ return t.length > 1; });
+        function insNormA(s){
+            var t = insNorm(s);
+            INS_ALIAS.forEach(function (a){ t = t.replace(a[0], a[1]); });
+            return t;
         }
-        function insDopasujKonto(bank, konta){
-            var zap = INS_MAPA[insNorm(bank)];
-            if (zap && konta.some(function (k){ return k.nr === zap; })) return { nr: zap, zrodlo: 'pamiec' };
-            var tok = insTokeny(bank);
-            if (!tok.length) return { nr: '', zrodlo: '' };
-            var traf = konta.filter(function (k){
-                var op = insNorm(k.opis);
-                return tok.every(function (t){
-                    return new RegExp('(^| )' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '( |$)').test(op);
-                });
+        function insTokeny(bank){
+            return insNormA(bank).split(' ').filter(function (t){ return t.length > 1; });
+        }
+        // Token musi stac jako CALE slowo. Dluzsze nazwy wlasne dopuszczamy tez jako
+        // POCZATEK slowa — bez tego „Raiff CZK" nie trafia w „Raiffeisenbank CZK", bo
+        // w ERP to jedno slowo. Prog 6 znakow zostawia krotkie skroty (bank, cic, ubs,
+        // gls, cs) przy dopasowaniu scislym, zeby nie zlapaly sie w srodku czegos innego.
+        function insTokPasuje(op, t){
+            var e = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp('(^| )' + e + (t.length >= 6 ? '' : '( |$)')).test(op);
+        }
+        // Tokeny, ktore same z siebie nic nie mowia o BANKU: waluty, kraje i szablon
+        // nazwy. Nie odrzucamy ich — po prostu przy zawezaniu ida na koniec kolejki.
+        const INS_SLABE = {
+            eur: 1, usd: 1, chf: 1, gbp: 1, pln: 1, czk: 1, huf: 1, dkk: 1, sek: 1,
+            nok: 1, ron: 1, cad: 1, cny: 1,
+            de: 1, pl: 1, pt: 1, uk: 1, at: 1, es: 1, fr: 1, it: 1, nl: 1, se: 1,
+            cz: 1, sk: 1, hu: 1, ro: 1, be: 1, eu: 1, no: 1, ch: 1, us: 1, usa: 1, int: 1,
+            gmbh: 1, bank: 1, beliani: 1, cod: 1, ltd: 1, limited: 1, kasse: 1
+        };
+        function insTrafienia(tok, opisy){
+            if (!tok.length) return [];
+            return opisy.filter(function (k){
+                return tok.every(function (t){ return insTokPasuje(k._n, t); });
             });
-            if (traf.length === 1) return { nr: traf[0].nr, zrodlo: 'auto' };
-            return { nr: '', zrodlo: '', ile: traf.length };
+        }
+        // Zwraca numer konta TYLKO wtedy, gdy pasuje dokladnie jedno. Poza tym oddaje
+        // liste kandydatow — im krotsza, tym mniej klikania przy recznym wyborze.
+        function insDopasujKonto(bank, konta){
+            var opisy = konta.map(function (k){ return { nr: k.nr, opis: k.opis, _n: insNormA(k.opis) }; });
+            // Klucz pamieci po nazwie PO slowniku, nie po surowej — inaczej „Millenium PT"
+            // i „Millennium PT" to dwa osobne wpisy i to samo konto trzeba wskazac dwa razy.
+            var zap = INS_MAPA[insNormA(bank)];
+            if (zap && konta.some(function (k){ return k.nr === zap; })){
+                return { nr: zap, zrodlo: 'pamiec', ile: 1, kand: [] };
+            }
+            var tok = insTokeny(bank);
+            if (!tok.length) return { nr: '', zrodlo: '', ile: 0, kand: [] };
+            // Token, ktorego nie ma w ZADNEJ etykiecie, moze wynik wylacznie wyzerowac —
+            // tak dziala „28" z „UBS (28) DKK" czy „ESPANOL" z „Deutsche Bank ESPANOL".
+            // Odkladamy takie na bok, zamiast pozwolic im skasowac cale dopasowanie.
+            var znane = tok.filter(function (t){
+                return opisy.some(function (k){ return insTokPasuje(k._n, t); });
+            });
+            var uzyte = znane.length ? znane : tok;
+            // Automat wybiera SAM tylko wtedy, gdy zadnego tokenu nie trzeba bylo
+            // odpuscic. Inaczej „Jakis Bank HUF" po odrzuceniu nieznanego „jakisbank"
+            // zostalby z samym „huf" i — gdyby konto HUF bylo jedno — wskazalby je bez
+            // pytania. To wlasnie tak wyglada zaksiegowanie na cudze konto.
+            var pelne = znane.length === tok.length;
+            var traf = insTrafienia(uzyte, opisy);
+            if (traf.length === 1 && pelne) return { nr: traf[0].nr, zrodlo: 'auto', ile: 1, kand: traf };
+            if (traf.length) return { nr: '', zrodlo: '', ile: traf.length, kand: traf,
+                                      luz: pelne ? '' : uzyte.join(' + ') };
+            // Komplet tokenow nie trafia w nic — np. „HVB UNICREDIT", bo zadne konto nie
+            // ma obu tych slow naraz. Schodzimy wiec po najbardziej charakterystycznym
+            // (najdluzszym) tokenie w dol, ale wynik oddajemy WYLACZNIE jako liste do
+            // wyboru: skoro trzeba bylo cos odpuscic, pewnosci nie ma i automat nie ma
+            // prawa wybrac za czlowieka.
+            // Kolejnosc odpuszczania: najpierw traci token NAJMNIEJ mowiacy o banku —
+            // waluta, kraj, szablon („gmbh", „bank"). Poza tym trzymamy KOLEJNOSC ZAPISU
+            // z wyciagu, bo ludzie pisza od marki: „HVB UNICREDIT", „GLS Germany GmbH",
+            // „Unicredit RON". Probowalem sortowac po rzadkosci tokenu i wyszlo gorzej:
+            // „HVB UNICREDIT" zawezalo sie do konta UniCredit HUF, czyli do zupelnie
+            // innego banku, bo akurat pasowalo do niego jedno konto zamiast pieciu.
+            var wg = uzyte.slice().sort(function (a, b){
+                return (INS_SLABE[a] ? 1 : 0) - (INS_SLABE[b] ? 1 : 0);
+            });
+            for (var i = wg.length - 1; i >= 1; i--){
+                var t2 = insTrafienia(wg.slice(0, i), opisy);
+                if (t2.length) return { nr: '', zrodlo: '', ile: t2.length, kand: t2, luz: wg.slice(0, i).join(' + ') };
+            }
+            return { nr: '', zrodlo: '', ile: 0, kand: [] };
         }
 
         // ---------- ramka do zapisu ----------
@@ -20388,6 +20468,107 @@
             pay.click();
             await czek;
             await insSleep(500);
+            return { ok: true };
+        }
+
+        // ---------- szybki zapis: POST formularza bez ladowania strony ----------
+        // Serializujemy formularz tak, jak zrobilaby to przegladarka: pomijamy pola
+        // wylaczone i nieodhaczone, z pojedynczego selecta bierzemy wartosc biezaca
+        // (czyli pierwsza opcje, gdy nic nie jest zaznaczone), z wielokrotnego wszystkie
+        // zaznaczone. Guziki i pola plikowe obslugujemy osobno.
+        function insPolaFormularza(doc){
+            var form = doc.querySelector('form#insurance-form') || (doc.forms && doc.forms[0]);
+            if (!form) return null;
+            var out = [];
+            Array.prototype.forEach.call(form.querySelectorAll('input, select, textarea'), function (e){
+                var nm = e.getAttribute('name');
+                if (!nm || e.disabled) return;
+                if (e.tagName === 'SELECT'){
+                    if (e.multiple){
+                        Array.prototype.forEach.call(e.options, function (o){
+                            if (o.selected) out.push([nm, o.value]);
+                        });
+                    } else {
+                        out.push([nm, e.value == null ? '' : e.value]);
+                    }
+                    return;
+                }
+                if (e.tagName === 'TEXTAREA'){ out.push([nm, e.value || e.textContent || '']); return; }
+                var typ = String(e.type || '').toLowerCase();
+                if (typ === 'checkbox' || typ === 'radio'){ if (e.checked) out.push([nm, e.value]); return; }
+                if (typ === 'submit' || typ === 'button' || typ === 'image' || typ === 'reset' || typ === 'file') return;
+                out.push([nm, e.value == null ? '' : e.value]);
+            });
+            return out;
+        }
+        // Numery zwrotow kosztow transportu. W HTML-u tabela jest PUSTA — wiersze dorabia
+        // insurance.js z tego obiektu. Pomijamy pozycje odwolane (cancelled = 1).
+        function insShIds(html){
+            var i = html.indexOf('shRefound');
+            if (i < 0) return [];
+            var j = html.indexOf('list:', i);
+            if (j < 0) return [];
+            var k = html.indexOf('[', j), koniec = html.indexOf(']', k);
+            if (k < 0 || koniec < 0) return [];
+            var out = [];
+            html.slice(k, koniec + 1).split('},{').forEach(function (cz){
+                var a = /"sh_tracking_id"\s*:\s*"?(\d+)"?/.exec(cz);
+                var c = /"cancelled"\s*:\s*"?(\d+)"?/.exec(cz);
+                if (a && (!c || c[1] === '0')) out.push(a[1]);
+            });
+            return out;
+        }
+        async function insPing(id){
+            try {
+                var r = await fetch(BASE + '/api/insuranceCase/getPingDays', {
+                    method: 'POST', credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: 'id=' + encodeURIComponent(id)
+                });
+                if (!r.ok) return [];
+                var j = await r.json();
+                var pu = j && j.ping_users;
+                if (!pu) return [];
+                return Array.isArray(pu) ? pu : [pu];
+            } catch (e){ return []; }
+        }
+        async function insZapiszPost(id, ymd, konto, kwota, dane){
+            var m = /(\d{4})-(\d{2})-(\d{2})/.exec(ymd || '');
+            if (!m) return { ok: false, blad: 'Zla data: ' + ymd };
+            var doc = new DOMParser().parseFromString(dane.html, 'text/html');
+            var pola = insPolaFormularza(doc);
+            if (!pola) return { ok: false, blad: 'Brak formularza sprawy' };
+            var nad = {
+                Date_Month: m[2], Date_Day: String(parseInt(m[3], 10)), Date_Year: m[1],
+                account: String(konto), amount: insFmt(kwota), paycomment: ''
+            };
+            var ma = {};
+            pola.forEach(function (p){ ma[p[0]] = 1; });
+            var fd = new FormData(), wstawione = {};
+            pola.forEach(function (p){
+                if (nad.hasOwnProperty(p[0])){
+                    if (wstawione[p[0]]) return;
+                    wstawione[p[0]] = 1;
+                    fd.append(p[0], nad[p[0]]);
+                    return;
+                }
+                fd.append(p[0], p[1]);
+            });
+            Object.keys(nad).forEach(function (k){ if (!wstawione[k]) fd.append(k, nad[k]); });
+            // Pola, ktorych w HTML-u nie ma — dorabia je JavaScript strony.
+            (dane.sh || []).forEach(function (x){ fd.append('sh[' + x + ']', x); });
+            if (dane.resp && !ma['responsible_uname']) fd.append('responsible_uname', dane.resp);
+            if (!ma['pingUsers']) (dane.ping || []).forEach(function (u){ fd.append('pingUsers', u); });
+            // Puste pole plikowe wysylamy tak, jak robi to przegladarka: z pusta nazwa.
+            fd.append('newnewpicfn', new Blob([], { type: 'application/octet-stream' }), '');
+            fd.append('payment', 'Make payment');
+            var r = await fetch(BASE + '/insurance.php', {
+                method: 'POST', credentials: 'include', body: fd, redirect: 'follow'
+            });
+            if (!r || !r.ok) return { ok: false, blad: 'HTTP ' + (r ? r.status : '?') };
             return { ok: true };
         }
 
@@ -20467,6 +20648,9 @@
           +   '<label style="font-size:11px;color:#750000">workerów:</label>'
           +   '<input id="ins-workers" type="number" min="1" max="10" value="5" style="width:55px;padding:4px 6px;'
           +     'border:1px solid #750000;border-radius:4px;font-size:12px;text-align:center">'
+          +   '<label style="font-size:11px;color:#750000;white-space:nowrap;cursor:pointer" '
+          +     'title="Zapis wysyła sam formularz, bez ładowania całej strony sprawy. Strona ciągnie ok. 10 MB skryptów i zapytań, więc w ramce jedno księgowanie trwa kilkanaście sekund, a tak — sekundę. Odznacz, jeśli cokolwiek zacznie się dziwnie zachowywać.">'
+          +     '<input type="checkbox" id="ins-fast" checked style="vertical-align:middle"> szybki zapis</label>'
           +   '<button id="ins-run" style="flex:1;min-width:260px;padding:7px;background:#FF2F00;color:white;border:none;'
           +     'border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold">🚀 Zaksięguj zaznaczone i sprawdź</button>'
           +   '<span style="font-size:10px;color:#750000;font-style:italic;width:100%">Po każdym zapisie moduł wchodzi na sprawę '
@@ -20479,6 +20663,10 @@
         document.body.appendChild(panel);
         btn.onclick = function (){ panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; };
 
+        function insSzybko(){
+            var c = panel.querySelector('#ins-fast');
+            return !c || c.checked;
+        }
         function insMow(t, kolor){
             var el = panel.querySelector('#ins-sum');
             if (el){ el.textContent = t || ''; el.style.color = kolor || '#333'; }
@@ -20521,9 +20709,14 @@
                     var kolor = p.stan === 'ok' ? '#0a7a2f' : (p.stan === 'blad' ? '#c00' : (p.stan === 'uwaga' ? '#c47f00' : '#555'));
                     var kontoHtml;
                     if (p.konta && p.konta.length && !p.konto){
+                        var opcja = function (k){ return '<option value="' + k.nr + '">' + insEsc(k.opis) + '</option>'; };
+                        var kand = p.kand || [];
                         kontoHtml = '<select class="ins-konto" data-g="' + gi + '" data-p="' + pi + '" style="max-width:280px;font-size:11px">'
                                   + '<option value="">— wybierz konto —</option>'
-                                  + p.konta.map(function (k){ return '<option value="' + k.nr + '">' + insEsc(k.opis) + '</option>'; }).join('')
+                                  + (kand.length
+                                     ? ('<optgroup label="Pasuje do „' + insEsc(g.bank) + '”">' + kand.map(opcja).join('') + '</optgroup>')
+                                     : '')
+                                  + '<optgroup label="Wszystkie konta">' + p.konta.map(opcja).join('') + '</optgroup>'
                                   + '</select>';
                     } else if (p.konto){
                         var op = (p.konta || []).filter(function (k){ return k.nr === p.konto; })[0];
@@ -20532,6 +20725,19 @@
                                   + ' <a href="#" class="ins-konto-zmien" data-g="' + gi + '" data-p="' + pi + '" style="font-size:10px">zmień</a>';
                     } else {
                         kontoHtml = '<span style="color:#888">—</span>';
+                    }
+                    var ktoHtml;
+                    if (!p.kto && p.osoby && p.osoby.length){
+                        ktoHtml = '<select class="ins-kto" data-g="' + gi + '" data-p="' + pi + '" style="font-size:11px">'
+                                + '<option value="">— wybierz osobę —</option>'
+                                + p.osoby.map(function (u){ return '<option value="' + insEsc(u) + '">' + insEsc(u) + '</option>'; }).join('')
+                                + '</select>';
+                    } else if (p.kto){
+                        ktoHtml = insEsc(p.kto)
+                                + (p.ktoZrodlo ? (' <span style="font-size:10px;color:#888">(' + insEsc(p.ktoZrodlo) + ')</span>') : '')
+                                + ' <a href="#" class="ins-kto-zmien" data-g="' + gi + '" data-p="' + pi + '" style="font-size:10px">zmień</a>';
+                    } else {
+                        ktoHtml = '<span style="color:#888">—</span>';
                     }
                     var dataHtml = p.data
                         ? insEsc(p.data)
@@ -20546,8 +20752,7 @@
                        +   ' ' + insEsc(p.waluta) + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + kontoHtml + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + dataHtml + '</td>'
-                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + insEsc(p.kto || '—')
-                       +   (p.ktoZrodlo ? (' <span style="font-size:10px;color:#888">(' + p.ktoZrodlo + ')</span>') : '') + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + ktoHtml + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb;color:' + kolor + '">' + insEsc(p.status || '') + '</td>'
                        + '</tr>';
                 });
@@ -20566,12 +20771,16 @@
             var dop = insDopasujKonto(g.bank, konta);
             p.konto = dop.nr;
             p.kontoZrodlo = dop.zrodlo;
+            p.kand = dop.kand || [];
+            p.kandLuz = dop.luz || '';
             var kom = insKomentarze(html);
+            p.osoby = insOsoby(kom);
             var kto = insKtoOKwocie(kom, p.kwota);
             if (kto){ p.kto = kto; p.ktoZrodlo = 'z komentarza'; }
             else {
-                p.kto = insResponsible(html);
-                p.ktoZrodlo = p.kto ? 'Responsible' : '';
+                var resp = insResponsible(html);
+                if (resp && !insBot(resp)){ p.kto = resp; p.ktoZrodlo = 'Responsible'; }
+                else { p.kto = ''; p.ktoZrodlo = ''; }
             }
             var pl = insPlatnosci(html);
             var juz = pl.wiersze.filter(function (w){
@@ -20589,10 +20798,14 @@
             }
             if (!p.konto){
                 p.stan = 'uwaga';
-                p.status = dop.ile ? ('pasuje ' + dop.ile + ' kont — wybierz') : 'nie dopasowałem konta — wybierz';
+                p.status = dop.ile
+                    ? ('pasuje ' + dop.ile + ' kont' + (dop.luz ? (' po zawężeniu do „' + dop.luz + '”') : '') + ' — wybierz')
+                    : 'nie dopasowałem konta — wybierz z listy';
             } else if (!p.kto){
                 p.stan = 'uwaga';
-                p.status = 'nie wiem, na kogo odbić komentarz';
+                p.status = p.osoby && p.osoby.length
+                    ? 'nie wiem, na kogo odbić komentarz — wybierz osobę'
+                    : 'w tej sprawie nie ma nikogo, na kogo odbić komentarz';
             } else {
                 p.stan = 'gotowy';
                 p.status = 'gotowe do księgowania' + (p.uwagi.length ? (' · ' + p.uwagi.join('; ')) : '');
@@ -20637,7 +20850,24 @@
         async function insKsiegujJedna(ctx, p, g){
             p.status = 'księguję…';
             insRysuj();
-            var w = await insZaksieguj(ctx, p.id, p.data, p.konto, p.kwota);
+            var w, przed = null;
+            if (insSzybko()){
+                var html0 = '';
+                try { html0 = await insPobierz(BASE + '/insurance.php?id=' + encodeURIComponent(p.id)); }
+                catch (e){
+                    p.stan = 'blad';
+                    p.status = 'nie udało się otworzyć sprawy: ' + String(e && e.message || e);
+                    return;
+                }
+                // Zdjecie stanu SPRZED zapisu — po zapisie porownamy, czy nie ubylo
+                // wierszy zwrotu kosztow transportu.
+                przed = { sh: insShIds(html0) };
+                var ping = await insPing(p.id);
+                w = await insZapiszPost(p.id, p.data, p.konto, p.kwota,
+                                        { html: html0, sh: przed.sh, resp: insResponsible(html0), ping: ping });
+            } else {
+                w = await insZaksieguj(ctx, p.id, p.data, p.konto, p.kwota);
+            }
             if (!w.ok){ p.stan = 'blad'; p.status = 'nie zaksięgowało: ' + w.blad; return; }
             var komOk = false;
             if (p.kto){
@@ -20670,7 +20900,18 @@
             if (p.kto) czesci.push(maKom ? 'komentarz ✓' : 'komentarza NIE MA ✗');
             else czesci.push('komentarz pominięty (brak osoby)');
             if (pl.open !== null) czesci.push('open amount ' + insFmt(pl.open));
-            p.stan = (wpis && (maKom || !p.kto)) ? 'ok' : 'blad';
+            // To jest ta jedna szkoda, ktorej zapis z reki moglby narobic po cichu:
+            // formularz wyslany bez pol sh[] kasuje wiersze zwrotu kosztow transportu.
+            var ubylo = false;
+            if (przed){
+                var po = insShIds(html);
+                if (po.join(',') !== przed.sh.join(',')){
+                    ubylo = true;
+                    czesci.push('UWAGA: lista zwrotów transportu była ' + przed.sh.length
+                              + ', jest ' + po.length + ' — sprawdź sprawę ręcznie');
+                }
+            }
+            p.stan = (wpis && (maKom || !p.kto) && !ubylo) ? 'ok' : 'blad';
             p.status = czesci.join(' · ');
         }
 
@@ -20731,15 +20972,43 @@
             if (!p) return;
             if (t.classList.contains('ins-chk')){ p.wybrany = t.checked; return; }
             if (t.classList.contains('ins-data')){ p.data = t.value; insRysuj(); return; }
+            if (t.classList.contains('ins-kto')){
+                p.kto = t.value;
+                p.ktoZrodlo = p.kto ? 'wybrane ręcznie' : '';
+                // Ta sama osoba idzie na POZOSTALE wiersze, ktore nadal nikogo nie maja —
+                // zwykle to jedna osoba prowadzi cala te reklamacje. Wiersze, w ktorych
+                // automat kogos znalazl, zostaja przy swoim.
+                if (p.kto){
+                    INS_GRUPY.forEach(function (gg){
+                        gg.poz.forEach(function (pp){
+                            if (pp === p || pp.kto) return;
+                            pp.kto = p.kto;
+                            pp.ktoZrodlo = 'przeniesione';
+                            if (pp.stan === 'uwaga' && /komentarz/.test(pp.status || '')){
+                                pp.stan = pp.konto ? 'gotowy' : 'uwaga';
+                                pp.status = pp.konto ? 'gotowe do księgowania' : 'nie dopasowałem konta — wybierz z listy';
+                            }
+                        });
+                    });
+                }
+                if (p.stan === 'uwaga' && /komentarz/.test(p.status || '')){
+                    p.stan = p.konto ? 'gotowy' : 'uwaga';
+                    p.status = p.konto ? 'gotowe do księgowania' : 'nie dopasowałem konta — wybierz z listy';
+                }
+                insRysuj();
+                return;
+            }
             if (t.classList.contains('ins-konto')){
                 p.konto = t.value;
                 p.kontoZrodlo = 'wybrane ręcznie';
                 if (p.konto && g.bank){
-                    INS_MAPA[insNorm(g.bank)] = p.konto;
+                    INS_MAPA[insNormA(g.bank)] = p.konto;
                     insMapaZapisz(INS_MAPA);
-                    // Ten sam bank w pozostalych wierszach dostaje konto od razu.
+                    // Ten sam bank w pozostalych wierszach dostaje konto od razu —
+                    // porownujemy po nazwie po slowniku, wiec „Millennium PT" i
+                    // „Millenium PT" licza sie jako ten sam bank.
                     INS_GRUPY.forEach(function (gg){
-                        if (insNorm(gg.bank) !== insNorm(g.bank)) return;
+                        if (insNormA(gg.bank) !== insNormA(g.bank)) return;
                         gg.poz.forEach(function (pp){
                             if (!pp.konto && pp.konta && pp.konta.length){
                                 pp.konto = p.konto;
@@ -20761,13 +21030,16 @@
         });
         panel.addEventListener('click', function (e){
             var t = e.target;
-            if (!t || !t.classList || !t.classList.contains('ins-konto-zmien')) return;
+            if (!t || !t.classList) return;
+            var kontoZm = t.classList.contains('ins-konto-zmien');
+            var ktoZm = t.classList.contains('ins-kto-zmien');
+            if (!kontoZm && !ktoZm) return;
             e.preventDefault();
             var g = INS_GRUPY[parseInt(t.getAttribute('data-g'), 10)];
             var p = g && g.poz[parseInt(t.getAttribute('data-p'), 10)];
             if (!p) return;
-            p.konto = '';
-            p.kontoZrodlo = '';
+            if (kontoZm){ p.konto = ''; p.kontoZrodlo = ''; }
+            else { p.kto = ''; p.ktoZrodlo = ''; }
             insRysuj();
         });
     })();
