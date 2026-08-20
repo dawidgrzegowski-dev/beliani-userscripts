@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.86
+// @version      4.87
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12673,6 +12673,7 @@
           +     '<label style="font-size:11px;color:#666;display:inline-flex;align-items:center;gap:4px" title="Bierze tylko potwierdzenia dodane tego dnia. PUSTE POLE = bez filtra: wezmę wszystkie z sekcji „Payment conformation”, pomijając te bez daty.">potwierdzenia z dnia <input type="date" id="sp-paste-day" style="font-size:11px;padding:2px 4px;border:1px solid #FFCCB7;border-radius:4px"></label>'
           +     '<button id="sp-paste-dzis" class="chn-btn ghost" style="padding:2px 8px;font-size:11px" title="Wstaw dzisiejszą datę">dziś</button>'
           +     '<button id="sp-paste-bez" class="chn-btn ghost" style="padding:2px 8px;font-size:11px" title="Wyczyść datę — wtedy wezmę wszystkie potwierdzenia, niezależnie od dnia">bez daty</button>'
+          +     '<button id="sp-paste-clr" class="chn-btn ghost" style="padding:2px 8px;font-size:11px" title="Czyści wklejkę, wyniki i datę tej sekcji. Wgranych plików i reszty panelu nie rusza.">🧹 Wyczyść</button>'
           +     '<span id="sp-paste-status" style="font-size:12px;color:#666"></span>'
           +   '</div>'
           +   '<div id="sp-paste-box" style="display:none;margin-top:10px"></div>'
@@ -13232,6 +13233,18 @@
                 // Ciagniemy liste tylko dopoki numery nie sa DLUZSZE od pierwszego i maja
                 // najwyzej cztery cyfry: „penalty 1270, 15395" nie moze polknac zamowienia.
                 var ogon = s0.slice(m.index + m[0].length), maks = Math.min(4, m[2].length);
+                // ZAKRES: „other - 1115-1117" to trzy roszczenia, nie jedno. Warunki te same,
+                // co w bcExpandRange, ktory rozwija zakresy w tytule: koniec wiekszy od
+                // poczatku, ta sama liczba cyfr, rozpietosc najwyzej 60. Bez nich
+                // „other - 1115 - 300.00 USD" udawaloby zakres.
+                var zak = ogon.match(/^\s*[-–]\s*(\d+)(?![\d.,])/);
+                if (zak && zak[1].length === m[2].length){
+                    var od = parseInt(m[2], 10), doo = parseInt(zak[1], 10);
+                    if (doo > od && doo - od <= 60){
+                        for (var q = od + 1; q <= doo; q++) dodaj(String(q));
+                        ogon = ogon.slice(zak[0].length);
+                    }
+                }
                 var lst = /^\s*(?:,|\/|;|\band\b|\bi\b)\s*(?:no\.?\s*)?(\d+)/i, x;
                 while ((x = lst.exec(ogon)) !== null){
                     if (x[1].length > maks) break;
@@ -15609,9 +15622,14 @@
                     // inaczej kazde puste pole wychodzi jako „konto ≠ konto" i wiersz
                     // czerwienieje bez powodu. Mowimy raz, ze go nie sprawdzilismy.
                     if (!piAcc && pi.comAmount == null && !bank.swift){
-                        kon(o, 'dane zamówienia', 'nie odczytałem P/I ani komentarza', '—', 'uwaga');
-                        if (w.uwagi.indexOf('nie odczytałem danych zamówienia ' + o) < 0)
-                            w.uwagi.push('nie odczytałem danych zamówienia ' + o);
+                        // POWOD wprost z checkOnePI. Bez niego nie dalo sie odroznic pliku,
+                        // ktorego NIE MA („brak P/I"), od takiego, ktorego nie umiem
+                        // przeczytac („P/I – sprawdz recznie") albo od strony zamowienia,
+                        // ktora sie nie otworzyla — a to trzy zupelnie rozne sprawy.
+                        var czemu = String(pi.msg || '').trim() || 'nie wiem dlaczego';
+                        kon(o, 'dane zamówienia', 'nie odczytałem P/I ani komentarza', czemu, 'uwaga');
+                        var uw = 'nie odczytałem danych zamówienia ' + o + ' — ' + czemu;
+                        if (w.uwagi.indexOf(uw) < 0) w.uwagi.push(uw);
                         return;
                     }
                     var k1 = bcKontoEq(d.accSys, piAcc);
@@ -15634,6 +15652,15 @@
                     // zmienic, to jedyny blad z tej listy, ktory kosztuje pieniadze — wiec
                     // patrzymy na to nawet wtedy, gdy wszystkie numery sie zgadzaja.
                     var sl = d.slady || {};
+                    // Linia jest ZAWSZE, takze gdy nic nie znalazlem. Jej brak dalo sie
+                    // czytac dwojako — „nie ma zmiany" albo „kontrola nie dziala" — a to
+                    // jest kontrola, ktorej przeoczenie kosztuje pieniadze.
+                    if (!sl.acc && !sl.chg && !sl.hint){
+                        kon(o, 'zmiana numeru konta u dostawcy',
+                            sl.znane ? 'nie znalazłem śladu zmiany' : 'nie sprawdziłem — nie pobrałem strony dostawcy',
+                            sl.znane ? 'sprawdzone: log konta u dostawcy + komentarze (dostawcy i zamówienia)' : '—',
+                            sl.znane ? 'ok' : 'uwaga');
+                    }
                     if (sl.acc){
                         var doNowego = bcKontoEq(sl.acc.to, q.acct).ok;
                         var doStarego = bcKontoEq(sl.acc.from, q.acct).ok;
@@ -15751,6 +15778,39 @@
             });
             return h + '</div>';
         }
+        // Filtr wynikow. Stan wiersza zmienia sie w trakcie pracy — po recznym zlozeniu
+        // kwot albo po zaznaczeniu wiersza — wiec filtr trzeba przykladac ZA KAZDYM
+        // razem, a nie raz po wyrysowaniu. Inaczej wiersz, ktory wlasnie zrobil sie
+        // zielony, dalej wisi na liscie „z bledami".
+        function bcZastosujFiltr(box){
+            if (!box) return;
+            var f = box.getAttribute('data-filtr') || 'wszystkie';
+            box.querySelectorAll('.bc-wiersz').forEach(function (w){
+                var st = w.getAttribute('data-stan') || 'ok';
+                w.style.display = (f === 'wszystkie' || f === st) ? '' : 'none';
+            });
+            box.querySelectorAll('.bc-filtr').forEach(function (b){
+                var akt = (b.getAttribute('data-filtr') === f);
+                b.style.fontWeight = akt ? '700' : '400';
+                b.style.textDecoration = akt ? 'underline' : 'none';
+            });
+        }
+        // Kolor i znak wiersza. Zielono robi sie na dwa sposoby: po recznym zlozeniu kwot
+        // i po prostym zaznaczeniu wiersza przez czlowieka. Stan wyjsciowy wiersz trzyma
+        // przy sobie (data-kol / data-znak / data-stan0), zeby dalo sie do niego wrocic.
+        function bcMalujWiersz(wiersz, zielony){
+            if (!wiersz) return;
+            var kol0 = wiersz.getAttribute('data-kol') || '#c00';
+            var zn0 = wiersz.getAttribute('data-znak') || '✗';
+            wiersz.style.borderLeftColor = zielony ? '#0a7a2f' : kol0;
+            var zn = wiersz.querySelector('.bc-znak');
+            if (zn){
+                zn.textContent = zielony ? '✓' : zn0;
+                zn.style.color = zielony ? '#0a7a2f' : kol0;
+            }
+            wiersz.setAttribute('data-stan', zielony ? 'ok' : (wiersz.getAttribute('data-stan0') || 'ok'));
+            bcZastosujFiltr(wiersz.closest ? wiersz.closest('#sp-paste-box') : null);
+        }
         // Przeliczenie zaznaczonych. Wolane po kazdym kliknieciu i przy rozwinieciu.
         function bcPrzeliczKom(box){
             if (!box) return;
@@ -15774,30 +15834,39 @@
             // wiersz dalej mowil „zle", a to on jest tym, na co sie patrzy.
             var wiersz = el.closest ? el.closest('.bc-wiersz') : null;
             if (!wiersz) return;
-            var kol0 = wiersz.getAttribute('data-kol') || '#c00';
-            var zn0 = wiersz.getAttribute('data-znak') || '✗';
-            wiersz.style.borderLeftColor = zgadza ? '#0a7a2f' : kol0;
-            var zn = wiersz.querySelector('.bc-znak');
-            if (zn){
-                zn.textContent = zgadza ? '✓' : zn0;
-                zn.style.color = zgadza ? '#0a7a2f' : kol0;
-            }
             // Zaznaczone z gory sa WYLACZNIE wiersze bez zastrzezen, wiec zielony wiersz
             // bez zaznaczenia przeczylby tej regule. Guzik komentarza i tak trzeba
             // nacisnac osobno — samo zaznaczenie niczego nie wysyla.
             var chk = wiersz.querySelector('.bc-wk-chk');
             if (chk) chk.checked = zgadza;
+            bcMalujWiersz(wiersz, zgadza);
         }
         function bcWklejkaHtml(r){
             if (!r) return '';
             var h = '';
             var zle = (r.wiersze || []).filter(function (w){ return w.bledy.length; }).length;
+            var uwg = (r.wiersze || []).filter(function (w){ return !w.bledy.length && w.uwagi.length; }).length;
+            var czyste = (r.wiersze || []).length - zle - uwg;
             h += '<div style="font-size:12px;margin-bottom:8px">'
                + 'Potwierdzeń: <b>' + (r.wiersze || []).length + '</b>'
-               + ' · bez zastrzeżeń: <b style="color:#0a0">' + ((r.wiersze || []).length - zle) + '</b>'
+               + ' · bez zastrzeżeń: <b style="color:#0a0">' + czyste + '</b>'
+               + (uwg ? (' · z uwagami: <b style="color:#c47f00">' + uwg + '</b>') : '')
                + (zle ? (' · z błędami: <b style="color:#c00">' + zle + '</b>') : '')
                + ((r.bezPotw || []).length ? (' · bez potwierdzenia: <b style="color:#c47f00">'
                     + r.bezPotw.length + '</b> (' + r.bezPotw.join(', ') + ')') : '')
+               + '</div>';
+            // Przy kilkunastu potwierdzeniach „z bledami: 5" trzeba bylo szukac tych pieciu
+            // wzrokiem. Przelaczniki dzialaja na stanie WIERSZA, wiec nadazaja za recznym
+            // skladaniem kwot.
+            h += '<div style="font-size:11px;margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+               + '<span style="color:#666">pokaż:</span>'
+               + [['wszystkie', 'wszystkie'], ['zle', 'z błędami'], ['uwaga', 'z uwagami'], ['ok', 'bez zastrzeżeń']]
+                   .map(function (p){
+                       return '<button class="chn-btn ghost bc-filtr" data-filtr="' + p[0] + '"'
+                            + ' style="padding:1px 8px;font-size:11px'
+                            + (p[0] === 'wszystkie' ? ';font-weight:700;text-decoration:underline' : '') + '">'
+                            + p[1] + '</button>';
+                   }).join('')
                + '</div>';
             (r.wiersze || []).forEach(function (w){
                 var kol = w.bledy.length ? '#c00' : (w.uwagi.length ? '#c47f00' : '#0a0');
@@ -15807,7 +15876,9 @@
                 var dobry = !w.bledy.length;
                 // Klasa i zapamietany kolor/znak — po recznym zlozeniu kwot wiersz musi dac
                 // sie przemalowac na zielono i wrocic do stanu wyjsciowego po odznaczeniu.
-                h += '<div class="bc-wiersz" data-kol="' + kol + '" data-znak="' + znak + '"'
+                var stan = w.bledy.length ? 'zle' : (w.uwagi.length ? 'uwaga' : 'ok');
+                h += '<div class="bc-wiersz" data-stan="' + stan + '" data-stan0="' + stan
+                   + '" data-kol="' + kol + '" data-znak="' + znak + '"'
                    + ' style="border:1px solid #eee;border-left:3px solid ' + kol + ';border-radius:6px;padding:6px 8px;margin-bottom:6px">'
                    + '<div style="font-size:12px;display:flex;align-items:flex-start;gap:6px">'
                    + '<label style="cursor:pointer" title="Zaznacz, żeby dopisać komentarz do zamówień z tego przelewu">'
@@ -15872,13 +15943,13 @@
             // Tresc komentarza stoi w polu i mozna ja zmienic PRZED wyslaniem — to zapis
             // do prologistics, wiec nie chcemy, zeby cokolwiek szlo tam bez spojrzenia.
             //
-            // Domyslnie „Payment confirmation attached." — ta sama tresc, co przy wgrywaniu
-            // potwierdzenia w Wprowadzaniu. To NIE jest kosmetyka: ten napis jest GRANICA
-            // partii kwot (bcPartiaKwot). Wczesniejsze „ok" granica nie bylo, wiec nastepne
-            // sprawdzenie tego zamowienia siegalo wstecz za daleko i wciagalo kwoty juz
-            // oplacone.
+            // Domyslnie „ok". Przez chwile stalo tu „Payment confirmation attached.", bo
+            // granice partii wyznaczal wtedy ostatni komentarz z potwierdzeniem liczac
+            // wstecz od najnowszej kwoty. Odkad granice wyznacza DATA PRZELEWU
+            // (bcPartiaKwot), tresc tego pola nie ma z granica nic wspolnego: potwierdzenie,
+            // ktore ja wyznacza, wstawia Wprowadzanie przy wgrywaniu pliku potwierdzenia.
             h += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #eee;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
-               + '<input type="text" id="bc-wk-kom" value="Payment confirmation attached." title="Ten napis zamyka partię kwot: przy następnym sprawdzeniu tego zamówienia wszystko sprzed niego liczy się jako zapłacone." style="font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:4px;min-width:220px">'
+               + '<input type="text" id="bc-wk-kom" value="ok" title="Trafi do KAŻDEGO zamówienia z zaznaczonych przelewów. Treść możesz zmienić przed wysłaniem." style="font-size:12px;padding:3px 6px;border:1px solid #FFCCB7;border-radius:4px;min-width:220px">'
                + '<button id="bc-wk-add" class="chn-btn maroon" style="padding:3px 10px;font-size:12px" title="Dopisze ten komentarz do KAŻDEGO zamówienia z zaznaczonych przelewów">💬 Dodaj komentarz do zaznaczonych</button>'
                + '<span id="bc-wk-kom-st" style="font-size:11px;color:#666"></span>'
                + '</div>';
@@ -19508,6 +19579,17 @@
             }
             sp.querySelector('#sp-grab').onclick = function(){ doGrab(); };
             sp.querySelector('#sp-paste-run').onclick = function(){ doPaste(); };
+            // Zaczynanie od nowa bez odswiezania strony. Czyscimy WYLACZNIE te sekcje —
+            // wgrane pliki i wyniki sciezki excelowej zostaja tam, gdzie byly.
+            sp.querySelector('#sp-paste-clr').onclick = function(){
+                if (busy) return;
+                var el = sp.querySelector('#sp-paste'); if (el) el.innerHTML = '';
+                var bx = sp.querySelector('#sp-paste-box'); if (bx){ bx.innerHTML = ''; bx.style.display = 'none'; }
+                var dd = sp.querySelector('#sp-paste-day'); if (dd) dd.value = '';
+                var st2 = sp.querySelector('#sp-paste-status');
+                if (st2){ st2.textContent = 'Wyczyszczone. Wklej listę jeszcze raz.'; st2.style.color = '#666'; }
+                if (el && el.focus) el.focus();
+            };
             // Sluchacz stoi na PUDLE wynikow, nie na guzikach: tresc pudla wymienia sie
             // przy kazdym przebiegu, wiec handlery przypiete do guzikow ginely by razem
             // z nia. Samo pudlo zostaje.
@@ -19527,9 +19609,23 @@
                 });
                 kb.addEventListener('change', function (e){
                     var c = e.target;
-                    if (!c || !c.className || String(c.className).indexOf('bc-kom-chk') < 0) return;
-                    var box = c.closest ? c.closest('.bc-kom-box') : null;
-                    if (box) bcPrzeliczKom(box);
+                    if (!c || !c.className) return;
+                    var kl = String(c.className);
+                    if (kl.indexOf('bc-kom-chk') >= 0){
+                        var box = c.closest ? c.closest('.bc-kom-box') : null;
+                        if (box) bcPrzeliczKom(box);
+                        return;
+                    }
+                    // Reczne zaznaczenie wiersza tez ma go zazielenic: czlowiek sprawdzil
+                    // go okiem i uznal za dobry, wiec kolor ma za tym nadazyc.
+                    if (kl.indexOf('bc-wk-chk') >= 0)
+                        bcMalujWiersz(c.closest ? c.closest('.bc-wiersz') : null, c.checked);
+                });
+                kb.addEventListener('click', function (e){
+                    var b = e.target && e.target.closest ? e.target.closest('.bc-filtr') : null;
+                    if (!b) return;
+                    kb.setAttribute('data-filtr', b.getAttribute('data-filtr') || 'wszystkie');
+                    bcZastosujFiltr(kb);
                 });
             })();
             sp.querySelector('#sp-paste-dzis').onclick = function(){
