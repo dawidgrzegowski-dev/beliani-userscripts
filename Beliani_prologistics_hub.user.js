@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.91
+// @version      4.93
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13657,12 +13657,63 @@
         // ===== scalona tabela: laczenie depo+balance per dostawca (konto), sekcje LACZONE/DEPO/BALANCE =====
         function pcSumRows(rows){ var s2 = 0, any = false; (rows || []).forEach(function(r){ var a = pcDepAmt(r); if (a != null && isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
         function pcBalSum(rows){ var s2 = 0, any = false; (rows || []).forEach(function(r){ var a = pcBalAmtVal(r); if (a != null && isFinite(a)) { s2 += a; any = true; } }); return any ? s2 : null; }
+        // ===== reczne scalanie dostawcow =====
+        // Zapis: klucz grupy -> { root, sup, cid }. Wpis maja WSZYSTKIE czlony scalenia,
+        // takze ten wybrany na glowny — dzieki temu nie trzeba nigdzie sprawdzac, czy
+        // dana grupa jest korzeniem, czy galezia.
+        var PC_MERGE_KEY = 'pc_merge_sup';
+        function pcMergeLoad(){
+            try { var o = JSON.parse(GM_getValue(PC_MERGE_KEY, '{}')); return (o && typeof o === 'object') ? o : {}; }
+            catch (e){ return {}; }
+        }
+        function pcMergeSave(o){ try { GM_setValue(PC_MERGE_KEY, JSON.stringify(o || {})); } catch (e){} }
+        // Czy w zestawie sa naprawde ROZNE rachunki. Ten sam rachunek zapisany raz
+        // z kontem lokalnym z przodu, a raz bez, rozny nie jest — od tego jest accTenSam.
+        function pcKontaRozne(lista){
+            var l = (lista || []).filter(function (x){ return x; });
+            for (var i = 1; i < l.length; i++) if (!accTenSam(l[0], l[i])) return true;
+            return false;
+        }
         function pcMergedGroups(){
             var byKey = {}, keys = [];
-            function keyOf(cidMap, sup){ var cid = (cidMap || {})[sup]; var acc = cid ? _acc[cid] : null; return { k: acc ? ('acc:' + normAcc(acc)) : ('name:' + norm(sup)), cid: cid || null }; }
+            // Klucz grupy. Gdy w polu konta jest IBAN, to ON rozstrzyga — jest jednoznaczny,
+            // a stary numer lokalny bywa dopisany z przodu albo nie. Na tym wlasnie rozjezdzal
+            // sie jeden dostawca na dwie grupy: „IBAN – BR86…C1" dawalo 25 cyfr, a
+            // „0000236470 IBAN – BR86…C1" 35, wiec klucze nie mialy szans byc rowne.
+            function pcAccKey(acc){
+                var cz = accCzesci(acc);
+                var iban = String(acc == null ? '' : acc).toUpperCase().match(/\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/);
+                if (iban) return 'acc:' + normAcc(iban[0]);
+                return 'acc:' + (cz.length ? cz[0] : normAcc(acc));
+            }
+            function keyOf(cidMap, sup){ var cid = (cidMap || {})[sup]; var acc = cid ? _acc[cid] : null; return { k: acc ? pcAccKey(acc) : ('name:' + norm(sup)), cid: cid || null }; }
             function ensure(k, sup, cid){ if (!byKey[k]) { byKey[k] = { key: k, sup: sup, cid: cid || null, dep: [], bal: [] }; keys.push(k); } if (!byKey[k].cid && cid) byKey[k].cid = cid; return byKey[k]; }
             state.dep.order.forEach(function(sup){ var ko = keyOf(state.depCid, sup); var G = ensure(ko.k, sup, ko.cid); G.dep = G.dep.concat(state.dep.groups[sup] || []); });
             state.bal.order.forEach(function(sup){ var ko = keyOf(state.sup2cid, sup); var G = ensure(ko.k, sup, ko.cid); G.bal = G.bal.concat(state.bal.groups[sup] || []); });
+            // Scalenie reczne. Robimy je TU, przed podzialem na sekcje — wiec tytul, tytul
+            // zapisu, sumy i przydzial do sekcji licza sie dalej same. Polaczenie grupy
+            // DEPO z grupa BALANCE daje grupe LACZONA, bo o sekcji decyduje ponizej to,
+            // czy grupa ma oba rodzaje wierszy.
+            var MRG = pcMergeLoad();
+            var byRoot = {}, rootKeys = [];
+            keys.forEach(function(k){
+                var G = byKey[k], m = MRG[k], rk = (m && m.root) ? m.root : k;
+                if (!byRoot[rk]){
+                    byRoot[rk] = { key: rk, sup: (m && m.sup) ? m.sup : G.sup,
+                                   cid: (m && m.cid) ? m.cid : G.cid,
+                                   dep: [], bal: [], czlony: [], konta: [], reczne: !!m };
+                    rootKeys.push(rk);
+                }
+                var R = byRoot[rk];
+                R.dep = R.dep.concat(G.dep);
+                R.bal = R.bal.concat(G.bal);
+                if (R.czlony.indexOf(G.sup) === -1) R.czlony.push(G.sup);
+                var ak = G.cid ? (_acc[G.cid] || '') : '';
+                if (ak && R.konta.indexOf(ak) === -1) R.konta.push(ak);
+                if (!R.cid && G.cid) R.cid = G.cid;
+                if (m) R.reczne = true;
+            });
+            byKey = byRoot; keys = rootKeys;
             var combined = [], depoOnly = [], balOnly = [];
             keys.forEach(function(k){ var G = byKey[k]; if (G.dep.length && G.bal.length) combined.push(G); else if (G.dep.length) depoOnly.push(G); else balOnly.push(G); });
             function bySup(a, b){ return String(a.sup).toLowerCase().localeCompare(String(b.sup).toLowerCase()); }
@@ -13732,14 +13783,29 @@
         // SWIFT-ow: gdy w grupie sa dwa rozne kraje, cos jest nie tak z danymi
         // i zostajemy przy „Deposit" — slowo w tytule to nie miejsce na domysly.
         var PC_ADV_KRAJE = { IN: 1 };
-        function pcAdvance(G){
+        // Kraje odczytane z blokow bankowych grupy.
+        //
+        // UWAGA na nazwe pola: blok bankowy wiersza DEPOZYTU lezy pod r.pi.piBank, a nie
+        // pod r.pi.bank (r.pi.bank ma tylko wiersz BALANCE, jako r.bpi.bank) — tak samo
+        // czyta to painBankOfG. Czytanie r.pi.bank dawalo undefined przy kazdym dostawcy,
+        // wiec lista krajow zawsze byla pusta i „Advance payment" nie wyszlo ani razu.
+        //
+        // Kraj wyznacza piBankGeo — ta sama droga, co przy pain.001: najpierw ADRES
+        // beneficjenta, dopiero potem BIC. Bank beneficjenta bywa w innym kraju niz sam
+        // beneficjent, wiec BIC jest ostatecznoscia, a nie pierwszym zrodlem.
+        function pcKrajeG(G){
             var kraje = {};
             ((G && G.dep) || []).forEach(function(r){
-                var b = r.pi && r.pi.bank;
-                var k = (b && b.ok) ? pcSwiftKraj(b.swift) : '';
+                var b = (r.pi && (r.pi.piBank || r.pi.bank)) || null;
+                if (!b || !b.ok) return;
+                var g = piBankGeo(b);
+                var k = (g && g.ctry) ? g.ctry : pcSwiftKraj(b.swift);
                 if (k) kraje[k] = 1;
             });
-            var lista = Object.keys(kraje);
+            return Object.keys(kraje);
+        }
+        function pcAdvance(G){
+            var lista = pcKrajeG(G);
             return lista.length === 1 && !!PC_ADV_KRAJE[lista[0]];
         }
         function pcBuildTitle(orders, pcts, conts, pens, cfg){
@@ -17214,6 +17280,13 @@
             var h = '<tr class="pc-suphdr" data-sup="' + gi + '"><td colspan="8" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
                 + ''
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
+                // Scalenie reczne ma byc WIDOCZNE — inaczej za pol roku nie wiadomo,
+                // czemu dwie firmy stoja w jednym wierszu.
+                + ((G.reczne && (G.czlony || []).length > 1)
+                    ? ('<span title="Scalone ręcznie. Automat łączy po numerze konta — te rekordy wspólnego nie mają." style="margin-left:8px;background:#750000;color:#fff;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700">⛓ scalone: '
+                       + esc(G.czlony.join(' + ')) + '</span>'
+                       + ' <button class="pc-unmerge" data-root="' + esc(G.key) + '" style="padding:1px 7px;border:1px solid #750000;border-radius:4px;background:#fff;color:#750000;font-size:10px;cursor:pointer">Rozłącz</button>')
+                    : '')
                 // Puste miejsce na znacznik postepu komentarzy — wypelnia je pcRefreshDone
                 // po kazdym renderze i po kazdym dodanym komentarzu.
                 + '<span class="pc-done-badge" data-sup="' + gi + '" style="margin-left:8px;font-size:10px;font-weight:700"></span>'
@@ -17224,6 +17297,13 @@
                 + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b class="pc-balsum" data-sup="' + gi + '">' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
                 + (pcHasInfoG(G) ? '<span class="pc-infobadge" title="' + pcAttr(pcDecodeInfo(pcInfoG(G))) + '" style="margin-left:12px;background:#c00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:700;cursor:help">! Info box</span>' : '');
+            // Rozne konta nie blokuja scalenia — dostawca moze wlasnie zmienic bank —
+            // ale nie wolno im przejsc po cichu.
+            if (G.reczne && pcKontaRozne(G.konta || [])){
+                h += '<div style="margin-top:3px;background:#c00;color:#fff;border-radius:5px;padding:2px 8px;font-size:11px;font-weight:700">'
+                  +  '⚠ Scalone rekordy mają RÓŻNE konta: ' + esc((G.konta || []).join('   |   '))
+                  +  ' — przelew pójdzie na konto z „' + esc(G.sup) + '".</div>';
+            }
             var t = pcTitleFor(G); if (t){ var _ov = t.length > PC_TITLE_MAX; h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button> <span style="font-size:10px;color:' + (_ov ? '#c00;font-weight:700' : '#888') + '">(' + t.length + '/' + PC_TITLE_MAX + ')</span></div>';
                 // v3.70: druga linia — nazwa do zapisania pliku pobranego z banku.
                 // Limit 140 znakow dotyczy TYTULU PRZELEWU, nie nazwy pliku, wiec tu go nie ma;
@@ -17258,7 +17338,8 @@
                 html += '<tr><td colspan="8" style="background:#750000;color:#fff;font-weight:700;padding:5px 8px">' + esc(title) + ' <span style="font-weight:400;opacity:.7">(' + groups.length + ')</span></td></tr>';
                 html += colhead();
                 groups.forEach(function(G){
-                    state._groups.push({ gi: gi, dep: G.dep, bal: G.bal });
+                    state._groups.push({ gi: gi, dep: G.dep, bal: G.bal, key: G.key, sup: G.sup,
+                                         cid: G.cid || null, konto: G.cid ? (_acc[G.cid] || '') : '' });
                     var gcol = CM[G.key] || '';
                     html += pcGroupHeader(G, gi, gcol);
                     G.dep.forEach(function(r, ri){ var rid = 'g' + gi + 'd' + ri; state._rowMap[rid] = r; html += pcRowDepo(r, gi, rid, gcol); });
@@ -17271,11 +17352,73 @@
             section('BALANCE', MG.balOnly);
             if (gi){ var gDepo = 0, gBal = 0; state._groups.forEach(function(g){ var d = pcSumRows(g.dep); if (d != null) gDepo += d; var bb = pcBalSum(g.bal); if (bb != null) gBal += bb; }); html += '<tr><td colspan="8" style="background:#332524;color:#fff;font-weight:700;padding:5px 8px">RAZEM &nbsp; Depo: <b id="pc-grand-depo">' + gDepo.toFixed(2) + '</b> &nbsp;·&nbsp; Balance: <b id="pc-grand-bal">' + gBal.toFixed(2) + '</b> &nbsp;·&nbsp; Łącznie: <b id="pc-grand-total">' + (gDepo + gBal).toFixed(2) + '</b></td></tr>'; }
             if (!gi) html += '<tr><td style="padding:8px;color:#888">Brak danych — wklej BALANCE/DEPO i kliknij Przetwórz.</td></tr>';
-            el.innerHTML = html + '</table>';
+            el.innerHTML = pcMergePasek() + html + '</table>';
+            pcMergeUI(el);
             pcSyncScroll();
             // Render buduje tabele od zera, wiec wyszarzenie trzeba nalozyc ponownie —
             // stan siedzi w pcDone.cm, nie w DOM-ie.
             try { pcRefreshDone(); } catch (e){}
+        }
+        function pcMergePasek(){
+            return '<div style="margin-bottom:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                 + '<button id="pc-merge-btn" title="Zaznacz checkboxy przy nazwach dwóch (lub więcej) dostawców, potem kliknij tutaj." '
+                 + 'style="padding:3px 10px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;font-weight:700;font-size:11px;cursor:pointer">'
+                 + '⛓ Połącz zaznaczonych dostawców</button>'
+                 + '<span style="font-size:10px;color:#888">Dla rekordów, których nie da się skleić po numerze konta. '
+                 + 'Wybór zostaje zapamiętany — przy kolejnej wklejce łączą się same.</span></div>';
+        }
+        function pcMergeUI(el){
+            var b = el.querySelector('#pc-merge-btn');
+            if (b) b.onclick = function(){
+                var wyb = [];
+                el.querySelectorAll('.pc-sup-chk').forEach(function (c){
+                    if (!c.checked) return;
+                    var g = (state._groups || [])[+c.getAttribute('data-sup')];
+                    if (g && wyb.indexOf(g) === -1) wyb.push(g);
+                });
+                if (wyb.length < 2){
+                    alert('Zaznacz checkboxy przy nazwach co najmniej DWÓCH dostawców, potem kliknij „Połącz".');
+                    return;
+                }
+                var lista = wyb.map(function (g, i){
+                    return (i + 1) + '. ' + g.sup + (g.konto ? ('   [' + g.konto + ']') : '   [bez konta]');
+                }).join('\n');
+                var od = prompt('Scalam ' + wyb.length + ' dostawców w jednego.\n\n' + lista
+                    + '\n\nKtórej nazwy użyć? Wpisz numer 1-' + wyb.length + '.\n'
+                    + 'Konto pójdzie z TEGO SAMEGO rekordu.', '1');
+                if (od == null) return;
+                var idx = parseInt(od, 10);
+                if (!(idx >= 1 && idx <= wyb.length)){ alert('Nie ma takiego numeru na liście.'); return; }
+                var glowny = wyb[idx - 1];
+                if (pcKontaRozne(wyb.map(function (g){ return g.konto; }))
+                    && !confirm('UWAGA: zaznaczeni dostawcy mają RÓŻNE numery kont:\n\n'
+                        + wyb.map(function (g){ return '  ' + g.sup + ': ' + (g.konto || '(brak)'); }).join('\n')
+                        + '\n\nPo scaleniu obowiązuje konto z „' + glowny.sup + '".\n\nScalić mimo to?')) return;
+                var M = pcMergeLoad();
+                // Gdy wybrany glowny sam jest juz czescia scalenia, korzeniem zostaje JEGO
+                // korzen — inaczej powstalby lancuch wskazan, ktorego nikt nie rozwija.
+                var root = (M[glowny.key] && M[glowny.key].root) || glowny.key;
+                var wpis = { root: root, sup: glowny.sup, cid: glowny.cid || null };
+                wyb.forEach(function (g){
+                    // Wszystko, co wskazywalo na stary korzen tej grupy, idzie razem z nia.
+                    Object.keys(M).forEach(function (k){ if (M[k] && M[k].root === g.key) M[k] = { root: root, sup: wpis.sup, cid: wpis.cid }; });
+                    M[g.key] = { root: root, sup: wpis.sup, cid: wpis.cid };
+                });
+                Object.keys(M).forEach(function (k){ if (M[k] && M[k].root === root) M[k] = { root: root, sup: wpis.sup, cid: wpis.cid }; });
+                M[root] = wpis;
+                pcMergeSave(M);
+                renderMerged();
+            };
+            el.querySelectorAll('.pc-unmerge').forEach(function (u){
+                u.onclick = function(){
+                    var root = u.getAttribute('data-root');
+                    if (!confirm('Rozłączyć tę grupę?\n\nDostawcy wrócą na osobne wiersze, tak jak przyszli z wklejki.')) return;
+                    var M = pcMergeLoad();
+                    Object.keys(M).forEach(function (k){ if (M[k] && M[k].root === root) delete M[k]; });
+                    pcMergeSave(M);
+                    renderMerged();
+                };
+            });
         }
         // ===== v3.68: dostawca „już wprowadzony" =====
         // Komentarz mozna dodac WYLACZNIE do wiersza z numerycznym numerem zamowienia —
@@ -17370,6 +17513,32 @@
             return added;
         }
         function normAcc(s){ return String(s == null ? '' : s).replace(/\D+/g, ''); }
+        // Wszystkie numery konta ukryte w JEDNYM polu, w postaci „same cyfry".
+        //
+        // Pole potrafi niesc dwa numery naraz — „0000236470 IBAN – BR8600000000014390000236470C1"
+        // to konto lokalne i IBAN tego samego rachunku. normAcc sklejalo je w 35 cyfr, czyli
+        // w liczbe, ktora nie jest zadnym kontem i przepada na kazdej kontroli dlugosci.
+        // Zwracamy liste: najpierw IBAN-y (maja wlasny, rozpoznawalny ksztalt), potem to,
+        // co zostalo po ich wycieciu.
+        var ACC_IBAN_RE = /\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/g;
+        function accCzesci(v){
+            var s0 = String(v == null ? '' : v).toUpperCase();
+            var out = [], seen = {};
+            function add(d){ if (d && d.length >= 8 && d.length <= 30 && !seen[d]){ seen[d] = 1; out.push(d); } }
+            var reszta = s0, m;
+            ACC_IBAN_RE.lastIndex = 0;
+            while ((m = ACC_IBAN_RE.exec(s0)) !== null){ add(normAcc(m[0])); reszta = reszta.split(m[0]).join(' '); }
+            (reszta.match(/\d[\d\s.–—-]{6,32}\d/g) || []).forEach(function(x){ add(normAcc(x)); });
+            if (!out.length) add(normAcc(s0));
+            return out;
+        }
+        // Czy to ten sam rachunek. Wystarczy JEDEN wspolny numer: ten sam rachunek bywa
+        // zapisany raz z kontem lokalnym z przodu, raz bez niego.
+        function accTenSam(a, b){
+            var A = accCzesci(a), B = accCzesci(b);
+            for (var i = 0; i < A.length; i++) if (B.indexOf(A[i]) !== -1) return true;
+            return false;
+        }
         function pcTxt(s){ return String(s == null ? '' : s).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#0?39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim(); }
         function pcComments(html){
             var out = [], parts = String(html == null ? '' : html).split(/<tr[^>]*class="[^"]*comment-row[^"]*"/i);
@@ -17659,7 +17828,14 @@
         }
         function extractBankAccts(html){
             var out = [], re = /Bank account number\s*:?\s*([^<]*)/gi, m;
-            while ((m = re.exec(html)) !== null){ m[1].split(/[\/,;]| or /i).forEach(function(part){ var d = normAcc(part); if (d.length >= 8 && d.length <= 24 && out.indexOf(d) === -1) out.push(d); }); }
+            // Pole potrafi niesc konto lokalne I IBAN naraz. Zlepek ich cyfr nie miescil
+            // sie w granicy 24 i cale pole przepadalo — stad „brak konta w systemie"
+            // przy dostawcy, ktory konto ma i to potwierdzone.
+            while ((m = re.exec(html)) !== null){
+                m[1].split(/[\/,;]| or /i).forEach(function(part){
+                    accCzesci(part).forEach(function(d){ if (out.indexOf(d) === -1) out.push(d); });
+                });
+            }
             return out;
         }
         // Wycina fragment HTML od naglowka "P/I:" do linku "dodaj" nastepnej sekcji.
@@ -18090,7 +18266,7 @@
         // dalej w „aoa", czyli z pominieciem kolumn ukrytych. Gdy nie podano, obie role
         // pelni „aoa" — tak jak dzialalo do 4.42.
         function scanPIsheet(aoa, aoaEt){
-            var pct = null, amount = null, acc = '';
+            var pct = null, amount = null, acc = '', accZlepek = '';
             var depRow = -1, depLabel = '', totRowNum = -1;
             var et = aoaEt || aoa;
             for (var i = 0; i < et.length && depRow < 0; i++){ var row = et[i] || []; for (var j = 0; j < row.length; j++){ var ct = String(row[j] == null ? '' : row[j]).trim(); if (/^deposit\b/i.test(ct) && ct.length < 20){ depRow = i; depLabel = ct; break; } } }
@@ -18140,8 +18316,28 @@
                 for (var c1 = 0; c1 < lrow.length; c1++){ if (isCleanAcc(lrow[c1])){ var d1 = normAcc(lrow[c1]); if (d1.length > acc.length) acc = d1; } }
                 if (!acc){ for (var c2 = 0; c2 < lrow.length; c2++){ if (isAccLbl(lrow[c2])){ var d2 = normAcc(lrow[c2]); if (d2.length >= 8 && d2.length > acc.length) acc = d2; } } }
                 if (acc.length < 8){ for (var w = Math.max(0, accLblRow - 3); w <= accLblRow + 3 && w < aoa.length; w++){ var wr = aoa[w] || []; for (var wj = 0; wj < wr.length; wj++){ if (isCleanAcc(wr[wj])){ var d3 = normAcc(wr[wj]); if (d3.length > acc.length) acc = d3; } } } }
+                // Ostatnia proba: w komorce stoja DWA numery naraz („0000236470 IBAN – BR86…C1").
+                // isCleanAcc slusznie ja odrzuca — 35 cyfr to nie jest konto — ale numery
+                // W NIEJ SA, a etykieta mowi wprost, ze to pole konta. Bierzemy IBAN, bo jest
+                // jednoznaczny; kontrola i tak porownuje przez accTenSam, wiec konto lokalne
+                // z ERP dalej sie z nim spotka.
+                if (acc.length < 8){
+                    for (var z = 0; z < lrow.length; z++){
+                        var zc = String(lrow[z] == null ? '' : lrow[z]).trim();
+                        if (!zc || isAccLbl(zc)) continue;
+                        var zl = accCzesci(zc);
+                        if (zl.length > 1 || (zl.length === 1 && zl[0].length >= 8)){
+                            var zt = piAccZTekstu(zc), zd = zt ? normAcc(zt) : zl[0];
+                            if (zd && zd.length >= 8){ acc = zd; accZlepek = zc; break; }
+                        }
+                    }
+                }
             }
-            return { pct: pct, amount: amount, acc: acc, bank: scanPIbank(aoa, et) };
+            // accAll niesie WSZYSTKIE numery z pola konta — kontrola porownuje po nich,
+            // a nie po jednym napisie.
+            return { pct: pct, amount: amount, acc: acc,
+                     accAll: accZlepek ? accCzesci(accZlepek) : (acc ? [acc] : []),
+                     bank: scanPIbank(aoa, et) };
         }
         function piSheetOrderMatch(aoa, order){
             var ord = String(order == null ? '' : order).replace(/\D+/g, '');
@@ -19272,7 +19468,11 @@
             if (pi && pi.err) return R({ ok: false, msg: pi.err, title: title });
             if (!pi || !pi.acc) return R({ ok: false, msg: 'brak konta w P/I', title: title });
             if (!banks.length) return R({ ok: false, warn: true, msg: 'brak konta w systemie (P/I: ' + pi.acc + ')', title: title });
-            if (banks.indexOf(pi.acc) === -1) return R({ ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title });
+            // Ten sam rachunek bywa zapisany na dwa sposoby (z kontem lokalnym z przodu
+            // albo bez). Wystarczy wiec JEDEN wspolny numer, a nie zgodnosc napisow.
+            var piNums = (pi.accAll && pi.accAll.length) ? pi.accAll : [pi.acc];
+            var trafia = piNums.some(function (x){ return banks.indexOf(x) !== -1; });
+            if (!trafia) return R({ ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title });
             return R({ ok: true, warn: !!(pi && pi.hidden), msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : ''), title: title });
         }
         async function runBalCheck(status, doPI){
@@ -21570,7 +21770,9 @@
     }
     // Czego brakuje zleceniu OBI CH. Odpowiednik c24Brak: dopoki nie ma awiza, wiersz
     // stoi na „czeka na dane" i bez tego zdania nie wiadomo, na co czeka.
-    // Numer fulfilmentu wpisany recznie do zwrotu OBI CH. Trzymamy to na stale, bo
+    // Numer FAKTURY wpisany recznie do zwrotu OBI CH. Awizo podaje przy zwrocie tylko
+    // numer wlasnej korekty OBI („15000011106"), po ktorym prologistics nie znajdzie nic —
+    // szuka sie polem invoice_number (radio_49). Trzymamy to na stale, bo
     // szukanie w poczcie kosztuje, a ta sama korekta potrafi wrocic w kolejnym awizie.
     const OBI_REF_KEY = 'mkt_obich_ref';
     function obiRefLoad(){
@@ -21593,7 +21795,7 @@
             suma = r2(suma + kw);
             note[klucz] = 'zwrot OBI CH · korekta ' + z.nr + ' z ' + (z.data || '?')
                         + ' · brutto ' + f2(Math.abs(z.brutto))
-                        + (ff ? '' : ' · BRAK numeru fulfilmentu — wpisz go przy zleceniu');
+                        + (ff ? '' : ' · BRAK numeru faktury — wpisz go przy zleceniu');
         });
         if (j && j.data){ j.data.ref = ref; j.data.refNote = note; j.data.refund = suma; }
         return { ref: ref, note: note, suma: suma,
@@ -21607,7 +21809,8 @@
         if (!zw.length) return '';
         const mapa = obiRefLoad();
         return '<div style="margin-top:4px;padding:4px 6px;background:#fff7ed;border:1px solid #fed7aa;border-radius:5px">'
-             + '<div style="font-size:10px;color:#7c2d12">zwroty — wpisz numer fulfilmentu z poczty, po nim moduł znajdzie auftrag:</div>'
+             + '<div style="font-size:10px;color:#7c2d12">zwroty — wpisz numer faktury z poczty '
+             + '(w prologistics szuka się go polem „invoice number"):</div>'
              + zw.map(function (z){
                    const ff = String(mapa[z.nr] || '').trim();
                    return '<div style="margin-top:3px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
@@ -21615,13 +21818,13 @@
                         + '<span style="font-size:11px;color:#666">' + f2(Math.abs(z.netto)) + ' ' + esc(z.waluta)
                         + ' · korekta z ' + esc(z.data || '?') + '</span>'
                         + '<input class="mk-obiref" data-nr="' + esc(z.nr) + '" data-ref="' + esc(j.ref) + '" '
-                        + 'value="' + esc(ff) + '" placeholder="numer fulfilmentu" '
+                        + 'value="' + esc(ff) + '" placeholder="numer faktury" '
                         + 'style="width:150px;font-size:11px;padding:2px 4px;border:1px solid #fdba74;border-radius:4px">'
                         + '<button class="mk-obirefb" data-nr="' + esc(z.nr) + '" data-ref="' + esc(j.ref) + '" '
                         + 'style="padding:2px 8px;border:none;border-radius:4px;background:#ea580c;color:#fff;'
                         + 'font-size:11px;cursor:pointer">zapisz</button>'
-                        + (ff ? '<span style="font-size:11px;color:#0a7a2f">✓ pójdzie do ticketu jako ' + esc(ff) + '</span>'
-                              : '<span style="font-size:11px;color:#c47f00">bez tego numeru zwrot nie znajdzie auftragu</span>')
+                        + (ff ? '<span style="font-size:11px;color:#0a7a2f">✓ pójdzie dalej jako faktura ' + esc(ff) + '</span>'
+                              : '<span style="font-size:11px;color:#c47f00">bez numeru faktury zwrot nie znajdzie auftragu</span>')
                         + '</div>';
                }).join('')
              + '</div>';
@@ -22865,18 +23068,25 @@
     // zostaje jak w reszcie modulu, a naglowki tych dwoch kolumn zamieniamy miejscami,
     // zeby czlowiek ogladajacy plik widzial prawde, nie „Date created" nad numerem.
     const OBI_CH_KOL_NR = 0, OBI_CH_KOL_KWOTA = 6;
+    // Siedem kolumn — tyle, ile widzi mapowanie importu 204. Wiecej nie zaszkodzi,
+    // ale i po nic: poza 1 (Description / Invoice number) i 7 (Amount) wszystkie sa puste.
+    const OBI_CH_KOL_ILE = 7;
+    // Kwota goła, bez dopisywanych zer — dokladnie tak, jak w pliku, ktory przechodzi
+    // („273", „518.7", „291.15"). r2 najpierw scina blad zmiennoprzecinkowy, zeby
+    // 273.00000000000006 nie wyszlo na wierzch.
+    function obiChKwCsv(n){ return String(r2(n)); }
     function mkCsvObiCh(o){
-        const hdr = MK_HDR.slice();
-        hdr[OBI_CH_KOL_NR] = 'Invoice number';
-        hdr[OBI_CH_KOL_KWOTA] = 'Amount';
-        const lines = [hdr.join(';')];
+        const lines = [];
         ((o && o.doImportu) || []).forEach(function (p){
-            const c = new Array(hdr.length).fill('');
+            const c = new Array(OBI_CH_KOL_ILE).fill('');
             c[OBI_CH_KOL_NR] = p.nr;
-            c[OBI_CH_KOL_KWOTA] = f2(p.brutto);
+            c[OBI_CH_KOL_KWOTA] = obiChKwCsv(p.brutto);
             lines.push(c.join(';'));
         });
-        return '﻿' + lines.join('\n') + '\n';
+        // Bez BOM-u i bez naglowka. Mapowanie jest POZYCYJNE, wiec jedno i drugie
+        // trafiloby do danych: BOM w numer faktury pierwszego wiersza, naglowek jako
+        // osobna „wplata". Konce wierszy CRLF, jak we wzorcu.
+        return lines.join('\r\n') + (lines.length ? '\r\n' : '');
     }
 
     // OBI ma WLASNY uklad pliku — dokladnie taki, jaki eksportuje ich panel. Ustawienia
@@ -29108,7 +29318,7 @@
                     obiChZwrotyRef(jj); ile++;
                 });
                 jobsSave(jobs); render(); renderRef();
-                say(ff ? ('Zwrot ' + nr + ' pójdzie do ticketu jako ' + ff
+                say(ff ? ('Zwrot ' + nr + ' pójdzie dalej jako faktura ' + ff
                           + (ile > 1 ? (' (poprawione w ' + ile + ' zleceniach)') : '') + '.')
                        : ('Numer przy zwrocie ' + nr + ' wyczyszczony.'),
                     ff ? '#0a7a2f' : '#c47f00');
@@ -32421,8 +32631,8 @@
                             'przelew ' + f2(o.sumNetto) + ' (potrącenie centralnej regulacji ' + f2(o.sumPotr) + ')'];
             if (o.zwroty.length){
                 czesci.push('ZWROTY POZA IMPORTEM (' + o.zwroty.length + ') na ' + f2(zr.suma)
-                    + (zr.brak ? (' — ' + zr.brak + ' bez numeru fulfilmentu, wpisz go niżej')
-                               : ' — numery fulfilmentu już są, idą do ticketu'));
+                    + (zr.brak ? (' — ' + zr.brak + ' bez numeru faktury, wpisz go niżej')
+                               : ' — numery faktur już są, idą do ticketu'));
             }
             if (poKwocie) czesci.push('dopasowane po KWOCIE, nie po numerze przelewu — sprawdź, czy to ten');
             j.note = czesci.join(' · ');
@@ -34501,24 +34711,37 @@
     // wplata potrafi trafic na auftrag ze statusem DELETED, a zwrot spada dopiero
     // w NASTEPNYM cyklu rozliczeniowym — wtedy wplate trzeba zaksiegowac mimo delete,
     // bo inaczej zawisa bez pokrycia, a zwrot w kolejnym cyklu nie ma sie z czym znosic.
-    // Szukamy wiec sami, po numerze fulfilmentu (search.php?what=ff_number) — ta sama
-    // droga, ktorej uzywa modul „Ksiegowanie w auftragu".
-    const mkNfState = {};        // ff -> { kand: [...], stan, err, zaks }
+    // Szukamy wiec sami — ta sama droga, ktorej uzywa modul „Ksiegowanie w auftragu".
+    //
+    // ALE: nie kazda paczka niesie numer fulfilmentu. Przy OBI CH awizo podaje numery
+    // FAKTUR (w mapowaniu importu 204 kolumna 1 idzie na „Invoice number csv"), a
+    // search.php po ff_number takiego numeru nie zna — wiec KAZDA pozycja wracala jako
+    // „auftragu nie ma", nawet gdy auftrag istnieje. Numeru faktury szuka sie osobnym
+    // kryterium (what=invoice_number, w formularzu radio_49).
+    function nfPoCzym(job){ return (job && job.kind === 'obich') ? 'faktura' : 'fulfilment'; }
+    function nfPoCzymOpis(job){
+        return (nfPoCzym(job) === 'faktura') ? 'numerze faktury' : 'numerze fulfilmentu';
+    }
+    function nfSzukaj(job, nr){
+        return (nfPoCzym(job) === 'faktura') ? joyFind(nr) : crFind(nr);
+    }
+    const mkNfState = {};        // numer -> { kand: [...], stan, err, zaks }
     async function nfSprawdz(job, lista, btn){
         if (!lista.length) return;
         btn.disabled = true;
         mkLog('notfound', '▶ szukam auftragow dla ' + lista.length + ' poz. NOT FOUND');
         for (let i = 0; i < lista.length; i++){
             const ff = lista[i];
-            say('Szukam auftragu ' + (i + 1) + '/' + lista.length + ' — ' + ff + '…');
+            say('Szukam auftragu po ' + nfPoCzymOpis(job) + ' ' + (i + 1) + '/' + lista.length
+                + ' — ' + ff + '…');
             const st = mkNfState[ff] = { kand: [] };
             const t0 = Date.now();
-            const f = await crFind(ff);
+            const f = await nfSzukaj(job, ff);
             if (f.err){ st.err = f.err; mkLog('notfound', '✖ ' + ff + ': ' + f.err); continue; }
             const nums = f.nums || [];
             if (!nums.length){
                 st.stan = 'brak';
-                mkLog('notfound', '· ' + ff + ': nie ma auftragu o tym numerze fulfilmentu');
+                mkLog('notfound', '· ' + ff + ': nie ma auftragu o tym ' + nfPoCzymOpis(job));
                 continue;
             }
             // Czytamy KAZDEGO kandydata — przy kilku trzeba wiedziec, ktory jest skasowany,
@@ -34735,15 +34958,25 @@
             // byla to sama lista numerow i zeby sprawdzic, czy pozycja faktycznie sie znosi,
             // trzeba bylo porownywac ja recznie z wierszem „rozliczone i zwrócone".
             h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>'
-              +  ' <button id="mk-nf-check" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" title="Szuka auftragu po numerze fulfilmentu — tą samą drogą co moduł „Księgowanie w auftragu”. Import potrafi nie znaleźć auftragu, który JEST, tylko ma status DELETED.">🔍 Szukaj auftragów po fulfilmencie</button>'
+              +  ' <button id="mk-nf-check" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" title="Szuka auftragu po '
+              +  esc(nfPoCzymOpis(job))
+              +  ' — tą samą drogą co moduł „Księgowanie w auftragu”. Import potrafi nie znaleźć auftragu, który JEST, tylko ma status DELETED.">🔍 Szukaj auftragów po '
+              +  (nfPoCzym(job) === 'faktura' ? 'numerze faktury' : 'fulfilmencie') + '</button>'
               +  '<div style="font-size:10px;color:#888;margin-top:2px">Prologistics nie znalazł auftragu dla tych numerów. '
               +  'Część tłumaczy zwrot z tego samego cyklu — wtedy wpłata i zwrot znoszą się i nie ma czego księgować. '
               +  'Reszta bywa auftragiem ze statusem DELETED: wpłata przyszła, a zwrot spadnie dopiero w kolejnym cyklu — '
               +  'wtedy trzeba zaksięgować mimo delete.'
               +  (maZrod ? ' <b>Nr operacji w Allegro</b> to numer z pliku operacji — po nim szukasz zamówienia w panelu sprzedawcy, gdy auftragu nie ma.' : '')
+              // Przy OBI CH numer w paczce to numer faktury, a nie fulfilmentu. Mowimy to
+              // wprost, bo inaczej „nie znalazlem" czyta sie jako „auftragu nie ma".
+              +  (nfPoCzym(job) === 'faktura'
+                    ? ' <b>Uwaga:</b> w awizie OBI CH numery w kolumnie 1 to numery <b>faktur</b>, nie fulfilmentu — '
+                      + 'guzik wyżej szuka ich polem „invoice number", tak jak w wyszukiwarce prologistics.'
+                    : '')
               +  '</div>'
               +  '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
-              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Fulfilment</td>'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">'
+              +  (nfPoCzym(job) === 'faktura' ? 'Faktura' : 'Fulfilment') + '</td>'
               +  (maZrod ? '<td style="padding:1px 6px">Nr operacji w Allegro</td>' : '')
               +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
               +  '<td style="padding:1px 6px;text-align:right">Zwrot w tym cyklu</td>'
