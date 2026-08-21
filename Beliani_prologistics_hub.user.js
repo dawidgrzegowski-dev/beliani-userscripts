@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.89
+// @version      4.90
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20166,13 +20166,57 @@
         }
         function insSleep(ms){ return new Promise(function (r){ setTimeout(r, ms); }); }
 
+        // ---------- wspolny ksztalt pozycji i grupy ----------
+        function insPozycja(id, kwota, waluta){
+            return {
+                id: String(id), kwota: kwota, waluta: String(waluta || '').toUpperCase(),
+                konto: '', kontoZrodlo: '', konta: [], kand: [], kandLuz: '',
+                data: '', kto: '', ktoZrodlo: '', osoby: [],
+                status: '', stan: 'nowy', wybrany: true,
+                juzJest: null, open: null, uwagi: [], kwotaEdyt: false
+            };
+        }
+        function insPrzelicz(g){
+            g.suma = g.poz.reduce(function (a, p){ return a + (Number(p.kwota) || 0); }, 0);
+            g.spina = (g.kwota !== null && g.kwota !== undefined)
+                    && Math.abs(g.kwota - g.suma) < 0.005;
+            return g;
+        }
+        function insGrupa(o){
+            var g = {
+                nr: o.nr || 0, data: o.data || '', bank: o.bank || '', kontr: o.kontr || '',
+                zrodlo: o.zrodlo || '', poz: o.poz || [], bezKontroli: false,
+                kwota: (o.kwota === undefined || o.kwota === null) ? null : o.kwota
+            };
+            // Gdy zrodlo nie podaje wlasnej kwoty przelewu, przyjmujemy sume pozycji.
+            // Wtedy kontrola sumy z definicji sie zgadza i NICZEGO nie sprawdza — musi
+            // to byc widoczne, inaczej zielony wiersz obiecywalby cos, czego nie ma.
+            if (g.kwota === null){
+                g.kwota = g.poz.reduce(function (a, p){ return a + (Number(p.kwota) || 0); }, 0);
+                g.bezKontroli = true;
+            }
+            g.poz.forEach(function (p){ if (!p.data) p.data = g.data; });
+            return insPrzelicz(g);
+        }
+
         // ---------- wklejka ----------
         // Kolumny nazywamy po tym, CO w nich stoi, a nie po numerze: wyciagi roznia sie
         // liczba pustych kolumn miedzy kwota a linkami.
         function insParsujWklejke(raw){
-            var out = [];
+            var out = [], pary = [];
             String(raw || '').split(/\r?\n/).forEach(function (linia, nr){
-                if (!/insurance\.php\?id=/i.test(linia)) return;
+                if (!/insurance\.php\?id=/i.test(linia)){
+                    // Drugi format: „numer INS <tab albo spacje> kwota" — tak wyglada
+                    // rozpiska od spedytora przeklejona z arkusza. Warunki sa ciasne
+                    // (dokladnie dwie wartosci, numer 4-7 cyfr, brak adresu), zeby nie
+                    // zjadlo przypadkiem wiersza wyciagu.
+                    var mp = /^\s*(\d{4,7})[\s;|]+(-?[\d  .,]+)\s*(?:[A-Za-z]{3})?\s*$/.exec(linia);
+                    if (mp && !/https?:/i.test(linia)){
+                        var kwp = insKwota(mp[2]);
+                        if (kwp !== null) pary.push(insPozycja(mp[1], kwp, 'EUR'));
+                    }
+                    return;
+                }
                 var kom = linia.split('\t');
                 var iLink = -1, iData = -1, k;
                 for (k = 0; k < kom.length; k++){
@@ -20190,29 +20234,110 @@
                 while ((m = re.exec(blob)) !== null){
                     var kw = insKwota(m[2]);
                     if (kw === null) continue;
-                    poz.push({
-                        id: m[1], kwota: kw, waluta: (m[3] || '').toUpperCase(),
-                        konto: '', kontoZrodlo: '', konta: [], data: '',
-                        kto: '', ktoZrodlo: '', status: '', stan: 'nowy', wybrany: true,
-                        juzJest: null, uwagi: []
-                    });
+                    poz.push(insPozycja(m[1], kw, m[3] || ''));
                 }
                 if (!poz.length) return;
-                var suma = poz.reduce(function (a, p){ return a + p.kwota; }, 0);
-                var dYmd = iData >= 0 ? insDataYmd(kom[iData]) : '';
-                poz.forEach(function (p){ p.data = dYmd; });
-                out.push({
+                out.push(insGrupa({
                     nr: nr + 1,
-                    data: dYmd,
+                    zrodlo: 'wyciag',
+                    data: iData >= 0 ? insDataYmd(kom[iData]) : '',
                     bank: iData >= 0 && kom[iData + 1] ? String(kom[iData + 1]).trim() : '',
                     kontr: iData >= 0 && kom[iData + 2] ? String(kom[iData + 2]).trim() : '',
                     kwota: kwota,
-                    suma: suma,
-                    spina: kwota !== null && Math.abs(kwota - suma) < 0.005,
                     poz: poz
-                });
+                }));
             });
+            if (pary.length) out.push(insGrupa({ zrodlo: 'pary', kontr: 'wklejone pary INS + kwota', poz: pary }));
             return out;
+        }
+
+        // ---------- list przelewowy spedytora (PDF) ----------
+        // Ten sam sposob dochodzenia do pdf.js, ktorego uzywaja juz potwierdzenia bankowe:
+        // w piaskownicy biblioteka bywa widoczna jako goly pdfjsLib, przez window albo
+        // dopiero przez unsafeWindow, a pdf.js 3.x nie ruszy bez workerSrc.
+        function insPdfLib(){
+            var lib = null;
+            try { if (typeof pdfjsLib !== 'undefined') lib = pdfjsLib; } catch (e){}
+            if (!lib){ try { lib = window.pdfjsLib; } catch (e){} }
+            if (!lib){ try { lib = window['pdfjs-dist/build/pdf']; } catch (e){} }
+            if (!lib){ try { if (typeof unsafeWindow !== 'undefined') lib = unsafeWindow.pdfjsLib; } catch (e){} }
+            if (lib && lib.GlobalWorkerOptions){
+                try {
+                    if (!lib.GlobalWorkerOptions.workerSrc)
+                        lib.GlobalWorkerOptions.workerSrc =
+                            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                } catch (e){}
+            }
+            return lib;
+        }
+        // pdf.js oddaje osobne kawalki tekstu z ich polozeniem, a nie wiersze. Sklejamy
+        // je po wspolrzednej pionowej (z tolerancja, bo linia bazowa potrafi drgnac)
+        // i porzadkujemy w poziomie — inaczej numer sprawy i kwota z tego samego wiersza
+        // trafilyby do roznych linii.
+        async function insPdfLinie(buf){
+            var lib = insPdfLib();
+            if (!lib) throw new Error('brak pdf.js — odśwież stronę');
+            var doc = await lib.getDocument({ data: new Uint8Array(buf) }).promise;
+            var linie = [];
+            for (var nrs = 1; nrs <= doc.numPages; nrs++){
+                var tc = await (await doc.getPage(nrs)).getTextContent();
+                var rows = [];
+                (tc.items || []).forEach(function (it){
+                    var t = it && it.str;
+                    if (!t || !String(t).trim()) return;
+                    var tr = it.transform || [], x = +tr[4] || 0, y = +tr[5] || 0, r = null;
+                    for (var i = 0; i < rows.length; i++){
+                        if (Math.abs(rows[i].y - y) <= 3){ r = rows[i]; break; }
+                    }
+                    if (!r){ r = { y: y, it: [] }; rows.push(r); }
+                    r.it.push({ x: x, s: String(t) });
+                });
+                rows.sort(function (a, b){ return b.y - a.y; });
+                rows.forEach(function (r){
+                    r.it.sort(function (a, b){ return a.x - b.x; });
+                    linie.push(r.it.map(function (i){ return i.s; }).join(' ').replace(/\s+/g, ' ').trim());
+                });
+            }
+            return linie;
+        }
+        // W wierszu listu stoja DWIE kwoty: naleznA i faktycznie zaplacona (po skoncie).
+        // Ksiegujemy zaplacona, bo to ona sumuje sie do kwoty przelewu. Roznice miedzy
+        // nimi odkladamy przy wierszu — nie blokuje, ale ma byc widoczna.
+        // Spacja bywa separatorem tysiecy („1 234,56"), a to jest pulapka: w wierszu stoi
+        // przed kwota TERMIN, wiec „23/10/2025 200,00" czytalo sie jako „025 200,00",
+        // czyli 25 200,00 zamiast 200,00. Stad dwa zabezpieczenia naraz — najpierw
+        // wycinamy z wiersza daty, a potem i tak nie pozwalamy, zeby liczba zaczynala
+        // sie tuz za cyfra.
+        const INS_LICZBA_PDF = /(?<![\d.,])-?\d{1,3}(?:[   .]\d{3})*,\d{2}|(?<![\d.,])-?\d+,\d{2}/g;
+        const INS_DATA_PDF = /\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b/g;
+        function insZListu(linie){
+            var caly = (linie || []).join('  '), poz = [];
+            (linie || []).forEach(function (l){
+                var m = /\bINS[\s:.\-]*(\d{3,7})\b/i.exec(l);
+                if (!m) return;
+                var kwoty = (l.slice(m.index + m[0].length).replace(INS_DATA_PDF, ' ')
+                             .match(INS_LICZBA_PDF) || [])
+                            .map(insKwota).filter(function (x){ return x !== null; });
+                if (!kwoty.length) return;
+                var nalezne = kwoty[0], zaplacone = kwoty.length > 1 ? kwoty[1] : kwoty[0];
+                var p = insPozycja(m[1], zaplacone, 'EUR');
+                if (Math.abs(nalezne - zaplacone) >= 0.005){
+                    p.uwagi.push('na liście należne ' + insFmt(nalezne) + ', zapłacone ' + insFmt(zaplacone));
+                }
+                poz.push(p);
+            });
+            if (!poz.length) return null;
+            var md = /en date du\s*(\d{1,2}[./]\d{1,2}[./]\d{4})/i.exec(caly)
+                  || /\b(\d{1,2}[./]\d{1,2}[./]\d{4})\b/.exec(caly);
+            var mk = /montant de\s*((?:\d{1,3}(?:[   .]\d{3})*|\d+),\d{2})/i.exec(caly);
+            var pierwsza = (linie || []).filter(function (l){ return l && l.trim(); })[0] || '';
+            return insGrupa({
+                zrodlo: 'pdf',
+                data: md ? insDataYmd(md[1]) : '',
+                kontr: pierwsza.slice(0, 60),
+                kwota: mk ? insKwota(mk[1]) : null,
+                poz: poz
+            });
         }
 
         // ---------- strona sprawy ----------
@@ -20642,6 +20767,14 @@
           +   '<button id="ins-clear" style="width:120px;padding:9px;background:#750000;color:white;border:none;'
           +     'border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">🧹 Wyczyść</button>'
           + '</div>'
+          + '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +   '<label style="padding:7px 10px;background:#fff;color:#750000;border:1px solid #750000;border-radius:6px;'
+          +     'cursor:pointer;font-size:12px;font-weight:bold" '
+          +     'title="List przelewowy spedytora (lettre de virement) w PDF: bierzemy z niego datę, kwotę całego przelewu i pozycje INS z kwotami.">'
+          +     '📄 Wgraj list przelewowy (PDF)'
+          +     '<input type="file" id="ins-pdf" accept=".pdf" multiple style="display:none"></label>'
+          +   '<span id="ins-pdf-st" style="font-size:11px;color:#666"></span>'
+          + '</div>'
           + '<div style="margin-top:8px;padding:8px;background:#F6E7E6;border:1px solid #FFCCB7;border-radius:6px;'
           +   'display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           +   '<span style="font-size:12px;color:#750000;font-weight:bold">⚙️ Księgowanie równoległe:</span>'
@@ -20690,23 +20823,40 @@
                   + '<th style="padding:5px 6px;border:1px solid #e5e7eb;width:34px">✓</th>'
                   + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">INS</th>'
                   + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right">Kwota</th>'
+                  + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right" '
+                  +   'title="Ile na sprawie zostaje do zapłaty. Powinno się zgadzać z kwotą, którą księgujemy.">Open</th>'
                   + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Konto</th>'
                   + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Data</th>'
                   + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Komentarz na</th>'
                   + '<th style="padding:5px 6px;border:1px solid #e5e7eb;text-align:left">Status</th>'
                   + '</tr></thead><tbody>';
             INS_GRUPY.forEach(function (g, gi){
-                var tlo = g.spina ? '#eef7ee' : '#fdecec';
-                var opis = (g.data || '—') + ' · ' + insEsc(g.bank || '?') + ' · ' + insEsc(g.kontr || '');
-                var kontrola = g.spina
-                    ? ('✓ ' + insFmt(g.kwota) + ' = suma linków')
-                    : ('✗ przelew ' + (g.kwota === null ? '?' : insFmt(g.kwota)) + ', suma linków ' + insFmt(g.suma)
-                       + ' — różnica ' + insFmt((g.kwota || 0) - g.suma));
-                h += '<tr style="background:' + tlo + '"><td colspan="7" style="padding:6px;border:1px solid #e5e7eb">'
-                   + '<b>' + opis + '</b> &nbsp; <span style="color:' + (g.spina ? '#0a7a2f' : '#c00') + '">' + kontrola + '</span>'
+                var tlo = g.bezKontroli ? '#fff8e6' : (g.spina ? '#eef7ee' : '#fdecec');
+                var kolorK = g.bezKontroli ? '#c47f00' : (g.spina ? '#0a7a2f' : '#c00');
+                var kontrola = g.bezKontroli
+                    ? ('⚠ brak niezależnej kwoty przelewu — sumy ' + insFmt(g.suma) + ' nie ma z czym porównać')
+                    : (g.spina
+                       ? ('✓ ' + insFmt(g.kwota) + ' = suma pozycji')
+                       : ('✗ przelew ' + insFmt(g.kwota) + ', suma pozycji ' + insFmt(g.suma)
+                          + ' — różnica ' + insFmt(g.kwota - g.suma)));
+                h += '<tr style="background:' + tlo + '"><td colspan="8" style="padding:6px;border:1px solid #e5e7eb">'
+                   + '<b>' + insEsc(g.kontr || g.bank || 'przelew') + '</b>'
+                   + (g.bank ? (' · ' + insEsc(g.bank)) : '')
+                   + ' &nbsp; data: <input type="date" class="ins-gdata" data-g="' + gi + '" value="'
+                   +   insEsc(g.data || '') + '" style="font-size:11px" title="Ustawia datę we wszystkich wierszach tego przelewu">'
+                   + ' &nbsp; kwota przelewu: <input type="text" class="ins-gkwota" data-g="' + gi + '" value="'
+                   +   insFmt(g.kwota) + '" style="width:90px;text-align:right;font-size:11px">'
+                   + ' &nbsp; <span style="color:' + kolorK + '">' + kontrola + '</span>'
                    + '</td></tr>';
                 g.poz.forEach(function (p, pi){
                     var kolor = p.stan === 'ok' ? '#0a7a2f' : (p.stan === 'blad' ? '#c00' : (p.stan === 'uwaga' ? '#c47f00' : '#555'));
+                    // Open amount pokazujemy PRZED ksiegowaniem: rozjazd z kwota do
+                    // zaksiegowania jest pierwszym sygnalem, ze cos jest nie tak ze sprawa.
+                    var rozjazd = p.open !== null && Math.abs(p.open - p.kwota) >= 0.005;
+                    var openHtml = p.open === null
+                        ? '<span style="color:#888">—</span>'
+                        : (insFmt(p.open) + (rozjazd ? ' ⚠' : ''));
+                    var kolorOpen = rozjazd ? '#c47f00' : '#555';
                     var kontoHtml;
                     if (p.konta && p.konta.length && !p.konto){
                         var opcja = function (k){ return '<option value="' + k.nr + '">' + insEsc(k.opis) + '</option>'; };
@@ -20748,8 +20898,14 @@
                        +   (p.wybrany ? ' checked' : '') + (g.spina ? '' : ' disabled') + '></td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb"><a href="' + BASE + '/insurance.php?id=' + p.id
                        +   '" target="_blank">' + p.id + '</a></td>'
-                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right">' + insFmt(p.kwota)
-                       +   ' ' + insEsc(p.waluta) + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right">'
+                       +   '<input type="text" class="ins-kwota" data-g="' + gi + '" data-p="' + pi + '" value="'
+                       +   insFmt(p.kwota) + '" style="width:74px;text-align:right;font-size:11px">'
+                       +   ' ' + insEsc(p.waluta)
+                       +   (p.kwotaEdyt ? ' <span title="kwota zmieniona ręcznie" style="color:#c47f00">✎</span>' : '')
+                       + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right;color:' + kolorOpen + '">'
+                       +   openHtml + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + kontoHtml + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + dataHtml + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + ktoHtml + '</td>'
@@ -20783,12 +20939,18 @@
                 else { p.kto = ''; p.ktoZrodlo = ''; }
             }
             var pl = insPlatnosci(html);
+            p.open = pl.open;
             var juz = pl.wiersze.filter(function (w){
                 return Math.abs((w.kwota || 0) - p.kwota) < 0.005 && (!p.konto || String(w.konto) === String(p.konto));
             })[0];
             p.juzJest = juz || null;
             var wal = insWalutaStrony(html);
-            p.uwagi = [];
+            p.uwagi = (p.uwagi || []).filter(function (u){ return /na liście/.test(u); });
+            // Open amount to najtansza kontrola tego, czy ksiegujemy na wlasciwa sprawe:
+            // gdy do zaplaty zostaje co innego niz mamy zaksiegowac, cos sie nie zgadza.
+            if (p.open !== null && Math.abs(p.open - p.kwota) >= 0.005){
+                p.uwagi.push('open amount ' + insFmt(p.open) + ' ≠ kwota ' + insFmt(p.kwota));
+            }
             if (p.waluta && wal && p.waluta !== wal) p.uwagi.push('waluta z wyciągu ' + p.waluta + ', na sprawie ' + wal);
             if (juz){
                 p.stan = 'uwaga';
@@ -20807,21 +20969,30 @@
                     ? 'nie wiem, na kogo odbić komentarz — wybierz osobę'
                     : 'w tej sprawie nie ma nikogo, na kogo odbić komentarz';
             } else {
-                p.stan = 'gotowy';
+                p.stan = p.uwagi.length ? 'uwaga' : 'gotowy';
                 p.status = 'gotowe do księgowania' + (p.uwagi.length ? (' · ' + p.uwagi.join('; ')) : '');
             }
         }
 
         async function insSprawdz(){
             if (insBusy) return;
-            INS_GRUPY = insParsujWklejke(panel.querySelector('#ins-input').value);
-            if (!INS_GRUPY.length){ insMow('Nie znalazłem żadnego wiersza z linkiem do sprawy.', '#c00'); return; }
+            // Grupy z wgranych listow zostaja — one nie pochodza z pola tekstowego
+            // i ponowne „Sprawdź" nie ma prawa ich skasowac.
+            var zPliku = INS_GRUPY.filter(function (g){ return g.zrodlo === 'pdf'; });
+            INS_GRUPY = insParsujWklejke(panel.querySelector('#ins-input').value).concat(zPliku);
+            if (!INS_GRUPY.length){
+                insMow('Nie mam czego sprawdzić — wklej wiersze albo wgraj list przelewowy.', '#c00');
+                return;
+            }
             insBusy = true;
             insRysuj();
             var zad = [], mapa = [];
             INS_GRUPY.forEach(function (g){
                 g.poz.forEach(function (p){
                     mapa.push({ g: g, p: p });
+                    // Tylko to, czego jeszcze nie sprawdzalismy. Wiersz poprawiony reka
+                    // wraca do stanu „nowy", wiec i tak zostanie sprawdzony ponownie.
+                    if (p.stan !== 'nowy') return;
                     zad.push(async function (){
                         p.status = 'sprawdzam…';
                         try { await insSprawdzJedna(p, g); }
@@ -20830,6 +21001,7 @@
                     });
                 });
             });
+            if (!zad.length){ insBusy = false; insRysuj(); insMow('Wszystko już sprawdzone.', '#0a7a2f'); return; }
             var zrobione = 0;
             insMow('Sprawdzam 0/' + zad.length + '…');
             await insPula(zad, 5, function (){
@@ -20953,6 +21125,32 @@
         // ---------- zdarzenia ----------
         panel.querySelector('#ins-input').addEventListener('input', insPodgladTekst);
         panel.querySelector('#ins-check').onclick = function (){ insSprawdz(); };
+        panel.querySelector('#ins-pdf').onchange = async function (e){
+            var st = panel.querySelector('#ins-pdf-st');
+            var pliki = Array.prototype.slice.call((e.target && e.target.files) || []);
+            e.target.value = '';
+            if (!pliki.length || insBusy) return;
+            var dodane = 0, bledy = [];
+            for (var i = 0; i < pliki.length; i++){
+                st.textContent = 'Czytam ' + pliki[i].name + '…';
+                st.style.color = '#666';
+                try {
+                    var linie = await insPdfLinie(await pliki[i].arrayBuffer());
+                    var gr = insZListu(linie);
+                    if (!gr){ bledy.push(pliki[i].name + ': nie znalazłem pozycji INS'); continue; }
+                    gr.kontr = gr.kontr || pliki[i].name;
+                    INS_GRUPY.push(gr);
+                    dodane += gr.poz.length;
+                } catch (err){
+                    bledy.push(pliki[i].name + ': ' + String(err && err.message || err));
+                }
+            }
+            st.textContent = (dodane ? ('Wczytane pozycje: ' + dodane + '. ') : '')
+                           + (bledy.length ? bledy.join(' · ') : '');
+            st.style.color = bledy.length ? '#c00' : '#0a7a2f';
+            insRysuj();
+            if (dodane) insSprawdz();
+        };
         panel.querySelector('#ins-run').onclick = function (){ insKsieguj(); };
         panel.querySelector('#ins-clear').onclick = function (){
             if (insBusy) return;
@@ -20967,11 +21165,39 @@
         panel.addEventListener('change', function (e){
             var t = e.target;
             if (!t || !t.classList) return;
+            var gg = INS_GRUPY[parseInt(t.getAttribute('data-g'), 10)];
+            if (gg && t.classList.contains('ins-gkwota')){
+                var nk = insKwota(t.value);
+                if (nk !== null){ gg.kwota = nk; gg.bezKontroli = false; insPrzelicz(gg); }
+                insRysuj();
+                return;
+            }
+            if (gg && t.classList.contains('ins-gdata')){
+                gg.data = t.value;
+                gg.poz.forEach(function (pp){ pp.data = t.value; });
+                insRysuj();
+                return;
+            }
             var g = INS_GRUPY[parseInt(t.getAttribute('data-g'), 10)];
             var p = g && g.poz[parseInt(t.getAttribute('data-p'), 10)];
             if (!p) return;
             if (t.classList.contains('ins-chk')){ p.wybrany = t.checked; return; }
             if (t.classList.contains('ins-data')){ p.data = t.value; insRysuj(); return; }
+            if (t.classList.contains('ins-kwota')){
+                var nk = insKwota(t.value);
+                if (nk === null || nk === 0){ insRysuj(); return; }
+                p.kwota = nk;
+                p.kwotaEdyt = true;
+                // Po zmianie kwoty i open amount, i kontrola „juz zaksiegowane" znacza
+                // co innego — wiersz wraca do sprawdzenia.
+                p.stan = 'nowy';
+                p.status = '';
+                p.open = null;
+                p.juzJest = null;
+                insPrzelicz(g);
+                insRysuj();
+                return;
+            }
             if (t.classList.contains('ins-kto')){
                 p.kto = t.value;
                 p.ktoZrodlo = p.kto ? 'wybrane ręcznie' : '';
@@ -21001,9 +21227,11 @@
             if (t.classList.contains('ins-konto')){
                 p.konto = t.value;
                 p.kontoZrodlo = 'wybrane ręcznie';
-                if (p.konto && g.bank){
-                    INS_MAPA[insNormA(g.bank)] = p.konto;
-                    insMapaZapisz(INS_MAPA);
+                if (p.konto){
+                    // Zapamietujemy tylko wtedy, gdy jest CO zapamietac. Przy zrodle bez
+                    // nazwy banku (list spedytora, wklejone pary) kluczem bylby pusty
+                    // napis i taki wybor podstawialby sie potem pod kazdy inny wyciag.
+                    if (g.bank){ INS_MAPA[insNormA(g.bank)] = p.konto; insMapaZapisz(INS_MAPA); }
                     // Ten sam bank w pozostalych wierszach dostaje konto od razu —
                     // porownujemy po nazwie po slowniku, wiec „Millennium PT" i
                     // „Millenium PT" licza sie jako ten sam bank.
