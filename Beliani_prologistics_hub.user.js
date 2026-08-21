@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.93
+// @version      4.94
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -16006,6 +16006,24 @@
                + ((r.bezPotw || []).length ? (' · bez potwierdzenia: <b style="color:#c47f00">'
                     + r.bezPotw.length + '</b> (' + r.bezPotw.join(', ') + ')') : '')
                + '</div>';
+            // Zamowienia, ktorych NIE MIALEM z czym porownac. Dopisek w linii licznikow
+            // ginal miedzy nimi, a to jest wlasnie ta informacja, ktorej brak najbardziej
+            // boli: zielone haczyki nizej nie dotycza tych zamowien w ogole.
+            if (!(r.wiersze || []).length){
+                h += '<div style="margin-bottom:8px;padding:6px 9px;background:#fdecea;border:1px solid #c00;'
+                   + 'border-radius:6px;color:#c00;font-size:12px;font-weight:700">'
+                   + '✗ Nie znalazłem ani jednego potwierdzenia — <u>nic nie zostało sprawdzone</u>.'
+                   + '<div style="font-weight:400;margin-top:3px">Potwierdzenia pobieram z sekcji '
+                   + '„Payment conformation" na stronie zamówienia. Albo ich tam jeszcze nie ma, '
+                   + 'albo mają inną datę niż wpisana w polu obok guzika (puste pole = bez filtra daty).</div></div>';
+            } else if ((r.bezPotw || []).length){
+                h += '<div style="margin-bottom:8px;padding:6px 9px;background:#fdecea;border:1px solid #c00;'
+                   + 'border-radius:6px;color:#c00;font-size:12px">'
+                   + '<b>✗ Bez potwierdzenia: ' + r.bezPotw.length + '</b> — tych zamówień '
+                   + '<u>nie sprawdziłem</u>: <span style="font-family:ui-monospace,monospace">'
+                   + esc(r.bezPotw.join(', ')) + '</span>'
+                   + '<div style="margin-top:3px">Haczyki niżej ich nie dotyczą.</div></div>';
+            }
             // Przy kilkunastu potwierdzeniach „z bledami: 5" trzeba bylo szukac tych pieciu
             // wzrokiem. Przelaczniki dzialaja na stanie WIERSZA, wiec nadazaja za recznym
             // skladaniem kwot.
@@ -16062,15 +16080,28 @@
                            + (g ? bcOrdLink(g) : 'cały przelew') + '</div>'
                            + '<ul style="margin:2px 0 0;padding-left:18px;font-size:11px;line-height:1.5">';
                         wg[g].forEach(function (k){
-                            var kk = k.wynik === 'zle' ? '#c00' : (k.wynik === 'uwaga' ? '#c47f00' : '#0a0');
-                            var zn = k.wynik === 'zle' ? '✗' : (k.wynik === 'uwaga' ? '⚠' : '✓');
+                            // Zielone „ok" przy PUSTCE po obu stronach to nie zgodnosc,
+                            // tylko brak danych. Zadne dzisiejsze porownanie tego nie
+                            // produkuje, ale to jest wlasnie ten rodzaj falszywego haczyka,
+                            // ktory podwazylby cala liste — wiec stoi tu zapora.
+                            var pustaL = !String(k.lewo == null ? '' : k.lewo).replace(/^—$/, '').trim();
+                            var pustaP = !String(k.prawo == null ? '' : k.prawo).replace(/^—$/, '').trim();
+                            var wyn = (k.wynik === 'ok' && pustaL && pustaP) ? 'uwaga' : k.wynik;
+                            var kk = wyn === 'zle' ? '#c00' : (wyn === 'uwaga' ? '#c47f00' : '#0a0');
+                            var zn = wyn === 'zle' ? '✗' : (wyn === 'uwaga' ? '⚠' : '✓');
                             // Identyczne wartosci pokazujemy RAZ — powtarzanie tego samego
                             // ciagu po obu stronach tylko rozpycha wiersz i nic nie wnosi.
+                            // Dopisek mowi jednak wprost, ze to WYNIK zestawienia dwoch
+                            // zrodel, a nie jedna przepisana liczba: bez niego pojedyncza
+                            // wartosc czyta sie dwuznacznie.
                             var war = (String(k.lewo) === String(k.prawo))
-                                ? ('<span style="font-family:monospace">' + esc(k.lewo) + '</span>')
+                                ? ('<span style="font-family:monospace">' + esc(k.lewo) + '</span>'
+                                   + ' <span style="color:#999;font-size:10px">(po obu stronach to samo)</span>')
                                 : ('<span style="font-family:monospace">' + esc(k.lewo) + '</span>'
                                    + ' <span style="color:#999">↔</span> '
                                    + '<span style="font-family:monospace">' + esc(k.prawo) + '</span>');
+                            if (wyn !== k.wynik)
+                                war += ' <span style="color:#c47f00;font-size:10px">— nie było czego porównać</span>';
                             h += '<li style="color:' + kk + '"><span style="color:#666">' + esc(k.co) + ':</span> '
                                + '<span style="color:#333">' + war + '</span> '
                                + '<span style="color:' + kk + '">' + zn + '</span></li>';
@@ -17756,13 +17787,46 @@
                                 + pcCzemuRozne(d, adjs, pens),
                              title: 'Wklejona kwota: ' + w.toFixed(2) + '\nKomentarz: ' + pcCandDesc(c) + extra, paid: w, okAmts: okAmts };
                 });
-            // 5) nic nie pasuje
-            var left = [];
-            cs.forEach(function(c, k){ if (!used[k]) left.push(pcCandDesc(c)); });
+            // 5) nic nie pasuje — i tu trzeba powiedziec, CZEGO brakuje
+            var left = [], wolne = [];
+            cs.forEach(function(c, k){ if (!used[k]){ left.push(pcCandDesc(c)); wolne.push(c); } });
             for (var j = 0; j < list.length; j++){
                 if (res[j]) continue;
-                res[j] = { bad: true, msg: cs.length ? 'brak pasującego komentarza' : 'brak komentarza z kwotą',
-                    title: left.length ? ('Niewykorzystane komentarze z kwotą:\n' + left.join('\n')) : 'W komentarzach ordera nie ma kwoty do dopasowania.' };
+                var r5 = list[j], w5 = want(r5), rc5 = contOf(r5);
+                var tyt5 = left.length ? ('Niewykorzystane komentarze z kwotą:\n' + left.join('\n'))
+                                       : 'W komentarzach ordera nie ma kwoty do dopasowania.';
+                // ROSZCZENIE (penalty / overpayment / underpayment / discount / other).
+                // Takiej pozycji nikt nie komentuje kwota z kontenerem — nie ma czego
+                // szukac i nie ma o czym mowic na czerwono.
+                var pen5 = [];
+                try { pen5 = pcParsePenalties((r5 && r5.note) || '') || []; } catch (e){ pen5 = []; }
+                if (pen5.length){
+                    res[j] = { ok: true, roszcz: true,
+                               msg: 'roszczenie (' + pen5.join(', ') + ') — komentarz niepotrzebny',
+                               title: 'Pozycja roszczenia z opisu wiersza. Kwoty roszczeń nie ma w komentarzach '
+                                    + 'do kontenerów, więc nie ma czego dopasowywać.\n' + tyt5 };
+                    continue;
+                }
+                // Czego dokladnie zabraklo. Patrzymy na komentarze JESZCZE WOLNE — te
+                // zajete przez inne wiersze to osobny, zupelnie inny powod.
+                var maKw  = (w5 != null) && wolne.some(function(c){
+                    return ((c && c.amts) || []).some(function(a){ return Math.abs(a - w5) < 0.005; }); });
+                var maKon = !!rc5 && wolne.some(function(c){ return c.cont && c.cont === rc5; });
+                var konZajety = !!rc5 && !maKon && cs.some(function(c){ return c.cont && c.cont === rc5; });
+                var kwStr = (w5 != null) ? Number(w5).toFixed(2) : '?';
+                var msg5;
+                // Powod NAJBARDZIEJ szczegolowy idzie pierwszy. „Wszystkie komentarze
+                // poszly gdzie indziej" jest prawda takze wtedy, gdy komentarz z TYM
+                // kontenerem zjadl sasiedni wiersz — a wtedy to drugie zdanie mowi wiecej.
+                if (!cs.length)          msg5 = 'brak komentarza z kwotą';
+                else if (konZajety)      msg5 = 'komentarz z kontenerem ' + rc5 + ' jest już użyty przy innym wierszu';
+                else if (!wolne.length)  msg5 = 'wszystkie komentarze z kwotą poszły do innych wierszy';
+                else if (!rc5 && !maKw)  msg5 = 'brak kwoty ' + kwStr + ' w komentarzach (wiersz nie ma też numeru kontenera)';
+                else if (!rc5)           msg5 = 'wiersz nie ma numeru kontenera — nie mam po czym dopasować';
+                else if (!maKon && !maKw) msg5 = 'brak w komentarzach i kontenera ' + rc5 + ', i kwoty ' + kwStr;
+                else if (!maKon)         msg5 = 'brak kontenera ' + rc5 + ' w komentarzach (kwota ' + kwStr + ' jest)';
+                else                     msg5 = 'brak kwoty ' + kwStr + ' przy kontenerze ' + rc5;
+                res[j] = { bad: true, msg: msg5, title: tyt5 };
             }
             if (left.length) res.forEach(function(v){ if (v && !v.title) v.title = 'Niewykorzystane komentarze z kwotą:\n' + left.join('\n'); });
             return res;
@@ -19901,9 +19965,22 @@
                     var box = sp.querySelector('#sp-paste-box');
                     if (box){ box.style.display = ''; box.innerHTML = bcWklejkaHtml(r); }
                     var zle = (r.wiersze || []).filter(function (w){ return w.bledy.length; }).length;
-                    mow('Gotowe: ' + (r.wiersze || []).length + ' potwierdzeń, '
-                        + (zle ? (zle + ' z zastrzeżeniami') : 'bez zastrzeżeń') + '.',
-                        zle ? '#c00' : '#0a7a2f');
+                    var brakP = (r.bezPotw || []).length;
+                    // „Bez zastrzezen" wolno powiedziec TYLKO o tym, co naprawde sprawdzono.
+                    // Zero potwierdzen to zero porownan, a nie czysty wynik — na zielono
+                    // czytalo sie to jak zgode na przelew.
+                    if (!(r.wiersze || []).length){
+                        mow('Nie znalazłem ANI JEDNEGO potwierdzenia dla ' + ord.length + ' zamówień'
+                            + (day ? (' z dnia ' + day) : '') + ' — NIC nie zostało porównane. '
+                            + 'Potwierdzenia biorę z sekcji „Payment conformation" na zamówieniu: '
+                            + 'albo ich tam nie ma, albo mają inną datę niż wpisana obok.', '#c00');
+                    } else {
+                        mow('Gotowe: ' + (r.wiersze || []).length + ' potwierdzeń, '
+                            + (zle ? (zle + ' z zastrzeżeniami') : 'bez zastrzeżeń')
+                            + (brakP ? ('. UWAGA: ' + brakP + ' zamówień BEZ potwierdzenia ('
+                                        + r.bezPotw.join(', ') + ') — tych nie sprawdziłem.') : '.'),
+                            (zle || brakP) ? '#c00' : '#0a7a2f');
+                    }
                 } catch (e){
                     mow('Nie doszło do skutku: ' + String((e && e.message) || e), '#c00');
                 } finally { busy = false; }
@@ -20429,14 +20506,28 @@
                     var kk = insKwota(kom[k]);
                     if (kk !== null && String(kom[k]).trim() !== ''){ kwota = kk; break; }
                 }
-                var poz = [], re = /insurance\.php\?id=(\d+)[^0-9]{0,6}?([0-9][0-9  .,]*)\s*([A-Za-z]{3})?/gi, m;
+                // (?!\d) — numer INS nie oddaje ani jednej cyfry. Bez tego wzorzec przy
+                // braku kwoty za linkiem COFAL sie i robil z „id=75072" numer 7507 na 2.00.
+                // Kwota za linkiem jest nieobowiazkowa: w wyciagu bywa jeden link na wiersz,
+                // a kwota stoi we wlasnej kolumnie.
+                var poz = [], re = /insurance\.php\?id=(\d+)(?!\d)(?:[^0-9\n]{0,6}?([0-9][0-9  .,]*)\s*([A-Za-z]{3})?)?/gi, m;
                 var blob = kom.slice(iLink).join(' ');
                 while ((m = re.exec(blob)) !== null){
-                    var kw = insKwota(m[2]);
-                    if (kw === null) continue;
-                    poz.push(insPozycja(m[1], kw, m[3] || ''));
+                    var sur = String(m[2] || '').trim(), wal = m[3] || '';
+                    // Kwota MUSI wygladac na kwote: albo ma czesc groszowa, albo stoi przy
+                    // niej symbol waluty. Inaczej pierwsza lepsza cyfra z dalszej czesci
+                    // wiersza wyciagu (numer referencyjny, „FALSE 2", data) udawalaby kwote.
+                    var kw = (sur && (/[.,]\d{1,2}$/.test(sur) || wal)) ? insKwota(sur) : null;
+                    poz.push(insPozycja(m[1], kw, wal));
                 }
                 if (!poz.length) return;
+                // Jeden link w wierszu i brak kwoty za nim — cala wplata dotyczy tego
+                // jednego INS-a. To nie jest domysl: przy jednej pozycji zadna inna liczba
+                // nie moglaby zepiac sumy z kwota przelewu.
+                if (poz.length === 1 && poz[0].kwota === null && kwota !== null){
+                    poz[0].kwota = kwota;
+                    poz[0].zWiersza = true;
+                }
                 out.push(insGrupa({
                     nr: nr + 1,
                     zrodlo: 'wyciag',
@@ -20956,7 +21047,9 @@
           +   '<span style="font-weight:normal;font-size:11px;color:#750000">HUB v' + INS_VER + '</span></div>'
           + '<div style="font-size:11px;color:#666;margin-bottom:8px">'
           +   'Wklej wiersze z wyciągu: data, bank, kontrahent, tytuł, kwota, a dalej linki '
-          +   '<code>insurance.php?id=… - kwota EUR</code>. Każdy przelew musi się spinać '
+          +   '<code>insurance.php?id=… - kwota EUR</code>. Kwota za linkiem nie jest '
+          +   'obowiązkowa: gdy w wierszu jest jeden link, biorę kwotę przelewu z wyciągu. '
+          +   'Numer INS można poprawić w tabeli. Każdy przelew musi się spinać '
           +   'z sumą kwot z linków — inaczej nie da się go zaksięgować.</div>'
           + '<textarea id="ins-input" placeholder="Wklej wiersze z wyciągu…" style="width:100%;height:90px;padding:8px;'
           +   'border:1px solid #ccc;border-radius:6px;font-size:12px;resize:vertical;box-sizing:border-box;font-family:monospace"></textarea>'
@@ -21096,13 +21189,25 @@
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:center">'
                        +   '<input type="checkbox" class="ins-chk" data-g="' + gi + '" data-p="' + pi + '"'
                        +   (p.wybrany ? ' checked' : '') + (g.spina ? '' : ' disabled') + '></td>'
-                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb"><a href="' + BASE + '/insurance.php?id=' + p.id
-                       +   '" target="_blank">' + p.id + '</a></td>'
+                       // Numer da sie poprawic: wyciagi potrafia go zlepic z sasiednim
+                       // tekstem, a wtedy caly wiersz dotyczy nie tej sprawy.
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;white-space:nowrap">'
+                       +   '<input type="text" class="ins-id" data-g="' + gi + '" data-p="' + pi + '" value="'
+                       +   insEsc(p.id) + '" inputmode="numeric" title="Numer INS — popraw, jeśli został źle odczytany"'
+                       +   ' style="width:64px;font-size:11px">'
+                       +   ' <a href="' + BASE + '/insurance.php?id=' + encodeURIComponent(p.id)
+                       +   '" target="_blank" title="Otwórz INS ' + insEsc(p.id) + '">↗</a>'
+                       +   (p.idEdyt ? ' <span title="numer zmieniony ręcznie" style="color:#c47f00">✎</span>' : '')
+                       + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right">'
+                       // Brak kwoty to PUSTE pole, nie „0.00" — zero wygladalo na odczytana
+                       // liczbe i nie bylo widac, ze przy linku kwoty po prostu nie bylo.
                        +   '<input type="text" class="ins-kwota" data-g="' + gi + '" data-p="' + pi + '" value="'
-                       +   insFmt(p.kwota) + '" style="width:74px;text-align:right;font-size:11px">'
+                       +   (p.kwota === null ? '' : insFmt(p.kwota)) + '" style="width:74px;text-align:right;font-size:11px">'
                        +   ' ' + insEsc(p.waluta)
                        +   (p.kwotaEdyt ? ' <span title="kwota zmieniona ręcznie" style="color:#c47f00">✎</span>' : '')
+                       +   (p.zWiersza ? ' <span title="Przy linku nie było kwoty, a link jest w wierszu jeden — wzięta kwota przelewu z wyciągu." style="color:#888;font-size:10px">↤ z wiersza</span>' : '')
+                       +   (p.kwota === null ? ' <span style="color:#c00;font-size:10px">brak kwoty przy linku — wpisz ją</span>' : '')
                        + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right;color:' + kolorOpen + '">'
                        +   openHtml + '</td>'
@@ -21383,6 +21488,22 @@
             if (!p) return;
             if (t.classList.contains('ins-chk')){ p.wybrany = t.checked; return; }
             if (t.classList.contains('ins-data')){ p.data = t.value; insRysuj(); return; }
+            if (t.classList.contains('ins-id')){
+                var ni = String(t.value || '').replace(/\D+/g, '');
+                if (!ni || ni === p.id){ insRysuj(); return; }
+                p.id = ni;
+                p.idEdyt = true;
+                // Inny numer to INNA sprawa. Open amount, „już zaksięgowane" i osoba do
+                // odbicia komentarza odnosza sie do POPRZEDNIEGO INS-a i nie wolno ich
+                // przeniesc. Konto zostaje: wynika z nazwy banku w wyciagu, nie z INS-a.
+                p.stan = 'nowy';
+                p.status = '';
+                p.open = null;
+                p.juzJest = null;
+                p.kto = ''; p.ktoZrodlo = ''; p.osoby = [];
+                insRysuj();
+                return;
+            }
             if (t.classList.contains('ins-kwota')){
                 var nk = insKwota(t.value);
                 if (nk === null || nk === 0){ insRysuj(); return; }
@@ -21537,6 +21658,19 @@
     //   acct — numer konta z planu kont (informacyjnie, do kontroli wzrokowej)
     //   bank — bank_setting, czyli to, czego naprawde chce /api/importPayments/
     // Vente DE = konto 1114 = bank_setting 157; reszta dopisuje sie przy pierwszym imporcie.
+    // Poprawki juz zapisanych ustawien — wykonywane RAZ i odhaczane. Bez tego zmiana
+    // w MK_SET_SEED nie dociera do nikogo, kto cokolwiek wczesniej zapisal.
+    const MK_MIG_KEY = 'mkt_migracje';
+    function migDone(id){
+        try { return (JSON.parse(GM_getValue(MK_MIG_KEY, '{}')) || {})[id] === 1; }
+        catch (e){ return false; }
+    }
+    function migMark(id){
+        try {
+            const o = JSON.parse(GM_getValue(MK_MIG_KEY, '{}')) || {};
+            o[id] = 1; GM_setValue(MK_MIG_KEY, JSON.stringify(o));
+        } catch (e){}
+    }
     const MK_SET_KEY = 'mkt_settings';
     function setKey(mp, shop){ return String(mp || '?') + ' · ' + String(shop || '?'); }
     // Przypisania znane z gory. Dopisujemy je takze do JUZ ZAPISANYCH ustawien — inaczej
@@ -21551,7 +21685,10 @@
         'Mirakl (Vente) · Beliani CH': { bank: '165', booking: '9', acct: '1122' },
         // OBI CH placi przez centralna regulacje, nie przez panel — zrodlem jest awizo
         // PDF, a nie eksport transakcji. Import 204, konto 1369.
-        'OBI CH · OBI CH':             { bank: '204', booking: '9', acct: '1369' },
+        // booking 12 = „Invoice No". NIE 9 („Fulfillment No") jak przy pozostalych:
+        // awizo OBI CH niesie numery FAKTUR, wiec dopasowanie po fulfilmencie nie ma
+        // czego szukac — paczka wchodzila w calosci jako NOT FOUND.
+        'OBI CH · OBI CH':             { bank: '204', booking: '12', acct: '1369' },
         'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' },
         'Wayfair · Wayfair DE':        { bank: '10',  booking: '9', acct: '1223' },
         'Manor · Manor CH':            { bank: '149', booking: '9', acct: '1092' },
@@ -21591,6 +21728,15 @@
         if (!d || typeof d !== 'object') d = {};
         let add = 0;
         Object.keys(MK_SET_SEED).forEach(function (k){ if (!d[k]){ d[k] = MK_SET_SEED[k]; add++; } });
+        // Jednorazowe poprawki juz ZAPISANYCH ustawien. Seed ich nie tknie, bo dopisuje
+        // wylacznie brakujace klucze — a wartosc z bledem siedzi pod kluczem, ktory
+        // istnieje. Kazda poprawka odhacza sie po wykonaniu, zeby nie deptac pozniejszej
+        // decyzji czlowieka.
+        if (!migDone('obich-booking-12')){
+            const o12 = d['OBI CH · OBI CH'];
+            if (o12 && String(o12.booking) === '9'){ o12.booking = '12'; add++; }
+            migMark('obich-booking-12');
+        }
         if (add) setSave(d);
         return d;
     }
@@ -21960,6 +22106,47 @@
         const cfg = shCfg();
         if (!cfg.url) throw new Error('nie ustawiono adresu arkusza');
         return shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, rows: rows }));
+    }
+
+    // --- booking_setting ---
+    // Mowi prologistics, PO CZYM dopasowac wiersze paczki do auftragow. To nie jest
+    // ustawienie kosmetyczne: 9 to „Fulfillment No", a 12 to „Invoice No", i pomylka
+    // miedzy nimi konczy sie paczka, w ktorej NIC sie nie dopasowalo — dokladnie tak
+    // wyszlo przy OBI CH. Liste bierzemy z tego samego rodzaju endpointu, co bank
+    // settings; numer jest KLUCZEM, nazwa siedzi w srodku.
+    const MK_BK_KEY = 'mkt_booking_settings';
+    const MK_BK_URL = '/api/bookingSettings/index/';
+    function bkLoad(){ try { return JSON.parse(GM_getValue(MK_BK_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    function bkSave(o){ try { GM_setValue(MK_BK_KEY, JSON.stringify(o)); } catch (e){} }
+    function bkFromJson(j){
+        const src = j && j.bookings_list;
+        if (!src || typeof src !== 'object') return null;
+        const out = {};
+        Object.keys(src).forEach(function (id){
+            if (!/^\d{1,6}$/.test(String(id))) return;
+            const v = src[id] || {};
+            const nm = String(v.name == null ? '' : v.name).replace(/\s+/g, ' ').trim();
+            if (!nm) return;
+            out[id] = { nm: nm, off: String(v.inactive) === '1' };
+        });
+        return Object.keys(out).length ? out : null;
+    }
+    // Kotwica jak przy bank settings: znamy jedna pare na pewno — 9 to „Fulfillment No".
+    // Bez niej nie przyjmujemy listy, bo zly booking_setting to paczka bez dopasowan.
+    function bkOk(map){
+        const v = map && map['9'];
+        return !!(v && /fulfil?l?ment\s*no/i.test(v.nm || ''));
+    }
+    async function bkFetch(){
+        const txt = await proGet(MK_BK_URL, { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' });
+        let j = null;
+        try { j = JSON.parse(txt); }
+        catch (e){ throw new Error('z ' + MK_BK_URL + ' przyszedł nie-JSON — najpewniej strona logowania'); }
+        const m = bkFromJson(j);
+        if (!m) throw new Error('w odpowiedzi nie ma listy „bookings_list" — podeślij mi jej treść');
+        if (!bkOk(m)) return { map: null, partial: m };
+        bkSave(m);
+        return { map: m, src: MK_BK_URL };
     }
 
     // --- bank_setting ---
@@ -23081,6 +23268,14 @@
             const c = new Array(OBI_CH_KOL_ILE).fill('');
             c[OBI_CH_KOL_NR] = p.nr;
             c[OBI_CH_KOL_KWOTA] = obiChKwCsv(p.brutto);
+            // SREDNIK. Probowalem przecinka — po tej zmianie prologistics nie wczytal
+            // z pliku ANI JEDNEGO wiersza, wiec import oczekuje srednika.
+            //
+            // Skad wzial sie ten falszywy trop: uzytkownik zapisal plik przez Excela jako
+            // „CSV rozdzielany przecinkami" i wtedy zadzialal. Na polskim Windowsie ten
+            // zapis NIE daje przecinkow — Excel bierze separator pol z ustawien regionalnych
+            // („lista separatorow"), a tam stoi srednik. Tamten plik tez byl wiec
+            // srednikowy i roznil sie od naszego czyms INNYM.
             lines.push(c.join(';'));
         });
         // Bez BOM-u i bez naglowka. Mapowanie jest POZYCYJNE, wiec jedno i drugie
@@ -32757,6 +32952,8 @@
             if (!rows[key]) rows[key] = { bank: '', booking: '9', acct: (mkAcctGuess(j.brand, j.data.shop, acc) || {}).n || '' };
         });
         const keys = Object.keys(rows).sort();
+        const bk = bkLoad();
+        const bkKeys = Object.keys(bk).sort(function (a, b){ return (Number(a) || 0) - (Number(b) || 0); });
         const bs = bsLoad(), bsN = Object.keys(bs).length;
         const bsKeys = Object.keys(bs).sort(function (a, b){ return (Number(a) || 0) - (Number(b) || 0); });
         // Zamiast listy rozwijanej — pole z podpowiedziami. Dzieki temu mozna szukac
@@ -32786,6 +32983,23 @@
             const lbl = e ? (val + ' — ' + String(e.nm || '').slice(0, 70) + (e.off ? ' (nieaktywny)' : '')) : (val || '');
             return '<input class="mk-s-bank" list="mk-dl-bank" value="' + esc(lbl) + '" placeholder="numer lub nazwa…"'
                  + ' style="width:210px;font-size:11px' + (hl ? ';background:#fef9c3' : '') + '">';
+        }
+        // Numer sam z siebie nic nie mowi — „9" i „12" wygladaja tak samo, a roznica
+        // miedzy nimi to paczka dopasowana albo pusta.
+        function fieldBook(val){
+            const e = val && bk[val];
+            const lbl = e ? (val + ' — ' + String(e.nm || '').slice(0, 40) + (e.off ? ' (nieaktywny)' : '')) : (val || '');
+            return '<input class="mk-s-book" list="mk-dl-book" value="' + esc(lbl) + '" placeholder="numer lub nazwa…"'
+                 + ' style="width:180px;font-size:11px">';
+        }
+        function dlBook(){
+            let o = '';
+            bkKeys.forEach(function (k){
+                const e = bk[k] || {};
+                if (e.off) return;
+                o += '<option value="' + esc(k + ' — ' + String(e.nm || '').slice(0, 60)) + '"></option>';
+            });
+            return '<datalist id="mk-dl-book">' + o + '</datalist>';
         }
         function fieldAcct(val){
             const a = acc.filter(function (x){ return x.n === String(val || ''); })[0];
@@ -32820,7 +33034,8 @@
             // na koniec — gdy zabraknie miejsca, to ona ucieka za krawedz, a nie ona.
             h += '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px">'
               +  '<tr style="color:#999;font-size:10px"><td style="padding:2px 4px">Marketplace · sklep</td>'
-              +  '<td style="padding:2px 4px">bank_setting</td><td style="padding:2px 4px">booking</td>'
+              +  '<td style="padding:2px 4px">bank_setting (mapowanie kolumn)</td>'
+              +  '<td style="padding:2px 4px">booking (po czym dopasować)</td>'
               +  '<td style="padding:2px 4px">Konto (informacyjnie)</td><td></td></tr>';
             let sugN = 0;
             keys.forEach(function (k, i){
@@ -32836,20 +33051,49 @@
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
                   +  '<td style="padding:3px 4px">' + fieldBank(c.bank || sug, sug && !c.bank) + '</td>'
-                  +  '<td style="padding:3px 4px"><input class="mk-s-book" value="' + esc(c.booking || '9') + '" style="width:40px;font-size:11px"></td>'
+                  +  '<td style="padding:3px 4px">' + fieldBook(c.booking || '9') + '</td>'
                   +  '<td style="padding:3px 4px">' + fieldAcct(c.acct) + '</td>'
-                  +  '<td style="padding:3px 4px;white-space:nowrap;color:' + (c.bank ? '#0a7a2f' : (sug ? '#a16207' : '#c47f00')) + '">'
-                  +  (c.bank ? '✓'
-                      : (sug ? 'podpowiedź — sprawdź i zapisz'
-                      : (cand.length ? (cand.length + ' pasujące: ' + esc(cand.slice(0, 3).map(function (x){ return x.id + ' ' + x.nm; }).join(', ')) + ' — wybierz')
-                                     : 'brak bank_setting'))) + '</td></tr>';
+                  +  (function (){
+                        // Samo „✓" przy wpisanym numerze nie mowilo NIC — znaczylo tylko
+                        // tyle, ze pole nie jest puste. Numer moze wskazywac cudze
+                        // ustawienie albo nie istniec wcale, a wtedy paczka importu
+                        // wchodzi z zupelnie innym mapowaniem kolumn i nic sie nie
+                        // dopasowuje. Konfrontujemy wiec numer z lista z prologistics.
+                        var kol, txt;
+                        if (c.bank){
+                            var e = bs[c.bank];
+                            if (e){
+                                kol = e.off ? '#c47f00' : '#0a7a2f';
+                                txt = '✓ ' + esc(String(e.nm || '').slice(0, 46)) + (e.off ? ' — NIEAKTYWNY' : '');
+                            } else if (bsKeys.length){
+                                kol = '#c00';
+                                txt = '✗ nie ma ustawienia nr ' + esc(c.bank) + ' w prologistics';
+                            } else {
+                                kol = '#c47f00';
+                                txt = 'numer jest, nazwy nie sprawdziłem — kliknij „⇩ Uzupełnij z prologistics"';
+                            }
+                        } else if (sug){
+                            kol = '#a16207'; txt = 'podpowiedź — sprawdź i zapisz';
+                        } else if (cand.length){
+                            kol = '#c47f00';
+                            txt = cand.length + ' pasujące: '
+                                + esc(cand.slice(0, 3).map(function (x){ return x.id + ' ' + x.nm; }).join(', '))
+                                + ' — wybierz';
+                        } else {
+                            kol = '#c47f00'; txt = 'brak bank_setting';
+                        }
+                        return '<td style="padding:3px 4px;white-space:nowrap;color:' + kol + '">' + txt + '</td>';
+                     })()
+                  +  '</tr>';
                 void i;
             });
-            h += '</table></div>' + dlBank() + dlAcct()
+            h += '</table></div>' + dlBank() + dlBook() + dlAcct()
               +  '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               +  '<button id="mk-set-save" type="button" style="padding:5px 14px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">Zapisz</button>'
               +  '<span id="mk-set-msg" style="font-size:11px;color:#0a7a2f"></span>'
-              +  '<span style="font-size:10px;color:#888">bank_setting to identyfikator konta w imporcie — nie numer konta. Vente DE = 157.</span></div>';
+              +  '<span style="font-size:10px;color:#888">bank_setting to identyfikator ustawienia importu — nie numer konta (Vente DE = 157). '
+              +  'booking mówi, PO CZYM prologistics dopasowuje wiersze: 9 = Fulfillment No, 12 = Invoice No. '
+              +  'Zły booking to paczka, w której nic się nie dopasowało.</span></div>';
             box.innerHTML = h;
             if (bsN){
                 const m0 = box.querySelector('#mk-set-msg');
@@ -32868,7 +33112,8 @@
                     out[tr.getAttribute('data-k')] = {
                         acct: numOf(tr.querySelector('.mk-s-acct').value),
                         bank: numOf(tr.querySelector('.mk-s-bank').value),
-                        booking: tr.querySelector('.mk-s-book').value.trim() || '9'
+                        // W polu siedzi pelny opis („12 — Invoice No"); zapisujemy sam numer.
+                        booking: numOf(tr.querySelector('.mk-s-book').value) || '9'
                     };
                 });
                 setSave(out);
@@ -32954,6 +33199,13 @@
                             + ' pozycji, ale 157 nie wyszło jako „Vente Unique DE" — nie przyjmuję listy, '
                             + 'żeby nie podpowiedzieć złego konta');
             } catch (e){ zle.push('bank settings: ' + ((e && e.message) || e)); }
+            try {
+                const rb = await bkFetch();
+                if (rb.map) dobre.push(Object.keys(rb.map).length + ' booking settings');
+                else zle.push('booking settings: dostałem ' + Object.keys(rb.partial || {}).length
+                            + ' pozycji, ale 9 nie wyszło jako „Fulfillment No" — nie przyjmuję listy, '
+                            + 'żeby nie podpowiedzieć złego sposobu dopasowania');
+            } catch (e){ zle.push('booking settings: ' + ((e && e.message) || e)); }
 
             if (dobre.length) renderSet();
             if (recznie || zle.length){
