@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.90
+// @version      4.91
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -20080,7 +20080,7 @@
     //
     // Wszystkie endpointy i formaty ustalone na zywych danych (wyciag UBS 20.07-03.08.2026,
     // cykl VEN290820 = 694.52 EUR, 111 plikow archiwalnych z szesciu sklepow Vente).
-    // ===== Ksiegowanie INS (v4.89) =====
+    // ===== Ksiegowanie INS =====
     // Wklejka z wyciagu bankowego: jeden przelew = jeden wiersz, a za nim lista linkow do
     // spraw ubezpieczeniowych z kwotami. Modul robi trzy rzeczy i kazda z nich SPRAWDZA:
     //   1. czy kwota przelewu rowna sie sumie kwot z linkow (nie spina sie -> caly przelew
@@ -21345,6 +21345,13 @@
     // wylacznie brakujace klucze.
     const MK_SET_SEED = {
         'Mirakl (Vente) · Beliani DE': { bank: '157', booking: '9', acct: '1114' },
+        // Vente CH: konto 1122 „Vente Unique Beliani Swizterland GmbH", import 165.
+        // Nazwa sklepu przyjeta przez analogie do „Beliani DE" — gdyby Mirakl nazywal
+        // go inaczej, wpis nie zadziala i trzeba go poprawic w ⚙ Konta.
+        'Mirakl (Vente) · Beliani CH': { bank: '165', booking: '9', acct: '1122' },
+        // OBI CH placi przez centralna regulacje, nie przez panel — zrodlem jest awizo
+        // PDF, a nie eksport transakcji. Import 204, konto 1369.
+        'OBI CH · OBI CH':             { bank: '204', booking: '9', acct: '1369' },
         'Galaxus · Galaxus CH':        { bank: '199', booking: '9', acct: '1034' },
         'Wayfair · Wayfair DE':        { bank: '10',  booking: '9', acct: '1223' },
         'Manor · Manor CH':            { bank: '149', booking: '9', acct: '1092' },
@@ -21560,6 +21567,72 @@
         return 'brakuje ' + b.join(' i ') + ' — kliknij „⬇ Pobierz zestawienia", żeby ściągnąć je '
              + 'z panelu, albo wgraj ręcznie guzikiem „📎 Dodaj pliki". PDF jest obowiązkowy, '
              + 'bo tylko on podaje kwotę wypłaty.';
+    }
+    // Czego brakuje zleceniu OBI CH. Odpowiednik c24Brak: dopoki nie ma awiza, wiersz
+    // stoi na „czeka na dane" i bez tego zdania nie wiadomo, na co czeka.
+    // Numer fulfilmentu wpisany recznie do zwrotu OBI CH. Trzymamy to na stale, bo
+    // szukanie w poczcie kosztuje, a ta sama korekta potrafi wrocic w kolejnym awizie.
+    const OBI_REF_KEY = 'mkt_obich_ref';
+    function obiRefLoad(){
+        try { return JSON.parse(GM_getValue(OBI_REF_KEY, '{}')) || {}; } catch (e){ return {}; }
+    }
+    function obiRefSave(o){ try { GM_setValue(OBI_REF_KEY, JSON.stringify(o)); } catch (e){} }
+    // Zwroty pod klucz, po ktorym prologistics naprawde cos znajdzie. Dopoki numeru
+    // fulfilmentu nie ma, kluczem zostaje numer korekty — pozycja jest wtedy widoczna
+    // na liscie, ale wprost oznaczona jako niekompletna.
+    function obiChZwrotyRef(j){
+        const zw = (j && j.data && j.data.obich && j.data.obich.zwroty) || [];
+        const mapa = obiRefLoad();
+        const ref = Object.create(null), note = Object.create(null);
+        let suma = 0;
+        zw.forEach(function (z){
+            const ff = String(mapa[z.nr] || '').trim();
+            const klucz = ff || z.nr;
+            const kw = Math.abs(z.netto);
+            ref[klucz] = r2((ref[klucz] || 0) + kw);
+            suma = r2(suma + kw);
+            note[klucz] = 'zwrot OBI CH · korekta ' + z.nr + ' z ' + (z.data || '?')
+                        + ' · brutto ' + f2(Math.abs(z.brutto))
+                        + (ff ? '' : ' · BRAK numeru fulfilmentu — wpisz go przy zleceniu');
+        });
+        if (j && j.data){ j.data.ref = ref; j.data.refNote = note; j.data.refund = suma; }
+        return { ref: ref, note: note, suma: suma,
+                 brak: zw.filter(function (z){ return !String(mapa[z.nr] || '').trim(); }).length };
+    }
+    // Pole do wpisania numeru. Stoi PRZY zleceniu, bo tam widac kwote i date korekty —
+    // czyli to, czego szuka sie w poczcie.
+    function obiChRefBox(j){
+        if (!onProlo || !j || j.kind !== 'obich') return '';
+        const zw = (j.data && j.data.obich && j.data.obich.zwroty) || [];
+        if (!zw.length) return '';
+        const mapa = obiRefLoad();
+        return '<div style="margin-top:4px;padding:4px 6px;background:#fff7ed;border:1px solid #fed7aa;border-radius:5px">'
+             + '<div style="font-size:10px;color:#7c2d12">zwroty — wpisz numer fulfilmentu z poczty, po nim moduł znajdzie auftrag:</div>'
+             + zw.map(function (z){
+                   const ff = String(mapa[z.nr] || '').trim();
+                   return '<div style="margin-top:3px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+                        + '<span style="font-family:monospace;font-size:11px">' + esc(z.nr) + '</span>'
+                        + '<span style="font-size:11px;color:#666">' + f2(Math.abs(z.netto)) + ' ' + esc(z.waluta)
+                        + ' · korekta z ' + esc(z.data || '?') + '</span>'
+                        + '<input class="mk-obiref" data-nr="' + esc(z.nr) + '" data-ref="' + esc(j.ref) + '" '
+                        + 'value="' + esc(ff) + '" placeholder="numer fulfilmentu" '
+                        + 'style="width:150px;font-size:11px;padding:2px 4px;border:1px solid #fdba74;border-radius:4px">'
+                        + '<button class="mk-obirefb" data-nr="' + esc(z.nr) + '" data-ref="' + esc(j.ref) + '" '
+                        + 'style="padding:2px 8px;border:none;border-radius:4px;background:#ea580c;color:#fff;'
+                        + 'font-size:11px;cursor:pointer">zapisz</button>'
+                        + (ff ? '<span style="font-size:11px;color:#0a7a2f">✓ pójdzie do ticketu jako ' + esc(ff) + '</span>'
+                              : '<span style="font-size:11px;color:#c47f00">bez tego numeru zwrot nie znajdzie auftragu</span>')
+                        + '</div>';
+               }).join('')
+             + '</div>';
+    }
+    function obiChBrak(j){
+        if (!j || j.kind !== 'obich' || j.data || j.status === 'done') return '';
+        return 'brakuje awiza OBI CH — wgraj PDF guzikiem „📎 Dodaj pliki" '
+             + '(plik nazywa się zwykle „OBI_AVIS <data>.PDF"). Tego zestawienia NIE da się '
+             + 'pobrać z panelu: OBI przysyła je mailem z zentralregulierung_ch@obi.de. '
+             + 'Doczepię je do tej wpłaty po numerze przelewu'
+             + (j.ref ? (' ' + j.ref) : '') + ', a nie po kwocie.';
     }
     // Data ksiegowania. Ze zlecenia z WYCIAGU pochodzi z banku i jest data wejscia na
     // konto — tej nie ruszamy. Ze zlecenia zalozonego z raportu portalu pochodzi z pola
@@ -21984,6 +22057,18 @@
         // slowa „KUNDENREFERENZ" i granica slowa miedzy „Z" a „P" nie istnieje.
         { mp: 'OBI',            ok: true,  payer: /OBI\s*Home/i, ref: /(PODE-\d{8}-\d+)/i,
           brand: 'OBI', short: 'OBI', host: 'belianide860.myvtex.com', kind: 'vtex', shop: 'OBI DE' },
+        // OBI CH to inna droga niz OBI DE: nie panel VTEX, tylko centralna regulacja.
+        // Platnik w wyciagu to „OBI BAU- UND HEIMWERKERMAERKTE SYSTEMZENTRALE (SCHWEIZ)",
+        // a kluczem jest numer z tytulu: „ZAHLUNGSBELEG 00 47162753". Ten sam numer stoi
+        // w awizie PDF, wiec po nim parujemy przelew z plikiem.
+        // Wzorzec platnika celuje w „OBI BAU", bo „OBI Home" nalezy juz do OBI DE i oba
+        // musza sie rozejsc bez pomylki. Dwucyfrowy przedrostek („00") bywa doklejony
+        // do numeru albo oddzielony spacja — dlatego jest w czesci nieprzechwytywanej.
+        { mp: 'OBI CH',         ok: true,  payer: /OBI\s*BAU|SYSTEMZENTRALE\s*\(SCHWEIZ\)/i,
+          ref: /ZAHLUNGSBELEG\s*(?:\d{2}\s+)?(\d{6,})/i,
+        // Marka to samo „OBI" — kod kraju dokleja mkShort z nazwy sklepu. Przy marce
+        // „OBI CH" kolumna pokazywala „OBI CH CH".
+          brand: 'OBI', short: 'OBI', kind: 'obich', shop: 'OBI CH' },
         // Galaxus: referencja to UUID wypisany w „Reason for payment", ktory wyciag lamie
         // spacja w srodku — dlatego wzorzec musi trafiac takze po sklejeniu bialych znakow.
         // Bywa tez zwykly numer faktury zamiast UUID (pojedyncze rozliczenie, nie wyplata),
@@ -22687,6 +22772,113 @@
         });
         return '﻿' + lines.join('\n') + '\n';
     }
+
+    // ================= OBI CH — awizo centralnej regulacji =================
+    // Kwoty pisane po niemiecku: kropka dzieli tysiace, przecinek grosze, a minus stoi
+    // ZA liczba („1.401,32-"). Kolejnosc zamiany ma znaczenie — najpierw wyrzucamy
+    // kropki, dopiero potem przecinek staje sie kropka dziesietna.
+    function obiChKw(t){
+        const s = String(t == null ? '' : t).trim();
+        if (!s) return null;
+        const neg = /-\s*$/.test(s);
+        const b = s.replace(/-\s*$/, '').replace(/[.  ]/g, '').replace(',', '.');
+        const n = Number(b);
+        if (!isFinite(n)) return null;
+        return neg ? -n : n;
+    }
+    function obiChYmd(d){
+        const m = /(\d{2})\.(\d{2})\.(\d{4})/.exec(String(d || ''));
+        return m ? (m[3] + '-' + m[2] + '-' + m[1]) : '';
+    }
+    // Wiersz kwotowy: rynek (3 cyfry), nazwa, waluta i trzy kwoty. Wiersze „Ubertrag"
+    // (przeniesienie na nastepna strone) maja te same trzy kwoty, ale NIE maja waluty
+    // ani numeru rynku — i wlasnie to je odsiewa. Gdyby wpadly, kazda strona doliczylaby
+    // sume poprzednich.
+    const OBI_CH_POZ = /^\s*(\d{3})\s*(\D.*?)\s+([A-Z]{3})\s+([\d.]+,\d{2}-?)\s+([\d.]+,\d{2}-?)\s+([\d.]+,\d{2}-?)\s*$/;
+    // Wiersz dokumentu: nasz numer, nasza data, numer SAP i data SAP. SAP jest SKLEJONY
+    // z data dokumentu („23.07.202661466945"), wiec data musi byc dopasowana wprost.
+    // Miedzy data dokumentu a numerem SAP moze nie byc NICZEGO (tekst prosto ze
+    // strumienia PDF-a) albo spacja (tekst zlozony przez pdf.js). Oba ksztalty sa
+    // prawdziwe, wiec wzorzec musi przyjac oba.
+    const OBI_CH_DOK = /^\s*(\d{5,})\s+(\d{2}\.\d{2}\.\d{4})\s*(\d+)\s+(\d{2}\.\d{2}\.\d{4})/;
+    const OBI_CH_SUM = /Gesamt-Summe\s+([\d.]+,\d{2}-?)\s+([\d.]+,\d{2}-?)\s+([\d.]+,\d{2}-?)/;
+    // Numer przelewu sklejony z data: „4716275321.08.2026CHF      6.848,59". Numer
+    // bierzemy leniwie, inaczej zjadlby poczatek daty.
+    const OBI_CH_ZAP = /^\s*(\d{6,}?)\s*(\d{2}\.\d{2}\.\d{4})\s*([A-Z]{3})\s*\**\s*([\d.]+,\d{2})/;
+    // Korekta (zwrot) ma numer 11-cyfrowy zaczynajacy sie od 15; faktura ma 7-8 cyfr.
+    // To jest DRUGI, niezalezny od znaku sposob rozpoznania zwrotu — trzymamy oba,
+    // zeby rozjazd miedzy nimi dalo sie zauwazyc, a nie przeoczyc.
+    const OBI_CH_KOREKTA = /^15\d{9}$/;
+    function obiChCzyAwizo(txt){
+        const t = String(txt || '');
+        return /OBI\s*Schweiz\s*GmbH/i.test(t)
+            && (/Zahlungsbeleg/i.test(t) || /Gesamt-Summe/i.test(t));
+    }
+    function obiChParse(linie){
+        const ls = (linie || []).map(function (x){ return String(x == null ? '' : x); });
+        const poz = [];
+        for (let i = 0; i < ls.length; i++){
+            const m = OBI_CH_POZ.exec(ls[i]);
+            if (!m) continue;
+            const d = (i + 1 < ls.length) ? OBI_CH_DOK.exec(ls[i + 1]) : null;
+            if (!d) continue;                       // kwota bez numeru dokumentu nie jest pozycja
+            const brutto = obiChKw(m[4]), potr = obiChKw(m[5]), netto = obiChKw(m[6]);
+            if (brutto === null || netto === null) continue;
+            poz.push({
+                nr: d[1], data: obiChYmd(d[2]), sap: d[3], dataSap: obiChYmd(d[4]),
+                waluta: m[3], brutto: brutto, potr: potr, netto: netto,
+                korekta: OBI_CH_KOREKTA.test(d[1]),
+                warunki: (i + 2 < ls.length) ? ls[i + 2].trim() : ''
+            });
+        }
+        if (!poz.length) return { err: 'w tym PDF-ie nie widzę ani jednej pozycji OBI' };
+        let dok = null, zap = null;
+        ls.forEach(function (l){
+            const a = OBI_CH_SUM.exec(l);
+            if (a) dok = { brutto: obiChKw(a[1]), potr: obiChKw(a[2]), netto: obiChKw(a[3]) };
+            const b = OBI_CH_ZAP.exec(l);
+            if (b && !zap) zap = { beleg: b[1], data: obiChYmd(b[2]), waluta: b[3], kwota: obiChKw(b[4]) };
+        });
+        const sB = r2(poz.reduce(function (a, p){ return a + p.brutto; }, 0));
+        const sP = r2(poz.reduce(function (a, p){ return a + (p.potr || 0); }, 0));
+        const sN = r2(poz.reduce(function (a, p){ return a + p.netto; }, 0));
+        const zwroty = poz.filter(function (p){ return p.netto < 0; });
+        const doImportu = poz.filter(function (p){ return p.brutto > 0; });
+        // Rozjazd miedzy znakiem a numerem korekty znaczy, ze OBI zmienilo ktoras
+        // z zasad. Lepiej o tym powiedziec, niz cicho przyjac jedna z nich.
+        const sporne = poz.filter(function (p){ return (p.netto < 0) !== p.korekta; });
+        return {
+            beleg: zap ? zap.beleg : '', dataPrzelewu: zap ? zap.data : '',
+            waluta: (poz[0] && poz[0].waluta) || (zap && zap.waluta) || 'CHF',
+            poz: poz, doImportu: doImportu, zwroty: zwroty, sporne: sporne,
+            sumBrutto: sB, sumPotr: sP, sumNetto: sN,
+            sumImport: r2(doImportu.reduce(function (a, p){ return a + p.brutto; }, 0)),
+            dok: dok, przelew: zap ? zap.kwota : null,
+            zgodaBrutto: !!(dok && eq(dok.brutto, sB)),
+            zgodaPotr:   !!(dok && eq(dok.potr, sP)),
+            zgodaNetto:  !!(dok && eq(dok.netto, sN)),
+            zgodaPrzelew: !!(zap && eq(zap.kwota, sN))
+        };
+    }
+    // Plik importu. Uzytkownik podal uklad wprost: numer dokumentu w kolumnie 1, kwota
+    // w kolumnie 7 — i tak jest ustawiony import 204 po stronie prologistics. Szerokosc
+    // zostaje jak w reszcie modulu, a naglowki tych dwoch kolumn zamieniamy miejscami,
+    // zeby czlowiek ogladajacy plik widzial prawde, nie „Date created" nad numerem.
+    const OBI_CH_KOL_NR = 0, OBI_CH_KOL_KWOTA = 6;
+    function mkCsvObiCh(o){
+        const hdr = MK_HDR.slice();
+        hdr[OBI_CH_KOL_NR] = 'Invoice number';
+        hdr[OBI_CH_KOL_KWOTA] = 'Amount';
+        const lines = [hdr.join(';')];
+        ((o && o.doImportu) || []).forEach(function (p){
+            const c = new Array(hdr.length).fill('');
+            c[OBI_CH_KOL_NR] = p.nr;
+            c[OBI_CH_KOL_KWOTA] = f2(p.brutto);
+            lines.push(c.join(';'));
+        });
+        return '﻿' + lines.join('\n') + '\n';
+    }
+
     // OBI ma WLASNY uklad pliku — dokladnie taki, jaki eksportuje ich panel. Ustawienia
     // importu w prologistics (bank_setting) sa dopasowane do TYCH kolumn, wiec podanie
     // ukladu Mirakla trafiloby danymi w niewlasciwe pola.
@@ -27230,6 +27422,7 @@
         if (j.kind === 'galx' && j.data && j.data.galx) return mkCsvGalx(j.data.galx);
         if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf).text;
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
+        if (j.kind === 'obich' && j.data && j.data.obich) return mkCsvObiCh(j.data.obich);
         if (j.kind === 'ebay' && j.data && j.data.ebay) return mkCsvEbay(j.data.ebay);
         if (j.kind === 'amz'  && j.data && j.data.amz)  return mkCsvAmz(j.data.amz);
         if (j.kind === 'mano' && j.data && j.data.mano) return mkCsvMano(j.data.mano);
@@ -28731,10 +28924,12 @@
                 else if (sh && sh.similar && sh.similar.length) det += '<div style="color:#c47f00">w arkuszu jest podobny wpis: ' + esc(sh.similar.map(function (x){ return x.data + ' ' + x.marketplace + ' ' + f2(x.kwota); }).join('; ')) + '</div>';
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
                 det += manorBox(j);
+                det += obiChRefBox(j);
                 if (j.msg) det += '<div style="color:#c47f00">' + linkify(j.msg) + '</div>';
                 if (c24Brak(j)) det += '<div style="color:#c47f00">' + esc(c24Brak(j)) + '</div>';
             }
             if (!j.data && c24Brak(j)) det += '<div style="color:#c47f00">' + esc(c24Brak(j)) + '</div>';
+            if (!j.data && obiChBrak(j)) det += '<div style="color:#c47f00">' + esc(obiChBrak(j)) + '</div>';
             h += '<tr style="border-top:1px solid #eee">'
               +  '<td style="padding:3px 5px">' + (onProlo && st === 'ready'
                     ? '<input type="checkbox" class="mk-ck" data-ref="' + esc(j.ref) + '"' + (selOn(j) ? ' checked' : '') + '>'
@@ -28890,6 +29085,35 @@
         // Zapis recznie wpisanych numerow Manora. Zlecenie wraca na „czeka na dane",
         // wiec podniesie je zwykle „Pobierz zestawienia" — nie robimy osobnej sciezki
         // pobierania, zeby byla jedna droga i jeden komplet kontroli.
+        // Numer fulfilmentu przy zwrocie OBI CH. Po zapisaniu PODMIENIAMY klucz pozycji
+        // zwrotu, wiec dalsza droga — ksiegowanie w tickecie — dostaje numer, po ktorym
+        // prologistics naprawde znajdzie auftrag.
+        out.querySelectorAll('.mk-obirefb').forEach(function (b){
+            b.onclick = function(){
+                const ref = b.getAttribute('data-ref'), nr = b.getAttribute('data-nr');
+                const inp = out.querySelector('.mk-obiref[data-nr="' + nr + '"][data-ref="' + ref + '"]');
+                if (!inp) return;
+                const ff = String(inp.value || '').trim().replace(/\s+/g, '');
+                const mapa = obiRefLoad();
+                if (ff) mapa[nr] = ff; else delete mapa[nr];
+                obiRefSave(mapa);
+                const jobs = jobsLoad();
+                // Ten sam numer korekty moze siedziec w kilku zleceniach — przeliczamy
+                // KAZDE, ktore go zna, zeby lista zwrotow nie rozjechala sie z pamiecia.
+                let ile = 0;
+                Object.keys(jobs).forEach(function (k){
+                    const jj = jobs[k];
+                    if (jj.kind !== 'obich' || !jj.data || !jj.data.obich) return;
+                    if (!(jj.data.obich.zwroty || []).some(function (z){ return z.nr === nr; })) return;
+                    obiChZwrotyRef(jj); ile++;
+                });
+                jobsSave(jobs); render(); renderRef();
+                say(ff ? ('Zwrot ' + nr + ' pójdzie do ticketu jako ' + ff
+                          + (ile > 1 ? (' (poprawione w ' + ile + ' zleceniach)') : '') + '.')
+                       : ('Numer przy zwrocie ' + nr + ' wyczyszczony.'),
+                    ff ? '#0a7a2f' : '#c47f00');
+            };
+        });
         out.querySelectorAll('.mk-mdocb').forEach(function (b){
             b.onclick = function(){
                 const ref = b.getAttribute('data-ref');
@@ -31455,7 +31679,7 @@
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
             const kubelki = { bank: [], mir: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [], cnov: [],
-                              alleops: [], allemap: [], allebil: [], hd: [] }, nieznane = [];
+                              alleops: [], allemap: [], allebil: [], hd: [], obich: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -31463,7 +31687,14 @@
                     const buf = await readBuf(f);
                     const u8 = new Uint8Array(buf);
                     // PDF poznajemy po naglowku pliku, nie po rozszerzeniu.
-                    if (u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46) typ = 'c24pdf';
+                    if (u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46){
+                        // Do tej pory KAZDY PDF szedl do CHECK24. Awizo OBI CH trzeba
+                        // odsiac wczesniej, i to po TRESCI — nazwa pliku nic nie gwarantuje.
+                        typ = 'c24pdf';
+                        try {
+                            if (obiChCzyAwizo(String(await c24PdfTekst(u8)))) typ = 'obich';
+                        } catch (e){ /* nie rozpoznalem — zostaje CHECK24, jak dotad */ }
+                    }
                     // Arkusz (ZIP). O tym, CZYJ jest, decyduje tresc, nie kontener — xlsx-y
                     // przychodza takze z Galaxusa. Rozpoznajemy wiec po zamianie na tekst
                     // i przyjmujemy WYLACZNIE trafienie w Cnove; przy czymkolwiek innym
@@ -31516,6 +31747,7 @@
             // CHECK24: najpierw „Details" (buduje zlecenie), potem „Abrechnung" (dokłada
             // kwote wyplaty). Kolejnosc w jednym rzucie ma znaczenie, przy osobnym
             // wrzucaniu nie — obie drogi dopisuja sie do tego samego zlecenia po numerze.
+            for (let i = 0; i < kubelki.obich.length; i++) await obiChWczytaj(kubelki.obich[i]);
             for (let i = 0; i < kubelki.c24.length; i++) await c24Wczytaj(kubelki.c24[i], false);
             for (let i = 0; i < kubelki.c24pdf.length; i++) await c24Wczytaj(kubelki.c24pdf[i], true);
             const rozpoznane = MK_TYPY_NAZWY
@@ -32126,6 +32358,81 @@
         };
         // Rozliczenie Galaxusa wrzucane recznie. Dopasowanie idzie po SUMIE „Amount paid out",
         // bo to ona trafia na konto — referencja z przelewu (UUID) nie wystepuje w pliku.
+        // Awizo OBI CH. Parujemy po numerze przelewu; kwota jest kontrola.
+        async function obiChWczytaj(f){
+            if (!f) return;
+            let linie;
+            try {
+                const buf = await readBuf(f);
+                // c24PdfTekst oddaje GOTOWY NAPIS z wierszami i rzuca wyjatkiem przy bledzie.
+                linie = String(await c24PdfTekst(new Uint8Array(buf))).split(/\r?\n/);
+            } catch (e){
+                say('OBI CH: nie udało się przeczytać PDF-a — ' + String(e && e.message || e), '#c00');
+                return;
+            }
+            const o = obiChParse(linie);
+            if (o.err){ say('OBI CH: ' + o.err, '#c00'); return; }
+            // Trzy niezalezne kontrole. Kazda lapie inny blad, wiec zadnej nie odpuszczamy.
+            const zle = [];
+            if (o.dok && !o.zgodaBrutto) zle.push('suma brutto ' + f2(o.sumBrutto) + ' ≠ Gesamt-Summe ' + f2(o.dok.brutto));
+            if (o.dok && !o.zgodaNetto)  zle.push('suma netto ' + f2(o.sumNetto) + ' ≠ Gesamt-Summe ' + f2(o.dok.netto));
+            if (o.przelew != null && !o.zgodaPrzelew) zle.push('kwota przelewu ' + f2(o.przelew) + ' ≠ suma netto ' + f2(o.sumNetto));
+            if (o.sporne.length) zle.push('rozjazd znaku i numeru korekty: ' + o.sporne.map(function (x){ return x.nr; }).join(', '));
+            if (zle.length){ say('OBI CH — awizo się nie zgadza: ' + zle.join(' · ') + '. Nie doczepiam.', '#c00'); return; }
+
+            const jobs = jobsLoad();
+            const czek = Object.keys(jobs).filter(function (k){ return jobs[k].kind === 'obich'; });
+            // Klucz to numer przelewu. Dopiero gdy go nie ma — kwota, i wtedy o tym mowimy.
+            let hit = czek.filter(function (k){ return o.beleg && String(jobs[k].ref || '').indexOf(o.beleg) >= 0; });
+            let poKwocie = false;
+            if (!hit.length){
+                hit = czek.filter(function (k){ return eq(jobs[k].amount, o.sumNetto); });
+                poKwocie = hit.length === 1;
+            }
+            if (!hit.length){
+                say('Wczytałem awizo ' + (o.beleg ? ('nr ' + o.beleg + ' ') : '') + 'na ' + f2(o.sumNetto)
+                    + ' ' + o.waluta + ' — ale nie mam zlecenia z wyciągu na ten przelew'
+                    + (czek.length ? (' (czekają: ' + czek.map(function (k){ return f2(jobs[k].amount); }).join(', ') + ')') : '')
+                    + '.', '#c47f00');
+                return;
+            }
+            if (hit.length > 1){
+                say('Numer ' + o.beleg + ' pasuje do ' + hit.length + ' wpłat — nie zgaduję. Wyczyść zbędne zlecenia i powtórz.', '#c47f00');
+                return;
+            }
+            const j = jobs[hit[0]];
+            const ord = Object.create(null);
+            o.doImportu.forEach(function (p){ ord[p.nr] = r2((ord[p.nr] || 0) + p.brutto); });
+            j.data = {
+                obich: o, shop: j.shop || 'OBI CH',
+                gross: o.sumBrutto, net: o.sumNetto, netOk: eq(o.sumNetto, j.amount),
+                ord: ord, ref: {}, unknown: {}, skipped: {},
+                full: true, pays: 1, split: false,
+                rows: o.poz.length, total: o.poz.length, pages: 1, how: 'awizo ' + f.name
+            };
+            // Zwroty pod klucz, po ktorym cos sie znajdzie — z uwzglednieniem numerow
+            // wpisanych wczesniej recznie.
+            const zr = obiChZwrotyRef(j);
+            j.status = 'ready';
+            j.msg = '';
+            // Roznica miedzy plikiem importu a przelewem jest ZAMIERZONA (importujemy
+            // brutto), ale nie moze byc niespodzianka przy uzgadnianiu konta.
+            const czesci = ['import ' + o.doImportu.length + ' × brutto = ' + f2(o.sumImport) + ' ' + o.waluta,
+                            'przelew ' + f2(o.sumNetto) + ' (potrącenie centralnej regulacji ' + f2(o.sumPotr) + ')'];
+            if (o.zwroty.length){
+                czesci.push('ZWROTY POZA IMPORTEM (' + o.zwroty.length + ') na ' + f2(zr.suma)
+                    + (zr.brak ? (' — ' + zr.brak + ' bez numeru fulfilmentu, wpisz go niżej')
+                               : ' — numery fulfilmentu już są, idą do ticketu'));
+            }
+            if (poKwocie) czesci.push('dopasowane po KWOCIE, nie po numerze przelewu — sprawdź, czy to ten');
+            j.note = czesci.join(' · ');
+            jobsSave(jobs); render();
+            say('Awizo OBI CH nr ' + (o.beleg || '?') + ' wczytane: ' + o.poz.length + ' pozycji, '
+                + 'do importu ' + o.doImportu.length + ' na ' + f2(o.sumImport) + ' ' + o.waluta
+                + (o.zwroty.length ? (', zwrotów ' + o.zwroty.length + ' poza importem') : '')
+                + '. Sumy zgodne z dokumentem.', '#0a7a2f');
+        }
+
         function galxWczytaj(f){
             if (!f) return;
             const rd = new FileReader();
