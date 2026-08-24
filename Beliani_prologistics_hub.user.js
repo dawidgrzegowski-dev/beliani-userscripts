@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.94
+// @version      4.95
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12,6 +12,7 @@
 // @match        https://toolbox.manomano.com/*
 // @match        https://seller.octopia.com/*
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
+// @connect      sellerhub.bricobravo.com
 // @connect      fxds-public-exchange-rates-api.oanda.com
 // @connect      oanda.com
 // @connect      ec.europa.eu
@@ -616,7 +617,11 @@
     })();
 
     // ---- Pobranie kursu z OANDA ----
-    // Zwraca średnią z average_bid i average_ask dla pary base->quote.
+    // Zwraca kurs BID — ten sam, ktorym liczy przelicznik na oanda.com. Sprawdzone:
+    // bid 10.9667 x 171.78 EUR = 1 883,86 SEK, co do grosza tyle, ile pokazuje ich strona.
+    // Srednia bid/ask dawala liczbe o kilkadziesiat groszy wyzsza, ktorej nie dalo sie
+    // u nich odtworzyc — a to wlasnie tam siega kontrola. Modul „Ksiegowanie INS" liczy
+    // teraz identycznie (insKursOanda), zeby ten sam dzien nie dawal dwoch liczb.
     function fetchRate(base, quote, dateStr) {
         return new Promise((resolve, reject) => {
             if (base === quote) { resolve(1); return; }
@@ -648,8 +653,7 @@
                         const bid = parseFloat(row.average_bid);
                         const ask = parseFloat(row.average_ask);
                         let rate;
-                        if (!isNaN(bid) && !isNaN(ask)) rate = (bid + ask) / 2;
-                        else if (!isNaN(bid)) rate = bid;
+                        if (!isNaN(bid)) rate = bid;
                         else if (!isNaN(ask)) rate = ask;
                         else { reject(new Error('Brak kursu w odpowiedzi')); return; }
                         resolve(rate);
@@ -6101,7 +6105,12 @@
     function applySavedProgress(rows) {
         const p = loadProgress();
         if (!p || !Array.isArray(p.rows)) return 0;
-        const key = r => `${r.orderNumber}|${r.amount}|${r.dupIndex || 1}`;
+        // Konto i data MUSZA byc w kluczu. Bez nich ten sam numer z ta sama kwota
+        // w innej paczce (inne konto ksiegowe albo inna data) byl pomijany jako
+        // zrobiony — a od teraz taka pomylka nie tylko pomija, ale i odhacza pozycje
+        // w arkuszu. Zapis niesie oba pola od poczatku, wiec starsze zapisy dalej
+        // sie dopasowuja.
+        const key = r => `${r.orderNumber}|${r.amount}|${r.dupIndex || 1}|${r.accountNum}|${r.bookingDate}`;
         const done = new Map();
         p.rows.forEach(r => { if (r.booked || r.alreadyBooked) done.set(key(r), r); });
         let n = 0;
@@ -6340,7 +6349,26 @@
 
         async function processOne(workerLabel, i, ctx) {
             const row = previewRows[i];
-            if (row.booked || row.alreadyBooked) { already++; return; } // wznawianie
+            if (row.booked || row.alreadyBooked) {
+                // WZNAWIANIE. Ta pozycja przeszla w jednym z wczesniejszych przebiegow —
+                // flaga zapisuje sie dopiero po POTWIERDZONYM zapisie w ERP albo po tym,
+                // jak sprawdzenie znalazlo zwrot juz w tickecie.
+                //
+                // Linia w logu nie jest tu ozdoba: modul marketplace ustala z tego logu,
+                // ktore pozycje uznac za zrobione (ksDone szuka przy numerze slowa
+                // „zaksiegowan"). Dopoki tej linii nie bylo, 91 pominietych pozycji
+                // znikalo bez sladu, cala paczka szla jako „BEZ potwierdzenia" i lista
+                // zwrotow nie schodzila mimo tego, ze pieniadze byly zaksiegowane.
+                //
+                // Tresc mowi WPROST, skad to wiemy — „wczesniejszy przebieg" to nie to
+                // samo co odczyt ticketu przed chwila i nie wolno tego zacierac.
+                logLine(`ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong> — `
+                        + `już zaksięgowane (wcześniejszy przebieg`
+                        + (row.ticketId ? `, ticket #${row.ticketId}` : '')
+                        + `). Pomijam.`, '#2563eb');
+                already++;
+                return 'pominiete';
+            }
             const logRow = logLine(`🔍 [W${workerLabel}] <strong>${row.orderNumber}</strong> — szukam ticketu…`, '#6b7280');
 
             let checkResult;
@@ -6473,9 +6501,12 @@
                 while (queue.length > 0) {
                     const i = queue.shift();
                     if (i == null) break;
-                    await processOne(workerLabel, i, ctx);
+                    const wynik = await processOne(workerLabel, i, ctx);
                     freeCtx(ctx); // zwolnij pamięć po każdej pozycji
-                    await sleep(300);
+                    // Przerwa jest po to, zeby nie zasypac prologistics. Pozycja pominieta
+                    // nie wyslala do niego ani jednego zapytania, wiec nie ma czego
+                    // odczekiwac: przy 91 pominietych to bylo 27 sekund czekania na nic.
+                    if (wynik !== 'pominiete') await sleep(300);
                 }
             } finally {
                 destroyFrameCtx(ctx);
@@ -15047,6 +15078,12 @@
             if (x === y) return { ok: true, msg: '' };
             if (x.replace(/-/g, '') === y.replace(/-/g, ''))
                 return { ok: false, myslnik: true, msg: 'ten sam numer, ale jeden zapisany z myślnikiem' };
+            // Pole konta bywa OPISANE („IBAN – BR86…C1") albo niesie DWA numery tego samego
+            // rachunku naraz („0000236470 IBAN – BR86…C1"). bcKontoNorm zdejmuje etykiete
+            // tylko wtedy, gdy konczy sie dwukropkiem, wiec samo slowo „IBAN" zostawalo
+            // w porownywanym ciagu i kazde takie zamowienie wychodzilo jako „rozne numery".
+            // accTenSam rozbija obie strony na skladowe numery i pyta o WSPOLNY.
+            if (accTenSam(a, b)) return { ok: true, opis: true, msg: 'ten sam rachunek, inaczej zapisany' };
             return { ok: false, msg: 'różne numery' };
         }
         // SWIFT/BIC: 8 albo 11 znakow, wielkoscia liter sie nie przejmujemy. Gdy jeden
@@ -15741,11 +15778,15 @@
                         if (w.uwagi.indexOf(uwk) < 0) w.uwagi.push(uwk);
                     } else {
                     var k1 = bcKontoEq(d.accSys, piAcc);
-                    kon(o, 'konto dostawcy ↔ konto z P/I', d.accSys || '—', piAcc || '—', k1.ok ? 'ok' : 'zle');
+                    kon(o, 'konto dostawcy ↔ konto z P/I', d.accSys || '—',
+                        (piAcc || '—') + (k1.ok && k1.msg ? (' — ' + k1.msg) : ''),
+                        k1.ok ? 'ok' : 'zle');
                     if (!k1.ok) w.bledy.push(o + ': konto dostawcy „' + (d.accSys || '—') + '” ≠ konto z P/I „'
                         + (piAcc || '—') + '”' + (k1.msg ? (' — ' + k1.msg) : ''));
                     var k2 = bcKontoEq(piAcc, q.acct);
-                    kon(o, 'konto z P/I ↔ konto na potwierdzeniu', piAcc || '—', q.acct || '—', k2.ok ? 'ok' : 'zle');
+                    kon(o, 'konto z P/I ↔ konto na potwierdzeniu', piAcc || '—',
+                        (q.acct || '—') + (k2.ok && k2.msg ? (' — ' + k2.msg) : ''),
+                        k2.ok ? 'ok' : 'zle');
                     if (!k2.ok) w.bledy.push(o + ': konto z P/I „' + (piAcc || '—') + '” ≠ konto z potwierdzenia „'
                         + (q.acct || '—') + '”' + (k2.msg ? (' — ' + k2.msg) : ''));
                     }
@@ -15785,7 +15826,8 @@
                     // i to ono wylapie przelew na cudzy numer.
                     if (!piAcc && d.accSys){
                         var kd = bcKontoEq(d.accSys, q.acct);
-                        kon(o, 'konto dostawcy ↔ konto na potwierdzeniu', d.accSys || '—', q.acct || '—',
+                        kon(o, 'konto dostawcy ↔ konto na potwierdzeniu', d.accSys || '—',
+                            (q.acct || '—') + (kd.ok && kd.msg ? (' — ' + kd.msg) : ''),
                             kd.ok ? 'ok' : 'zle');
                         if (!kd.ok) w.bledy.push(o + ': konto dostawcy „' + (d.accSys || '—')
                             + '” ≠ konto z potwierdzenia „' + (q.acct || '—') + '”'
@@ -17694,7 +17736,43 @@
             rel.forEach(function(p){ add(p.amt, [p]); });
             return out;
         }
-        // Co DOKLADNIE jest nie tak, gdy kwota sie nie zgadza. Sama liczba „(-947.96)"
+        // Roszczenia przypisane do wiersza TWARDO: numerem z notatki albo kontenerem.
+        // To NIE to samo co pcPenAdj: tamta funkcja ma jeszcze trzecia, slaba regule
+        // („roszczenie bez kontenera, a notatka milczy — bierzemy pod uwage mimo to"),
+        // ktora sluzy do SZUKANIA pasujacej kwoty. Tutaj chodzi o cos odwrotnego —
+        // o zarzut, ze czegos NIE odjeto — a takiego zarzutu nie wolno stawiac na
+        // przeslance „byc moze dotyczy tego wiersza". Dlatego powtorzenie jest celowe.
+        function pcPenTwarde(pens, r, rc){
+            var nos = pcRowPenNos(r);
+            // Kontener W NAWIASIE („(KKFU7794929)") to doplata do INNEGO zamowienia, ktora
+            // tylko jedzie tym kontenerem. Roszczenie zapiete na kontener nalezy do jego
+            // wlasnego zamowienia — bez tego warunku ostrzezenie szloby do obu wierszy
+            // naraz, a doplata nie ma z penalty nic wspolnego.
+            var wlasny = !!rc && !/^\s*\(/.test(String((r && r.container) || ''));
+            return (pens || []).filter(function (p){
+                if (!p || !isFinite(p.amt) || !p.amt) return false;
+                if (nos.length && p.nos.some(function (n){ return nos.indexOf(n) !== -1; })) return true;
+                if (wlasny && p.cont && p.cont === rc) return true;
+                return false;
+            });
+        }
+        // Czy to roszczenie jest rozliczone WLASNYM wierszem wklejki. Tak robi sie
+        // z overpaymentem: osobna linia na sama kwote roszczenia („-30 USD OVERPAYMENT 729").
+        // Wtedy kwota kontenera ma byc pelna i nie ma czego odejmowac.
+        function pcPenOsobno(list, p){
+            return (list || []).some(function (r){
+                var nos = pcRowPenNos(r);
+                if (!nos.length) return false;
+                if (!p.nos.some(function (n){ return nos.indexOf(n) !== -1; })) return false;
+                var a = pcBalAmtVal(r);
+                return a != null && isFinite(a) && Math.abs(Math.abs(a) - Math.abs(p.amt)) < 0.005;
+            });
+        }
+        // Roszczenia, ktore POWINNY byly pomniejszyc te wplate, a nie pomniejszyly.
+        function pcPenNieodjeta(list, pens, r, rc){
+            return pcPenTwarde(pens, r, rc).filter(function (p){ return !pcPenOsobno(list, p); });
+        }
+        // Co DOKLADNIE jest nie tak, gdy kwota sie nie zgadza. Sama liczba „(-947.96)\"
         // nie mowi, gdzie szukac, a najczestsza przyczyna to zle policzona penalty.
         // Sprawdzamy po kolei: czy roznica to jedna penalty, ta sama policzona dwa razy,
         // czy suma kilku. Piszemy tylko FAKT (o ile i w ktora strone), bez rozstrzygania,
@@ -17748,14 +17826,35 @@
                     if (w == null) { res[i] = { bad: true, msg: 'brak kwoty', title: '' }; continue; }
                     var adjs = pcPenAdj(pens, r, rc);
                     var hit = pick(function(c){ return test(c, w, rc, adjs); });
-                    if (hit) res[i] = make(hit.c, w, rc, adjs, hit.v);
+                    // Wiersz idzie dalej JAKO SZOSTY argument: bez niego werdykt nie ma
+                    // z czego odczytac numerow roszczen z notatki.
+                    if (hit) res[i] = make(hit.c, w, rc, adjs, hit.v, r);
                 }
             }
             function withPen(h){ return h && h.adj ? ' (po ' + pcPenLabel(h.adj) + ')' : ''; }
             function penTtl(h){ return h && h.adj ? '\nKorekta penalty: ' + pcPenLabel(h.adj) + '\n' + pcPenDesc(h.adj) : ''; }
             // 1) kontener + kwota (kwota wprost lub po korekcie o penalty)
             pass(function(c, w, rc, adjs){ return (!!c.cont && c.cont === rc) ? pcCandHit(c, w, adjs) : null; },
-                function(c, w, rc, adjs, h){ return { ok: true, msg: 'kwota + kontener' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) }; });
+                function(c, w, rc, adjs, h, r){
+                    // Kwota trafila WPROST (h.adj == null), a do wiersza jest przypisane
+                    // roszczenie — czyli placimy tyle, ile mowi komentarz, chociaz penalty
+                    // miala te wplate pomniejszyc. Dotad wychodzilo z tego zielone ✓.
+                    var pom = (h && h.adj) ? [] : pcPenNieodjeta(list, pens, r, rc);
+                    if (pom.length){
+                        var suma = 0;
+                        pom.forEach(function (p){ suma += p.amt; });
+                        var powinno = w + suma;                    // p.amt jest ujemne
+                        return { warn: true,
+                                 msg: 'kwota + kontener, ale ' + pcPenLabel({ used: pom })
+                                    + ' NIE odjęta — powinno być ' + powinno.toFixed(2),
+                                 title: 'Komentarz: ' + pcCandDesc(c)
+                                      + '\nWklejona kwota: ' + w.toFixed(2)
+                                      + ' — tyle samo, co w komentarzu, więc roszczenie nie zostało uwzględnione.'
+                                      + '\n' + pcPenDesc({ used: pom })
+                                      + '\nJeśli to roszczenie ma być rozliczone osobno, zostaw kwotę bez zmian.' };
+                    }
+                    return { ok: true, msg: 'kwota + kontener' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) };
+                });
             // 2) kwota sie zgadza, komentarz bez kontenera
             pass(function(c, w, rc, adjs){ return !c.cont ? pcCandHit(c, w, adjs) : null; },
                 function(c, w, rc, adjs, h){ return { warn: true, msg: 'kwota OK, komentarz bez kontenera' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) }; });
@@ -20660,7 +20759,10 @@
                 wiersze.push({ data: tds[0], konto: tds[1], kwota: insKwota(tds[2]), user: tds[7] });
             }
             var mo = /Open amount[^:]*:\s*([A-Z]{3})?\s*([\-0-9., ]+)/i.exec(insTxt(tab));
-            return { wiersze: wiersze, open: mo ? insKwota(mo[2]) : null };
+            // Waluta z „Open amount : SEK 0.00" byla w tym wzorcu lapana i wyrzucana.
+            // To najpewniejsze zrodlo waluty SPRAWY — potrzebne przy przewalutowaniu.
+            return { wiersze: wiersze, open: mo ? insKwota(mo[2]) : null,
+                     openWal: (mo && mo[1]) ? mo[1].toUpperCase() : '' };
         }
         function insKomentarze(html){
             var out = [];
@@ -20988,12 +21090,94 @@
             return { ok: true };
         }
 
+        // ---------- przewalutowanie ----------
+        // Publiczny endpoint OANDA — ten sam, ktorego uzywa panel kursow w tym skrypcie.
+        // Okno jest POLOTWARTE: [D, D+1) oddaje zamkniecie dnia D (sprawdzone na zywym
+        // API). Pytamy wiec o [D, D+1] i weryfikujemy close_time, zeby nie wziac po cichu
+        // kursu z innego dnia.
+        const INS_FX_URL = 'https://fxds-public-exchange-rates-api.oanda.com/cc-api/currencies';
+        function insDzienO(ymd, ile){
+            var d = new Date(String(ymd) + 'T12:00:00Z');
+            d = new Date(d.getTime() + ile * 24 * 3600 * 1000);
+            return d.toISOString().slice(0, 10);
+        }
+        function insKursOanda(base, quote, ymd){
+            return new Promise(function (resolve, reject){
+                var b = String(base || '').toUpperCase(), q = String(quote || '').toUpperCase();
+                if (!b || !q){ reject(new Error('nie znam obu walut')); return; }
+                if (b === q){ resolve({ rate: 1, data: ymd || '', zamk: ymd || '', bid: 1, ask: 1 }); return; }
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ymd || ''))){ reject(new Error('zła data: ' + ymd)); return; }
+                // Okres, ktorego uzywa PRZELICZNIK OANDA dla wskazanej daty: 24 godziny
+                // konczace sie DZIEN WCZESNIEJ. Ich strona pisze to wprost („24-hour period
+                // ending …"). Dzieki temu liczba w komentarzu jest odtwarzalna: kto wpisze
+                // te sama date na oanda.com, dostanie to samo.
+                var zamk = insDzienO(ymd, -1);
+                var url = INS_FX_URL + '?base=' + encodeURIComponent(b) + '&quote=' + encodeURIComponent(q)
+                        + '&data_type=general_currency_pair'
+                        + '&start_date=' + zamk + '&end_date=' + ymd;
+                GM_xmlhttpRequest({
+                    method: 'GET', url: url, timeout: 20000,
+                    headers: { 'Accept': 'application/json' },
+                    onload: function (res){
+                        var j = null;
+                        try { j = JSON.parse(res.responseText); }
+                        catch (e){ reject(new Error('OANDA oddała nie-JSON')); return; }
+                        var rows = (j && j.response) || [];
+                        // Bierzemy wiersz Z TEGO DNIA, a nie „ostatni jaki jest".
+                        var row = null;
+                        for (var i = 0; i < rows.length; i++){
+                            if (String(rows[i].close_time || '').slice(0, 10) === zamk){ row = rows[i]; break; }
+                        }
+                        if (!row){
+                            reject(new Error('OANDA nie ma kursu ' + b + '/' + q + ' na ' + ymd));
+                            return;
+                        }
+                        // BID — tym kursem liczy przelicznik OANDA (sprawdzone: 10.9667 x 171.78
+                        // = 1 883,86 co do grosza). Srednia bid/ask dawalaby liczbe, ktorej nie
+                        // da sie u nich odtworzyc.
+                        var bid = parseFloat(row.average_bid), ask = parseFloat(row.average_ask);
+                        var r = isFinite(bid) ? bid : (isFinite(ask) ? ask : NaN);
+                        if (!isFinite(r) || r <= 0){ reject(new Error('OANDA nie podała kursu dla ' + b + '/' + q)); return; }
+                        resolve({ rate: r, data: ymd, zamk: zamk, bid: bid, ask: ask });
+                    },
+                    onerror:   function (){ reject(new Error('brak połączenia z OANDA')); },
+                    ontimeout: function (){ reject(new Error('OANDA nie odpowiedziała w 20 s')); }
+                });
+            });
+        }
+        // Kurs w tekscie: bez ogona zer, ale i bez gubienia miejsc znaczacych.
+        function insKursTxt(v){
+            var t = (Math.round(Number(v) * 1e6) / 1e6).toFixed(6);
+            return t.replace(/0+$/, '').replace(/\.$/, '');
+        }
+        // Kwota, ktora NAPRAWDE idzie na sprawe. p.kwota zostaje tym, co stoi na wyciagu,
+        // bo po niej liczy sie kontrola sumy przelewu — przeliczona zyje osobno.
+        function insDoZapisu(p){
+            return (p && p.kwotaFx != null && isFinite(p.kwotaFx)) ? p.kwotaFx : (p ? p.kwota : null);
+        }
+        function insWalZapisu(p){
+            return (p && p.kwotaFx != null) ? (p.walSprawy || '') : ((p && p.waluta) || '');
+        }
+        // Komentarz po angielsku — ma tlumaczyc, DLACZEGO zaksiegowano wlasnie te kwote.
+        function insKomTekst(p){
+            if (!p || p.kwotaFx == null) return 'Booked';
+            var wp = p.waluta || '?', ws = p.walSprawy || '?', k = insKursTxt(p.kurs);
+            return 'Booked. Payment received: ' + insFmt(p.kwota) + ' ' + wp
+                 + ' on ' + (p.data || '?') + '. This case is in ' + ws
+                 + ', so the payment was converted at the OANDA rate'
+                 + ' for ' + (p.kursData || p.data || '?')
+                 + ' (bid rate, 24-hour period ending ' + (p.kursZamk || '?') + '):'
+                 + ' 1 ' + wp + ' = ' + k + ' ' + ws + '.'
+                 + ' ' + insFmt(p.kwota) + ' ' + wp + ' x ' + k + ' = ' + insFmt(p.kwotaFx) + ' ' + ws
+                 + ' — this is the amount booked.';
+        }
+
         // ---------- komentarz ----------
-        async function insDopiszKomentarz(id, kto){
+        async function insDopiszKomentarz(id, kto, tekst){
             var body = 'fn=reassignComment'
                      + '&username=' + encodeURIComponent(kto)
                      + '&obj=ins&obj_id=' + encodeURIComponent(id)
-                     + '&comment=' + encodeURIComponent('Booked')
+                     + '&comment=' + encodeURIComponent(String(tekst || 'Booked'))
                      + '&field=responsible';
             var r = await fetch(BASE + '/js_backend.php', {
                 method: 'POST', credentials: 'include',
@@ -21208,6 +21392,17 @@
                        +   (p.kwotaEdyt ? ' <span title="kwota zmieniona ręcznie" style="color:#c47f00">✎</span>' : '')
                        +   (p.zWiersza ? ' <span title="Przy linku nie było kwoty, a link jest w wierszu jeden — wzięta kwota przelewu z wyciągu." style="color:#888;font-size:10px">↤ z wiersza</span>' : '')
                        +   (p.kwota === null ? ' <span style="color:#c00;font-size:10px">brak kwoty przy linku — wpisz ją</span>' : '')
+                       // Przewalutowanie musi byc widoczne PRZED zapisem: na sprawe idzie
+                       // inna liczba niz ta z wyciagu i nie wolno, zeby to byla niespodzianka.
+                       +   (p.kwotaFx != null
+                             ? ('<div style="font-size:10px;color:#0a7a2f;white-space:nowrap" title="Kurs OANDA (średnia bid/ask) z dnia wpłaty '
+                                + insEsc(p.kursData || '') + '">→ ' + insFmt(p.kwotaFx) + ' ' + insEsc(p.walSprawy || '')
+                                + ' &nbsp;<span style="color:#888">kurs ' + insEsc(insKursTxt(p.kurs)) + '</span></div>')
+                             : '')
+                       +   (p.fxBlad
+                             ? ('<div style="font-size:10px;color:#c00;white-space:normal;max-width:190px">brak kursu: '
+                                + insEsc(p.fxBlad) + '</div>')
+                             : '')
                        + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb;text-align:right;color:' + kolorOpen + '">'
                        +   openHtml + '</td>'
@@ -21249,14 +21444,47 @@
                 return Math.abs((w.kwota || 0) - p.kwota) < 0.005 && (!p.konto || String(w.konto) === String(p.konto));
             })[0];
             p.juzJest = juz || null;
-            var wal = insWalutaStrony(html);
+            // Waluta SPRAWY: napis przy polu kwoty albo wiersz „Open amount : SEK 0.00".
+            var wal = insWalutaStrony(html) || pl.openWal || '';
+            p.walSprawy = wal;
             p.uwagi = (p.uwagi || []).filter(function (u){ return /na liście/.test(u); });
+            // Przewalutowanie. Wplata w EUR na sprawie w SEK znaczy, ze na sprawe idzie
+            // kwota przeliczona — inaczej „Open amount" nigdy sie nie zamknie. Kurs bierzemy
+            // z dnia WPLATY i tylko z tego dnia; brak kursu blokuje wiersz, bo kwota na
+            // domysl jest gorsza niz brak kwoty.
+            p.kwotaFx = null; p.kurs = null; p.kursData = ''; p.fxBlad = '';
+            if (p.waluta && wal && p.waluta !== wal){
+                try {
+                    var fx = await insKursOanda(p.waluta, wal, p.data);
+                    p.kurs = fx.rate;
+                    p.kursData = fx.data;
+                    p.kursZamk = fx.zamk || '';
+                    p.kwotaFx = Math.round(p.kwota * fx.rate * 100) / 100;
+                } catch (e){
+                    p.fxBlad = String((e && e.message) || e);
+                    p.stan = 'uwaga';
+                    p.wybrany = false;
+                    p.status = 'przewalutowanie ' + p.waluta + ' → ' + wal + ': ' + p.fxBlad
+                             + ' — nie księguję';
+                    return;
+                }
+            }
             // Open amount to najtansza kontrola tego, czy ksiegujemy na wlasciwa sprawe:
             // gdy do zaplaty zostaje co innego niz mamy zaksiegowac, cos sie nie zgadza.
-            if (p.open !== null && Math.abs(p.open - p.kwota) >= 0.005){
-                p.uwagi.push('open amount ' + insFmt(p.open) + ' ≠ kwota ' + insFmt(p.kwota));
+            // Porownujemy z kwota, ktora NAPRAWDE pojdzie na sprawe — przy przewalutowaniu
+            // porownanie z kwota z wyciagu nie mialoby sensu, bo to inna waluta.
+            var doZap = insDoZapisu(p);
+            if (p.open !== null && doZap !== null && Math.abs(p.open - doZap) >= 0.005){
+                p.uwagi.push('open amount ' + insFmt(p.open) + (wal ? (' ' + wal) : '')
+                           + ' ≠ kwota ' + insFmt(doZap) + (insWalZapisu(p) ? (' ' + insWalZapisu(p)) : ''));
             }
-            if (p.waluta && wal && p.waluta !== wal) p.uwagi.push('waluta z wyciągu ' + p.waluta + ', na sprawie ' + wal);
+            if (p.kwotaFx != null){
+                p.uwagi.push('przewalutowane: ' + insFmt(p.kwota) + ' ' + p.waluta + ' × '
+                           + insKursTxt(p.kurs) + ' = ' + insFmt(p.kwotaFx) + ' ' + wal
+                           + ' (OANDA, ' + p.kursData + ')');
+            } else if (p.waluta && wal && p.waluta !== wal){
+                p.uwagi.push('waluta z wyciągu ' + p.waluta + ', na sprawie ' + wal);
+            }
             if (juz){
                 p.stan = 'uwaga';
                 p.wybrany = false;
@@ -21340,17 +21568,17 @@
                 // wierszy zwrotu kosztow transportu.
                 przed = { sh: insShIds(html0) };
                 var ping = await insPing(p.id);
-                w = await insZapiszPost(p.id, p.data, p.konto, p.kwota,
+                w = await insZapiszPost(p.id, p.data, p.konto, insDoZapisu(p),
                                         { html: html0, sh: przed.sh, resp: insResponsible(html0), ping: ping });
             } else {
-                w = await insZaksieguj(ctx, p.id, p.data, p.konto, p.kwota);
+                w = await insZaksieguj(ctx, p.id, p.data, p.konto, insDoZapisu(p));
             }
             if (!w.ok){ p.stan = 'blad'; p.status = 'nie zaksięgowało: ' + w.blad; return; }
             var komOk = false;
             if (p.kto){
                 p.status = 'dopisuję komentarz…';
                 insRysuj();
-                try { komOk = await insDopiszKomentarz(p.id, p.kto); } catch (e){ komOk = false; }
+                try { komOk = await insDopiszKomentarz(p.id, p.kto, insKomTekst(p)); } catch (e){ komOk = false; }
             }
             p.status = 'sprawdzam zapis…';
             insRysuj();
@@ -21364,13 +21592,15 @@
             var pl = insPlatnosci(html);
             var wpis = pl.wiersze.filter(function (r){
                 return r.data === p.data && String(r.konto) === String(p.konto)
-                    && Math.abs((r.kwota || 0) - p.kwota) < 0.005;
+                    && Math.abs((r.kwota || 0) - insDoZapisu(p)) < 0.005;
             })[0];
             var ja = insZalogowany(html);
             var kom = insKomentarze(html);
             var ostatnie = kom.slice(-3);
             var maKom = ostatnie.some(function (c){
-                return /^booked$/i.test(String(c.text || '').trim()) && (!ja || c.user === ja);
+                // Przy przewalutowaniu komentarz niesie caly rachunek, wiec „Booked" jest
+                // POCZATKIEM tresci, a nie cala trescia.
+                return /^booked\b/i.test(String(c.text || '').trim()) && (!ja || c.user === ja);
             });
             var czesci = [];
             czesci.push(wpis ? 'płatność ✓' : 'płatności NIE MA ✗');
@@ -21400,7 +21630,10 @@
                 g.poz.forEach(function (p){
                     if (!p.wybrany) return;
                     if (p.juzJest) return;
-                    if (!p.konto || !p.data || !p.kwota) return;
+                    // Wiersz bez kursu jest zablokowany: przeliczenie „na oko" byloby
+                    // ksiegowaniem kwoty, ktorej nikt nie policzyl.
+                    if (p.fxBlad) return;
+                    if (!p.konto || !p.data || !insDoZapisu(p)) return;
                     doZrobienia.push({ g: g, p: p });
                 });
             });
@@ -21695,6 +21928,31 @@
         // Cnova FR: import 58, konto 1310. Kont NIE sprawdzamy i nie ma tu podzialu
         // B2B/B2C, ktory przy Amazonie i ManoMano decyduje o koncie i koncie VAT.
         'Cnova · Cnova FR':            { bank: '58',  booking: '9', acct: '1310' },
+        // Brico Bravo: konto 1513 — stoi w ACCOUNTS jako „Brico Bravo IT", czyli dokladnie
+        // pod ta nazwa sklepu, ktora nadaje modul. Numeru importu (bank_setting) NIE ZNAM:
+        // lista bankow przychodzi z prologistics, wiec zostaje pusty do wyboru w ⚙ Konta
+        // (modul podpowie go po nazwie). Booking 9 („Fulfillment No") PRZEZ ANALOGIE do
+        // pozostalych sklepow — po pierwszym imporcie sprawdz, ile wierszy sie dopasowalo:
+        // jesli paczka wejdzie w calosci jako NOT FOUND, jest to ten sam blad co przy
+        // OBI CH i wystarczy przestawic na 12 („Invoice No").
+        'Brico Bravo · Brico Bravo IT': { bank: '', booking: '9', acct: '1513' },
+        // Carrefour FR: numeru bank_setting nie znam z gory (jak przy Allegro/Amazonie/
+        // Empiku) — modul go podpowie po nazwie z listy pobranej w ⚙ Konta. Konto z planu
+        // kont tez zostaje puste do wyboru. Booking 9 (Fulfillment No) PRZEZ ANALOGIE do
+        // wszystkich pozostalych sklepow Mirakla tutaj — sprawdz w ⚙ Konta po pierwszym
+        // pobraniu, ze kolumna „booking" pokazuje wlasciwa nazwe.
+        'Mirakl (Carrefour) · Carrefour FR': { bank: '', booking: '9', acct: '' },
+        // Leroy Merlin: cztery kraje, jeden panel, wplaty przez Xpollens. Konta z planu
+        // kont (potwierdzone): FR 1355, IT 1362, ES 1117 „Leroy Merlin ES Beliani DE",
+        // PT 1455. Numeru importu (bank_setting) NIE ZNAM dla zadnego — lista bankow
+        // przychodzi z prologistics, wiec zostaje pusty do wyboru w ⚙ Konta.
+        // Booking 9 („Fulfillment No") PRZEZ ANALOGIE do pozostalych sklepow Mirakla;
+        // gdyby paczka weszla w calosci jako NOT FOUND, jest to ten sam przypadek co
+        // przy OBI CH i wystarczy przestawic na 12 („Invoice No").
+        'Mirakl (Leroy) · Leroy Merlin FR': { bank: '', booking: '9', acct: '1355' },
+        'Mirakl (Leroy) · Leroy Merlin IT': { bank: '', booking: '9', acct: '1362' },
+        'Mirakl (Leroy) · Leroy Merlin ES': { bank: '', booking: '9', acct: '1117' },
+        'Mirakl (Leroy) · Leroy Merlin PT': { bank: '', booking: '9', acct: '1455' },
         // Allegro: numeru ustawienia importu nie znamy z gory — modul podpowie go sam
         // po nazwie konta (bsGuess), tak jak przy Amazonie. Konto jest tu pewne.
         'Allegro · Allegro Beliani':        { bank: '', booking: '9', acct: '1071' },
@@ -22328,11 +22586,13 @@
         'KAUFLAND|SK':                       'https://sellerportal.kaufland.de/onboarding?storefront=sk',
         'KUANTO KUSTA|PT':                   'https://seller.kuantokusta.pt/',
         'LEEN BAKKER|NL':                    'https://partnerplatform.leenbakker.nl/',
-        'LEROY MERLIN|ES':                   'https://leroymerlin-marketplace.mirakl.net/',
-        'LEROY MERLIN|FR':                   'https://leroymerlin-marketplace.mirakl.net/',
-        'LEROY MERLIN|IT':                   'https://leroymerlin-marketplace.mirakl.net/login',
-        'LEROY MERLIN|PT':                   'https://leroymerlin-marketplace.mirakl.net/',
-        'LEROY MERLIN|RO':                   'https://leroymerlin-marketplace.mirakl.net/',
+        // Wszystkie Leroye chodza przez wspolny panel grupy ADEO — tak stoi w zapisie
+        // ruchu przegladarki z czterech zakladek. Starego adresu nie ma tam ani razu.
+        'LEROY MERLIN|ES':                   'https://adeo-marketplace.mirakl.net/',
+        'LEROY MERLIN|FR':                   'https://adeo-marketplace.mirakl.net/',
+        'LEROY MERLIN|IT':                   'https://adeo-marketplace.mirakl.net/',
+        'LEROY MERLIN|PT':                   'https://adeo-marketplace.mirakl.net/',
+        'LEROY MERLIN|RO':                   'https://adeo-marketplace.mirakl.net/',
         'LIMANGO|DE':                        'https://partner.limango.de',
         'MAISONS DU MONDE|DE':               'https://maisonsdumonde-prod.mirakl.net/',
         'MAISONS DU MONDE|ES':               'https://maisonsdumonde-prod.mirakl.net/',
@@ -22547,6 +22807,16 @@
         // bez slowa, a cicho polkniety przelew to najgorszy blad, jaki ten modul moze
         // popelnic. Tak zobaczysz go przynajmniej w „pozostałych marketplace'ów".
         { mp: 'PayPro (nieznany sklep)', ok: false, payer: /PAYPRO/i },
+        // Carrefour FR: ten sam platnik co Vente (MANGOPAY), ale referencja to numer
+        // cyklu ze slowem „MARKETPAY" (PSP Carrefoura), bez przedrostka VEN — nie koliduje
+        // z regula Vente powyzej. Sprawdzone na trzech cyklach z wyciagu UBS EUR: 269548
+        // (8195.47), 269249 (9406.54), 268946 (7193.02) — kazda kwota rowna co do grosza
+        // wierszowi „Payment" w eksporcie Transaction logs (Shop ID 3052, „Beliani France").
+        { mp: 'Mirakl (Carrefour)', ok: true, payer: /MANGOPAY/i, ref: /\b(\d{5,})\s*MARKETPAY/i,
+          brand: 'Carrefour', short: 'Carrefour', host: 'carrefourfr.mirakl.net', shop: 'Carrefour FR' },
+        // Zapasowa: inny, NIEZNANY Mirakl przez MANGOPAY z tym samym ksztaltem referencji.
+        // Regula Carrefoura powyzej ma IDENTYCZNY wzorzec ref, wiec ta linia nie odbiera
+        // jej niczego — zostaje jako siatka bezpieczenstwa, gdyby doszedl piaty taki sklep.
         { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
@@ -22566,6 +22836,36 @@
         // sum, a data z tytulu sluzy do zapytania panelu o wlasciwy eksport.
         { mp: 'Cnova',          ok: true,  payer: /CNOVA/i, ref: /CNOVA\s*PAY\s+(\d{6,})/i,
           brand: 'Cdiscount', short: 'Cnova', host: 'seller.octopia.com', kind: 'cnov', shop: 'Cnova FR' },
+        // Brico Bravo (BBO S.R.L., Rzym) placi sam, bez posrednika. W tytule stoi
+        // „BRAVO MSR2607T1.3" — numer ich dokumentu rozliczeniowego, ktorego w arkuszu
+        // ZESTAWIENIA NIE MA. Sluzy wiec za klucz zlecenia, ale plik parujemy po kwocie,
+        // dokladnie tak jak przy Cnovie.
+        { mp: 'Brico Bravo',    ok: true,  payer: /\bBBO\s*S\.?R\.?L\.?\b|BRICOBRAVO|BRICO\s*BRAVO/i,
+          ref: /\bBRAVO\s+([A-Z0-9][A-Z0-9.\-]{3,})/i,
+          brand: 'Brico Bravo', short: 'Brico', host: 'sellerhub.bricobravo.com',
+          kind: 'brico', shop: 'Brico Bravo IT' },
+        // Gdyby kiedys w tytule zabraklo „BRAVO <numer>": wiersz ma byc chociaz NAZWANY,
+        // a nie przepasc bez sladu. Tak samo stoi to przy Wayfairze i Joybuy.
+        { mp: 'Brico Bravo',    ok: false, payer: /\bBBO\s*S\.?R\.?L\.?\b|BRICOBRAVO|BRICO\s*BRAVO/i },
+        // Leroy Merlin (grupa ADEO) placi przez XPOLLENS — wlasna instytucje platnicza,
+        // nie przez MangoPay. W tytule stoi spolka i NUMER FAKTURY Mirakla, w dwoch
+        // zapisach zaleznie od banku:
+        //   HVB : „SEPA-GUTSCHRIFT XPOLLENS Societe Beliani DE GmbH KUNDENREFERENZ 000000653514"
+        //   inny: „SEPA-GUTSCHRIFT XPOLLENS SOCIETE Beliani Europe OU CUSTOMER REF 000000653855"
+        // Ten sam numer stoi w kolumnie „Invoice number" eksportu i w wykazie cykli,
+        // w ktory patrzy cycFields — czyli tak samo jak przy Home24.
+        // Nazwa spolki NIE rozstrzyga kraju: cztery Leroye ida przez tego samego
+        // posrednika i przez jeden panel. Sklep wychodzi dopiero z dopasowania cyklu,
+        // dlatego regula celowo nie ustawia „shop".
+        { mp: 'Mirakl (Leroy)', ok: true,  payer: /XPOLLENS/i,
+        // „(?!\s*\d)" pilnuje, zeby numer byl CALY: wyciag lamie dlugie opisy i wstawia
+        // spacje w srodku („0000006 53855"), a bez tego warunku na tekscie oryginalnym
+        // lapal sie sam poczatek. Tak zabezpieczony wzorzec nie pasuje do polowki numeru,
+        // wiec mkDetect siega po tekst sklejony i numer wraca w calosci.
+          ref: /(?:KUNDENREFERENZ|CUSTOMER\s*REF(?:ERENCE)?|KUNDENREF)\s*[:.]?\s*(\d{6,})(?!\s*\d)/i,
+          brand: 'Leroy Merlin', short: 'Leroy', host: 'adeo-marketplace.mirakl.net' },
+        // Gdyby w tytule zabraklo numeru: wiersz ma byc chociaz NAZWANY, a nie przepasc
+        // bez sladu — ta regula stala tu od dawna i wlasnie ta role dalej pelni.
         { mp: 'Xpollens',       ok: false, payer: /XPOLLENS/i },
         { mp: 'Furniture1',     ok: false, payer: /BALDAI1|Furniture1/i }
     ];
@@ -22936,13 +23236,67 @@
     // Ten sam plik, ktory czlowiek sciaga z panelu („Transaction logs" -> Export).
     // Rozpoznajemy go po kolumnie „Billing Cycle ID" — zadne inne obslugiwane zrodlo
     // takiej nie ma — a MARKETPLACE po „Shop ID". Wartosc jest identyczna w kazdym
-    // wierszu pliku, sprawdzone na 13 eksportach z czterech marketplace'ow.
+    // wierszu pliku, sprawdzone na 16 eksportach z pieciu marketplace'ow.
     // Numer sklepu, a nie nazwa: nazwy bywaja zmieniane w panelu, numer nie.
+    // Jeden panel dla wszystkich Leroyow (grupa ADEO). Wprost z zapisu ruchu:
+    // adeo-marketplace.mirakl.net, tenant „leroymerlinfr-prod".
+    const MK_LEROY_HOST = 'adeo-marketplace.mirakl.net';
     const MK_SHOPID = {
         '2750': { mp: 'Mirakl (Empik)', brand: 'Empik', short: 'Empik', host: 'marketplace.empik.com' },
         '2004': { mp: 'Mirakl (BRW)', brand: 'Black Red White', short: 'BRW', host: 'blackredwhitepl-prod.mirakl.net' },
-        '3514': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }
+        '3514': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' },
+        // Shop ID wprost z kolumny „Shop ID" trzech prawdziwych eksportow Carrefoura —
+        // ta sama wartosc w kazdym wierszu kazdego z nich, tak jak przy pozostalych.
+        '3052': { mp: 'Mirakl (Carrefour)', brand: 'Carrefour', short: 'Carrefour', host: 'carrefourfr.mirakl.net' },
+        // Leroy: cztery kraje na JEDNYM hoscie, wiec numer sklepu jest tu jedynym
+        // pewnym rozroznieniem — nazwy w panelu potrafia byc takie same („Beliani"
+        // przy FR). Oba numery sa z prawdziwych eksportow: 2327 niesie kanal LMFR,
+        // 4263 kanal LMIT. „shop" nadpisuje nazwe z panelu wlasnie po to, zeby klucz
+        // ustawien („marketplace · sklep") byl inny dla kazdego kraju.
+        '2327': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
+                  host: MK_LEROY_HOST, shop: 'Leroy Merlin FR' },
+        '4263': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
+                  host: MK_LEROY_HOST, shop: 'Leroy Merlin IT' },
+        '5318': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
+                  host: MK_LEROY_HOST, shop: 'Leroy Merlin ES' }
     };
+    // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
+    // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
+    // raz wgrany eksport ES nazywa ten sklep takze przy pozniejszym pobieraniu z panelu.
+    const MK_LSHOP_KEY = 'mkt_leroy_shops';
+    function lshopLoad(){
+        try { const o = JSON.parse(GM_getValue(MK_LSHOP_KEY, '{}')); return (o && typeof o === 'object') ? o : {}; }
+        catch (e){ return {}; }
+    }
+    function lshopSave(id, nazwa){
+        const i = String(id || '').trim();
+        if (!i || !nazwa) return;
+        const o = lshopLoad();
+        if (o[i] === nazwa) return;
+        o[i] = nazwa;
+        try { GM_setValue(MK_LSHOP_KEY, JSON.stringify(o)); } catch (e){}
+    }
+    // Kraj z kanalu sprzedazy: „LMFR" -> „FR". Nic wiecej nie zgadujemy — sam kanal
+    // musi miec ksztalt LM + dwie litery, inaczej odpowiadamy pusto.
+    function leroyKraj(chan){
+        const m = String(chan || '').trim().toUpperCase().match(/^LM([A-Z]{2})$/);
+        return m ? m[1] : '';
+    }
+    // Etykieta sklepu, pod ktora zapisuja sie USTAWIENIA IMPORTU (klucz to „marketplace
+    // · sklep"). Przy wiekszosci platform zostaje nazwa z panelu i nic sie nie zmienia.
+    // Przy Leroyu nazwa nie wystarcza: cztery kraje na jednym hoscie moga nazywac sie
+    // tak samo, a wtedy dwa kraje dostalyby jeden numer importu i jedno konto. Sklep,
+    // ktorego numeru jeszcze nie znam, dostaje wiec etykiete z numerem — brzydka, ale
+    // wlasna, i od razu widac, ktory numer mi podeslac.
+    function mkShopLabel(id, nazwaZPanelu, host){
+        const i = String(id == null ? '' : id).trim();
+        const w = MK_SHOPID[i];
+        if (w && w.shop) return w.shop;
+        const zap = lshopLoad()[i];
+        if (zap) return zap;
+        if (i && String(host || '') === MK_LEROY_HOST) return 'Leroy Merlin · sklep ' + i;
+        return String(nazwaZPanelu || '');
+    }
     // Pozycje z pliku maja miec DOKLADNIE te nazwy pol, ktorych uzywa mkAggregate przy
     // danych z API — inaczej trzeba by rozgalezic caly dalszy ciag. Typy pozycji zgadzaja
     // sie same z siebie: mkCls klasyfikuje zarowno „ORDER_AMOUNT" z JSON-a, jak
@@ -22953,6 +23307,15 @@
         const hdr = rows[0].map(function (h){ return String(h || '').trim(); });
         const ix = {};
         hdr.forEach(function (h, k){ if (ix[h] == null) ix[h] = k; });
+        // Eksport przychodzi w JEZYKU PANELU i nazwy kolumn sie z nim zmieniaja:
+        // en-GB pisze „Shop"/„Shop ID", en-US „Store"/„Store ID". Mam oba pliki na TYM
+        // SAMYM rozliczeniu Leroya FR, wiec to nie jest przypuszczenie. Bez tej zamiany
+        // wersja amerykanska wchodzila jako plik bez numeru sklepu — czyli „tego numeru
+        // nie mam w konfiguracji" — mimo ze numer w niej stal.
+        [['Shop', 'Store'], ['Shop ID', 'Store ID'],
+         ['Shop order reference', 'Store order reference']].forEach(function (p){
+            if (ix[p[0]] == null && ix[p[1]] != null) ix[p[0]] = ix[p[1]];
+        });
         // Warunek wejscia CELOWO waski: bez „Billing Cycle ID" to nie jest eksport
         // Mirakla i nie wolno nam odbierac pliku innemu parserowi.
         if (ix['Billing Cycle ID'] == null || ix['Type'] == null
@@ -22960,9 +23323,31 @@
             return { err: 'to nie jest eksport transakcji z Mirakla (brak kolumn Billing Cycle ID / Type / Amount / Order number)' };
         const out = [];
         let shopId = '', shop = '', cyc = '', cur = '', pay = null, okresOd = '', okresDo = '';
+        // Kanal sprzedazy niesie kraj („LMFR", „LMIT") — przy Leroyu to jedyne miejsce
+        // w pliku, ktore go podaje. Pusty jest tylko w wierszach abonamentu i wyplaty,
+        // wiec bierzemy pierwszy niepusty.
+        let chan = '';
+        // Kolejnosci dnia i miesiaca NIE zgadujemy z nazwy kolumny, tylko liczymy
+        // z danych: liczba > 12 na pierwszym miejscu przesadza o dniu-miesiacu, na
+        // drugim o miesiacu-dniu. Gdy nic nie rozstrzyga, decyduje obecnosc AM/PM
+        // (en-US pisze „02:12:25 PM", en-GB „15:25:26"). Wynik dotyczy JEDNEGO pola:
+        // okresu z wiersza wyplaty — a to on trafia potem do opisu i do dopasowania
+        // po dacie przy Empiku, wiec „2026-16-08" nie jest tu drobiazgiem.
+        let dDzien = 0, dMies = 0, dAmPm = 0, okresRaw = null;
+        const DATY = ['Date created', 'Transaction Date', 'Billing cycle date', 'Date received'];
         for (let i = 1; i < rows.length; i++){
             const r = rows[i];
             if (!r || !r.join('').trim()) continue;
+            for (let d = 0; d < DATY.length; d++){
+                if (ix[DATY[d]] == null) continue;
+                const v = String(r[ix[DATY[d]]] || '');
+                if (!v) continue;
+                if (/\b[AP]M\b/i.test(v)) dAmPm++;
+                const md = v.match(/(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/);
+                if (!md) continue;
+                if (+md[1] > 12) dDzien++;
+                if (+md[2] > 12) dMies++;
+            }
             const typ = String(r[ix['Type']] || '').trim();
             // „Transaction Number" i „Description" niosa znaczniki pobrania
             // (PAY_ON_DELIVERY / COURIER_POD), po ktorych liczy mkPobrania. Bez nich
@@ -22978,19 +23363,50 @@
             if (!shop && ix['Shop'] != null) shop = String(r[ix['Shop']] || '').trim();
             if (!cyc) cyc = String(r[ix['Billing Cycle ID']] || '').trim();
             if (!cur && ix['Currency'] != null) cur = String(r[ix['Currency']] || '').trim();
+            if (!chan && ix['Sales channel'] != null) chan = String(r[ix['Sales channel']] || '').trim();
             // Wiersz wyplaty niesie i kwote, i okres — nie trzeba niczego liczyc.
             // „Payment of PLN 110461.98 period from 31/07/2026 to 15/08/2026"
             if (pay == null && /^payment$/i.test(typ)){
                 pay = Math.abs(mkNum(r[ix['Amount']]) || 0);
                 const m = String((ix['Description'] == null) ? '' : (r[ix['Description']] || ''))
                             .match(/period\s+from\s+(\S+)\s+to\s+(\S+)/i);
-                if (m){ okresOd = mkIso(m[1]) || m[1]; okresDo = mkIso(m[2]) || m[2]; }
+                // Same napisy zapamietujemy tutaj, a na daty przerabiamy je DOPIERO po
+                // petli — kolejnosc dnia i miesiaca znamy w calosci na koniec pliku.
+                if (m) okresRaw = [m[1], m[2]];
             }
         }
+        // Rozstrzygniecie kolejnosci: przewaga twardych dowodow, a przy remisie AM/PM.
+        const dmy = (dDzien !== dMies) ? (dDzien > dMies) : !dAmPm;
+        if (okresRaw){
+            const zam = function (v){
+                const t = String(v || '').trim();
+                const md = t.match(/^(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/);
+                if (!md) return mkIso(t) || t;
+                const dd = dmy ? +md[1] : +md[2], mm = dmy ? +md[2] : +md[1];
+                if (!(dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12)) return mkIso(t) || t;
+                return md[3] + '-' + pad2(mm) + '-' + pad2(dd);
+            };
+            okresOd = zam(okresRaw[0]); okresDo = zam(okresRaw[1]);
+        }
         if (!out.length) return { err: 'eksport Mirakla bez ani jednej pozycji' };
-        const w = MK_SHOPID[shopId] || null;
-        return { rows: out, shopId: shopId, shop: shop, cycle: cyc, cur: cur || 'PLN',
-                 wyplata: pay, od: okresOd, do: okresDo,
+        let w = MK_SHOPID[shopId] || null;
+        // Sklep Leroya, ktorego numeru jeszcze nie znam, rozpoznaje sie po KANALE
+        // SPRZEDAZY („LMES" -> ES). To jedyne miejsce w pliku, ktore podaje kraj —
+        // i jedyna droga, zeby ES albo PT weszly bez dopisywania numerow do kodu.
+        // Numer zapamietujemy: panel kanalu nie oddaje, wiec bez tego pobieranie
+        // z panelu dalej nazywaloby ten sklep „sklep <numer>".
+        const kraj = w ? '' : leroyKraj(chan);
+        if (kraj){
+            w = { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
+                  host: MK_LEROY_HOST, shop: 'Leroy Merlin ' + kraj };
+            lshopSave(shopId, w.shop);
+        }
+        // Etykieta sklepu musi byc TA SAMA co przy pobieraniu z panelu — inaczej te same
+        // pieniadze zapisalyby sie pod dwoma kluczami ustawien.
+        const nazwaSkl = (w && w.shop) ? w.shop : shop;
+        return { rows: out, shopId: shopId, shop: nazwaSkl, shopFile: shop, chan: chan,
+                 cycle: cyc, cur: cur || 'PLN',
+                 wyplata: pay, od: okresOd, do: okresDo, dmy: dmy,
                  mp: w ? w.mp : '', brand: w ? w.brand : '', short: w ? w.short : '',
                  host: w ? w.host : '' };
     }
@@ -26345,6 +26761,310 @@
         }
         return ok;
     }
+    // ================= BRICO BRAVO =================
+    // Arkusz z panelu: naglowek po wlosku, potem pozycje, potem blok podsumowania.
+    // Kwota przelewu NIE jest wierszem „IN PAGAMENTO" — patrz komentarz przy bbLicz.
+    const MK_BB_HOST = 'sellerhub.bricobravo.com';
+    function bbNum(v){
+        const t = String(v == null ? '' : v).replace(/\s/g, '').replace(',', '.').replace(/[^\d.\-]/g, '');
+        if (!t || !/\d/.test(t)) return null;
+        const x = Number(t);
+        return isFinite(x) ? x : null;
+    }
+    function bbNorm(v){
+        return String(v == null ? '' : v).toLowerCase()
+               .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+    // Warunek wejscia CELOWO waski: dwie nazwy kolumn naraz. Zaden inny obslugiwany
+    // plik nie ma „Numero Ordine" ORAZ „Importo Ordine".
+    function bbCzyPlik(txt){
+        const g = bbNorm(String(txt || '').slice(0, 4000));
+        return g.indexOf('numero ordine') >= 0 && g.indexOf('importo ordine') >= 0;
+    }
+    // Etykiety bloku podsumowania. Szukamy po znormalizowanym POCZATKU, bo arkusz
+    // dokleja do nich gwiazdki i symbole walut („ADV €", „Commissioni sulle vendite *").
+    const BB_SUMY = [
+        ['evasi',    'ordini evasi'],
+        ['prowizja', 'commissioni sulle vendite'],
+        ['perf',     'di cui trattenute per performance'],
+        ['abon',     'abbonamento'],
+        ['rekl',     'reclami'],
+        ['inne',     'altri addebiti o accrediti'],
+        ['sosp',     'fondi sospesi per reclami'],
+        ['sblo',     'fondi sbloccati da reclami'],
+        ['adv',      'adv'],
+        ['spons',    'sponsored'],
+        ['pagam',    'in pagamento']
+    ];
+    function mkParseBrico(text){
+        const rows = mkCsvRows(String(text == null ? '' : text));
+        if (!rows.length) return { err: 'pusty plik' };
+        let hi = -1;
+        for (let i = 0; i < rows.length && hi < 0; i++){
+            const g = bbNorm((rows[i] || []).join(' '));
+            if (g.indexOf('numero ordine') >= 0 && g.indexOf('importo ordine') >= 0) hi = i;
+        }
+        if (hi < 0) return { err: 'to nie jest zestawienie Brico Bravo (brak kolumn „Numero Ordine" / „Importo Ordine")' };
+        const hdr = (rows[hi] || []).map(bbNorm);
+        const kol = function (nazwa){ for (let i = 0; i < hdr.length; i++) if (hdr[i] === nazwa) return i; return -1; };
+        const cNr = kol('numero ordine'), cKw = kol('importo ordine'),
+              cSt = kol('stato ordine'),  cDt = kol('data ordine');
+        // Prowizja Z VAT-em, bo to ona jest potracana. Gdy kolumny z VAT-em nie ma,
+        // bierzemy sama prowizje — przy IVA 0 (odwrotne obciazenie) to ta sama liczba.
+        let cPr = kol('commissioni iva inclusa');
+        if (cPr < 0) cPr = kol('commissioni');
+        if (cNr < 0 || cKw < 0) return { err: 'zestawienie Brico Bravo bez kolumny z numerem albo kwotą zamówienia' };
+
+        const ord = {}, ref = {}, refNote = {}, dataOrd = {};
+        const poz = [];
+        let brutto = 0, prowZaokr = 0, nOrd = 0, nZwr = 0, zwrotSum = 0;
+        for (let i = hi + 1; i < rows.length; i++){
+            const r = rows[i] || [];
+            const nr = String(r[cNr] == null ? '' : r[cNr]).trim();
+            const kw = bbNum(r[cKw]);
+            if (!nr || kw === null) continue;
+            const pr = (cPr >= 0) ? (bbNum(r[cPr]) || 0) : 0;
+            const st = (cSt >= 0) ? String(r[cSt] || '').trim() : '';
+            const dt = (cDt >= 0) ? String(r[cDt] || '').trim() : '';
+            poz.push({ nr: nr, kwota: kw, prow: pr, stan: st, data: dt });
+            brutto = r2(brutto + kw);
+            prowZaokr = r2(prowZaokr + pr);
+            if (!dataOrd[nr]) dataOrd[nr] = dt;
+            if (kw < 0){
+                nZwr++;
+                zwrotSum = r2(zwrotSum + Math.abs(kw));
+                ref[nr] = r2((ref[nr] || 0) + Math.abs(kw));
+                refNote[nr] = 'zwrot Brico Bravo' + (st ? (' · ' + st) : '') + (dt ? (' · ' + dt) : '');
+            } else {
+                nOrd++;
+                ord[nr] = r2((ord[nr] || 0) + kw);
+            }
+        }
+        if (!poz.length) return { err: 'zestawienie Brico Bravo bez ani jednej pozycji' };
+
+        // Blok podsumowania: etykieta w jednej komorce, liczba w nastepnej niepustej.
+        const sumy = {};
+        for (let i = hi + 1; i < rows.length; i++){
+            const r = rows[i] || [];
+            const g = bbNorm(r[0]);
+            if (!g) continue;
+            for (let k = 0; k < BB_SUMY.length; k++){
+                const klucz = BB_SUMY[k][0], etyk = BB_SUMY[k][1];
+                if (sumy[klucz] != null) continue;
+                if (g !== etyk && g.indexOf(etyk) !== 0) continue;
+                for (let c = 1; c < r.length; c++){
+                    const v = bbNum(r[c]);
+                    if (v !== null){ sumy[klucz] = v; break; }
+                }
+            }
+        }
+        return bbLicz({ poz: poz, ord: ord, ref: ref, refNote: refNote, dataOrd: dataOrd,
+                        brutto: brutto, prowZaokr: prowZaokr, nOrd: nOrd, nZwr: nZwr,
+                        zwrotSum: zwrotSum, sumy: sumy });
+    }
+    // Kwota, ktora NAPRAWDE wchodzi na konto.
+    //
+    // Arkusz liczy prowizje osobno dla kazdego zamowienia i ZAOKRAGLA ja do groszy, po
+    // czym sumuje zaokraglone. Brico Bravo liczy ja od SUMY sprzedazy. Na zestawieniu
+    // 28.06-27.07.2026 daje to 1526.16 kontra 1526.23 — i to wlasnie te 7 groszy dzieli
+    // wiersz „IN PAGAMENTO" (9681.20) od przelewu (9681.13). Ich wlasna faktura
+    // (fattura 1/1720) wpisuje w pozycji „Fees" 1526.23, czyli wersje OD SUMY.
+    //
+    // Dlatego „IN PAGAMENTO" sluzy nam tylko do porownania, a kontrola idzie po kwocie,
+    // ktora liczymy sami. Stawki NIE wpisujemy na sztywno — wyprowadzamy ja z danych,
+    // bo inny miesiac moze miec inna, a rozne kategorie moga miec rozne.
+    function bbLicz(p){
+        const s = p.sumy || {};
+        // Stawka prowizji z KAZDEGO wiersza sprzedazy. Zgoda wszystkich wierszy jest
+        // warunkiem — przy rozjezdzie nie mamy prawa liczyc prowizji „od sumy".
+        let stawka = null, zgodna = true;
+        p.poz.forEach(function (x){
+            if (!x.kwota || x.kwota <= 0 || !x.prow) return;
+            const w = x.prow / x.kwota;
+            if (stawka === null){ stawka = w; return; }
+            if (Math.abs(w - stawka) > 0.002) zgodna = false;
+        });
+        // Zaokraglamy do czwartego miejsca: 13.5% zapisane jako 0.13499998 to ta sama stawka.
+        if (stawka !== null) stawka = Math.round(stawka * 10000) / 10000;
+        const prowOdSumy = (stawka !== null && zgodna) ? r2(p.brutto * stawka) : null;
+        const prow = (prowOdSumy !== null) ? prowOdSumy : p.prowZaokr;
+        const potrPozostale = r2((s.abon || 0) + (s.rekl || 0) + (s.inne || 0)
+                                + (s.adv || 0) + (s.spons || 0));
+        const wyplata = r2(p.brutto - prow - potrPozostale);
+        return {
+            poz: p.poz, ord: p.ord, ref: p.ref, refNote: p.refNote, dataOrd: p.dataOrd,
+            brutto: p.brutto, nOrd: p.nOrd, nZwr: p.nZwr, zwrotSum: p.zwrotSum,
+            stawka: stawka, stawkaZgodna: zgodna,
+            prowZaokr: p.prowZaokr, prowOdSumy: prowOdSumy, prow: prow,
+            potr: potrPozostale, sumy: s,
+            wyplata: wyplata,
+            wPliku: (s.pagam == null) ? null : r2(s.pagam),
+            // Roznica miedzy naszym rachunkiem a wierszem z arkusza. Nie jest bledem —
+            // jest DOKLADNIE tym zaokragleniem, o ktore pytal uzytkownik.
+            roznicaZaokr: (s.pagam == null) ? null : r2(r2(s.pagam) - wyplata),
+            // Kontrola wlasna arkusza: suma pozycji kontra jego wlasny wiersz „Ordini evasi".
+            evasiOk: (s.evasi == null) ? null : eq(r2(s.evasi), p.brutto)
+        };
+    }
+    function bbZastosuj(j, p, skad){
+        j.shop = j.shop || 'Brico Bravo IT';
+        if (!j.cur) j.cur = 'EUR';
+        const both = Object.keys(p.ord).filter(function (x){ return p.ref[x] != null; });
+        j.data = { brico: p, shop: j.shop, gross: p.brutto, refund: p.zwrotSum,
+                   net: p.wyplata, netOk: (j.amount == null) ? true : eq(p.wyplata, j.amount),
+                   ord: p.ord, ref: p.ref, refNote: p.refNote, dataOrd: p.dataOrd,
+                   unknown: {}, skipped: {}, full: true, both: both,
+                   pays: 1, split: false, rows: p.poz.length, total: p.poz.length,
+                   pages: 1, how: skad };
+        const bad = [];
+        if (j.amount != null && !eq(p.wyplata, j.amount))
+            bad.push('policzona wypłata ' + f2(p.wyplata) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+        if (p.evasiOk === false)
+            bad.push('suma pozycji ' + f2(p.brutto) + ' ≠ wiersz „Ordini evasi" ' + f2(p.sumy.evasi));
+        if (!p.stawkaZgodna)
+            bad.push('wiersze mają RÓŻNE stawki prowizji — prowizję wziąłem z sumy zaokrąglonych, sprawdź fakturę');
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join(' · ');
+        j.note = 'sprzedaży ' + p.nOrd + ' na ' + f2(p.brutto) + ' EUR brutto'
+               + ' · prowizja ' + f2(p.prow)
+               + (p.stawka !== null ? (' (' + (Math.round(p.stawka * 10000) / 100) + '%)') : '')
+               + ' · pozostałe potrącenia ' + f2(p.potr)
+               + ' · wypłata ' + f2(p.wyplata)
+               + (p.roznicaZaokr ? (' · UWAGA: wiersz „IN PAGAMENTO" w arkuszu mówi '
+                     + f2(p.wPliku) + ', czyli o ' + f2(p.roznicaZaokr)
+                     + ' więcej — arkusz zaokrągla prowizję przy KAŻDYM zamówieniu, '
+                     + 'a Brico Bravo liczy ją od sumy (tak stoi na ich fakturze). '
+                     + 'Kontroluję po kwocie policzonej, nie po tym wierszu.') : '')
+               + (p.nZwr ? (' · zwrotów ' + p.nZwr + ' na ' + f2(p.zwrotSum) + ' — idą na listę zwrotów') : '');
+    }
+    // ---------- Brico Bravo: pobieranie zestawien z panelu ----------
+    // Adresy odczytane WPROST z zapisu ruchu przegladarki na sellerhub.bricobravo.com:
+    //   GET /invoices                    — lista rozliczen
+    //   GET /invoices/files/{id}/excel   — arkusz danego rozliczenia
+    // Ciasteczka sesji wystarczaja, tokena nie ma — dlatego idziemy GM_xmlhttpRequest
+    // (patrz @connect), tak samo jak po zestawienia Cnovy.
+    function bbGet(sciezka, jakoBufor){
+        return new Promise(function (res, rej){
+            GM_xmlhttpRequest({
+                method: 'GET', url: 'https://' + MK_BB_HOST + sciezka,
+                responseType: jakoBufor ? 'arraybuffer' : undefined,
+                headers: { 'Accept': jakoBufor ? '*/*' : 'text/html,*/*' },
+                timeout: 120000,
+                onload: function (r){
+                    if (r.status !== 200)
+                        return rej(new Error('panel Brico Bravo odpowiedział HTTP ' + r.status
+                                             + ' — zaloguj się na ' + MK_BB_HOST));
+                    res(jakoBufor ? r.response : String(r.responseText || ''));
+                },
+                onerror:   function (){ rej(new Error('nie mogę połączyć się z ' + MK_BB_HOST)); },
+                ontimeout: function (){ rej(new Error(MK_BB_HOST + ' nie odpowiedział na czas')); }
+            });
+        });
+    }
+    // Numery rozliczen z listy. Bierzemy je z ADRESOW pobierania, a nie z ukladu strony:
+    // panel jest reactowo-livewire'owy i jego DOM zmienia sie miedzy wydaniami, a ten
+    // adres jest tym, co naprawde oddaje plik. Od najnowszego, bo szukamy ostatniej wyplaty.
+    function bbIdZListy(html){
+        const out = [], seen = {}, re = /\/invoices\/files\/(\d+)\/excel/gi;
+        let m;
+        while ((m = re.exec(String(html || ''))) !== null){
+            if (!seen[m[1]]){ seen[m[1]] = 1; out.push(m[1]); }
+        }
+        return out.sort(function (a, b){ return Number(b) - Number(a); });
+    }
+    function bbLeft(jobs){
+        const j = jobs || jobsLoad();
+        return Object.keys(j).filter(function (k){ return j[k].kind === 'brico' && mkTodo(j[k]); }).length;
+    }
+    async function bbPass(jobs){
+        const todo = Object.keys(jobs).filter(function (k){ return jobs[k].kind === 'brico' && mkTodo(jobs[k]); });
+        if (!todo.length) return 0;
+        let lista = [];
+        try {
+            say('Brico Bravo — czytam listę rozliczeń…');
+            lista = bbIdZListy(await bbGet('/invoices', false));
+        } catch (e){
+            const t = (e && e.message) || String(e);
+            todo.forEach(function (k){ jobs[k].status = 'err'; jobs[k].msg = withLogin(jobs[k], t); });
+            jobsSave(jobs); render();
+            return 0;
+        }
+        if (!lista.length){
+            todo.forEach(function (k){
+                jobs[k].status = 'err';
+                jobs[k].msg = withLogin(jobs[k], 'na liście rozliczeń nie widzę ani jednego pliku do pobrania — '
+                    + 'zaloguj się na ' + MK_BB_HOST + ' i sprawdź zakładkę „Invoices"');
+            });
+            jobsSave(jobs); render();
+            return 0;
+        }
+        // Numeru z tytulu przelewu w zestawieniu NIE MA, wiec plik z wplata parujemy
+        // po KWOCIE — tak samo jak przy Cnovie. Przegladamy od najnowszego i bierzemy
+        // ten, ktorego policzona wyplata zgadza sie z wyciagiem co do grosza.
+        const MAKS = 12;
+        const cache = {};
+        let ok = 0;
+        for (let i = 0; i < todo.length; i++){
+            const j = jobs[todo[i]];
+            let trafiony = null, ostatniBlad = '', sprawdzone = [];
+            for (let k = 0; k < lista.length && k < MAKS && !trafiony; k++){
+                const id = lista[k];
+                try {
+                    if (!cache[id]){
+                        say('Brico Bravo — czytam rozliczenie ' + id + ' (' + (k + 1) + '/'
+                            + Math.min(lista.length, MAKS) + ')…');
+                        const buf = await bbGet('/invoices/files/' + id + '/excel', true);
+                        const txt = await cnovZArkusza(buf);
+                        const p = mkParseBrico(txt);
+                        if (p.err) throw new Error(p.err);
+                        cache[id] = p;
+                    }
+                    const p = cache[id];
+                    sprawdzone.push(id + ': ' + f2(p.wyplata));
+                    if (j.amount == null || eq(p.wyplata, j.amount)) trafiony = p;
+                } catch (e){ ostatniBlad = (e && e.message) || String(e); }
+            }
+            if (trafiony){
+                bbZastosuj(j, trafiony, 'panel Brico Bravo');
+                ok++;
+            } else {
+                j.status = 'err';
+                j.msg = withLogin(j, 'nie znalazłem rozliczenia na ' + f2(j.amount) + ' EUR'
+                    + (sprawdzone.length ? (' — sprawdziłem ' + sprawdzone.length + ' ostatnich: '
+                        + sprawdzone.slice(0, 6).join(', ')) : '')
+                    + (ostatniBlad ? (' · ostatni błąd: ' + ostatniBlad) : ''));
+            }
+            jobsSave(jobs); render();
+        }
+        return ok;
+    }
+    async function bbWczytaj(file){
+        const jobs = jobsLoad();
+        try {
+            const buf = await readBuf(file);
+            const txt = await cnovZArkusza(buf);
+            const p = mkParseBrico(txt);
+            if (p.err){ say('Brico Bravo: ' + p.err, '#c00'); return; }
+            // Do ktorej wplaty nalezy ten plik: po policzonej kwocie. Numeru z przelewu
+            // w zestawieniu nie ma, wiec kwota jest jedynym lacznikiem.
+            const kand = Object.keys(jobs).filter(function (k){
+                return jobs[k].kind === 'brico' && jobs[k].amount != null && eq(jobs[k].amount, p.wyplata);
+            });
+            if (!kand.length){
+                say('Wczytałem zestawienie Brico Bravo na ' + f2(p.wyplata)
+                    + ' EUR, ale nie widzę wpłaty na tę kwotę. Wgraj najpierw wyciąg bankowy.', '#c47f00');
+                return;
+            }
+            if (kand.length > 1){
+                say('Do kwoty ' + f2(p.wyplata) + ' pasuje ' + kand.length
+                    + ' wpłat Brico Bravo — nie zgaduję, którą to jest.', '#c47f00');
+                return;
+            }
+            bbZastosuj(jobs[kand[0]], p, 'plik wgrany ręcznie');
+            jobsSave(jobs); render();
+            say('Brico Bravo: wczytane, wypłata ' + f2(p.wyplata) + ' EUR.', '#0a7a2f');
+        } catch (e){ say('Brico Bravo: ' + ((e && e.message) || e), '#c00'); }
+    }
     function mkParseMano(text){
         // Tresc zrodlowa zostaje NIETKNIETA — to ona idzie potem do prologistics.
         // Zadnego obcinania, sortowania ani przepisywania kolumn.
@@ -28060,6 +28780,20 @@
         const o = [];
         if (c && c.payOut) o.push(c.payOut.reference, c.payOut.invoiceNumber, c.payOut.number, c.payOut.id);
         if (c) o.push(c.invoiceNumber, c.reference, c.number, c.name, c.id);
+        // Nazw pol nowego operatora nie znam z gory (zapis ruchu z panelu Leroya przyszedl
+        // bez tresci odpowiedzi — i dobrze, bo tresc niosla by dane zamowien). Dokladamy
+        // wiec pola, ktorych NAZWA mowi, ze to numer dokumentu albo wyplaty. Wezszego
+        // kryterium niz nazwa klucza tu nie ma, a mkMatchIn i tak wymaga zgodnosci
+        // calego numeru po odarciu z zer — samo poszerzenie listy niczego nie zgaduje.
+        const dopisz = function (obj){
+            if (!obj || typeof obj !== 'object') return;
+            Object.keys(obj).forEach(function (k){
+                if (!/invoice|payout|reference|documentnumber/i.test(k)) return;
+                const v = obj[k];
+                if (v != null && typeof v !== 'object') o.push(v);
+            });
+        };
+        dopisz(c); dopisz(c && c.payOut);
         return o.filter(function (x){ return x != null && typeof x !== 'object'; }).map(String);
     }
     function mkMatchIn(list, ref){
@@ -28209,7 +28943,9 @@
     // Sam adres domeny prowadzi do sklepu dla klientow („Storefront route not found").
     // Panel sprzedawcy, w ktorym dziala sesja, jest pod /admin.
     const MK_PANEL = { 'belianide860.myvtex.com': '/admin/commission-report/detail',
-                       'partner.galaxus.ch': '/en/ui/Receivables/PayoutOverviewCmi/Show' };
+                       'partner.galaxus.ch': '/en/ui/Receivables/PayoutOverviewCmi/Show',
+                       // Wykaz rozliczen Leroya — adres wprost z zapisu ruchu panelu.
+                       'adeo-marketplace.mirakl.net': '/sellerpayment/shop/shop-billing-cycles' };
     function mkPanelUrl(host){ return 'https://' + host + (MK_PANEL[host] || '/'); }
     // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
     // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
@@ -28409,6 +29145,14 @@
         return ids;
     }
     function mkShopIds(){ return mkShopIdsFrom(onMirakl && document.documentElement ? document.documentElement.innerHTML : ''); }
+    // Czy to strona logowania Mirakla. Rozpoznajemy po polu hasla ORAZ po tym, ze nie ma
+    // ani jednego numeru sklepu — samo pole hasla bywa tez w ustawieniach konta.
+    function mkStronaLogowania(){
+        if (!onMirakl || !document.documentElement) return false;
+        const h = document.documentElement.innerHTML;
+        if (!/<input[^>]+type=["']password["']/i.test(h)) return false;
+        return !/(?:switch-shop|shop-logo)\/\d|[?&]shopUid=\d|"(?:shopUid|shopId|currentShopUUID)"\s*:\s*"?\d/.test(h);
+    }
     // Sklep, na ktorym zaczynamy — zdejmowany z HTML-a PRZED jakimkolwiek przelaczaniem,
     // zeby bylo dokad wrocic.
     function mkCurShopId(){
@@ -28449,7 +29193,25 @@
             }
             scan();
             const iv = setInterval(function (){ scan(); if (done) clearInterval(iv); }, 2000);
-            setTimeout(function (){ clearInterval(iv); }, 120000);
+            setTimeout(function (){
+                clearInterval(iv);
+                if (done) return;
+                // Okno skanowania minelo, a wiecej niz jednego sklepu nie zobaczylismy.
+                // Dotad byla tu CISZA — uzytkownik dowiadywal sie o tym dopiero
+                // w prologistics, przy „zostaly rozliczenia na innych sklepach".
+                let ile = 0;
+                try { ile = mkShopIds().length; } catch (e){}
+                if (mkStronaLogowania()){
+                    mkToast('Nie jesteś zalogowany na ' + mkHost() + ' — nie mam skąd wziąć listy sklepów. '
+                          + 'Zaloguj się, a potem rozwiń przełącznik sklepu w nagłówku; wtedy zapamiętam '
+                          + 'wszystkie sklepy tej platformy i pobiorę rozliczenia z prologistics.');
+                    return;
+                }
+                mkToast('Znam tylko ' + (ile || 'jeden') + ' sklep tej platformy (' + mkHost() + '). '
+                      + 'Rozwiń przełącznik sklepu w nagłówku — przy zwiniętym, albo gdy wszedłeś na inną '
+                      + 'zakładkę sklepu, w drzewie strony stoi wyłącznie sklep bieżący. Bez pełnej listy '
+                      + 'rozliczenia z pozostałych sklepów nie zostaną pobrane.');
+            }, 120000);
             // Nowa nawigacja Mirakla (Home24) rysuje liste sklepow DOPIERO po rozwinieciu
             // przelacznika — przy zamknietym w drzewie nie ma jej wcale. Stara (Vente)
             // laduje logotypy od razu w naglowku. Dlatego oprocz odpytywania co chwile
@@ -30652,6 +31414,12 @@
                             mirakl: 'Mirakl' };
     function mkKindNazwa(k){ const n = String(k || ''); return MK_KIND_NAZWA[n] || (n || 'nieznany'); }
     function komWolno(r){ return !!MK_KOM_MP[String((r && r.kind) || '')]; }
+    // Nazwy marketplace'ow, przy ktorych komentarz w tickecie w ogole wchodzi w gre —
+    // czytane Z BRAMKI, nie wpisane w komunikat. Dopoki byly wpisane, komunikat mowil
+    // „wylacznie przy Wayfairze" jeszcze dlugo po tym, jak doszedl do niej Amazon.
+    function komWolnoMp(){
+        return Object.keys(MK_KOM_MP).map(mkKindNazwa).join(' i ');
+    }
     // Wiersze, ktorych opis ma prawo trafic do ticketu. Jedno miejsce dla wszystkich
     // czterech uzyc (status grupy, guzik kontroli, dopisywanie, sprawdzanie) — inaczej
     // ktores z nich zostaloby przy starej regule.
@@ -31580,6 +32348,12 @@
     function ksBtn(){ return document.getElementById('tm-t-check-and-book-parallel-btn'); }
     // Sygnal konca: tamten modul blokuje swoj przycisk na czas pracy i odblokowuje go
     // w bloku finally. Czekamy wiec az sie zablokuje, a potem az znow bedzie wolny.
+    // Ile czekamy na modul ticketa z JEDNA paczka. Bylo 45 minut i to wlasnie ta liczba
+    // zatrzymywala przelot zbiorczy: jedna zawieszona paczka blokowala wszystkie nastepne
+    // na trzy kwadranse. Przy pieciu workerach paczka na kilkanascie pozycji schodzi
+    // w 2-3 minuty, wiec piec minut to zapas, a nie ciasnota. Po tym czasie paczka trafia
+    // do drugiego podejscia zamiast wstrzymywac reszte.
+    const KS_LIMIT_MS = 5 * 60 * 1000;
     function ksWait(btn){
         return new Promise(function (resolve){
             const t0 = Date.now();
@@ -31589,7 +32363,7 @@
                 else if (started){ clearInterval(iv); resolve('ok'); }
                 const dt = Date.now() - t0;
                 if (!started && dt > 30000){ clearInterval(iv); resolve('anulowane'); }
-                if (dt > 45 * 60 * 1000){ clearInterval(iv); resolve('przerwane po czasie'); }
+                if (dt > KS_LIMIT_MS){ clearInterval(iv); resolve('przerwane po czasie'); }
             }, 400);
         });
     }
@@ -31702,7 +32476,7 @@
         if (milczace.length){
             mkLog('komentarz', 'pomijam ' + milczace.length + ' poz. z opisem ('
                   + komMilczaceMp(x.rows).join(', ') + ') — komentarze w ticketach '
-                  + 'zostawiamy wylacznie przy Wayfairze');
+                  + 'zostawiamy tylko przy: ' + komWolnoMp());
         }
         // Puste „done" znaczylo dotad „nie odczytalem logu" i komentowalismy wszystko.
         // To bylo sluszne, dopoki nie umielismy odczytac POWODOW. Teraz umiemy: gdy log
@@ -31720,10 +32494,14 @@
             if (milczace.length){
                 return { msg: 'opisów nie dopisuję — ' + milczace.length + ' poz. ma opis ('
                               + komMilczaceMp(x.rows).join(', ') + '), ale komentarze w ticketach '
-                              + 'zostawiamy wyłącznie przy Wayfairze', col: '#666' };
+                              + 'zostawiamy tylko przy: ' + komWolnoMp(), col: '#666' };
             }
+            // Zwykly zwrot opisu nie ma i miec nie musi (v3.72) — komentarz zostaje przy
+            // pozycjach, ktore naprawde trzeba wytlumaczyc: SAFE-T, Goodwill, chargeback,
+            // potracenia z rozliczenia Wayfaira.
             return { msg: 'opisów nie dopisuję — żadna pozycja nie ma opisu potrącenia '
-                          + '(dostarcza je rozliczenie Wayfaira)', col: '#666' };
+                          + '(mają go tylko pozycje wymagające wyjaśnienia: potrącenia '
+                          + 'z rozliczenia Wayfaira, SAFE-T, Goodwill, chargeback)', col: '#666' };
         }
         // v3.66: powod pominiecia zapisujemy PRZY POZYCJI. Dotad zostawal wylacznie
         // w komunikacie na pasku, ktory znikal — i pozycja bez komentarza wygladala
@@ -31747,34 +32525,36 @@
             return { msg: 'opisów nie dopiszę — moduł „Księgowanie w tickecie" jest wyłączony w launcherze', col: '#c47f00' };
         }
         let ok = 0; const bad = [];
-        for (let i = 0; i < want.length; i++){
-            // v3.90: licznik z dotychczasowym wynikiem. Jedna pozycja potrafi trwac
-            // 10-30 s (zaladowanie ticketu, otwarcie zamknietego, zapis, potwierdzenie,
-            // zamkniecie z powrotem) — bez biezacego ✔/✖ cala ta praca wygladala jak cisza.
-            say('Dopisuję opis potrącenia ' + (i + 1) + '/' + want.length
+        // PIEC naraz. Jedna pozycja to 10-30 s (zaladowanie ticketu, otwarcie zamknietego,
+        // zapis, potwierdzenie, zamkniecie z powrotem) — przy kilkunastu pozycjach szereg
+        // znaczyl kilka minut czekania. Tyle samo workerow, ile ma ksiegowanie.
+        let zrobione = 0;
+        await amzPula(want, async function (poz){
+            zrobione++;
+            say('Dopisuję opis potrącenia ' + zrobione + '/' + want.length
                 + (ok || bad.length ? (' (✔ ' + ok + (bad.length ? (' · ✖ ' + bad.length) : '') + ')') : '')
-                + ' — ' + want[i].id + '… (10-30 s na pozycję)');
+                + ' — ' + poz.id + '… (5 naraz, 10-30 s na pozycję)');
             const tPoz = Date.now();
             try {
-                const r = await window.__TM_TICKET_COMMENT(want[i].id, want[i].note);
-                mkLog('komentarz', want[i].id + ': '
+                const r = await window.__TM_TICKET_COMMENT(poz.id, poz.note);
+                mkLog('komentarz', poz.id + ': '
                       + ((r && r.ok) ? ('✔ ' + (r.duplikat ? 'byl juz na tickecie' : (r.potwierdzone || 'zapisany')))
                                      : ('✖ ' + ((r && r.error) || 'nie powiodlo sie')))
                       + ' — ' + mkLogSek(tPoz));
                 if (r && r.ok){
                     ok++;
-                    rcMark(want[i].id, true, r.duplikat ? 'był już na tickecie'
-                                           : ((r.potwierdzone || '') + (r.poPowtorzeniu ? ', za drugim razem' : '')));
+                    rcMark(poz.id, true, r.duplikat ? 'był już na tickecie'
+                                       : ((r.potwierdzone || '') + (r.poPowtorzeniu ? ', za drugim razem' : '')));
                 } else {
                     const p = (r && r.error) || 'nie powiodło się';
-                    bad.push(want[i].id + ': ' + p);
-                    rcMark(want[i].id, false, p);
+                    bad.push(poz.id + ': ' + p);
+                    rcMark(poz.id, false, p);
                 }
             } catch (e){
                 const p = (e && e.message) || String(e);
-                mkLog('komentarz', want[i].id + ': ✖ wyjatek — ' + p + ' — ' + mkLogSek(tPoz));
-                bad.push(want[i].id + ': ' + p);
-                rcMark(want[i].id, false, p);
+                mkLog('komentarz', poz.id + ': ✖ wyjatek — ' + p + ' — ' + mkLogSek(tPoz));
+                bad.push(poz.id + ': ' + p);
+                rcMark(poz.id, false, p);
             }
             // v3.90: lista zwrotow przerysowuje sie PO KAZDEJ pozycji, nie dopiero na
             // koncu. Dotad przez kilka minut wisialo „opisy: jeszcze nie dopisywane",
@@ -31783,7 +32563,7 @@
             // z rcMark, wiec ✔/✖ pojawiaja sie na biezaco; refBusy gasi guziki na czas
             // przebiegu, zeby przerysowana lista nie zapraszala do drugiego startu.
             try { renderRef(); } catch (e){}
-        }
+        }, 5);
         zOpisem.forEach(function (r){ if (want.indexOf(r) < 0) pominietePowod(r); });
         const pominiete = zOpisem.length - want.length;
         const powody = pominiete ? powodyPre : {};
@@ -31872,11 +32652,33 @@
                       + 'Sprawdz te auftragi wzrokowo.');
             }
         } catch (e){ mkLog('ticket', '    (nie odczytalem powodow z logu: ' + ((e && e.message) || e) + ')'); }
-        if (done.length) rdMark(x.key, done, true);
-        else rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
         // Opis potracenia z rozliczenia trafia do ticketu jako komentarz — tam go szuka
-        // ksiegowosc, gdy pyta, skad sie wzial ten zwrot.
+        // ksiegowosc, gdy pyta, skad sie wzial ten zwrot. Idzie ZARAZ po paczce: przed
+        // arkuszem i przed zazielenieniem wierszy.
         const kom = await refComment(x, done) || { msg: '', col: '#666' };
+        // Zielona jest tylko pozycja, ktora I weszla, I ma juz swoj komentarz — o ile
+        // w ogole go potrzebuje. Dotad rdMark szedl PRZED refComment, wiec wiersz robil
+        // sie zielony, zanim komentarz ruszyl, i zostawal zielony takze wtedy, gdy
+        // komentarz nie wszedl. Zielone „zrobione" przy braku opisu w tickecie to
+        // dokladnie ten rodzaj cichej straty, ktorej ta lista ma zapobiegac.
+        if (done.length){
+            const trzeba = {};
+            komWiersze(x.rows).forEach(function (rr){ trzeba[String(rr.id)] = 1; });
+            const zKom = [], bezKom = [];
+            done.forEach(function (id){
+                if (!trzeba[String(id)]){ zKom.push(id); return; }
+                const st = rcState(id);
+                if (st && st.ok) zKom.push(id); else bezKom.push(id);
+            });
+            if (zKom.length)   rdMark(x.key, zKom, true);
+            if (bezKom.length){
+                rdMark(x.key, bezKom, false);
+                mkLog('komentarz', 'zaksiegowane, ale BEZ komentarza — zostaja do zrobienia: '
+                      + bezKom.join(', '));
+            }
+        } else {
+            rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
+        }
         // Zwroty zaksiegowane — odhaczamy je w arkuszu. Niepowodzenie tego kroku nie
         // cofa ksiegowania, trafia tylko na pasek stanu.
         let ark = '';
@@ -31942,6 +32744,29 @@
                 say('Grupa ' + (i + 1) + '/' + keys.length + ' — konto ' + g[keys[i]].acct + '…');
                 const r = await bookRefunds(g[keys[i]]);
                 if (r) bad.push('konto ' + g[keys[i]].acct + ': ' + r); else ok++;
+            }
+            // DRUGIE PODEJSCIE. Jedna awaria — wygasla sesja, chwilowy 500, zawieszony
+            // ticket ubity po KS_LIMIT_MS — nie moze zostawiac polowy roboty. Zbieramy
+            // wszystko, co PO pierwszym przelocie nadal nie jest zaksiegowane (takze
+            // pozycje z grup, ktore czesciowo weszly), i probujemy raz jeszcze.
+            // Raz, nie w kolko: przy trwalej awarii drugi przelot i tak nic nie da,
+            // a trzeci tylko przedluza czekanie.
+            const g2 = refGroups();
+            const zostalo = Object.keys(g2).sort().filter(function (k){
+                if (!g2[k].acct) return false;
+                const st = rdState(k, g2[k]);
+                return !st || st.left.length;
+            });
+            if (zostalo.length){
+                mkLog('start', '=== drugie podejscie: ' + zostalo.length + ' grup, ktore nie weszly ===');
+                for (let i = 0; i < zostalo.length; i++){
+                    say('Drugie podejście ' + (i + 1) + '/' + zostalo.length
+                        + ' — konto ' + g2[zostalo[i]].acct + '…');
+                    const r2 = await bookRefunds(g2[zostalo[i]]);
+                    if (!r2) ok++;
+                }
+            } else {
+                mkLog('start', 'drugie podejscie niepotrzebne — nic nie zostalo');
             }
         } finally { window.__MKT_AUTO = false; }
         b.disabled = false;
@@ -32045,7 +32870,7 @@
             ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair',
             c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova',
             alleops: 'operacje Allegro', allemap: 'raport zamówień Allegro', allebil: 'billing Allegro',
-            hd: 'rozliczenie Homedeco' };
+            hd: 'rozliczenie Homedeco', brico: 'rozliczenie Brico Bravo' };
         const MK_TYPY_NAZWY = Object.keys(MK_TYPY_ETYK);
         function mkTypPliku(txt){
             try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
@@ -32084,7 +32909,7 @@
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
             const kubelki = { bank: [], mir: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [], cnov: [],
-                              alleops: [], allemap: [], allebil: [], hd: [], obich: [] }, nieznane = [];
+                              alleops: [], allemap: [], allebil: [], hd: [], obich: [], brico: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -32113,7 +32938,12 @@
                             if (csvy.some(function (x){ return alleCzyMapa(x.tekst); })) typ = 'allemap';
                             else {
                                 const txt = await cnovZArkusza(buf);
-                                typ = alleCzyOperacje(txt) ? 'alleops' : (mkTypPliku(txt) === 'cnov' ? 'cnov' : '');
+                                // Brico Bravo pytamy PRZED Cnova: jego warunek wejscia jest
+                                // wezszy (dwie nazwy kolumn naraz), wiec nie ma jak podebrac
+                                // pliku sasiadowi.
+                                typ = alleCzyOperacje(txt) ? 'alleops'
+                                    : (bbCzyPlik(txt) ? 'brico'
+                                    : (mkTypPliku(txt) === 'cnov' ? 'cnov' : ''));
                             }
                         } catch (e){ typ = ''; }
                     }
@@ -32141,6 +32971,7 @@
             kubelki.mano.forEach(function (f){ manoWczytaj(f); });
             kubelki.cnov.forEach(function (f){ cnovWczytaj(f); });
             kubelki.hd.forEach(function (f){ hdWczytaj(f); });
+            kubelki.brico.forEach(function (f){ bbWczytaj(f); });
             // Allegro: NAJPIERW raporty zamowien i billing, na koncu operacje — wtedy
             // zlecenie sklada sie raz, z kompletem danych, zamiast trzy razy po kawalku.
             for (let i = 0; i < kubelki.allemap.length; i++) await alleWczytajMapy(kubelki.allemap[i]);
@@ -32425,7 +33256,7 @@
                 // Nieznany numer sklepu to nie blad pliku, tylko brak wpisu u nas.
                 // Mowimy WPROST, czego brakuje — inaczej trzeba by tego szukac po kodzie.
                 if (!p.mp){
-                    say('To ' + opis + ' ze sklepu „' + (p.shop || '?') + '" (Shop ID ' + (p.shopId || '?')
+                    say('To ' + opis + ' ze sklepu „' + (p.shopFile || p.shop || '?') + '" (Shop ID ' + (p.shopId || '?')
                         + '), ale tego numeru nie mam w konfiguracji — powiedz, do którego marketplace’u należy.', '#c47f00');
                     return;
                 }
@@ -32702,6 +33533,13 @@
                 j.data = { amz: p, shop: p.shop, gross: p.gross, refund: Math.abs(p.refund),
                            net: p.net, netOk: true, ord: p.ord, ref: p.ref,
                            refNote: p.refNote, refSign: p.refSign,
+                           // SAFE-T, REVERSAL_REIMBURSEMENT i Goodwill stoja OBOK ref[] —
+                           // to nie sa zwroty do klienta, tylko osobne decyzje Amazona.
+                           // Bez tego pola refPozycje dostawalo puste [] i ani jedna taka
+                           // pozycja nie dochodzila na liste zwrotow, chociaz adnotacja
+                           // zlecenia wprost je zapowiadala („SAFE-T / REVERSAL … — na listę
+                           // zwrotów ze znakiem minus"). Homedeco przepisuje to tak samo.
+                           refExtra: p.refExtra || [],
                            unknown: {}, skipped: {}, full: true, both: both,
                            pays: 1, split: false, rows: p.nOrd + p.nRef, total: p.nOrd + p.nRef,
                            pages: 1, how: 'plik ' + f.name };
@@ -32748,9 +33586,19 @@
                     + ': ' + p.shop + ' · rozliczenie ' + p.setId + ' z ' + (p.payDate || '—')
                     + ' · wypłata ' + f2(p.net) + ' ' + p.cur
                     + ' · zamówień ' + Object.keys(p.ord).length + ' brutto ' + f2(p.gross)
-                    + (Object.keys(p.ref).length ? (' · na listę zwrotów ' + Object.keys(p.ref).length
-                        + ' poz. (zwroty ' + f2(Math.abs(p.refund))
-                        + (p.rekomp ? (', SAFE-T/REVERSAL ' + f2(p.rekompSum) + ' ze znakiem minus') : '') + ')') : '')
+                    // Liczymy OBIE listy naraz. Dotad stala tu sama dlugosc ref[], wiec
+                    // komunikat mowil „na listę zwrotów 40 poz." takze wtedy, gdy pozycji
+                    // bylo 41 — a przy rozliczeniu zlozonym z samych roszczen (bez ani
+                    // jednego zwyklego zwrotu) cala ta czesc znikala.
+                    + (function (){
+                        const nZwr = Object.keys(p.ref).length, nEx = (p.refExtra || []).length;
+                        if (!nZwr && !nEx) return '';
+                        return ' · na listę zwrotów ' + (nZwr + nEx) + ' poz. (zwroty ' + nZwr
+                             + ' na ' + f2(Math.abs(p.refund))
+                             + (p.rekomp ? (', SAFE-T/REVERSAL ' + p.rekompN + ' na '
+                                            + f2(p.rekompSum) + ' ze znakiem minus') : '')
+                             + (p.goodwill ? (', Goodwill ' + p.goodwill) : '') + ')';
+                      })()
                     + ' · kontrola pliku ✓', '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
@@ -33846,7 +34694,7 @@
             try {
                 const jobs = jobsLoad();
                 if (!mkLeft(jobs)){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
-                const nm = await mkShopName();
+                const nm = mkShopLabel(mkCurShopId(), await mkShopName(), location.hostname);
                 const ok = await mkPass(jobs, nm, location.hostname);
                 const left = mkLeft(jobsLoad());
                 say('Sklep ' + (nm || '?') + ': pobranych ' + ok + (left ? (', zostało ' + left + ' na innych sklepach — użyj „Przeleć wszystkie sklepy"') : '') + '.', left ? '#c47f00' : '#0a7a2f');
@@ -33857,9 +34705,9 @@
         if (bAll) bAll.onclick = async function(){
             const b = this, b2 = $('#mk-run');
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs);
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs), nBb = bbLeft(jobs);
             // CHECK24 doliczamy do komunikatu, ale NIE do przelotu — nie ma czym go pobrac.
-            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov && !nBb){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -33873,18 +34721,22 @@
             const c24p = (onMirakl || onVtex) ? 0 : nC24;
             const mano = (onMirakl || onVtex) ? 0 : nMano;
             const cnov = (onMirakl || onVtex) ? 0 : nCnov;
-            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            // Brico Bravo ma wlasny panel — siegamy tam z prologistics, tak jak po Cnove.
+            const bb   = (onMirakl || onVtex) ? 0 : nBb;
+            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov && !bb){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : [])
                               .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : [])
-                              .concat(mano ? [MK_MM_HOST] : []).concat(cnov ? [MK_CN_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano + cnov) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+                              .concat(mano ? [MK_MM_HOST] : []).concat(cnov ? [MK_CN_HOST] : [])
+                              .concat(bb ? [MK_BB_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano + cnov + bb) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
                     .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
                     .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : [])
                     .concat(ebay ? ['  • ' + MK_EBAY_HOST + ' — ' + ebay + ' szt. (rozpoznanie wypłaty)'] : [])
                     .concat(c24p ? ['  • ' + MK_C24_HOST + ' — ' + c24p + ' szt. (Details + Abrechnung)'] : [])
                     .concat(mano ? ['  • ' + MK_MM_HOST + ' — ' + mano + ' szt.'] : [])
-                    .concat(cnov ? ['  • ' + MK_CN_HOST + ' — ' + cnov + ' szt.'] : []).join('\n')
+                    .concat(cnov ? ['  • ' + MK_CN_HOST + ' — ' + cnov + ' szt.'] : [])
+                    .concat(bb ? ['  • ' + MK_BB_HOST + ' — ' + bb + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -33919,6 +34771,11 @@
                 try { ok += await mkPrzelot('Cnova', 'cnov', MK_CN_HOST, 'Cdiscount', cnovPass); }
                 catch (e){ problem.push(MK_CN_HOST + ': ' + ((e && e.message) || e)); }
             }
+            if (bb){
+                seen++;
+                try { ok += await mkPrzelot('Brico Bravo', 'brico', MK_BB_HOST, 'Brico Bravo', bbPass); }
+                catch (e){ problem.push(MK_BB_HOST + ': ' + ((e && e.message) || e)); }
+            }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
                 let home = '';
@@ -33939,7 +34796,7 @@
                         // cofnalby pobrane rozliczenie Galaxusa i Wayfaira do „czeka na dane".
                         // Petla po sklepach nizej robi to samo w kazdej iteracji (22203).
                         jobs = jobsLoad();
-                        ok += await mkPass(jobs, await mkShopName(), host);
+                        ok += await mkPass(jobs, mkShopLabel(home, await mkShopName(), host), host);
                         if (mkLeft(jobsLoad(), host)){
                             const t = host + ': zostały rozliczenia na innych sklepach — wejdź tam raz na '
                                     + mkPanelUrl(host) + ', moduł zapamięta ich listę';
@@ -33954,7 +34811,7 @@
                         say(host + ' — sklep ' + (i + 1) + '/' + ids.length + '…');
                         try { await mkSwitch(ids[i]); } catch (e){ continue; }
                         seen++;
-                        const nm = await mkShopName();
+                        const nm = mkShopLabel(ids[i], await mkShopName(), host);
                         ok += await mkPass(jobs, nm, host);
                     }
                     // v3.87: przelot przeszedl bez wyjatku, a zlecenia dalej czekaja i nie maja
@@ -34922,6 +35779,50 @@
     // Link do auftragu: prologistics pokazuje go jako „15254075/3", a strona chce
     // number + txnid osobno. Numer transakcji bywa w roznych polach albo doklejony
     // ukosnikiem — bierzemy pierwszy, ktory sie znajdzie.
+    // Data platnosci wiersza paczki. Trzy zrodla, od najpewniejszego — bo zadne nie jest
+    // pewne zawsze: nazw pol daty w hash_result NIE ZNAM na pewno (tak samo jak przy
+    // numerze transakcji w impAuction), a przy Allegro data jest per WIERSZ, nie per paczka.
+    const IMP_DATA_POLA = ['payment_date', 'paymentDate', 'date', 'booking_date', 'bookingDate',
+                           'value_date', 'valueDate', 'transaction_date', 'transactionDate',
+                           'op_date', 'created_at', 'data'];
+    function impDataYmd(v){
+        const s0 = String(v == null ? '' : v).trim();
+        if (!s0) return '';
+        let m = s0.match(/(\d{4})-(\d{2})-(\d{2})/);
+        if (m) return m[0];
+        m = s0.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
+        if (!m) return '';
+        const d = parseInt(m[1], 10), mc = parseInt(m[2], 10);
+        if (!(d >= 1 && d <= 31 && mc >= 1 && mc <= 12)) return '';
+        return m[3] + '-' + ('0' + mc).slice(-2) + '-' + ('0' + d).slice(-2);
+    }
+    // Mapa „numer zamowienia -> data" z NASZEGO rozliczenia. Buduja ja parsery Allegro,
+    // Amazona i ManoMano jako „dataOrd" — nie wiemy z gory, pod ktorym kubelkiem
+    // (j.data.alle / j.data.amz / …), wiec przegladamy je wszystkie.
+    function impDataOrd(job){
+        const d = (job && job.data) || {};
+        const klucze = Object.keys(d);
+        for (let i = 0; i < klucze.length; i++){
+            const v = d[klucze[i]];
+            if (v && typeof v === 'object' && v.dataOrd && typeof v.dataOrd === 'object') return v.dataOrd;
+        }
+        return null;
+    }
+    // Zwraca { txt, zWyciagu } — druga flaga mowi, ze to data CALEGO przelewu, a nie
+    // tej pozycji. Bez niej data z wyciagu udawalaby date platnosci wiersza.
+    function impDataWiersza(job, x, ordMap){
+        for (let i = 0; i < IMP_DATA_POLA.length; i++){
+            const t = impDataYmd(x && x[IMP_DATA_POLA[i]]);
+            if (t) return { txt: t, zWyciagu: false };
+        }
+        const id = String((x && x.payment_descr) != null ? x.payment_descr : '').trim();
+        if (id && ordMap){
+            const t = impDataYmd(ordMap[id]);
+            if (t) return { txt: t, zWyciagu: false };
+        }
+        const jd = impDataYmd(job && job.date);
+        return jd ? { txt: jd, zWyciagu: true } : { txt: '', zWyciagu: false };
+    }
     function impAuction(x){
         const raw = String(x.auction_number == null ? '' : x.auction_number).trim();
         if (!raw) return null;
@@ -35132,9 +36033,16 @@
         // wyjasnienia, tylko normalny skutek drugiej wplaty do tego samego auftragu.
         // Nie znikaja, przestaja tylko krzyczec: przy jednym uruchomieniu dziewiec z dziesieciu
         // wierszy CHECK to byly wlasnie zera i jedyny prawdziwy rozjazd gubil sie miedzy nimi.
+        // ZERO to zero, a nie „w tolerancji". Warunek uzywal tu „tol" z pola „grosze do
+        // wyrownania" — wiec po podniesieniu tolerancji do 6.00 kazdy wiersz z open amount
+        // do 6.00 wpadal do kubelka opisanego „Open amount 0 — auftrag nie ma juz nic do
+        // zaplaty", znikal z widocznej listy i dostawal etykiete, ktora klamala.
+        // Tolerancja sluzy WYLACZNIE do hurtowego wyrownania (patrz „near" i guzik nizej);
+        // wiersze w tolerancji zostaja na widocznej liscie, tylko chkTabela maluje je na
+        // zielono z ✓, wiec od razu widac, ze sa drobne.
         const zeroOpen = chk.filter(function (x){
             const o = impNum(x.open_amount);
-            return o != null && Math.abs(o) <= tol;
+            return o != null && Math.abs(o) < 0.005;
         });
         const doWyj = chk.filter(function (x){ return zeroOpen.indexOf(x) < 0; });
 
@@ -35230,13 +36138,17 @@
               +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">'
               +  (nfPoCzym(job) === 'faktura' ? 'Faktura' : 'Fulfilment') + '</td>'
               +  (maZrod ? '<td style="padding:1px 6px">Nr operacji w Allegro</td>' : '')
+              +  '<td style="padding:1px 6px">Data płatności</td>'
               +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
               +  '<td style="padding:1px 6px;text-align:right">Zwrot w tym cyklu</td>'
               +  '<td style="padding:1px 6px">Co to znaczy</td>'
               +  '<td style="padding:1px 6px">Auftrag</td></tr>';
+            // Mape dat czytamy RAZ na cala tabele, a nie przy kazdym wierszu.
+            const nfOrdMap = impDataOrd(job);
             nf.forEach(function (x){
                 const id = String(x.payment_descr == null ? '' : x.payment_descr).trim();
                 const a = impNum(x.amount);
+                const dt = impDataWiersza(job, x, nfOrdMap);
                 const rv = (id && refs[id] != null) ? Math.abs(refs[id]) : null;
                 const full = (rv != null && a != null && Math.abs(rv - a) < 0.005);
                 const au = impAuction(x);
@@ -35250,6 +36162,12 @@
                   +  (au ? (' <a href="' + esc(au.url) + '" target="_blank" style="font-weight:400">' + esc(au.label) + '</a>') : '')
                   +  '</td>'
                   +  (maZrod ? ('<td style="padding:2px 6px;font-family:monospace;font-size:10px">' + nfZrodlo(zrod, id) + '</td>') : '')
+                  // „(z wyciągu)" znaczy: to data CALEGO przelewu, nie tej pozycji.
+                  // Przy Allegro kazdy wiersz ma wlasna date i wtedy stoi tu ta wlasciwa.
+                  +  '<td style="padding:2px 6px;white-space:nowrap' + (dt.zWyciagu ? ';color:#888' : '') + '">'
+                  +  (dt.txt ? esc(dt.txt) : '—')
+                  +  (dt.txt && dt.zWyciagu ? '<span style="font-size:9px"> (z wyciągu)</span>' : '')
+                  +  '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (rv == null ? '—' : f2(rv)) + '</td>'
                   +  '<td style="padding:2px 6px;color:' + colr + '">' + msg + '</td>'
