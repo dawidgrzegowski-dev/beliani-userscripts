@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.95
+// @version      4.97
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -28,6 +28,8 @@
 // @connect      prologistics.info
 // @connect      mirakl.net
 // @connect      empik.com
+// @connect      leenbakker.nl
+// @connect      xxxlgroup.com
 // @connect      myvtex.com
 // @connect      galaxus.ch
 // @connect      wayfair.com
@@ -21978,7 +21980,12 @@
         'Mirakl (Empik) · Beliani - Oficjalny Sklep': { bank: '', booking: '9', acct: '1359' },
         // BRW: konto 1116 „Black Red White", sklep w panelu nazywa sie po prostu „Beliani PL"
         // (kolumna „Shop" w eksporcie, shopUid 2004).
-        'Mirakl (BRW) · Beliani PL':                  { bank: '', booking: '9', acct: '1116' }
+        'Mirakl (BRW) · Beliani PL':                  { bank: '', booking: '9', acct: '1116' },
+        // Leen Bakker: oba sklepy na konto 1354 „Leen Bakker Beliani NL" (uzgodnione).
+        // Nazwy sklepow to numery z tytulow przelewow — panel poda wlasne, ale te sa
+        // pewne i nie zmienia sie po przelaczeniu sklepu.
+        'Mirakl (Leen Bakker) · Leen Bakker · sklep 2297': { bank: '', booking: '9', acct: '1354' },
+        'Mirakl (Leen Bakker) · Leen Bakker · sklep 2298': { bank: '', booking: '9', acct: '1354' }
     };
     function setLoad(){
         let d = null;
@@ -22699,6 +22706,33 @@
         // z tytulu: „PAYOUT FOR INVOICE 318628 FOR SHOP 3481".
         { mp: 'Mirakl (Home24)', ok: true, payer: /HOME\s?24/i, ref: /INVOICE\s+(\d+)/i,
           brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        // Leen Bakker: Mirakl na wlasnej domenie (partnerplatform.leenbakker.nl —
+        // stad osobny @connect). Tytul ma ten sam ksztalt, co Home24:
+        //   „Leen Bakker Nederland B.V. Payout for invoice 260449 f or shop 2298
+        //    KUNDENREFERENZ 260449"
+        // Kluczem jest numer faktury; numer sklepu z tytulu („for shop 2298") sluzy
+        // tylko do czytania — sklep i tak rozstrzyga sie po eksporcie.
+        { mp: 'Mirakl (Leen Bakker)', ok: true, payer: /LEEN\s*BAKKER/i, ref: /INVOICE\s+(\d+)/i,
+          brand: 'Leen Bakker', short: 'Leen Bakker', host: 'partnerplatform.leenbakker.nl' },
+        // Gdyby w tytule zabraklo numeru faktury: mkDetect POMIJA regule, ktorej wzorzec
+        // referencji nie trafil, wiec bez tej blizniaczej wiersz przepadlby bez sladu.
+        // Tak samo zabezpieczone sa Brico Bravo i Leroy.
+        { mp: 'Leen Bakker',         ok: false, payer: /LEEN\s*BAKKER/i },
+        // XXXLutz i Momax to JEDEN panel (marketplace.xxxlgroup.com — stad osobny
+        // @connect) i kilka sklepow na nim: XXXLUTZ|DE, |AT, |CH oraz MÖMAX|DE
+        // wskazuja w liscie paneli ten sam adres. Dlatego oba platnicy maja ten sam
+        // „mp" — rozroznia je nazwa sklepu z panelu — a marka zostaje wlasna, zeby
+        // w logu bylo widac, kto zaplacil.
+        // Tytul jak u Home24: „XXXLutz KG Payout for invoice 263049 f or shop 3752".
+        { mp: 'Mirakl (XXXLutz)', ok: true, payer: /XXX\s*LUTZ|XXXL[- ]?GROUP/i,
+          ref: /INVOICE\s+(\d+)/i,
+          brand: 'XXXLutz', short: 'XXXLutz', host: 'marketplace.xxxlgroup.com' },
+        { mp: 'Mirakl (XXXLutz)', ok: true, payer: /M(?:O|Ö|OE)MAX/i,
+          ref: /INVOICE\s+(\d+)/i,
+          brand: 'Mömax', short: 'Mömax', host: 'marketplace.xxxlgroup.com' },
+        // Bez numeru faktury wiersz ma zostac chociaz NAZWANY — mkDetect pomija regule,
+        // ktorej wzorzec referencji nie trafil.
+        { mp: 'XXXLutz',          ok: false, payer: /XXX\s*LUTZ|XXXL[- ]?GROUP|M(?:O|Ö|OE)MAX/i },
         // OBI to nie Mirakl, tylko VTEX — inne API (GraphQL), wiec ma wlasna sciezke.
         // Kluczem jest referencja PODE-RRRRMMDD-NNNN z tytulu przelewu, rowna dokladnie
         // polu payoutReportFileName w raporcie. Data w niej to dzien rozliczenia,
@@ -22864,8 +22898,22 @@
         // wiec mkDetect siega po tekst sklejony i numer wraca w calosci.
           ref: /(?:KUNDENREFERENZ|CUSTOMER\s*REF(?:ERENCE)?|KUNDENREF)\s*[:.]?\s*(\d{6,})(?!\s*\d)/i,
           brand: 'Leroy Merlin', short: 'Leroy', host: 'adeo-marketplace.mirakl.net' },
-        // Gdyby w tytule zabraklo numeru: wiersz ma byc chociaz NAZWANY, a nie przepasc
-        // bez sladu — ta regula stala tu od dawna i wlasnie ta role dalej pelni.
+        // UBS nie oddaje numeru faktury WCALE. Caly tytul to nazwa spolki:
+        //   „Reason for payment: SOCIETE BELIANI  DE  GMBH; Costs: Incoming payment
+        //    abroad (*e); Transaction no. ZD81230AE8946345"
+        // Numer faktury widac w HVB („KUNDENREFERENZ") i w drugim banku („CUSTOMER REF"),
+        // ale nie tutaj. Bierzemy wiec za klucz NUMER TRANSAKCJI z wyciagu — jest
+        // unikalny i od razu wiadomo, z ktorej linii wyciagu powstalo zlecenie.
+        // Cykl dobierze sie po KWOCIE: mkMatchCycle probuje numeru, potem kwoty w oknie
+        // +-3 dni (i tylko gdy pasuje DOKLADNIE JEDEN cykl), a kontrola netto i tak
+        // porownuje wyplate z kwota z wyciagu. Tak samo lapiemy Home24 i BRW.
+        // Regula stoi ZA ta od numeru faktury, wiec HVB dalej idzie numerem faktury.
+        { mp: 'Mirakl (Leroy)', ok: true,  payer: /XPOLLENS/i,
+          ref: /Transaction\s*no\.?\s*:?\s*([A-Z0-9]{6,})/i,
+          brand: 'Leroy Merlin', short: 'Leroy', host: 'adeo-marketplace.mirakl.net' },
+        // Gdyby w tytule zabraklo i numeru faktury, i numeru transakcji: wiersz ma byc
+        // chociaz NAZWANY, a nie przepasc bez sladu — ta regula stala tu od dawna
+        // i wlasnie ta role dalej pelni.
         { mp: 'Xpollens',       ok: false, payer: /XPOLLENS/i },
         { mp: 'Furniture1',     ok: false, payer: /BALDAI1|Furniture1/i }
     ];
@@ -23258,7 +23306,21 @@
         '4263': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
                   host: MK_LEROY_HOST, shop: 'Leroy Merlin IT' },
         '5318': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
-                  host: MK_LEROY_HOST, shop: 'Leroy Merlin ES' }
+                  host: MK_LEROY_HOST, shop: 'Leroy Merlin ES' },
+        // Leen Bakker ma DWA sklepy na jednym hoscie — 2297 i 2298 stoja wprost
+        // w tytulach przelewow („for shop 2297" / „for shop 2298"). Numer jest tu
+        // jedynym pewnym rozroznieniem, wiec — jak przy Leroyu — „shop" nadpisuje
+        // nazwe z panelu, zeby klucz ustawien byl osobny dla kazdego sklepu.
+        '2297': { mp: 'Mirakl (Leen Bakker)', brand: 'Leen Bakker', short: 'Leen Bakker',
+                  host: 'partnerplatform.leenbakker.nl', shop: 'Leen Bakker · sklep 2297' },
+        '2298': { mp: 'Mirakl (Leen Bakker)', brand: 'Leen Bakker', short: 'Leen Bakker',
+                  host: 'partnerplatform.leenbakker.nl', shop: 'Leen Bakker · sklep 2298' },
+        // XXXLutz: z tytulow przelewow wiadomo na pewno tylko tyle, ze sklep 3752 nalezy
+        // do panelu XXXL Group. Nazwy NIE wpisujemy — poda ja panel przy pierwszym
+        // pobraniu, tak jak przy Empiku i BRW. Wpis sluzy do rozpoznania marketplace'u
+        // po kolumnie „Shop ID" w eksporcie.
+        '3752': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -28945,7 +29007,11 @@
     const MK_PANEL = { 'belianide860.myvtex.com': '/admin/commission-report/detail',
                        'partner.galaxus.ch': '/en/ui/Receivables/PayoutOverviewCmi/Show',
                        // Wykaz rozliczen Leroya — adres wprost z zapisu ruchu panelu.
-                       'adeo-marketplace.mirakl.net': '/sellerpayment/shop/shop-billing-cycles' };
+                       'adeo-marketplace.mirakl.net': '/sellerpayment/shop/shop-billing-cycles',
+                       // Wykaz rozliczen Leen Bakkera — adres wprost z zapisu ruchu panelu.
+                       'partnerplatform.leenbakker.nl': '/sellerpayment/shop/shop-billing-cycles',
+                       // Wykaz rozliczen XXXL Group — adres wprost z zapisu ruchu panelu.
+                       'marketplace.xxxlgroup.com': '/sellerpayment/shop/shop-billing-cycles' };
     function mkPanelUrl(host){ return 'https://' + host + (MK_PANEL[host] || '/'); }
     // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
     // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
@@ -29520,13 +29586,22 @@
             const w = poFf[id] || [];
             if (w.some(function (r){ return r.zwrot; })) return;
             const a = Math.abs(r2(p.ref[id]));
-            if (w.some(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
+            // Sladem NIE MOZE byc wiersz sprzedazy tego samego zamowienia: przy pelnym
+            // zwrocie ma te sama kwote co zwrot, wiec usprawiedliwialby sam siebie
+            // i zamowienie sprzedane i zwrocone w jednym rozliczeniu przechodzilo
+            // bez slowa (sprawdzone na 27661335692: 4 takie zwroty na 710.88).
+            if (w.some(function (r){ return !r.sprzedaz && Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
             brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
         });
         // --- wiersze exportu bez odpowiednika w raporcie ---
         const znane = {};
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
         Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
+        // Pozycje osobne — SAFE-T, REVERSAL_REIMBURSEMENT, Goodwill — nie sa zwrotami
+        // i nie leza w p.ref, tylko w p.refExtra. Bez nich wiersz exportu, ktory je
+        // ksieguje, wygladal na bezpanski i szedl do „w exporcie, a nie ma w rozliczeniu"
+        // (27661335692: 303-6410664-0265104 na 20.34 — SAFE-T, ktory W RAPORCIE JEST).
+        (p.refExtra || []).forEach(function (x){ if (x && x.id) znane[x.id] = 1; });
         const wolne = ex.filter(function (r){ return !r.ff || !znane[r.ff]; });
         const zuzyte = [];          // wiersze, ktore juz cos wyjasnily — nie pokazujemy ich drugi raz
 
@@ -30648,7 +30723,11 @@
             const w = poFf[id] || [];
             if (w.some(function (r){ return r.zwrot; })) return;
             const a = Math.abs(r2(p.ref[id]));
-            if (w.some(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
+            // Sladem NIE MOZE byc wiersz sprzedazy tego samego zamowienia: przy pelnym
+            // zwrocie ma te sama kwote co zwrot, wiec usprawiedliwialby sam siebie
+            // i zamowienie sprzedane i zwrocone w jednym rozliczeniu przechodzilo
+            // bez slowa (sprawdzone na 27661335692: 4 takie zwroty na 710.88).
+            if (w.some(function (r){ return !r.sprzedaz && Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
             brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
         });
         // Wiersze exportu bez odpowiednika w rozliczeniu — druga strona tej samej kontroli.
@@ -30826,7 +30905,11 @@
             const w = poFf[id] || [];
             if (w.some(function (r){ return r.zwrot; })) return;
             const a = Math.abs(r2(p.ref[id]));
-            if (w.some(function (r){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
+            // Sladem NIE MOZE byc wiersz sprzedazy tego samego zamowienia: przy pelnym
+            // zwrocie ma te sama kwote co zwrot, wiec usprawiedliwialby sam siebie
+            // i zamowienie sprzedane i zwrocone w jednym rozliczeniu przechodzilo
+            // bez slowa (sprawdzone na 27661335692: 4 takie zwroty na 710.88).
+            if (w.some(function (r){ return !r.sprzedaz && Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
             brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
         });
         const znane = Object.create(null);
