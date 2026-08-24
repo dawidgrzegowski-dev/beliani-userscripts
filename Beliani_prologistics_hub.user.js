@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.97
+// @version      4.98
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -29407,6 +29407,24 @@
     //   1323 po stronie Debit  -> sprzedaz,
     //   1323 po stronie Credit -> zwrot / korekta.
     // Konto sprzedazy to zawsze to DRUGIE.
+    // Numer w exporcie bywa DOSTAWIONY o koncowke po myslniku: nota kredytowa
+    // wystawiona przez ticket stoi pod „302-8013770-5601969-T1", a rozliczenie zna
+    // samo „302-8013770-5601969". Bez sklejenia ten sam fakt wychodzil dwa razy —
+    // raz jako „zwrot bez korekty", raz jako „w exporcie, a nie ma w rozliczeniu".
+    //
+    // Koncowke ucinamy TYLKO wtedy, gdy to, co zostaje, jest dalej pelnym numerem
+    // zamowienia Amazona: on sam ma dwa myslniki (302-8013770-5601969) i „utnij po
+    // ostatnim myslniku" skrocilby go do „302-8013770". Przy takim warunku sufiks
+    // moze byc dowolny, bo rozstrzyga poczatek, a nie jego ksztalt.
+    const MK_FF_AMZ = /^(\d{3}-\d{7}-\d{7})(?:-.+)?$/;
+    function mkFfBaza(ff){
+        const t = String(ff == null ? '' : ff).trim();
+        const m = t.match(MK_FF_AMZ);
+        if (m) return m[1];
+        // Poza Amazonem nie znam ksztaltu numerow na tyle, zeby ciac cokolwiek —
+        // zostaje sama konwencja prologistics: „-T<numer>" to nota z ticketu.
+        return t.replace(/-T\d+$/i, '');
+    }
     const MK_EXP_KOL = ['Fulfillment number', 'Auftrag number', 'Debit', 'Credit', 'Amount'];
     // Konta sprzedazy dopuszczalne dla danego typu klienta — SZERSZE niz tabela importu,
     // bo w prologistics zdarzaja sie poprawne warianty krajowe (decyzja z 13.08.2026):
@@ -29514,7 +29532,7 @@
         const kraj = String(p.kraj || 'de').toLowerCase();
         const okKonta = mkExpOk(kraj) || {}, stKraj = MK_EXP_STAWKA[kraj];
         const poFf = {};
-        ex.forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
+        ex.forEach(function (r){ if (r.ff){ const kl = mkFfBaza(r.ff); (poFf[kl] || (poFf[kl] = [])).push(r); } });
 
         const brakuje = [], zleKonto = [], zlaKwota = [], stawki = [], obce = [], brakZwrot = [];
         const bezKonta = [];                                  // v3.96
@@ -29591,8 +29609,28 @@
             // i zamowienie sprzedane i zwrocone w jednym rozliczeniu przechodzilo
             // bez slowa (sprawdzone na 27661335692: 4 takie zwroty na 710.88).
             if (w.some(function (r){ return !r.sprzedaz && Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
-            brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
+            // „sprzedazy" niesiemy po to, zeby dalo sie napisac, CZEGO brakuje, zamiast
+            // mowic o kwocie: przy pelnym zwrocie w Export Payments stoi zwykle sam
+            // wiersz sprzedazy tego zamowienia i to wlasnie trzeba powiedziec wprost.
+            brakZwrot.push({ id: id, kwota: a, wierszy: w.length,
+                             sprzedazy: w.filter(function (r){ return r.sprzedaz; }).length });
         });
+        // --- claimy: pozycje osobne z raportu i ich slad w ksiegach ---
+        // SAFE-T, REVERSAL_REIMBURSEMENT i Goodwill nie sa zwrotami — Amazon oddaje nam
+        // pieniadze albo doklada rekompensate. Nie maja zwyklego VAT-u sprzedazy, wiec
+        // osoba saldujaca poprawia go potem RECZNIE i musi wiedziec, gdzie ich szukac.
+        // Lista jest informacyjna: nie liczy sie do bledow i nie zmienia werdyktu.
+        const claimy = (p.refExtra || []).filter(function (x){ return x && x.id; })
+            .map(function (x){
+                const w = poFf[mkFfBaza(x.id)] || [];
+                return { id: x.id, rodzaj: x.rodzaj || 'pozycja osobna',
+                         kwota: r2(Math.abs(x.amt)), data: x.data || '',
+                         wiersze: w.map(function (r){
+                             return { auf: r.auf, kwota: r.kwota, vat: r.vat, konto: r.konto,
+                                      deb: r.deb, cre: r.cre, data: r.data, paid: r.paid,
+                                      zwrot: r.zwrot };
+                         }) };
+            });
         // --- wiersze exportu bez odpowiednika w raporcie ---
         const znane = {};
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
@@ -29602,7 +29640,7 @@
         // ksieguje, wygladal na bezpanski i szedl do „w exporcie, a nie ma w rozliczeniu"
         // (27661335692: 303-6410664-0265104 na 20.34 — SAFE-T, ktory W RAPORCIE JEST).
         (p.refExtra || []).forEach(function (x){ if (x && x.id) znane[x.id] = 1; });
-        const wolne = ex.filter(function (r){ return !r.ff || !znane[r.ff]; });
+        const wolne = ex.filter(function (r){ return !r.ff || !znane[mkFfBaza(r.ff)]; });
         const zuzyte = [];          // wiersze, ktore juz cos wyjasnily — nie pokazujemy ich drugi raz
 
         // --- lista „do wyjasnienia": szukamy odpowiednika KWOTOWEGO ---
@@ -29677,6 +29715,7 @@
             sklejone: sklejone.sort(function (a, b){ return b.kwota - a.kwota; }),
             niepewne: niepewne.sort(function (a, b){ return b.kwota - a.kwota; }),
             zleKonto: zleKonto, zlaKwota: zlaKwota, obce: obce, brakZwrot: brakZwrot,
+            claimy: claimy,
             stawki: stawki.sort(function (a, b){ return a.st - b.st; }),
             wyj: wyj,
             wyjBez: wyj.filter(function (x){ return !x.ile; }),      // v3.95: tylko te bez sladu
@@ -30437,6 +30476,30 @@
             h += sek('Plików nie przeczytałem: ' + zle.length, '#c00',
                      '<div style="' + mono + '">' + zle.map(esc).join('<br>') + '</div>');
 
+        // Na samej gorze, chociaz reszta idzie w kolejnosci waznosci — tak poprosila
+        // osoba saldujaca: to od tej listy zaczyna, bo VAT przy tych pozycjach poprawia
+        // recznie i musi miec je pod reka, zanim zajmie sie usterkami.
+        if ((k.claimy || []).length){
+            h += sek('\u2139\ufe0f Claimy zaksięgowane — do wglądu: ' + k.claimy.length, '#5b21b6',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">SAFE-T, REVERSAL i Goodwill to nie są zwroty — Amazon oddaje nam pieniądze albo dokłada rekompensatę, więc nie mają zwykłego VAT-u sprzedaży i saldując trzeba go poprawić ręcznie. Poniżej: co mówi raport i gdzie ta pozycja siedzi w księgach. Ta lista niczego nie zgłasza.</div>'
+                + '<div style="' + mono + '">'
+                + k.claimy.map(function (x){
+                      const glowa = esc(x.rodzaj) + '  <b>' + esc(x.id) + '</b>  ' + f2(x.kwota)
+                                  + (x.data ? ('  ' + esc(x.data)) : '');
+                      if (!x.wiersze.length)
+                          return glowa + '  →  <span style="color:#c47f00">brak śladu w exporcie</span>';
+                      return glowa + x.wiersze.map(function (r){
+                          return '<br>&nbsp;&nbsp;&nbsp;&nbsp;→ ' + knLink(r.auf) + '  ' + f2(r.kwota)
+                               + (r.vat ? ('  VAT <b>' + esc(r.vat) + '</b>') : '')
+                               + (r.konto ? ('  konto ' + esc(r.konto)) : '')
+                               + (r.data ? ('  ' + esc(r.data)) : '')
+                               + (r.zwrot ? '  (korekta)' : '')
+                               + (r.paid && r.paid.toUpperCase() !== 'YES'
+                                  ? ('  <span style="color:#c47f00">Paid ' + esc(r.paid) + '</span>') : '');
+                      }).join('');
+                  }).join('<br>') + '</div>');
+        }
+
         if (k.brakuje.length){
             h += sek('❌ Nie zaksięgowane — ' + k.brakuje.length + ' zamówień na ' + f2(k.brakujeSuma) + ' ' + esc(p.cur), '#c00',
                 '<div style="font-size:10px;color:#666;margin-bottom:3px">Są w rozliczeniu Amazona, w exporcie nie ma dla nich wiersza pod ich numerem <b>ani</b> płatności o tej samej kwocie.</div>'
@@ -30509,13 +30572,17 @@
                   }).join('<br>') + '</div>');
         }
         if (k.brakZwrot.length){
-            h += sek('❌ Zwrot bez korekty w exporcie — ' + k.brakZwrot.length, '#c00',
-                '<div style="' + mono + '">'
+            h += sek('❌ Brak w Export Payments — ' + k.brakZwrot.length, '#c00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Zwroty, które są w rozliczeniu Amazona, a w Export Payments nie mają korekty. Przy każdym stoi, co dla tego numeru w Export Payments w ogóle jest.</div>'
+                + '<div style="' + mono + '">'
                 + k.brakZwrot.map(function (x){
-                      return esc(x.id) + '  ' + f2(x.kwota)
-                           + (x.wierszy ? ('  <span style="color:#666">(zamówienie ma ' + x.wierszy
-                                           + ' wierszy, ale żaden na tę kwotę)</span>')
-                                        : '  <span style="color:#666">(brak jakiegokolwiek wiersza)</span>');
+                      const ile = x.wierszy || 0, sprz = x.sprzedazy || 0;
+                      const co = !ile
+                          ? 'tego numeru nie ma w Export Payments'
+                          : (sprz === ile
+                             ? ('w Export Payments jest tylko sprzedaż tego zamówienia — korekty zwrotu brak')
+                             : ('w Export Payments jest ' + ile + ' wierszy dla tego numeru, ale żaden nie jest korektą tego zwrotu'));
+                      return esc(x.id) + '  ' + f2(x.kwota) + '  <span style="color:#666">(' + co + ')</span>';
                   }).join('<br>') + '</div>');
         }
         // v3.95: pokazujemy WYLACZNIE pozycje z listy dla marketingu, ktorych naprawde
@@ -30555,9 +30622,9 @@
         // teraz pokazujemy wiersze z kwota i auftragiem, bo to wlasnie wsrod nich szuka
         // sie pary dla pozycji, ktorej import nie dopasowal.
         if (k.wolne.length){
-            h += sek('W exporcie, a nie ma w rozliczeniu — ' + k.wolne.length
+            h += sek('Brak na zestawieniu Amazon — ' + k.wolne.length
                      + ' wierszy na ' + f2(k.wolneSuma) + ' ' + esc(p.cur), '#c47f00',
-                '<div style="font-size:10px;color:#666;margin-bottom:3px">Płatności, których numer fulfilmentu nie występuje w tym rozliczeniu Amazona. Częściowo to normalne (export obejmuje szerszy zakres), ale to także miejsce, gdzie siedzą pozycje zaksięgowane ręcznie pod innym numerem.</div>'
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Płatności, których numer fulfilmentu nie występuje w tym rozliczeniu Amazona. Częściowo to normalne — Export Payments obejmuje szerszy zakres. Noty z końcówką po numerze zamówienia (np. <code>…-T1</code>) tu już nie trafiają: wracają do swojego zamówienia.</div>'
                 + '<div style="' + mono + ';max-height:200px;overflow:auto">'
                 + k.wolne.slice(0, 60).map(function (r){
                       return f2(r.kwota) + '  ' + knLink(r.auf)
@@ -30585,6 +30652,23 @@
         L.push('rozliczenie ' + p.setId + ' · wypłata ' + (p.payDate || '—') + ' · ' + f2(p.net) + ' ' + p.cur);
         L.push('zamówień w raporcie ' + k.nOrd + ', wierszy w exporcie ' + k.nExp + ', dopasowanych ' + k.nDopasowanych);
         if (zle.length){ L.push(''); L.push('NIE PRZECZYTAŁEM: ' + zle.join(' | ')); }
+        // Ta sama lista, co na ekranie, i tak samo na gorze — do wklejenia w arkusz.
+        if ((k.claimy || []).length){
+            L.push(''); L.push('CLAIMY ZAKSIĘGOWANE — DO WGLĄDU (' + k.claimy.length + ')');
+            L.push('\t(SAFE-T, REVERSAL i Goodwill nie mają zwykłego VAT-u sprzedaży — poprawia się go ręcznie)');
+            k.claimy.forEach(function (x){
+                if (!x.wiersze.length){
+                    L.push('\t' + x.id + '\t' + x.rodzaj + '\t' + f2(x.kwota) + '\t' + (x.data || '')
+                         + '\tbrak śladu w exporcie');
+                    return;
+                }
+                x.wiersze.forEach(function (r){
+                    L.push('\t' + x.id + '\t' + x.rodzaj + '\t' + f2(x.kwota) + '\t' + (x.data || '')
+                         + '\t' + (r.auf || '') + '\tVAT ' + (r.vat || '—')
+                         + '\tkonto ' + (r.konto || '—') + '\t' + (r.data || ''));
+                });
+            });
+        }
         if (k.brakuje.length){
             L.push(''); L.push('NIE ZAKSIĘGOWANE (' + k.brakuje.length + ' na ' + f2(k.brakujeSuma) + ' ' + p.cur + ')');
             k.brakuje.forEach(function (x){
@@ -30605,7 +30689,7 @@
             });
         }
         if (k.wolne.length){
-            L.push(''); L.push('W EXPORCIE, A NIE MA W ROZLICZENIU ('
+            L.push(''); L.push('BRAK NA ZESTAWIENIU AMAZON ('
                    + k.wolne.length + ' na ' + f2(k.wolneSuma) + ' ' + p.cur + ')');
             k.wolne.forEach(function (r){
                 L.push('\t' + f2(r.kwota) + '\t' + (r.auf || '') + '\t' + (r.ff || '')
@@ -30627,8 +30711,14 @@
             });
         }
         if (k.brakZwrot.length){
-            L.push(''); L.push('ZWROT BEZ KOREKTY W EXPORCIE (' + k.brakZwrot.length + ')');
-            k.brakZwrot.forEach(function (x){ L.push('\t' + x.id + '\t' + f2(x.kwota)); });
+            L.push(''); L.push('BRAK W EXPORT PAYMENTS (' + k.brakZwrot.length + ')');
+            k.brakZwrot.forEach(function (x){
+                const ile = x.wierszy || 0, sprz = x.sprzedazy || 0;
+                L.push('\t' + x.id + '\t' + f2(x.kwota) + '\t'
+                     + (!ile ? 'nie ma tego numeru w Export Payments'
+                             : (sprz === ile ? 'tylko sprzedaż tego zamówienia, korekty brak'
+                                             : (ile + ' wierszy, żaden nie jest korektą tego zwrotu'))));
+            });
         }
         if (k.wyjBez.length){
             L.push(''); L.push('Z LISTY DLA MARKETINGU — BEZ ŚLADU W KSIĘGACH (' + k.wyjBez.length
@@ -30668,7 +30758,7 @@
         const kraj = String(p.kraj || '').toLowerCase();
         const tab = MK_MM_ACC[kraj] || null;
         const poFf = Object.create(null);
-        (ex || []).forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
+        (ex || []).forEach(function (r){ if (r.ff){ const kl = mkFfBaza(r.ff); (poFf[kl] || (poFf[kl] = [])).push(r); } });
 
         const brakuje = [], zleKonto = [], zlaKwota = [], brakZwrot = [], obce = [], bezTypu = [];
         Object.keys(p.ord).forEach(function (id){
@@ -30734,7 +30824,7 @@
         const znane = Object.create(null);
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
         Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
-        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[r.ff]; });
+        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[mkFfBaza(r.ff)]; });
 
         return { kraj: kraj, brakuje: brakuje, zleKonto: zleKonto, zlaKwota: zlaKwota,
                  brakZwrot: brakZwrot, obce: obce, bezTypu: bezTypu, wolne: wolne,
@@ -30849,7 +30939,7 @@
     // MK_ALLE_VAT (B2B 3209 / B2C 3292), a nie z tabeli krajow.
     function mkKontrolaAlle(p, ex){
         const poFf = Object.create(null);
-        (ex || []).forEach(function (r){ if (r.ff) (poFf[r.ff] || (poFf[r.ff] = [])).push(r); });
+        (ex || []).forEach(function (r){ if (r.ff){ const kl = mkFfBaza(r.ff); (poFf[kl] || (poFf[kl] = [])).push(r); } });
 
         const brakuje = [], zleKonto = [], zlaKwota = [], brakZwrot = [], obce = [], bezTypu = [];
         Object.keys(p.ord).forEach(function (id){
@@ -30915,7 +31005,7 @@
         const znane = Object.create(null);
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
         Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
-        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[r.ff]; });
+        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[mkFfBaza(r.ff)]; });
 
         // Zamowienie, ktorego nie ma w prologistics, a w TYM SAMYM zestawieniu ma i wplate,
         // i zwrot: pieniadze sie znosza i nie ma czego ksiegowac. Dotad wychodzilo jako DWIE
