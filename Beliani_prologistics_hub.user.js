@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      4.98
+// @version      5.00
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22330,6 +22330,69 @@
     // Klucz wiersza w arkuszu: data + konto + kwota. Ten sam, ktorego uzywa Apps Script
     // do wykrywania duplikatow, wiec oznaczanie trafia dokladnie w ten sam wiersz.
     function shKey(j, acct){ return { data: j.date, konto: acct || '', kwota: j.amount }; }
+    // Nazwa marketplace'u z arkusza bywa pisana reka, wiec porownujemy po znakach
+    // znaczacych: bez wielkosci liter, bez spacji i myslnikow, bez ogonkow.
+    function mkNorm(v){
+        return String(v == null ? '' : v).toLowerCase()
+            .replace(/[\u0105\u00e0\u00e2\u00e4]/g, 'a').replace(/[\u0107\u00e7]/g, 'c')
+            .replace(/[\u0119\u00e8\u00e9\u00ea\u00eb]/g, 'e').replace(/[\u00ed\u00ee\u00ef]/g, 'i')
+            .replace(/[\u0142]/g, 'l').replace(/[\u0144\u00f1]/g, 'n')
+            .replace(/[\u00f3\u00f2\u00f4\u00f6]/g, 'o').replace(/[\u015b\u0161]/g, 's')
+            .replace(/[\u00fa\u00f9\u00fb\u00fc]/g, 'u').replace(/[\u017c\u017a\u017e]/g, 'z')
+            .replace(/[^a-z0-9]/g, '');
+    }
+    // Wszystko, co modul potrafi obsluzyc, sprowadzone do jednej listy celow. Zrodla
+    // sa dwa i uzupelniaja sie: reczne wejscia (MK_MAN) nios\u0105 walute i rodzaj,
+    // a ustawienia „marketplace · sklep" — konto, po ktorym najpewniej sie rozpoznaje.
+    // Marke i host dobieramy z reguly wyciagu tego samego marketplace'u.
+    function mkCele(){
+        const out = [];
+        MK_MAN.forEach(function (w){
+            out.push({ mp: w.mp, shop: w.shop, brand: w.brand, short: w.short, host: w.host || '',
+                       kind: w.kind, cur: w.cur, label: w.label, acct: '', zrodlo: 'ręczne' });
+        });
+        const ust = setLoad();
+        Object.keys(ust).forEach(function (k){
+            const i = k.indexOf(' · ');
+            if (i < 0) return;
+            const mp = k.slice(0, i), shop = k.slice(i + 3);
+            const juz = out.filter(function (x){ return x.mp === mp && x.shop === shop; })[0];
+            if (juz){ if (!juz.acct) juz.acct = (ust[k] || {}).acct || ''; return; }
+            const r = MK_RULES.filter(function (y){ return y.mp === mp && y.ok; })[0] || {};
+            out.push({ mp: mp, shop: shop, brand: r.brand || '', short: r.short || mp,
+                       host: r.host || '', kind: r.kind || 'mirakl', cur: '',
+                       label: shop, acct: (ust[k] || {}).acct || '', zrodlo: 'ustawienia' });
+        });
+        return out;
+    }
+    // Jeden cel albo powod, dla ktorego nie da sie rozstrzygnac. Zgadywanie jest tu
+    // najgorszym wyjsciem: zle rozpoznany marketplace to zlecenie pobrane z cudzego
+    // panelu i zaksiegowane na cudzym koncie.
+    function mkDopasuj(cele, nazwa, konto){
+        const n = mkNorm(nazwa);
+        const kt = String(konto == null ? '' : konto).trim();
+        const poKoncie = kt ? cele.filter(function (c){ return String(c.acct || '') === kt; }) : [];
+        const poNazwie = !n ? [] : cele.filter(function (c){
+            return [c.shop, c.label, c.mp, (c.brand || '') + ' ' + (c.shop || '')]
+                .some(function (x){ const y = mkNorm(x); return y && y === n; });
+        });
+        // Dopiero gdy dokladnie nic nie pasuje, probujemy zawierania — i tylko wtedy,
+        // gdy wskazuje JEDEN cel.
+        const luzno = poNazwie.length ? poNazwie : (!n ? [] : cele.filter(function (c){
+            return [c.shop, c.label, (c.brand || '') + ' ' + (c.shop || '')]
+                .some(function (x){ const y = mkNorm(x); return y && y.length > 3 && (y.indexOf(n) === 0 || n.indexOf(y) === 0); });
+        }));
+        const jeden = function (l){ return l.length === 1 ? l[0] : null; };
+        const zN = jeden(luzno), zK = jeden(poKoncie);
+        if (zN && zK && !(zN.mp === zK.mp && zN.shop === zK.shop))
+            return { err: 'nazwa wskazuje „' + zN.mp + ' · ' + zN.shop + '", a konto ' + kt
+                        + ' — „' + zK.mp + ' · ' + zK.shop + '"' };
+        const w = zN || zK;
+        if (w) return { cel: w, po: zN ? (zK ? 'nazwie i koncie' : 'nazwie') : 'koncie' };
+        if (luzno.length > 1)   return { err: 'nazwa pasuje do kilku: ' + luzno.slice(0, 3).map(function (x){ return x.shop; }).join(', ') };
+        if (poKoncie.length > 1) return { err: 'konto ' + kt + ' ma kilka sklepów w ustawieniach' };
+        return { err: 'nie rozpoznaję ani nazwy, ani konta' + (kt ? (' ' + kt) : '') };
+    }
     async function shMarkRefunded(list){
         const cfg = shCfg();
         if (!cfg.on || !cfg.url || !cfg.secret || !list || !list.length) return null;
@@ -22371,6 +22434,52 @@
         const cfg = shCfg();
         if (!cfg.url) throw new Error('nie ustawiono adresu arkusza');
         return shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, rows: rows }));
+    }
+    // Wiersze, ktorych nikt jeszcze nie zaksiegowal — Booked stoi dokladnie „Nie".
+    // Pusta kolumna to „ktos nie wypelnil", a nie „do zrobienia", wiec jej nie bierzemy.
+    async function shTodo(miesiecy){
+        const cfg = shCfg();
+        if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (' + shWhy(cfg) + ')');
+        const r = await shReq('POST', cfg.url,
+            JSON.stringify({ secret: cfg.secret, action: 'todo', months: miesiecy || 12 }));
+        if (!r || !Array.isArray(r.result))
+            throw new Error('arkusz nie odesłał listy — najpewniej wdrożone Apps Script nie zna jeszcze akcji „todo"');
+        return r;
+    }
+    // Zapis w KONKRETNYM wierszu, po wspolrzednych, ktore arkusz sam podal. Klucz
+    // data + konto + kwota tu nie wystarcza: jedno i drugie mozna bylo poprawic.
+    async function shTodoSet(rows){
+        const cfg = shCfg();
+        if (!cfg.on || !cfg.url || !cfg.secret || !rows || !rows.length) return null;
+        const r = await shReq('POST', cfg.url,
+            JSON.stringify({ secret: cfg.secret, action: 'todoSet', rows: rows }));
+        if (!r || r.ok !== true)
+            throw new Error((r && r.err) || 'arkusz nie potwierdził zapisu — sprawdź, czy zna akcję „todoSet"');
+        return r;
+    }
+    async function shMarkBooked(list){
+        return shTodoSet((list || []).map(function (x){
+            return { tab: x.tab, row: x.row, booked: 'Tak' };
+        }));
+    }
+    // Po zaksiegowaniu: zlecenie z arkusza ODHACZAMY, cudze dopisujemy jak dotad.
+    // Bez tego rozroznienia poprawiona data albo konto tworzyly DRUGI wiersz, a pierwszy
+    // zostawal na „Nie" — czyli lista do zrobienia rosla po kazdym zaksiegowaniu.
+    async function shZapisz(j, c){
+        const a = j && j.zArkusza;
+        if (a && a.tab && a.row){
+            const r = await shMarkBooked([{ tab: a.tab, row: a.row }]);
+            return { added: (r && r.updated) || 0, tabs: [a.tab], odhaczone: true };
+        }
+        return shPost([shRow(j, c)]);
+    }
+    // Jedno zdanie o tym, co sie z arkuszem stalo — zeby trzy miejsca ksiegowania
+    // mowily to samo i zeby „odhaczone" nie udawalo „wpisane".
+    function shSlowo(res){
+        if (!res) return ' · arkusz nie odpowiedział';
+        if (res.odhaczone)
+            return res.added ? ' · odhaczone w arkuszu' : ' · NIE ZNALAZŁEM wiersza w arkuszu — odhacz ręcznie';
+        return res.added ? ' · wpisane do arkusza' : ' · w arkuszu już było';
     }
 
     // --- booking_setting ---
@@ -22733,6 +22842,21 @@
         // Bez numeru faktury wiersz ma zostac chociaz NAZWANY — mkDetect pomija regule,
         // ktorej wzorzec referencji nie trafil.
         { mp: 'XXXLutz',          ok: false, payer: /XXX\s*LUTZ|XXXL[- ]?GROUP|M(?:O|Ö|OE)MAX/i },
+        // Conforama to DWIE osobne instalacje Mirakla i dwie rozne spolki. Hiszpanska
+        // placi za oba sklepy iberyjskie — w wyciagu „Conforama Espana S.A. Payout for
+        // invoice 238285 f or shop 3406" i to samo dla 3404. Dlatego regula od Espany
+        // stoi PIERWSZA; ogolna „CONFORAMA" zostaje dla Francji, ktora rozlicza sie
+        // z wlasnego panelu. Numeru sklepu z tytulu do wyboru hosta nie uzywamy:
+        // wyciag lamie opis w srodku („f or shop") i taki warunek bylby kruchy.
+        { mp: 'Mirakl (Conforama)', ok: true,
+          payer: /CONFORAMA\s*(?:ESPA|IBERIA|PORTUGAL)/i, ref: /INVOICE\s+(\d+)/i,
+          brand: 'Conforama', short: 'Conforama', host: 'conforamaiberia-prod.mirakl.net' },
+        { mp: 'Mirakl (Conforama FR)', ok: true,
+          payer: /CONFORAMA/i, ref: /INVOICE\s+(\d+)/i,
+          brand: 'Conforama', short: 'Conforama', host: 'conforama-prod.mirakl.net' },
+        // Bez numeru faktury wiersz ma zostac chociaz NAZWANY — mkDetect pomija regule,
+        // ktorej wzorzec referencji nie trafil.
+        { mp: 'Conforama',        ok: false, payer: /CONFORAMA/i },
         // OBI to nie Mirakl, tylko VTEX — inne API (GraphQL), wiec ma wlasna sciezke.
         // Kluczem jest referencja PODE-RRRRMMDD-NNNN z tytulu przelewu, rowna dokladnie
         // polu payoutReportFileName w raporcie. Data w niej to dzien rozliczenia,
@@ -22848,6 +22972,36 @@
         // wierszowi „Payment" w eksporcie Transaction logs (Shop ID 3052, „Beliani France").
         { mp: 'Mirakl (Carrefour)', ok: true, payer: /MANGOPAY/i, ref: /\b(\d{5,})\s*MARKETPAY/i,
           brand: 'Carrefour', short: 'Carrefour', host: 'carrefourfr.mirakl.net', shop: 'Carrefour FR' },
+        // Maxeda (Praxis NL + Brico BE) — Mangopay. Wszystkie wplaty tego posrednika maja
+        // ten sam ksztalt: „Mangopay <REFERENCJA> <marketplace> KUNDENREFERENZ <hex>".
+        // Kluczem jest REFERENCJA stojaca przed nazwa marketplace'u — to ona jest numerem
+        // wyplaty, po ktorym mkMatchCycle trafia w cykl WPROST. Hex po „KUNDENREFERENZ"
+        // to identyfikator przelewu Mangopaya: ma ten sam ksztalt u wszystkich i o
+        // rozliczeniu nie mowi nic (w 4.99 stal tu blednie on).
+        // Wzorzec zaczepia sie o slowo „Maxeda", a nie o „Mangopay" — dzieki temu nie
+        // zalezy od tego, ile z opisu bank wsadzi do pola platnika, a ile do tytulu.
+        { mp: 'Mirakl (Maxeda)', ok: true, payer: /MANGOPAY/i,
+          ref: /\b(\d{4,})\s+MAXEDA\b/i,
+          brand: 'Maxeda', short: 'Maxeda', host: 'maxedanl-prod.mirakl.net' },
+        // Gdyby referencji zabraklo albo miala inny ksztalt: wiersz ma zostac chociaz
+        // NAZWANY. Warunek „MAXEDA" w tytule zostaje, zeby ta regula nie zabrala wplat
+        // Vente ani Carrefoura — one tez przychodza od MANGOPAY.
+        { mp: 'Maxeda',         ok: false, payer: /MANGOPAY/i, ref: /(MAXEDA)/i },
+        // Conforama FR przez Mangopay. Francja NIE placi wprost — platnikiem jest
+        // posrednik, wiec regula od platnika „CONFORAMA" (nizej) sie tu nie odpala.
+        // Referencja ma prefiks CON: „Mangopay CON341503 Mirakl KUNDENREFERENZ …".
+        // Sprawdzone w panelu: 2 447,12 z 19.08 to cykl za 25/07–06/08 ze statusem Paid.
+        // Dopasowanie PO REFERENCJI jest tu konieczne, a nie wygodne: miedzy zamknieciem
+        // cyklu a wplywem na konto minelo 13 dni, wiec szukanie po kwocie w oknie kilku
+        // dni w ogole by nie trafilo.
+        { mp: 'Mirakl (Conforama FR)', ok: true, payer: /MANGOPAY/i, ref: /\b(CON\d{4,})\b/i,
+          brand: 'Conforama', short: 'Conforama', host: 'conforama-prod.mirakl.net' },
+        // Hobbybox — panel IP Agency FI (ipagencyfi-prod.mirakl.net, sklep 2044).
+        // Referencja wyplaty ma prefiks IPA: „Mangopay IPA230493 Mirakl KUNDENREFERENZ …".
+        // Do 5.00 te wplaty nie mialy ZADNEJ reguly i przechodzily bez sladu — w samym
+        // sierpniu trzy, na 11 199,13.
+        { mp: 'Mirakl (Hobbybox)', ok: true, payer: /MANGOPAY/i, ref: /\b(IPA\d{4,})\b/i,
+          brand: 'Hobbybox', short: 'Hobbybox', host: 'ipagencyfi-prod.mirakl.net' },
         // Zapasowa: inny, NIEZNANY Mirakl przez MANGOPAY z tym samym ksztaltem referencji.
         // Regula Carrefoura powyzej ma IDENTYCZNY wzorzec ref, wiec ta linia nie odbiera
         // jej niczego — zostaje jako siatka bezpieczenstwa, gdyby doszedl piaty taki sklep.
@@ -23320,7 +23474,25 @@
         // pobraniu, tak jak przy Empiku i BRW. Wpis sluzy do rozpoznania marketplace'u
         // po kolumnie „Shop ID" w eksporcie.
         '3752': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
-                  host: 'marketplace.xxxlgroup.com' }
+                  host: 'marketplace.xxxlgroup.com' },
+        // Conforama: 3404 i 3406 to panel iberyjski (oba z tytulow przelewow, 3404
+        // takze z naglowka mirakl-shop-uuid tego panelu), 2294 to panel francuski.
+        // Ktory z iberyjskich jest ES, a ktory PT — z danych NIE WYNIKA, a konta sa
+        // rozne (1103 ES, 1115 PT). Nazw wiec nie wpisujemy: poda je panel.
+        '3404': { mp: 'Mirakl (Conforama)', brand: 'Conforama', short: 'Conforama',
+                  host: 'conforamaiberia-prod.mirakl.net' },
+        '3406': { mp: 'Mirakl (Conforama)', brand: 'Conforama', short: 'Conforama',
+                  host: 'conforamaiberia-prod.mirakl.net' },
+        '2294': { mp: 'Mirakl (Conforama FR)', brand: 'Conforama', short: 'Conforama',
+                  host: 'conforama-prod.mirakl.net' },
+        // Maxeda: 4379 z naglowka mirakl-shop-uuid panelu. Praxis NL i Brico BE siedza
+        // na tym samym panelu i maja rozne konta (1519 i 1520), a z danych nie wynika,
+        // ktory to sklep — nazwy nie wpisujemy, poda ja panel.
+        '4379': { mp: 'Mirakl (Maxeda)', brand: 'Maxeda', short: 'Maxeda',
+                  host: 'maxedanl-prod.mirakl.net' },
+        // Hobbybox: 2044 z naglowka mirakl-shop-uuid panelu IP Agency FI.
+        '2044': { mp: 'Mirakl (Hobbybox)', brand: 'Hobbybox', short: 'Hobbybox',
+                  host: 'ipagencyfi-prod.mirakl.net' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -29011,7 +29183,14 @@
                        // Wykaz rozliczen Leen Bakkera — adres wprost z zapisu ruchu panelu.
                        'partnerplatform.leenbakker.nl': '/sellerpayment/shop/shop-billing-cycles',
                        // Wykaz rozliczen XXXL Group — adres wprost z zapisu ruchu panelu.
-                       'marketplace.xxxlgroup.com': '/sellerpayment/shop/shop-billing-cycles' };
+                       'marketplace.xxxlgroup.com': '/sellerpayment/shop/shop-billing-cycles',
+                       // Conforama — dwa panele, ten sam wykaz rozliczen.
+                       'conforamaiberia-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles',
+                       'conforama-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles',
+                       // Maxeda — Praxis NL i Brico BE na jednym panelu.
+                       'maxedanl-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles',
+                       // Hobbybox — panel IP Agency FI.
+                       'ipagencyfi-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles' };
     function mkPanelUrl(host){ return 'https://' + host + (MK_PANEL[host] || '/'); }
     // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
     // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
@@ -29966,6 +30145,10 @@
               + '<span id="mk-man-cur" style="font-size:10px;color:#666;min-width:26px"></span>'
               + '<input id="mk-man-date" type="date" style="font-size:11px;padding:1px 4px;border:1px solid #ddd;border-radius:4px" title="Data wpływu na konto — nie dzisiejsza, tylko z wyciągu albo z awiza">'
               + '<button id="mk-man-add" style="padding:3px 9px;border:none;border-radius:5px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">+ Dodaj wpłatę</button>'
+              // Ta sama droga, tylko dane nie z reki, a z arkusza: wiersze, ktorych
+              // nikt jeszcze nie zaksiegowal (Booked = „Nie").
+              + '<span style="width:1px;height:16px;background:#ddd6fe"></span>'
+              + '<button id="mk-sh-todo" style="padding:3px 9px;border:1px solid #5b21b6;border-radius:5px;background:#fff;color:#5b21b6;font-weight:700;cursor:pointer;font-size:11px" title="Wiersze z arkusza, gdzie Booked = Nie">⬇ Z arkusza</button>'
               + '</span>'
               + '<button id="mk-cfg" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">⚙ Konta</button>'
               + '<button id="mk-sal" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">📊 Salda</button>'
@@ -29973,6 +30156,7 @@
               + '<button id="mk-clear" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#f9fafb;cursor:pointer;font-size:11px">Wyczyść zlecenia</button>'
               + '<span id="mk-status" style="font-size:11px;color:#666"></span></div>'
               + '<div id="mk-set" style="display:none;margin-top:10px;padding:8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:8px"></div>'
+              + '<div id="mk-todo" style="display:none;margin-top:10px;padding:8px;background:#faf5ff;border:1px solid #ddd6fe;border-radius:8px"></div>'
             : (onVtex
                 ? '<div style="font-size:11px;color:#666;margin-bottom:6px">Czekające zlecenia z wyciągu bankowego. Zestawienia OBI pobieram stąd, bo sesja tego panelu nie jedzie w zapytaniu z prologistics. Dopasowanie idzie po referencji PODE z przelewu.</div>'
                   + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
@@ -32456,9 +32640,9 @@
         const cfg = shCfg();
         if (cur && cfg.on && cfg.url && cfg.secret){
             try {
-                const res = await shPost([shRow(j, c)]);
+                const res = await shZapisz(j, c);
                 const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
-                cur.msg += res.added ? (' · wpisane do arkusza' + tb) : ' · w arkuszu już było';
+                cur.msg += shSlowo(res) + (res.added ? tb : '');
             } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); }
             jobsSave(jobs);
         }
@@ -33221,6 +33405,134 @@
             say('Dodano wpłatę bez wyciągu: ' + w.label + ' · ' + f2(kwota) + ' ' + w.cur + ' z ' + data
                 + (w.kind === 'ebay' ? ' — kliknij „⬇ Pobierz zestawienia", żeby moduł rozpoznał, która to wypłata.'
                                      : ' — teraz wgraj raport z portalu.'), '#0a7a2f');
+        };
+
+        // ---------- niezaksięgowane z arkusza ----------
+        // Arkusz jest wspolny i czesc wierszy wpisuja ludzie recznie, wiec to jedyne
+        // miejsce, ktore wie o CALEJ pracy do zrobienia — prologistics o recznym
+        // ksiegowaniu nie powie nic, bo nie powstaje wtedy paczka importu.
+        const shBtn = $('#mk-sh-todo'), shBox = $('#mk-todo');
+        let shLista = [];
+        function shZamknij(){
+            if (shBox){ shBox.style.display = 'none'; shBox.innerHTML = ''; }
+            shLista = [];
+        }
+        function shRysuj(){
+            if (!shBox) return;
+            const cele = mkCele(), jobs = jobsLoad();
+            let gotowe = 0;
+            const h = shLista.map(function (r, i){
+                const dop = mkDopasuj(cele, r.marketplace, r.konto);
+                r._cel = dop.cel || null;
+                const dup = dop.cel ? manDuplikat(jobs, dop.cel, r.kwota, r.data) : '';
+                r._dup = dup;
+                const mozna = !!dop.cel && !dup;
+                if (mozna) gotowe++;
+                const opis = dop.cel
+                    ? ('<span style="color:#0a7a2f">' + esc(dop.cel.mp) + ' · ' + esc(dop.cel.shop) + '</span>'
+                       + '<span style="color:#888"> (po ' + esc(dop.po) + ')</span>'
+                       + (dup ? '<span style="color:#c47f00"> — już jest na liście zleceń</span>' : ''))
+                    : ('<span style="color:#c00">' + esc(dop.err || 'nie rozpoznaję') + '</span>');
+                return '<div style="display:flex;gap:6px;align-items:center;padding:2px 0;border-top:1px solid #f1eafe">'
+                     + '<input type="checkbox" data-i="' + i + '" class="mk-td-c"' + (mozna ? ' checked' : ' disabled') + '>'
+                     + '<input type="date" data-i="' + i + '" class="mk-td-d" value="' + esc(r.data) + '" style="font-size:11px;padding:1px 3px;border:1px solid #ddd;border-radius:4px">'
+                     + '<input data-i="' + i + '" class="mk-td-k" value="' + esc(r.konto) + '" placeholder="konto" style="width:56px;font-size:11px;padding:1px 3px;border:1px solid #ddd;border-radius:4px;text-align:center">'
+                     + '<b style="font-size:11px;min-width:78px;text-align:right">' + f2(r.kwota) + '</b>'
+                     + '<span style="font-size:11px;color:#374151;min-width:150px">' + esc(r.marketplace || '(bez nazwy)') + '</span>'
+                     + '<span style="font-size:11px">→ ' + opis + '</span>'
+                     + '<span style="font-size:10px;color:#aaa;margin-left:auto">' + esc(r.tab) + ' w. ' + r.row + '</span>'
+                     + '</div>';
+            }).join('');
+            shBox.innerHTML =
+                '<div style="font-size:11px;color:#5b21b6;font-weight:700;margin-bottom:2px">Niezaksięgowane z arkusza — ' + shLista.length + '</div>'
+              + '<div style="font-size:10px;color:#666;margin-bottom:6px">Wiersze, w których Booked stoi na „Nie". Datę i konto możesz poprawić przed założeniem — poprawka wraca do arkusza, do tego samego wiersza. Zlecenie tylko powstaje; pobranie rozliczenia i księgowanie zostają na Twoje kliknięcie.</div>'
+              + (h || '<div style="font-size:11px;color:#0a7a2f">Nie ma nic do zrobienia.</div>')
+              + '<div style="margin-top:8px;display:flex;gap:8px;align-items:center">'
+              + '<button id="mk-td-go" style="padding:4px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px"' + (gotowe ? '' : ' disabled') + '>Załóż zlecenia (' + gotowe + ')</button>'
+              + '<button id="mk-td-x" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">Zamknij</button>'
+              + '<span id="mk-td-msg" style="font-size:11px;color:#666"></span></div>';
+            shBox.style.display = '';
+            // Poprawka daty albo konta zmienia rozpoznanie, wiec przerysowujemy —
+            // inaczej ptaszek stalby przy wierszu, ktory juz znaczy co innego.
+            shBox.querySelectorAll('.mk-td-d').forEach(function (el){
+                el.onchange = function(){ shLista[Number(el.dataset.i)].data = el.value; shRysuj(); };
+            });
+            shBox.querySelectorAll('.mk-td-k').forEach(function (el){
+                el.onchange = function(){ shLista[Number(el.dataset.i)].konto = el.value.trim(); shRysuj(); };
+            });
+            const x = shBox.querySelector('#mk-td-x');
+            if (x) x.onclick = shZamknij;
+            const go = shBox.querySelector('#mk-td-go');
+            if (go) go.onclick = function(){ shZaloz(go); };
+        }
+        async function shZaloz(b){
+            const zazn = [];
+            shBox.querySelectorAll('.mk-td-c').forEach(function (el){
+                if (el.checked && !el.disabled) zazn.push(shLista[Number(el.dataset.i)]);
+            });
+            if (!zazn.length){ say('Nic nie zaznaczyłeś.', '#c47f00'); return; }
+            b.disabled = true;
+            // Magazyn czytamy TUZ przed zapisem — przelot zapisuje caly obiekt jobs naraz.
+            const jobs = jobsLoad();
+            const poprawki = [];
+            let dodane = 0;
+            zazn.forEach(function (r){
+                const w = r._cel;
+                if (!w || r._dup) return;
+                const k = 'SH_' + (w.short || w.mp) + '_' + r.data + '_' + Number(r.kwota).toFixed(2);
+                if (jobs[k]) return;
+                jobs[k] = { ref: '', date: r.data, amount: r2(Number(r.kwota)), cur: w.cur || 'EUR',
+                            mp: w.mp, brand: w.brand || '', short: w.short || '', host: w.host || '',
+                            kind: w.kind, shop: w.shop, docs: null, payer: '', txId: '',
+                            status: 'new', msg: '', manual: true,
+                            manualAt: new Date().toISOString().slice(0, 10),
+                            // Wspolrzedne wiersza w arkuszu — po nich, a nie po kluczu
+                            // data+konto+kwota, odhaczymy go po zaksiegowaniu. Klucz
+                            // przestalby trafiac, gdyby date albo konto poprawiono.
+                            zArkusza: { tab: r.tab, row: r.row, konto: r.konto } };
+                dodane++;
+                if (r.data !== r._data0 || String(r.konto) !== String(r._konto0))
+                    poprawki.push({ tab: r.tab, row: r.row,
+                                    data: (r.data !== r._data0) ? r.data : undefined,
+                                    konto: (String(r.konto) !== String(r._konto0)) ? r.konto : undefined });
+            });
+            jobsSave(jobs); render();
+            let ark = '';
+            if (poprawki.length){
+                try {
+                    const res = await shTodoSet(poprawki);
+                    ark = ' · poprawki zapisane w arkuszu: ' + ((res && res.updated) || 0);
+                } catch (e){ ark = ' · POPRAWKI NIE WESZŁY do arkusza: ' + ((e && e.message) || e); }
+            }
+            shZamknij();
+            say('Z arkusza: założone zlecenia ' + dodane + ark
+                + (dodane ? ' — teraz pobierz rozliczenia albo wgraj raporty.' : ''),
+                dodane ? '#0a7a2f' : '#c47f00');
+        }
+        if (shBtn) shBtn.onclick = async function(){
+            if (MK_PULLING){ say('Trwa pobieranie zestawień — spróbuj po jego zakończeniu.', '#c47f00'); return; }
+            shBtn.disabled = true;
+            say('Pytam arkusz o niezaksięgowane…', '#666');
+            try {
+                const r = await shTodo(12);
+                // Zapamietujemy, co przyszlo z arkusza, zeby wiedziec, CO zostalo
+                // poprawione — i odeslac tylko to, a nie caly wiersz.
+                shLista = (r.result || []).map(function (x){
+                    return { tab: x.tab, row: x.row, data: String(x.data || '').slice(0, 10),
+                             marketplace: x.marketplace || '', konto: String(x.konto == null ? '' : x.konto).trim(),
+                             kwota: Number(x.kwota), comments: x.comments || '',
+                             _data0: String(x.data || '').slice(0, 10),
+                             _konto0: String(x.konto == null ? '' : x.konto).trim() };
+                });
+                shRysuj();
+                say('Arkusz: ' + shLista.length + ' wierszy z Booked = Nie'
+                    + ((r.tabs && r.tabs.length) ? (' · zakładki ' + r.tabs.slice(0, 3).join(', ')
+                       + (r.tabs.length > 3 ? ' …' : '')) : ''), '#0a7a2f');
+            } catch (e){
+                shZamknij();
+                say('Arkusz: ' + ((e && e.message) || e), '#c00');
+            }
+            shBtn.disabled = false;
         };
 
 
@@ -36469,8 +36781,8 @@
         }
         const c = setLoad()[setKey(j.mp, j.data && j.data.shop)] || {};
         try {
-            const res = await shPost([shRow(j, c)]);
-            j.msg = String(j.msg || '') + (res.added ? ' · wpisane do arkusza' : ' · w arkuszu już było');
+            const res = await shZapisz(j, c);
+            j.msg = String(j.msg || '') + shSlowo(res);
         } catch (e){
             j.msg = String(j.msg || '') + ' · ARKUSZ: ' + ((e && e.message) || e) + ' — wiersz dopisz ręcznie';
         }
@@ -36681,9 +36993,9 @@
             const cfg = shCfg();
             if (cfg.on && cfg.url && cfg.secret){
                 try {
-                    const res = await shPost([shRow(j, c)]);
+                    const res = await shZapisz(j, c);
                     const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
-                    cur.msg += res.added ? (' · wpisane do arkusza' + tb) : ' · w arkuszu już było';
+                    cur.msg += shSlowo(res) + (res.added ? tb : '');
                 } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); }
                 jobsSave(jobs);
             } else {
