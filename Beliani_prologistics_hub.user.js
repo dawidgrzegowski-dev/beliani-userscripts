@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.04
+// @version      5.05
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -6077,6 +6077,45 @@
 
     const PROGRESS_KEY = 'tm_t_progress_v1';
 
+    // TRWALY SLAD ZAKSIEGOWANYCH POZYCJI — oddzielny od zapisu wznawiania.
+    // Zapis wznawiania (wyzej) jest kasowany, gdy przebieg skonczy sie bez bledow,
+    // i slusznie: nie ma czego wznawiac. Ale modul marketplace'ow czytal go po to,
+    // zeby wiedziec, CO JUZ ZAKSIEGOWANO — a ta informacja ma przezyc wlasnie udany
+    // przebieg. Skutek byl przewrotny: o pracy tego modulu dowiadywal sie tylko wtedy,
+    // gdy czesc pozycji padla.
+    // Ta lista jest DOPISYWANA i nie kasuje jej nic: ani koniec pracy, ani „Wyczysc",
+    // ani domkniecie wznawiania.
+    const BOOKED_KEY = 'tm_t_booked_v1';
+    const BOOKED_MAX = 3000;
+    function ledgerAdd(rows) {
+        try {
+            let o = null;
+            try { o = JSON.parse(localStorage.getItem(BOOKED_KEY) || 'null'); } catch (e) {}
+            const lista = (o && Array.isArray(o.rows)) ? o.rows : [];
+            const maja = {};
+            lista.forEach(function (r) { if (r && r.k) maja[r.k] = 1; });
+            let nowe = 0;
+            (rows || []).forEach(function (r) {
+                if (!r || (!r.booked && !r.alreadyBooked)) return;
+                const id = String(r.orderNumber == null ? '' : r.orderNumber).trim();
+                if (!id) return;
+                // Klucz DOKLADNIE taki sam jak po stronie czytajacej (ksZapis w module
+                // marketplace'ow) — inaczej obie polowy mowilyby o czym innym.
+                const kw = Math.abs(Number(String(r.amount == null ? '' : r.amount).replace(',', '.')) || 0);
+                const k = id + '|' + kw.toFixed(2);
+                if (maja[k]) return;
+                maja[k] = 1;
+                lista.push({ k: k, at: new Date().toISOString().slice(0, 10) });
+                nowe++;
+            });
+            if (!nowe) return;
+            // Obcinamy od NAJSTARSZYCH: lista ma sluzyc biezacym rozliczeniom,
+            // a nie rosnac bez konca w pamieci przegladarki.
+            const cut = lista.length > BOOKED_MAX ? lista.slice(lista.length - BOOKED_MAX) : lista;
+            localStorage.setItem(BOOKED_KEY, JSON.stringify({ ts: Date.now(), rows: cut }));
+        } catch (e) {}
+    }
+
     function saveProgress() {
         try {
             if (!Array.isArray(previewRows) || !previewRows.length) return;
@@ -6097,6 +6136,10 @@
                 raw: (document.getElementById('tm-t-input') || {}).value || '',
                 rows: slim
             }));
+            // Ten sam moment, druga lista — ta, ktora przezyje skasowanie zapisu
+            // wznawiania. saveProgress chodzi po kazdej zmianie, wiec slad powstaje
+            // na biezaco, a nie dopiero na koncu przebiegu.
+            ledgerAdd(slim);
         } catch (e) {}
     }
     function loadProgress() {
@@ -22096,7 +22139,7 @@
     // Adres i klucz siedza w ustawieniach, nie w kodzie: adres jest jak haslo, a klucz
     // ma zostac tylko u Ciebie.
     const MK_SH_KEY = 'mkt_sheet';
-    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycby6aTUAxVPXQcADY5zLlzmT6A9a9eMN85gEk9HLtxFaYmnXo_3Qqdvn9zzIt7NH7mGIsw/exec';
+    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycbzJ-55TNvMZob4CEpD0nlLLLmZApdH8oGFZA1nfpe3PuIMWz_0OWf_1vAvDS7juD6_TrQ/exec';
     // Adresy WCZESNIEJSZYCH wdrozen. Trzymamy je po to, zeby przeniesc tych, ktorzy
     // maja ktorys zapisany w ustawieniach — patrz shCfg. Stare wdrozenia serwuja kod
     // bez nowych akcji i nie da sie tego odkrecic: w Apps Script adres jest przypiety
@@ -22106,7 +22149,8 @@
     const MK_SH_STARE = [
         'https://script.google.com/macros/s/AKfycby17PasQqFV7vkVT3_j8oZ0L2QmejC3SSs69YxWVxG57nniiclm19AG1q7FZ6r7R80NZQ/exec',   // sprzed 5.01
         'https://script.google.com/macros/s/AKfycbyKDrklk31Y48nRxc3gKyDLbkC1sk-CdIKuAFOOBkv62Jywi4XaIaR9HV2GH0e1Qog-dg/exec',   // 5.01, wymienione 25.08.2026
-        'https://script.google.com/macros/s/AKfycby-XNIPume9BApHqtUzoqdCJsJk0xlWendwkoZjlV1WgMBl4AMTz5pR_1ek-Je_kcrPjw/exec'    // wymienione 25.08.2026 po poludniu
+        'https://script.google.com/macros/s/AKfycby-XNIPume9BApHqtUzoqdCJsJk0xlWendwkoZjlV1WgMBl4AMTz5pR_1ek-Je_kcrPjw/exec',   // wymienione 25.08.2026 po poludniu
+        'https://script.google.com/macros/s/AKfycby6aTUAxVPXQcADY5zLlzmT6A9a9eMN85gEk9HLtxFaYmnXo_3Qqdvn9zzIt7NH7mGIsw/exec'    // wymienione 25.08.2026 wieczorem
     ];
 
     // ==========================================================================
@@ -22399,6 +22443,126 @@
         });
         return out;
     }
+    // Kod kraju z konca nazwy. „Vente Unique NL" -> „NL"; „Trademax" -> „".
+    const MK_KRAJE = ('PL CZ SK HU RO DE AT CH FR IT ES PT NL BE LU UK SE NO DK FI EU IE')
+                     .split(' ');
+    function mkKrajZ(v){
+        const m = String(v == null ? '' : v).trim().match(/[\s\-_]([A-Za-z]{2})$/);
+        const k = m ? m[1].toUpperCase() : '';
+        return MK_KRAJE.indexOf(k) >= 0 ? k : '';
+    }
+    function mkBezKraju(v){
+        const t = String(v == null ? '' : v).trim();
+        return mkKrajZ(t) ? t.replace(/[\s\-_][A-Za-z]{2}$/, '').trim() : t;
+    }
+    // Kraj celu bierzemy z nazwy sklepu, a gdy jej nie ma — z etykiety.
+    function mkKrajCelu(c){ return mkKrajZ(c && (c.shop || c.label || '')); }
+    // Odleglosc edycyjna, przycieta: przy dluzszej roznicy niz trzy znaki i tak
+    // nie chcemy niczego podpowiadac, wiec nie ma po co liczyc.
+    function mkOdl(a, b){
+        if (a === b) return 0;
+        if (Math.abs(a.length - b.length) > 3) return 99;
+        let p = [];
+        for (let j = 0; j <= b.length; j++) p.push(j);
+        for (let i = 1; i <= a.length; i++){
+            const n = [i];
+            for (let j = 1; j <= b.length; j++)
+                n.push(Math.min(p[j] + 1, n[j - 1] + 1, p[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)));
+            p = n;
+        }
+        return p[b.length];
+    }
+    // „Vente NN" — umowa na wypadek, gdy wpisujacy nie wie, ktory to kraj. Modul czyta
+    // to jako „ten panel, kraj jeszcze nieznany" i ustala go z pobranego rozliczenia.
+    function mkNNRdzen(v){
+        const m = String(v == null ? '' : v).trim().match(/^(.*?)[\s\-_]NN$/i);
+        return m ? m[1].trim() : '';
+    }
+    // Najblizszy cel, gdy dopasowanie zawiodlo. Kolejnosc prob jest wzieta z tego,
+    // jak naprawde wygladaja pomylki w arkuszu — najliczniejsze sa SKROTY nazwy,
+    // nie literowki. Zwracamy kandydata I POWOD, bo bez powodu podpowiedz jest
+    // tylko drugim zgadywaniem.
+    // Postaci nazwy celu, z ktorymi warto porownywac. Pierwsze slowo jest tu osobno,
+    // bo pomylka siedzi zwykle wlasnie w nim: „liroy" zamiast „leroy" przy „Leroy Merlin".
+    function mkPostaci(c){
+        const out = [];
+        [c.brand, c.short, mkBezKraju(c.shop), mkBezKraju(c.label)].forEach(function (x){
+            const t = String(x == null ? '' : x).trim();
+            if (!t) return;
+            const y = mkNorm(t);
+            if (y && out.indexOf(y) < 0) out.push(y);
+            const w = mkNorm(t.split(/[\s(]+/)[0]);        // samo pierwsze slowo
+            if (w && w.length > 3 && out.indexOf(w) < 0) out.push(w);
+        });
+        return out;
+    }
+    function mkPodpowiedz(cele, nazwa, konto){
+        const tekst = String(nazwa == null ? '' : nazwa).trim();
+        if (!tekst) return null;
+        const kr = mkKrajZ(tekst);
+        const rdzen = mkNorm(mkBezKraju(tekst));
+        if (!rdzen) return null;
+        const jeden = function (l, powod){ return l.length === 1 ? { cel: l[0], powod: powod } : null; };
+        // 1. SKROT NAZWY przy zgodnym kraju: „Vente NL" -> „Vente Unique NL".
+        if (kr){
+            const wKraju = cele.filter(function (c){ return mkKrajCelu(c) === kr; });
+            let t = jeden(wKraju.filter(function (c){
+                return mkPostaci(c).some(function (y){ return y.indexOf(rdzen) === 0; });
+            }), 'skrót nazwy');
+            if (t) return t;
+            // 2. LITEROWKA przy zgodnym kraju — „castorma fr" -> „Castorama FR".
+            // Porownujemy takze z PIERWSZYM SLOWEM nazwy (patrz mkPostaci): „liroy es"
+            // to skrot I literowka naraz, a wobec calego „leroymerlin" odleglosc jest
+            // za duza, zeby cokolwiek zobaczyc.
+            let naj = null;
+            wKraju.forEach(function (c){
+                mkPostaci(c).forEach(function (y){
+                    if (y.length < 4) return;
+                    const d = mkOdl(rdzen, y);
+                    if (d <= 2 && (!naj || d < naj.d)) naj = { d: d, cel: c };
+                });
+            });
+            if (naj) return { cel: naj.cel, powod: 'literówka (' + naj.d + ' znak' + (naj.d > 1 ? 'i' : '') + ')' };
+            // 3. UCIETY POCZATEK nazwy — „lutz de" wobec „XXXLutz DE". Tylko przy
+            // rdzeniu od czterech znakow i tylko gdy pasuje DOKLADNIE JEDEN cel.
+            if (rdzen.length >= 4){
+                const t2 = jeden(wKraju.filter(function (c){
+                    return mkPostaci(c).some(function (y){ return y.indexOf(rdzen) > 0; });
+                }), 'skrócona nazwa');
+                if (t2) return t2;
+            }
+        }
+        // 3. SAMA NAZWA, gdy prowadzi do jednego kraju: „obi" -> „OBI DE".
+        // Bierzemy takze cele, ktorych nazwa ZACZYNA SIE od wpisanego rdzenia. Bez tego
+        // „rakuten" widzialo tylko „Rakuten ES" i nie zauwazalo „Rakuten (Priceminister) FR"
+        // — czyli podpowiadalo kraj tam, gdzie sa dwa.
+        const poNazwie = cele.filter(function (c){
+            return mkPostaci(c).some(function (y){ return y === rdzen || y.indexOf(rdzen) === 0; });
+        });
+        const t3 = jeden(poNazwie, 'sama nazwa, jeden kraj');
+        if (t3) return t3;
+        // 4. WIELE KRAJOW — tu nie zgadujemy. Mowimy, ze trzeba dopisac kraj albo „NN".
+        if (poNazwie.length > 1){
+            const kraje = poNazwie.map(mkKrajCelu).filter(Boolean)
+                                  .filter(function (x, i, a){ return a.indexOf(x) === i; });
+            return { wiele: poNazwie, kraje: kraje,
+                     powod: 'ten marketplace ma ' + poNazwie.length + ' krajów' };
+        }
+        // 5. LITEROWKA bez kraju — ostatnia proba, o jeden znak.
+        let naj = null, ile = 0;
+        cele.forEach(function (c){
+            let trafil = false;
+            mkPostaci(c).forEach(function (y){
+                if (y.length < 5) return;
+                const d = mkOdl(rdzen, y);
+                if (d <= 1){ trafil = true; if (!naj || d < naj.d) naj = { d: d, cel: c }; }
+            });
+            if (trafil) ile++;
+        });
+        // Przy kilku rownie bliskich celach nie wybieramy zadnego — to juz nie jest
+        // podpowiedz, tylko losowanie.
+        return (naj && ile === 1) ? { cel: naj.cel, powod: 'literówka (1 znak)' } : null;
+    }
     // Jeden cel albo powod, dla ktorego nie da sie rozstrzygnac. Zgadywanie jest tu
     // najgorszym wyjsciem: zle rozpoznany marketplace to zlecenie pobrane z cudzego
     // panelu i zaksiegowane na cudzym koncie.
@@ -22444,7 +22608,11 @@
                      host: host, kind: l[0].kind || 'mirakl', cur: l[0].cur || '',
                      label: l[0].brand || mp, acct: '', zrodlo: 'jeden panel' };
         };
-        const luzno = szukaj(nazwa);
+        // „Vente NN" — wpisujacy nie wie, ktory to kraj, i nie udaje, ze wie. Bierzemy
+        // wszystkie sklepy tej marki; jesli stoja na jednym panelu, jedenPanel nizej
+        // zwroci cel bez nazwy sklepu, a kraj poda samo rozliczenie.
+        const nn = mkNNRdzen(nazwa);
+        const luzno = nn ? szukaj(nn) : szukaj(nazwa);
         const poKoncie = kt ? cele.filter(function (c){ return String(c.acct || '') === kt; }) : [];
         const zN = jeden(luzno) || jedenPanel(luzno), zK = jeden(poKoncie) || jedenPanel(poKoncie);
         // Cel zlozony z kilku sklepow jednego panelu nie ma nazwy sklepu. Konto
@@ -28875,6 +29043,31 @@
         });
         return cz.length ? (' — Wayfair mówi: ' + cz.join(' · ')) : '';
     }
+    // Jak WYGLADA odpowiedz, gdy nie ma w niej powodu. Nigdy jej tresc — opis zlecenia
+    // zostaje w pamieci na stale, a odpowiedz z API potrafi niesc dane rozliczen.
+    // Sam ksztalt wystarcza, zeby odroznic trzy zupelnie rozne sytuacje: brama odbila
+    // zapytanie (HTML), API odpowiedzialo po swojemu (JSON bez „errors") albo tresc jest
+    // pusta (najczesciej blokada po stronie przegladarki).
+    function wayfKsztalt(r){
+        const txt = String((r && r.responseText) || '');
+        const cz = ['odpowiedź ' + txt.length + ' znaków'];
+        // Z naglowkow bierzemy JEDEN, z bialej listy — nie caly zrzut.
+        const h = String((r && r.responseHeaders) || '').match(/^content-type:\s*([^\r\n;]+)/im);
+        if (h) cz.push('typ ' + h[1].trim());
+        if (!txt.length) cz.push('treść PUSTA — zapytanie mogło zostać zablokowane, zanim wyszło');
+        else if (/^\s*</.test(txt)) cz.push('to nie JSON, tylko strona HTML — najpewniej odbiła brama, nie API');
+        else {
+            let j = null;
+            try { j = JSON.parse(txt); } catch (e){}
+            if (!j) cz.push('treść nie jest JSON-em');
+            else {
+                const kl = Object.keys(j);
+                cz.push('JSON z polami: ' + (kl.length ? kl.join(', ') : '(pusty obiekt)'));
+                if (!j.errors) cz.push('BEZ pola „errors" — czyli nie odrzucił tego sam GraphQL');
+            }
+        }
+        return ' [' + cz.join(' · ') + ']';
+    }
     async function wayfGql(op, query, variables){
         const hdrs = { 'content-type': 'application/json', 'accept': '*/*',
                        'apollographql-client-name': 'ph-ui-finance',
@@ -28888,8 +29081,13 @@
             throw new Error('Wayfair odrzucił zapytanie (HTTP ' + r.status + ') — zaloguj się na ' + MK_WAYF_HOST);
         // 400 znaczy „odrzucilem ZAPYTANIE" — powod stoi w tresci, ktora dotad ginela.
         // Nazwa operacji mowi, KTORE zapytanie padlo: lista wyplat czy podpisany link.
-        if (r.status !== 200)
-            throw new Error('Wayfair API: HTTP ' + r.status + ' przy „' + op + '"' + wayfPowod(r.responseText));
+        if (r.status !== 200){
+            // Gdy w tresci jest powod — podajemy powod. Gdy go nie ma, opisujemy KSZTALT
+            // odpowiedzi: bez tego „HTTP 400" nie mowi, czy odbila brama, czy API.
+            const powod = wayfPowod(r.responseText);
+            throw new Error('Wayfair API: HTTP ' + r.status + ' przy „' + op + '"'
+                          + (powod || wayfKsztalt(r)));
+        }
         let j;
         try { j = JSON.parse(r.responseText || '{}'); }
         catch (e){ throw new Error('Wayfair API oddał coś, co nie jest JSON-em — najpewniej stronę logowania'); }
@@ -28903,12 +29101,22 @@
         if (!(sup > 0))
             throw new Error('numer dostawcy Wayfaira wyszedł pusty — otwórz ' + MK_WAYF_HOST
                           + ' i zaloguj się, żeby ciasteczko „supplierID" było widoczne');
+        // Zakres dat idzie do komunikatu o bledzie: to JEDYNA wartosc w tym zapytaniu,
+        // ktora skladamy sami, wiec przy odrzuceniu jest pierwszym podejrzanym. Numeru
+        // dostawcy nie dopisujemy — bledu nie tlumaczy, a to cudza dana.
+        const okres = ' [pytałem o ' + from + ' … ' + to + ']';
         const out = [];
         for (let page = 1; page <= 10; page++){
-            const d = await wayfGql('supplierReceivablePayments', WAYF_Q_LIST, {
-                input: { filter: { supplierId: sup, paymentDateRange: { dateFrom: from, dateTo: to } },
-                         paging: { sortingColumn: 'PAYMENT_DATE', sortingDirection: 'DESCENDING',
-                                   page: page, pageSize: 50 } } });
+            let d;
+            try {
+                d = await wayfGql('supplierReceivablePayments', WAYF_Q_LIST, {
+                    input: { filter: { supplierId: sup, paymentDateRange: { dateFrom: from, dateTo: to } },
+                             paging: { sortingColumn: 'PAYMENT_DATE', sortingDirection: 'DESCENDING',
+                                       page: page, pageSize: 50 } } });
+            } catch (e){
+                throw new Error(((e && e.message) || String(e)) + okres
+                              + (page > 1 ? (' · strona ' + page) : ''));
+            }
             const con = d.supplierReceivablePayments || {};
             if (con.errorMessage) throw new Error('Wayfair: ' + con.errorMessage);
             (con.nodes || []).forEach(function (n){ out.push(n); });
@@ -32329,20 +32537,32 @@
     // OSTATNI przebieg, wiec to uzupelnienie rdMark, a nie jego zamiennik.
     // Porownujemy numer ORAZ kwote — sam numer zamowienia potrafi wystapic w tym module
     // takze przy czyms innym niz ten zwrot.
-    const MK_TPROG = 'tm_t_progress_v1';
+    const MK_TPROG = 'tm_t_progress_v1';      // zapis wznawiania — znika po udanym przebiegu
+    const MK_TBOOKED = 'tm_t_booked_v1';     // trwaly slad zaksiegowanych pozycji
+    // Co zaksiegowal modul ticketa. Czytamy DWIE listy, bo sluza do czego innego:
+    //   * zapis wznawiania — zyje tylko do konca przebiegu i jest kasowany, gdy wszystko
+    //     sie udalo. Sam w sobie znaczy wiec „przebieg zostal przerwany", a nie
+    //     „to zostalo zaksiegowane";
+    //   * trwala lista zaksiegowanych — dopisywana i nigdy nie kasowana, wiec to ona
+    //     odpowiada na pytanie, o ktore tu chodzi.
+    // Do 5.04 byla tylko pierwsza i dlatego udany przebieg ticketa nie zostawial sladu:
+    // „zaksiegowano 49" po jednej stronie, „czesciowo 4 z 49" po drugiej.
     function ksZapis(){
+        const o = {};
+        const dodaj = function (r){
+            if (!r || (!r.booked && !r.alreadyBooked)) return;
+            const id = String(r.orderNumber == null ? '' : r.orderNumber).trim();
+            if (!id) return;
+            const kw = Math.abs(Number(String(r.amount == null ? '' : r.amount).replace(',', '.')) || 0);
+            o[id + '|' + kw.toFixed(2)] = 1;
+        };
         let p = null;
         try { p = JSON.parse(localStorage.getItem(MK_TPROG) || 'null'); } catch (e){ p = null; }
-        const o = {};
-        if (p && Array.isArray(p.rows)){
-            p.rows.forEach(function (r){
-                if (!r || (!r.booked && !r.alreadyBooked)) return;
-                const id = String(r.orderNumber == null ? '' : r.orderNumber).trim();
-                if (!id) return;
-                const kw = Math.abs(Number(String(r.amount == null ? '' : r.amount).replace(',', '.')) || 0);
-                o[id + '|' + kw.toFixed(2)] = 1;
-            });
-        }
+        if (p && Array.isArray(p.rows)) p.rows.forEach(dodaj);
+        let b = null;
+        try { b = JSON.parse(localStorage.getItem(MK_TBOOKED) || 'null'); } catch (e){ b = null; }
+        // Trwala lista trzyma juz gotowe klucze — nie ma czego skladac drugi raz.
+        if (b && Array.isArray(b.rows)) b.rows.forEach(function (r){ if (r && r.k) o[r.k] = 1; });
         return o;
     }
     function rdState(key, x){
@@ -33833,7 +34053,14 @@
             const cele = mkCele(), jobs = jobsLoad();
             let gotowe = 0;
             const h = shLista.map(function (r, i){
-                const dop = mkDopasuj(cele, r.marketplace, r.konto);
+                let dop = mkDopasuj(cele, r.marketplace, r.konto);
+                // Nie rozpoznano — szukamy najblizszego kandydata. Podpowiedz NIE staje
+                // sie automatycznie celem: dopoki nikt jej nie kliknie, wiersz zostaje
+                // zablokowany. Cicha podmiana nazwy w kolumnie, od ktorej zalezy konto,
+                // to dokladnie ten rodzaj pomocy, ktory kiedys zaboli.
+                const pp = dop.cel ? null : mkPodpowiedz(cele, r.marketplace, r.konto);
+                if (pp && pp.cel && r._uzyj) dop = { cel: pp.cel, po: 'podpowiedzi' };
+                r._pp = pp;
                 r._cel = dop.cel || null;
                 const dup = dop.cel ? manDuplikat(jobs, dop.cel, r.kwota, r.data) : '';
                 r._dup = dup;
@@ -33850,7 +34077,22 @@
                        + '<span style="color:#888"> (po ' + esc(dop.po) + ')</span>'
                        + (dup ? '<span style="color:#c47f00"> — już jest na liście zleceń</span>' : '')
                        + (maDate ? '' : '<span style="color:#c47f00"> — najpierw uzupełnij datę</span>'))
-                    : ('<span style="color:#c00">' + esc(dop.err || 'nie rozpoznaję') + '</span>');
+                    : ('<span style="color:#c00">' + esc(dop.err || 'nie rozpoznaję') + '</span>'
+                       + (function (){
+                            if (!pp) return '';
+                            // Wiele krajow: nie podpowiadamy zadnego. Konto idzie za krajem,
+                            // wiec zgadywanie konczyloby sie zle zaksiegowana wplata.
+                            if (pp.wiele) return '<span style="color:#c47f00;font-size:10px"> — '
+                                 + esc(pp.powod) + ' (' + esc(pp.kraje.join(', ')) + '). '
+                                 + 'Dopisz kraj albo wpisz „' + esc(mkBezKraju(String(r.marketplace || '')))
+                                 + ' NN", jeśli go nie znasz.</span>';
+                            if (!pp.cel) return '';
+                            return '<span style="font-size:10px;color:#7c3aed"> — czy chodziło o <b>'
+                                 + esc(pp.cel.shop || pp.cel.label || pp.cel.mp) + '</b>? ('
+                                 + esc(pp.powod) + ') </span>'
+                                 + '<button data-i="' + i + '" class="mk-td-u" style="padding:1px 7px;border:none;'
+                                 + 'border-radius:4px;background:#7c3aed;color:#fff;font-size:10px;cursor:pointer">użyj</button>';
+                         })());
                 return '<div style="display:flex;gap:6px;align-items:center;padding:2px 0;border-top:1px solid #f1eafe">'
                      + '<input type="checkbox" data-i="' + i + '" class="mk-td-c"' + (mozna ? ' checked' : ' disabled') + '>'
                      + '<input type="date" data-i="' + i + '" class="mk-td-d" value="' + esc(r.data) + '" style="font-size:11px;padding:1px 3px;border:1px solid #ddd;border-radius:4px">'
@@ -33893,6 +34135,17 @@
                 if (go){ go.textContent = 'Załóż zlecenia (' + n + ')'; go.disabled = !n; }
             };
             shBox.querySelectorAll('.mk-td-c').forEach(function (el){ el.onchange = przelicz; });
+            // „użyj" bierze podpowiedz jako cel TEGO wiersza i przerysowuje liste.
+            // W arkuszu nie zmienia sie nic — nazwa poprawi sie tam dopiero po pobraniu
+            // rozliczenia, bo dopiero wtedy wiadomo na pewno, ktory to sklep.
+            shBox.querySelectorAll('.mk-td-u').forEach(function (b){
+                b.onclick = function(){
+                    const r = shLista[Number(b.getAttribute('data-i'))];
+                    if (!r) return;
+                    r._uzyj = true;
+                    shRysuj();
+                };
+            });
             przelicz();
         }
         async function shZaloz(b){
@@ -43427,7 +43680,3 @@
     [500, 1500].forEach(function(ms){ setTimeout(buildLauncher, ms); });
 
 })();
-
-
-
-
