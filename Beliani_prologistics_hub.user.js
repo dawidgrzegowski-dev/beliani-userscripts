@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.05
+// @version      5.06
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22599,14 +22599,31 @@
         // „home 24" albo „Vente" bez kraju: pasuje kilka sklepow, ale WSZYSTKIE stoja
         // na tym samym panelu. Wtedy nie ma czego blokowac — host jest jeden, a ktory
         // to sklep, powie samo rozliczenie. Oddajemy cel bez nazwy sklepu.
-        const jedenPanel = function (l){
+        const jedenPanel = function (l, wiele){
             if (l.length < 2) return null;
             const mp = l[0].mp, host = String(l[0].host || '');
             const zgodne = l.every(function (c){ return c.mp === mp && String(c.host || '') === host; });
-            if (!zgodne) return null;
-            return { mp: mp, shop: '', brand: l[0].brand || '', short: l[0].short || mp,
-                     host: host, kind: l[0].kind || 'mirakl', cur: l[0].cur || '',
-                     label: l[0].brand || mp, acct: '', zrodlo: 'jeden panel' };
+            if (zgodne)
+                return { mp: mp, shop: '', brand: l[0].brand || '', short: l[0].short || mp,
+                         host: host, kind: l[0].kind || 'mirakl', cur: l[0].cur || '',
+                         label: l[0].brand || mp, acct: '', zrodlo: 'jeden panel' };
+            // KILKA PANELOW. Normalnie to powod, zeby nie zgadywac — ale przy „NN"
+            // wpisujacy powiedzial wprost, ze nie wie. Zamiast wybierac jeden panel
+            // na chybil trafil, zapamietujemy WSZYSTKIE i sprawdzamy po kolei: przelot
+            // po sklepach i tak je odwiedza, a rozstrzyga to samo co zawsze — czy jest
+            // tam cykl o zgodnej kwocie i dacie.
+            if (!wiele) return null;
+            const hosty = [];
+            l.forEach(function (c){
+                const h = String(c.host || '');
+                if (h && hosty.indexOf(h) < 0) hosty.push(h);
+            });
+            if (hosty.length < 2) return null;
+            // Kolejnosc bierze sie z kolejnosci regul — zadnego wyjatku na konkretny
+            // marketplace. Przy Conforamie iberyjska stoi tam przed francuska.
+            return { mp: l[0].mp, shop: '', brand: l[0].brand || '', short: l[0].short || l[0].mp,
+                     host: hosty[0], hosty: hosty, kind: l[0].kind || 'mirakl', cur: '',
+                     label: l[0].brand || l[0].mp, acct: '', zrodlo: 'kilka paneli' };
         };
         // „Vente NN" — wpisujacy nie wie, ktory to kraj, i nie udaje, ze wie. Bierzemy
         // wszystkie sklepy tej marki; jesli stoja na jednym panelu, jedenPanel nizej
@@ -22614,7 +22631,9 @@
         const nn = mkNNRdzen(nazwa);
         const luzno = nn ? szukaj(nn) : szukaj(nazwa);
         const poKoncie = kt ? cele.filter(function (c){ return String(c.acct || '') === kt; }) : [];
-        const zN = jeden(luzno) || jedenPanel(luzno), zK = jeden(poKoncie) || jedenPanel(poKoncie);
+        // Szersze szukanie WYLACZNIE przy „NN" — patrz jedenPanel.
+        const zN = jeden(luzno) || jedenPanel(luzno, !!nn);
+        const zK = jeden(poKoncie) || jedenPanel(poKoncie, !!nn);
         // Cel zlozony z kilku sklepow jednego panelu nie ma nazwy sklepu. Konto
         // takiemu celowi NIE PRZECZY — ono go uscisla. Sprzecznoscia jest wylacznie
         // wskazanie dwoch roznych marketplace'ow albo dwoch roznych sklepow.
@@ -24152,7 +24171,10 @@
     // jednym miejscem, wiec zamiast osobnego budowniczego trzymamy numer kolumny w tabeli
     // — dolozenie kolejnego marketplace'u to jedna linijka, a nie kopia funkcji.
     // UWAGA: reszta Mirakla czyta z O i nie wolno jej ruszyc przy okazji.
-    const MK_KOL_KWOTA = { 'Manor': 13 };
+    // Numer kolumny z kwota, gdy ma stac gdzie indziej niz „Amount" z naglowka.
+    // LICZYMY OD ZERA: 13 to czternasta kolumna arkusza, czyli „N" (domyslne „Amount"
+    // stoi na 14, czyli w „O"). Tak czyta import po stronie prologistics.
+    const MK_KOL_KWOTA = { 'Manor': 13, 'Mirakl (But)': 13 };
     // Nie kazdy Mirakl eksportuje ten sam komplet kolumn. Empik nie ma „Payment reference"
     // ani „Sales channel", wiec jego plik ma 25 kolumn zamiast 27, a „Amount" stoi na 13.
     // Plik do importu budujemy w ukladzie TEGO marketplace'u — ustawienie importu po
@@ -29561,11 +29583,26 @@
         });
         return out;
     }
+    // Panele, na ktorych KAZDY KRAJ MA WLASNY LOGIN — nie da sie ich obejsc jedna sesja.
+    // To nie to samo, co kilka adresow (Conforama): tam pomaga przelot po hostach, tu
+    // pomaga wylacznie przelogowanie, wiec trzeba o tym POWIEDZIEC, a nie probowac dalej.
+    const MK_LOGIN_NA_KRAJ = {
+        'adeo-marketplace.mirakl.net':
+            'Przy Leroyu każdy kraj ma OSOBNY login (inny e-mail). Widzę tylko konto, ' +
+            'na które jesteś teraz zalogowany — zaloguj się na kolejne i kliknij ' +
+            '„⬇ Pobierz zestawienia" jeszcze raz. Zlecenie czeka, nie trzeba go zakładać od nowa.'
+    };
     function mkCoWPanelu(list, j){
         const kand = mkKandydaci(list, j);
         if (!kand.length)
             return 'w panelu nie ma żadnego rozliczenia zamkniętego w okolicy ' + j.date
-                 + ' (±10 dni). Sprawdź, czy wypłata jest już widoczna w panelu.';
+                 + ' (±10 dni). Sprawdź, czy wypłata jest już widoczna w panelu.'
+                 + (MK_LOGIN_NA_KRAJ[String((j && j.host) || '')]
+                    ? (' ' + MK_LOGIN_NA_KRAJ[String(j.host)]) : '');
+        // Zdanie o osobnych loginach doklejamy do KAZDEJ odpowiedzi dla takiego panelu —
+        // takze wtedy, gdy w oknie stoi jakis cykl, ale nie ten. Przy Leroyu „nie ten"
+        // najczesciej znaczy „to nie ten kraj", a wiec „to nie to konto".
+        const login = MK_LOGIN_NA_KRAJ[String((j && j.host) || '')] || '';
         const opis = kand.slice(0, 3).map(function (x){
             return (x.data || '?')
                  + (x.kwota == null ? ' (panel nie podaje kwoty)' : (' na ' + f2(x.kwota)))
@@ -29580,7 +29617,8 @@
                    + f2(kand[0].kwota) + ', a z wyciągu przyszło ' + f2(j.amount)
                    + ' — sprawdź kwotę wpłaty albo wskaż rozliczenie niżej. ')
                 : ('nie znalazłem rozliczenia na ' + f2(j.amount) + ' ' + (j.cur || '') + '. '))
-             + 'W panelu w okolicy ' + j.date + ': ' + opis + '.';
+             + 'W panelu w okolicy ' + j.date + ': ' + opis + '.'
+             + (login ? (' ' + login) : '');
     }
     function mkMatchCycle(list, ref, dateStr, amount, tried){
         // Cykle juz sprawdzone i odrzucone (bo kwota nie pasowala) pomijamy, inaczej
@@ -34071,9 +34109,14 @@
                 const maDate = /^\d{4}-\d{2}-\d{2}$/.test(String(r.data || ''));
                 const mozna = !!dop.cel && !dup && maDate;
                 if (mozna) gotowe++;
+                const wielePaneli = ((dop.cel && dop.cel.hosty) || []).length > 1;
                 const opis = dop.cel
                     ? ('<span style="color:#0a7a2f">' + esc(dop.cel.mp) + ' · '
                        + (dop.cel.shop ? esc(dop.cel.shop) : '<i style="color:#888">nazwę sklepu poda panel</i>') + '</span>'
+                       // Dwa panele to inna sytuacja niz jeden — ma byc widac ZANIM
+                       // ktos kliknie „Załóż zlecenia", a nie dopiero w przelocie.
+                       + (wielePaneli ? ('<span style="color:#7c3aed;font-size:10px"> · sprawdzę po kolei '
+                            + dop.cel.hosty.length + ' panele: ' + esc(dop.cel.hosty.join(', ')) + '</span>') : '')
                        + '<span style="color:#888"> (po ' + esc(dop.po) + ')</span>'
                        + (dup ? '<span style="color:#c47f00"> — już jest na liście zleceń</span>' : '')
                        + (maDate ? '' : '<span style="color:#c47f00"> — najpierw uzupełnij datę</span>'))
@@ -34167,6 +34210,8 @@
                 jobs[k] = { ref: '', date: r.data, amount: r2(Number(r.kwota)), cur: w.cur || 'EUR',
                             mp: w.mp, brand: w.brand || '', short: w.short || '', host: w.host || '',
                             kind: w.kind, shop: w.shop, docs: null, payer: '', txId: '',
+                            // Kilka paneli do sprawdzenia po kolei (tylko przy „NN").
+                            hosty: (w.hosty && w.hosty.length > 1) ? w.hosty.slice() : null,
                             status: 'new', msg: '', manual: true,
                             manualAt: new Date().toISOString().slice(0, 10),
                             // Wspolrzedne wiersza w arkuszu — po nich, a nie po kluczu
@@ -35271,6 +35316,7 @@
                 // Bez numeru cykl dobiera sie po kwocie i dacie — ale wtedy host MUSI
                 // byc znany, inaczej zlecenie trafiloby do instancji domyslnej.
                 if (!j.ref && !j.host) return false;
+                if (host && (j.hosty || []).length > 1) return j.hosty.indexOf(host) >= 0;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
             });
             let ok = 0;
@@ -35412,6 +35458,9 @@
                     // Zostawione zasmiecalyby ekran i przy nastepnym przelocie kazalyby
                     // pobrac raz jeszcze to samo.
                     j.wymus = ''; j.kand = null; j.kandSklep = '';
+                    // Panel juz znany — lista przestaje byc potrzebna, a zlecenie
+                    // ma pamietac TEN, z ktorego rozliczenie naprawde przyszlo.
+                    if ((j.hosty || []).length > 1){ j.host = host || j.host; j.hosty = null; }
                     ok++;
                 } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
@@ -35635,6 +35684,9 @@
                 const kind = j.kind || 'mirakl';
                 if (kind === 'joy' || kind === 'galx' || kind === 'wayf') return false;
                 const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
+                // Zlecenie „NN" z kilkoma panelami nalezy do KAZDEGO z nich, dopoki
+                // ktorys nie odda rozliczenia.
+                if (host && (j.hosty || []).length > 1) return j.hosty.indexOf(host) >= 0;
                 return host ? (h === host) : true;
             }).length;
         }
@@ -35912,8 +35964,12 @@
                 if (!mkTodo(j)) return;
                 if (!j.ref && !j.host) return;      // patrz mkLeft — bez numeru musi byc host
                 if ((j.kind || 'mirakl') !== kind) return;
-                const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
-                if (h && !o[h]){ o[h] = 1; out.push(h); }
+                // Przy „NN" z kilkoma panelami na liste trafiaja WSZYSTKIE — przelot
+                // ma je odwiedzic po kolei.
+                const lista = ((j.hosty || []).length > 1)
+                    ? j.hosty
+                    : [j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '')];
+                lista.forEach(function (h){ if (h && !o[h]){ o[h] = 1; out.push(h); } });
             });
             return out;
         }
@@ -43680,3 +43736,7 @@
     [500, 1500].forEach(function(ms){ setTimeout(buildLauncher, ms); });
 
 })();
+
+
+
+
