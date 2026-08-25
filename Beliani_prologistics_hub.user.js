@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.00
+// @version      5.02
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -29,6 +29,7 @@
 // @connect      mirakl.net
 // @connect      empik.com
 // @connect      leenbakker.nl
+// @connect      castorama.fr
 // @connect      xxxlgroup.com
 // @connect      myvtex.com
 // @connect      galaxus.ch
@@ -22095,7 +22096,17 @@
     // Adres i klucz siedza w ustawieniach, nie w kodzie: adres jest jak haslo, a klucz
     // ma zostac tylko u Ciebie.
     const MK_SH_KEY = 'mkt_sheet';
-    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycby17PasQqFV7vkVT3_j8oZ0L2QmejC3SSs69YxWVxG57nniiclm19AG1q7FZ6r7R80NZQ/exec';
+    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycby-XNIPume9BApHqtUzoqdCJsJk0xlWendwkoZjlV1WgMBl4AMTz5pR_1ek-Je_kcrPjw/exec';
+    // Adresy WCZESNIEJSZYCH wdrozen. Trzymamy je po to, zeby przeniesc tych, ktorzy
+    // maja ktorys zapisany w ustawieniach — patrz shCfg. Stare wdrozenia serwuja kod
+    // bez nowych akcji i nie da sie tego odkrecic: w Apps Script adres jest przypiety
+    // DO WDROZENIA, wiec kazda wersja zalozona guzikiem „Deploy" zamiast olowkiem
+    // dostaje nowy adres. Lista, a nie pojedyncza zmienna, bo to sie juz powtorzylo
+    // dwa razy i powtorzy znowu.
+    const MK_SH_STARE = [
+        'https://script.google.com/macros/s/AKfycby17PasQqFV7vkVT3_j8oZ0L2QmejC3SSs69YxWVxG57nniiclm19AG1q7FZ6r7R80NZQ/exec',   // sprzed 5.01
+        'https://script.google.com/macros/s/AKfycbyKDrklk31Y48nRxc3gKyDLbkC1sk-CdIKuAFOOBkv62Jywi4XaIaR9HV2GH0e1Qog-dg/exec'    // 5.01, wymienione 25.08.2026
+    ];
 
     // ==========================================================================
     //  KLUCZ DO ARKUSZA — JEDYNE MIEJSCE DO EDYCJI
@@ -22119,9 +22130,17 @@
         // Uzupelniamy z wbudowanych wartosci takze wtedy, gdy cos JUZ jest zapisane
         // z pustym polem — inaczej osoba, ktora raz dotknela ustawien przed
         // wbudowaniem klucza, zostalaby z nieczynnym arkuszem po aktualizacji.
-        if (!o.url) o.url = MK_SH_DEF;
-        if (!o.secret) o.secret = MK_SH_SECRET;
+        let zmiana = false;
+        if (!o.url){ o.url = MK_SH_DEF; zmiana = true; }
+        if (!o.secret){ o.secret = MK_SH_SECRET; zmiana = true; }
         if (o.secret === 'WPISZ_TU_SECRET') o.secret = '';
+        // Wartosc wbudowana jest tylko DOMYSLNA: kto raz otworzyl ⚙ Konta, ma adres
+        // zapisany, a zapis przykrywa domysl. Bez tej podmiany taka osoba po aktualizacji
+        // pukalaby dalej pod martwe wdrozenie i widziala „nie zna akcji todo", nie majac
+        // pojecia dlaczego. Podmieniamy WYLACZNIE doslownie stary adres — kto wpisal
+        // wlasny, zostaje przy swoim.
+        if (MK_SH_STARE.indexOf(o.url) >= 0){ o.url = MK_SH_DEF; zmiana = true; }
+        if (zmiana) shSave(o);
         return o;
     }
     function shSave(o){ try { GM_setValue(MK_SH_KEY, JSON.stringify(o)); } catch (e){} }
@@ -22363,33 +22382,84 @@
                        host: r.host || '', kind: r.kind || 'mirakl', cur: '',
                        label: shop, acct: (ust[k] || {}).acct || '', zrodlo: 'ustawienia' });
         });
+        // Marketplace, ktory ma juz regule w wyciagu, ale NIE MA jeszcze wiersza ustawien
+        // — bo nikt nie pobral jego rozliczenia i nazwa sklepu nie jest znana — byl dla
+        // tej listy niewidzialny. Tak wypadl Hobbybox tuz po dodaniu reguly.
+        // Sklep zostaje PUSTY, dokladnie jak przy zleceniu z wyciagu: nazwe poda panel.
+        // Gdy ten sam „mp" jest juz w katalogu z ustawien, drugiego wpisu NIE dokladamy —
+        // inaczej przestalby byc jednoznaczny i kazde dopasowanie konczyloby sie
+        // „pasuje do kilku".
+        MK_RULES.forEach(function (r){
+            if (!r.ok || !r.mp) return;
+            if (out.some(function (x){ return x.mp === r.mp; })) return;
+            out.push({ mp: r.mp, shop: r.shop || '', brand: r.brand || '', short: r.short || r.mp,
+                       host: r.host || '', kind: r.kind || 'mirakl', cur: '',
+                       label: r.brand || r.short || r.mp, acct: '', zrodlo: 'reguły' });
+        });
         return out;
     }
     // Jeden cel albo powod, dla ktorego nie da sie rozstrzygnac. Zgadywanie jest tu
     // najgorszym wyjsciem: zle rozpoznany marketplace to zlecenie pobrane z cudzego
     // panelu i zaksiegowane na cudzym koncie.
     function mkDopasuj(cele, nazwa, konto){
-        const n = mkNorm(nazwa);
         const kt = String(konto == null ? '' : konto).trim();
-        const poKoncie = kt ? cele.filter(function (c){ return String(c.acct || '') === kt; }) : [];
-        const poNazwie = !n ? [] : cele.filter(function (c){
-            return [c.shop, c.label, c.mp, (c.brand || '') + ' ' + (c.shop || '')]
-                .some(function (x){ const y = mkNorm(x); return y && y === n; });
-        });
-        // Dopiero gdy dokladnie nic nie pasuje, probujemy zawierania — i tylko wtedy,
-        // gdy wskazuje JEDEN cel.
-        const luzno = poNazwie.length ? poNazwie : (!n ? [] : cele.filter(function (c){
-            return [c.shop, c.label, (c.brand || '') + ' ' + (c.shop || '')]
-                .some(function (x){ const y = mkNorm(x); return y && y.length > 3 && (y.indexOf(n) === 0 || n.indexOf(y) === 0); });
-        }));
         const jeden = function (l){ return l.length === 1 ? l[0] : null; };
-        const zN = jeden(luzno), zK = jeden(poKoncie);
-        if (zN && zK && !(zN.mp === zK.mp && zN.shop === zK.shop))
-            return { err: 'nazwa wskazuje „' + zN.mp + ' · ' + zN.shop + '", a konto ' + kt
-                        + ' — „' + zK.mp + ' · ' + zK.shop + '"' };
-        const w = zN || zK;
-        if (w) return { cel: w, po: zN ? (zK ? 'nazwie i koncie' : 'nazwie') : 'koncie' };
-        if (luzno.length > 1)   return { err: 'nazwa pasuje do kilku: ' + luzno.slice(0, 3).map(function (x){ return x.shop; }).join(', ') };
+        // Najpierw scisle, potem dopiero zawieranie — i zawsze tylko wtedy, gdy wskazuje
+        // JEDEN cel. „Hobbybox FI" ma trafic w marke „Hobbybox", ale „But" (trzy znaki)
+        // nie moze trafic w nic przez przypadek, stad prog dlugosci.
+        const szukaj = function (tekst){
+            const n = mkNorm(tekst);
+            if (!n) return [];
+            const scisle = cele.filter(function (c){
+                return [c.shop, c.label, c.mp, (c.brand || '') + ' ' + (c.shop || '')]
+                    .some(function (x){ const y = mkNorm(x); return y && y === n; });
+            });
+            if (scisle.length) return scisle;
+            return cele.filter(function (c){
+                return [c.shop, c.label, c.brand, (c.brand || '') + ' ' + (c.shop || '')]
+                    .some(function (x){ const y = mkNorm(x); return y && y.length > 3 && (y.indexOf(n) === 0 || n.indexOf(y) === 0); });
+            });
+        };
+        // „home 24" albo „Vente" bez kraju: pasuje kilka sklepow, ale WSZYSTKIE stoja
+        // na tym samym panelu. Wtedy nie ma czego blokowac — host jest jeden, a ktory
+        // to sklep, powie samo rozliczenie. Oddajemy cel bez nazwy sklepu.
+        const jedenPanel = function (l){
+            if (l.length < 2) return null;
+            const mp = l[0].mp, host = String(l[0].host || '');
+            const zgodne = l.every(function (c){ return c.mp === mp && String(c.host || '') === host; });
+            if (!zgodne) return null;
+            return { mp: mp, shop: '', brand: l[0].brand || '', short: l[0].short || mp,
+                     host: host, kind: l[0].kind || 'mirakl', cur: l[0].cur || '',
+                     label: l[0].brand || mp, acct: '', zrodlo: 'jeden panel' };
+        };
+        const luzno = szukaj(nazwa);
+        const poKoncie = kt ? cele.filter(function (c){ return String(c.acct || '') === kt; }) : [];
+        const zN = jeden(luzno) || jedenPanel(luzno), zK = jeden(poKoncie) || jedenPanel(poKoncie);
+        // Cel zlozony z kilku sklepow jednego panelu nie ma nazwy sklepu. Konto
+        // takiemu celowi NIE PRZECZY — ono go uscisla. Sprzecznoscia jest wylacznie
+        // wskazanie dwoch roznych marketplace'ow albo dwoch roznych sklepow.
+        const zgodne = function (a, b){
+            if (a.mp !== b.mp) return false;
+            return !a.shop || !b.shop || a.shop === b.shop;
+        };
+        if (zN && zK && !zgodne(zN, zK))
+            return { err: 'nazwa wskazuje „' + zN.mp + ' · ' + (zN.shop || '(sam panel)')
+                        + '", a konto ' + kt + ' — „' + zK.mp + ' · ' + (zK.shop || '(sam panel)') + '"' };
+        // Gdy oba wskazuja to samo, bierzemy ten Z NAZWA SKLEPU: konto wie wiecej
+        // niz nazwa marketplace'u wpisana recznie.
+        let w = (zN && zK) ? (zN.shop ? zN : zK) : (zN || zK);
+        let po = zN ? (zK ? 'nazwie i koncie' : 'nazwie') : (zK ? 'koncie' : '');
+        // Trzecia droga: konto przez PLAN KONT. „1528" nie znaczy nic, ale
+        // „Hobbybox FI Beliani (DE) GmbH" juz tak. Nazwy kont sa pobrane z prologistics
+        // i leza w pamieci modulu — nie powtarzamy ich w kodzie i nie siegamy po
+        // ACCOUNTS z init_ksieg, bo to CUDZE domkniecie i odwolanie byloby cichym bledem.
+        if (!w && kt){
+            const nm = (mkAcctLoad().filter(function (a){ return String(a.n) === kt; })[0] || {}).nm || '';
+            const zA = nm ? jeden(szukaj(nm)) : null;
+            if (zA){ w = zA; po = 'nazwie konta ' + kt; }
+        }
+        if (w) return { cel: w, po: po };
+        if (luzno.length > 1)   return { err: 'nazwa pasuje do kilku: ' + luzno.slice(0, 3).map(function (x){ return x.shop || x.mp; }).join(', ') };
         if (poKoncie.length > 1) return { err: 'konto ' + kt + ' ma kilka sklepów w ustawieniach' };
         return { err: 'nie rozpoznaję ani nazwy, ani konta' + (kt ? (' ' + kt) : '') };
     }
@@ -22401,7 +22471,20 @@
     // Czy ta wyplata jest juz w arkuszu. To najwazniejsza z trzech kontroli duplikatow,
     // bo arkusz jest wspolny i czesc wierszy powstaje recznie — o cudzej pracy nie dowiemy
     // sie z prologistics, skoro reczne ksiegowanie nie tworzy paczki importu.
-    const mkSheet = {};                    // ref -> { found, row, similar }
+    // Klucz wyniku sprawdzenia w arkuszu. SAMA REFERENCJA NIE WYSTARCZA: zlecenia
+    // z arkusza i dopisane recznie maja ja pusta, wiec wszystkie wpadalyby pod jeden
+    // klucz "" i czytaly wynik ostatniego — tak zlecenie Hobbyboxa na 4553.30 pokazalo
+    // „podobny wpis" nalezacy do Home24 na 43675.49. Gorsze od dopiska bylo to, ze tym
+    // samym kluczem chodzi kontrola „JEST JUZ W ARKUSZU" przed ksiegowaniem.
+    // Bez numeru zlecenie ma wlasne tylko marketplace, date, kwote i walute — i to
+    // wystarcza, bo dwie takie same wplaty tego samego dnia to jedna wplata.
+    function mkJobId(j){
+        if (!j) return '';
+        if (j.ref) return String(j.ref);
+        return '#' + String(j.mp || '') + '|' + String(j.date || '')
+             + '|' + f2(j.amount) + '|' + String(j.cur || '');
+    }
+    const mkSheet = {};                    // mkJobId -> { found, row, similar }
     async function shCheck(list){
         const cfg = shCfg();
         if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (' + shWhy(cfg) + ')');
@@ -22418,7 +22501,7 @@
             return shKey(j, c.acct);
         });
         const res = await shCheck(list);
-        jobs.forEach(function (j, i){ mkSheet[j.ref] = res[i] || null; });
+        jobs.forEach(function (j, i){ mkSheet[mkJobId(j)] = res[i] || null; });
         return res;
     }
     // Czego brakuje, zeby arkusz dzialal. Uzywane wszedzie tam, gdzie zapis albo
@@ -22437,17 +22520,56 @@
     }
     // Wiersze, ktorych nikt jeszcze nie zaksiegowal — Booked stoi dokladnie „Nie".
     // Pusta kolumna to „ktos nie wypelnil", a nie „do zrobienia", wiec jej nie bierzemy.
+    // Data z arkusza bywa TEKSTEM w innym zapisie niz ISO — wtedy pole daty zostawaloby
+    // puste („mm/dd/yyyy") i trzeba by ja wklepywac recznie. Rozpoznajemy trzy najczestsze
+    // zapisy. Czego nie rozpoznamy, zostaje puste: z pusta data zlecenia nie da sie
+    // zalozyc i lepiej, zeby bylo to widac, niz zeby modul zgadywal dzien.
+    function shData(v){
+        const t = String(v == null ? '' : v).trim();
+        let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m) return m[1] + '-' + m[2] + '-' + m[3];
+        m = t.match(/^(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/);
+        if (m) return m[3] + '-' + pad2(m[2]) + '-' + pad2(m[1]);
+        return '';
+    }
     async function shTodo(miesiecy){
         const cfg = shCfg();
         if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (' + shWhy(cfg) + ')');
         const r = await shReq('POST', cfg.url,
             JSON.stringify({ secret: cfg.secret, action: 'todo', months: miesiecy || 12 }));
-        if (!r || !Array.isArray(r.result))
-            throw new Error('arkusz nie odesłał listy — najpewniej wdrożone Apps Script nie zna jeszcze akcji „todo"');
+        if (!r || !Array.isArray(r.result)){
+            // Stare wdrozenie NIE odrzuca nieznanej akcji — puszcza ja do galezi
+            // dopisywania, a ta przy pustych rows odpowiada „dodano 0". To sukces,
+            // ktory niczego nie mowi, i po tym wlasnie ksztalcie go poznajemy.
+            const stare = r && r.ok === true && !r.result && Number(r.added) === 0;
+            throw new Error(stare
+                ? 'wdrożone Apps Script nie zna akcji „todo" — żądanie trafiło do gałęzi dopisywania '
+                  + 'i odpowiedziało „dodano 0". Dopisz linie w doPost i wdróż NOWĄ wersję: '
+                  + 'Deploy → Manage deployments → ołówek → Version: New version → Deploy.'
+                : ('arkusz odpowiedział bez listy: ' + JSON.stringify(r).slice(0, 200)));
+        }
         return r;
     }
     // Zapis w KONKRETNYM wierszu, po wspolrzednych, ktore arkusz sam podal. Klucz
     // data + konto + kwota tu nie wystarcza: jedno i drugie mozna bylo poprawic.
+    // Co naprawde stoi pod adresem, pod ktory pukamy. Nowy doGet oddaje pole „akcje",
+    // stary go nie ma — i to jedyna roznica, ktora rozstrzyga bez zgadywania.
+    // Koncowka adresu (12 znakow) sluzy do porownania z „Manage deployments"; caly
+    // adres jest jak haslo, wiec pokazujemy tylko tyle, zeby dalo sie go rozpoznac.
+    async function shSonda(){
+        const cfg = shCfg();
+        if (!cfg.url || !cfg.secret) return '';
+        const ogon = String(cfg.url).replace(/\/exec.*$/, '').slice(-12);
+        try {
+            const r = await shReq('GET', cfg.url + (cfg.url.indexOf('?') < 0 ? '?' : '&')
+                                  + 'secret=' + encodeURIComponent(cfg.secret));
+            if (r && Array.isArray(r.akcje))
+                return 'wdrożenie …' + ogon + ' zna akcje: ' + r.akcje.join(', ');
+            return 'wdrożenie …' + ogon + ' NIE ma pola „akcje" — pod tym adresem leży kod '
+                 + 'sprzed zmiany. Albo wdrożenie nie dostało nowej wersji, albo nowa wersja '
+                 + 'poszła pod INNY adres (wtedy popraw adres w ⚙ Konta).';
+        } catch (e){ return 'sonda GET: ' + ((e && e.message) || e); }
+    }
     async function shTodoSet(rows){
         const cfg = shCfg();
         if (!cfg.on || !cfg.url || !cfg.secret || !rows || !rows.length) return null;
@@ -22839,9 +22961,17 @@
         { mp: 'Mirakl (XXXLutz)', ok: true, payer: /M(?:O|Ö|OE)MAX/i,
           ref: /INVOICE\s+(\d+)/i,
           brand: 'Mömax', short: 'Mömax', host: 'marketplace.xxxlgroup.com' },
+        // XXXLutz DE placi przez wlasna spolke rozliczeniowa: „BDSK Handels GmbH & Co. KG".
+        // Nazwa platnika nie mowi nic o marketplace, wiec bez tej reguly trzy sierpniowe
+        // wplaty na 100 717,58 przechodzily bez sladu — najwieksza pozycja calego wyciagu.
+        // Tytul jest za to zwyczajny: „BDSK Handels GmbH & Co. KG Payout for invoice
+        // 262736 f or shop 2026", czyli ten sam ksztalt, co wyzej.
+        { mp: 'Mirakl (XXXLutz)', ok: true, payer: /\bBDSK\b/i,
+          ref: /INVOICE\s+(\d+)/i,
+          brand: 'XXXLutz', short: 'XXXLutz', host: 'marketplace.xxxlgroup.com' },
         // Bez numeru faktury wiersz ma zostac chociaz NAZWANY — mkDetect pomija regule,
         // ktorej wzorzec referencji nie trafil.
-        { mp: 'XXXLutz',          ok: false, payer: /XXX\s*LUTZ|XXXL[- ]?GROUP|M(?:O|Ö|OE)MAX/i },
+        { mp: 'XXXLutz',          ok: false, payer: /XXX\s*LUTZ|XXXL[- ]?GROUP|M(?:O|Ö|OE)MAX|\bBDSK\b/i },
         // Conforama to DWIE osobne instalacje Mirakla i dwie rozne spolki. Hiszpanska
         // placi za oba sklepy iberyjskie — w wyciagu „Conforama Espana S.A. Payout for
         // invoice 238285 f or shop 3406" i to samo dla 3404. Dlatego regula od Espany
@@ -23002,6 +23132,19 @@
         // sierpniu trzy, na 11 199,13.
         { mp: 'Mirakl (Hobbybox)', ok: true, payer: /MANGOPAY/i, ref: /\b(IPA\d{4,})\b/i,
           brand: 'Hobbybox', short: 'Hobbybox', host: 'ipagencyfi-prod.mirakl.net' },
+        // But (BUT INTERNATIONAL) — panel but-prod.mirakl.net, sklep 2496. Placi przez
+        // Mangopay, tytul ma ten sam uklad co Maxeda: „Mangopay 281371 BUT INTERNATI
+        // CUSTOMER REF <32 hex>". Numer po „Mangopay" to referencja wyplaty, hex to
+        // identyfikator przelewu Mangopaya i o rozliczeniu nie mowi nic.
+        // Cztery cyfry PRZED slowem sa tu konieczne, a nie ozdobne: samo „but" bywa
+        // zwyklym angielskim slowem i bez tego warunku regula lapalaby cudze tytuly.
+        { mp: 'Mirakl (But)', ok: true, payer: /MANGOPAY/i,
+          ref: /\b(\d{4,})\s+BUT\b/i,
+          brand: 'But', short: 'But', host: 'but-prod.mirakl.net' },
+        // Gdyby referencji zabraklo albo miala inny ksztalt: wiersz ma zostac chociaz
+        // NAZWANY. Warunek trzyma sie pelniejszego „BUT INTERNATI", zeby nie zabrac
+        // wplat pozostalych Miraklow — one tez przychodza od MANGOPAY.
+        { mp: 'But',          ok: false, payer: /MANGOPAY/i, ref: /(BUT\s+INTERNATI)/i },
         // Zapasowa: inny, NIEZNANY Mirakl przez MANGOPAY z tym samym ksztaltem referencji.
         // Regula Carrefoura powyzej ma IDENTYCZNY wzorzec ref, wiec ta linia nie odbiera
         // jej niczego — zostaje jako siatka bezpieczenstwa, gdyby doszedl piaty taki sklep.
@@ -23069,6 +23212,18 @@
         // chociaz NAZWANY, a nie przepasc bez sladu — ta regula stala tu od dawna
         // i wlasnie ta role dalej pelni.
         { mp: 'Xpollens',       ok: false, payer: /XPOLLENS/i },
+        // Castorama FR — panel marketplace.castorama.fr (wlasna domena, stad osobny
+        // @connect), sklep 2241. Nie placi przez Mangopaya: przelew idzie „ON BEHALF OF
+        // CASTORAMA FRANCE", a numer stoi po „CUSTOMER REF". Ten sam ksztalt, co przy
+        // Leroyu, wiec i wzorzec ten sam — razem z ochrona „(?!\s*\d)", bo wyciag lamie
+        // dlugie opisy i wstawia spacje w srodku numeru.
+        // Platnik ZAWEZONY do Francji: Castorama PL siedzi na osobnym panelu, a samo
+        // „CASTORAMA" wyslaloby ja po zestawienie pod zly adres.
+        { mp: 'Mirakl (Castorama FR)', ok: true, payer: /CASTORAMA\s*FRAN/i,
+          ref: /(?:KUNDENREFERENZ|CUSTOMER\s*REF(?:ERENCE)?|KUNDENREF)\s*[:.]?\s*(\d{6,})(?!\s*\d)/i,
+          brand: 'Castorama', short: 'Castorama', host: 'marketplace.castorama.fr' },
+        // Castorama spoza Francji albo bez numeru: wiersz ma zostac chociaz NAZWANY.
+        { mp: 'Castorama',      ok: false, payer: /CASTORAMA/i },
         { mp: 'Furniture1',     ok: false, payer: /BALDAI1|Furniture1/i }
     ];
     function mkDetect(payer, reason){
@@ -23475,6 +23630,12 @@
         // po kolumnie „Shop ID" w eksporcie.
         '3752': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
                   host: 'marketplace.xxxlgroup.com' },
+        // 2026 stoi wprost w tytulach przelewow od BDSK („for shop 2026"). Nazwe TU
+        // wpisujemy, inaczej niz przy 3752, bo wiadomo, ktory to kraj — powiedzial to
+        // uzytkownik. Dzieki temu klucz ustawien jest wlasny dla tego sklepu, a etykieta
+        // zlozona przez mkShort („XXXLutz DE") trafia w pozycje z listy _Markety.
+        '2026': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz DE' },
         // Conforama: 3404 i 3406 to panel iberyjski (oba z tytulow przelewow, 3404
         // takze z naglowka mirakl-shop-uuid tego panelu), 2294 to panel francuski.
         // Ktory z iberyjskich jest ES, a ktory PT — z danych NIE WYNIKA, a konta sa
@@ -23492,7 +23653,14 @@
                   host: 'maxedanl-prod.mirakl.net' },
         // Hobbybox: 2044 z naglowka mirakl-shop-uuid panelu IP Agency FI.
         '2044': { mp: 'Mirakl (Hobbybox)', brand: 'Hobbybox', short: 'Hobbybox',
-                  host: 'ipagencyfi-prod.mirakl.net' }
+                  host: 'ipagencyfi-prod.mirakl.net' },
+        // But: 2496 z naglowka mirakl-shop-uuid panelu but-prod. Nazwy sklepu nie
+        // wpisujemy — poda ja panel, tak samo jak przy Hobbyboxie i XXXLutzu.
+        '2496': { mp: 'Mirakl (But)', brand: 'But', short: 'But',
+                  host: 'but-prod.mirakl.net' },
+        // Castorama FR: 2241 z naglowka mirakl-shop-uuid panelu marketplace.castorama.fr.
+        '2241': { mp: 'Mirakl (Castorama FR)', brand: 'Castorama', short: 'Castorama',
+                  host: 'marketplace.castorama.fr' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -28651,6 +28819,23 @@
         if (saved) return saved;
         throw new Error('nie widzę, na którego dostawcę jesteś zalogowany — otwórz ' + MK_WAYF_HOST + ' i zaloguj się');
     }
+    // Z odrzuconej odpowiedzi bierzemy TYLKO to, co tlumaczy blad: komunikaty i kody
+    // z „errors". Nigdy calej tresci — opis zlecenia zostaje w pamieci na stale
+    // i przechodzi przez linkify, a tresc odpowiedzi potrafi niesc dane rozliczenia.
+    // Adresy wycinamy: w komunikacie bledu nie wnosza nic, a bywa w nich token.
+    function wayfPowod(txt){
+        let j = null;
+        try { j = JSON.parse(String(txt || '')); } catch (e){ return ''; }
+        const cz = [];
+        ((j && j.errors) || []).slice(0, 2).forEach(function (x){
+            const m = String((x && x.message) || '').replace(/https?:\/\/\S+/g, '…')
+                        .replace(/\s+/g, ' ').trim().slice(0, 160);
+            const ex = (x && x.extensions) || {};
+            const kod = ex.code || ex.errorType || '';
+            if (m) cz.push(m + (kod ? (' [' + kod + ']') : ''));
+        });
+        return cz.length ? (' — Wayfair mówi: ' + cz.join(' · ')) : '';
+    }
     async function wayfGql(op, query, variables){
         const hdrs = { 'content-type': 'application/json', 'accept': '*/*',
                        'apollographql-client-name': 'ph-ui-finance',
@@ -28662,7 +28847,10 @@
         const r = await gmPost(MK_WAYF_API, JSON.stringify({ operationName: op, variables: variables, query: query }), hdrs);
         if (r.status === 401 || r.status === 403)
             throw new Error('Wayfair odrzucił zapytanie (HTTP ' + r.status + ') — zaloguj się na ' + MK_WAYF_HOST);
-        if (r.status !== 200) throw new Error('Wayfair API: HTTP ' + r.status);
+        // 400 znaczy „odrzucilem ZAPYTANIE" — powod stoi w tresci, ktora dotad ginela.
+        // Nazwa operacji mowi, KTORE zapytanie padlo: lista wyplat czy podpisany link.
+        if (r.status !== 200)
+            throw new Error('Wayfair API: HTTP ' + r.status + ' przy „' + op + '"' + wayfPowod(r.responseText));
         let j;
         try { j = JSON.parse(r.responseText || '{}'); }
         catch (e){ throw new Error('Wayfair API oddał coś, co nie jest JSON-em — najpewniej stronę logowania'); }
@@ -28671,6 +28859,11 @@
     }
     async function wayfList(from, to){
         const sup = parseInt(await wayfSupplier(), 10);
+        // Bez tego zapytanie poszloby z pustym supplierId i wrocilby nic nie mowiacy
+        // HTTP 400 — czyli szukalibysmy bledu po stronie Wayfaira zamiast u siebie.
+        if (!(sup > 0))
+            throw new Error('numer dostawcy Wayfaira wyszedł pusty — otwórz ' + MK_WAYF_HOST
+                          + ' i zaloguj się, żeby ciasteczko „supplierID" było widoczne');
         const out = [];
         for (let page = 1; page <= 10; page++){
             const d = await wayfGql('supplierReceivablePayments', WAYF_Q_LIST, {
@@ -30384,7 +30577,7 @@
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
-                const sh = mkSheet[j.ref];
+                const sh = mkSheet[mkJobId(j)];
                 if (sh && sh.found) det += '<div style="color:#c00;font-weight:700">JEST JUŻ W ARKUSZU — wiersz ' + esc(sh.row.row) + ' (' + esc(sh.row.marketplace) + ', ' + esc(sh.row.comments || '') + ')</div>';
                 else if (sh && sh.similar && sh.similar.length) det += '<div style="color:#c47f00">w arkuszu jest podobny wpis: ' + esc(sh.similar.map(function (x){ return x.data + ' ' + x.marketplace + ' ' + f2(x.kwota); }).join('; ')) + '</div>';
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
@@ -33426,12 +33619,19 @@
                 r._cel = dop.cel || null;
                 const dup = dop.cel ? manDuplikat(jobs, dop.cel, r.kwota, r.data) : '';
                 r._dup = dup;
-                const mozna = !!dop.cel && !dup;
+                // Bez daty zlecenia nie zakladamy: data wplywu idzie potem do ksiegowania
+                // jako date_overwrite_to, wiec pusta jest gorsza niz brak zlecenia.
+                // Po wpisaniu daty wiersz odblokuje sie sam — lista przerysowuje sie
+                // po kazdej poprawce.
+                const maDate = /^\d{4}-\d{2}-\d{2}$/.test(String(r.data || ''));
+                const mozna = !!dop.cel && !dup && maDate;
                 if (mozna) gotowe++;
                 const opis = dop.cel
-                    ? ('<span style="color:#0a7a2f">' + esc(dop.cel.mp) + ' · ' + esc(dop.cel.shop) + '</span>'
+                    ? ('<span style="color:#0a7a2f">' + esc(dop.cel.mp) + ' · '
+                       + (dop.cel.shop ? esc(dop.cel.shop) : '<i style="color:#888">nazwę sklepu poda panel</i>') + '</span>'
                        + '<span style="color:#888"> (po ' + esc(dop.po) + ')</span>'
-                       + (dup ? '<span style="color:#c47f00"> — już jest na liście zleceń</span>' : ''))
+                       + (dup ? '<span style="color:#c47f00"> — już jest na liście zleceń</span>' : '')
+                       + (maDate ? '' : '<span style="color:#c47f00"> — najpierw uzupełnij datę</span>'))
                     : ('<span style="color:#c00">' + esc(dop.err || 'nie rozpoznaję') + '</span>');
                 return '<div style="display:flex;gap:6px;align-items:center;padding:2px 0;border-top:1px solid #f1eafe">'
                      + '<input type="checkbox" data-i="' + i + '" class="mk-td-c"' + (mozna ? ' checked' : ' disabled') + '>'
@@ -33464,6 +33664,18 @@
             if (x) x.onclick = shZamknij;
             const go = shBox.querySelector('#mk-td-go');
             if (go) go.onclick = function(){ shZaloz(go); };
+            // Napis na guziku ma mowic, ile jest ZAZNACZONYCH, a nie ile dalo sie
+            // zaznaczyc przy rysowaniu. Bez tego przy jednym ptaszku guzik dalej
+            // pokazywal „(3)" — zakladalo sie wtedy poprawnie, ale napis klamal.
+            const przelicz = function (){
+                let n = 0;
+                shBox.querySelectorAll('.mk-td-c').forEach(function (el){
+                    if (el.checked && !el.disabled) n++;
+                });
+                if (go){ go.textContent = 'Załóż zlecenia (' + n + ')'; go.disabled = !n; }
+            };
+            shBox.querySelectorAll('.mk-td-c').forEach(function (el){ el.onchange = przelicz; });
+            przelicz();
         }
         async function shZaloz(b){
             const zazn = [];
@@ -33489,7 +33701,10 @@
                             // Wspolrzedne wiersza w arkuszu — po nich, a nie po kluczu
                             // data+konto+kwota, odhaczymy go po zaksiegowaniu. Klucz
                             // przestalby trafiac, gdyby date albo konto poprawiono.
-                            zArkusza: { tab: r.tab, row: r.row, konto: r.konto } };
+                            // Etykiete z kolumny B pamietamy po to, zeby po pobraniu
+                            // rozliczenia bylo z czym porownac nazwe sklepu z panelu.
+                            zArkusza: { tab: r.tab, row: r.row, konto: r.konto,
+                                        market: r.marketplace || '' } };
                 dodane++;
                 if (r.data !== r._data0 || String(r.konto) !== String(r._konto0))
                     poprawki.push({ tab: r.tab, row: r.row,
@@ -33518,10 +33733,10 @@
                 // Zapamietujemy, co przyszlo z arkusza, zeby wiedziec, CO zostalo
                 // poprawione — i odeslac tylko to, a nie caly wiersz.
                 shLista = (r.result || []).map(function (x){
-                    return { tab: x.tab, row: x.row, data: String(x.data || '').slice(0, 10),
+                    return { tab: x.tab, row: x.row, data: shData(x.data),
                              marketplace: x.marketplace || '', konto: String(x.konto == null ? '' : x.konto).trim(),
                              kwota: Number(x.kwota), comments: x.comments || '',
-                             _data0: String(x.data || '').slice(0, 10),
+                             _data0: shData(x.data),
                              _konto0: String(x.konto == null ? '' : x.konto).trim() };
                 });
                 shRysuj();
@@ -33530,7 +33745,11 @@
                        + (r.tabs.length > 3 ? ' …' : '')) : ''), '#0a7a2f');
             } catch (e){
                 shZamknij();
-                say('Arkusz: ' + ((e && e.message) || e), '#c00');
+                // Nie zostawiamy czlowieka z samym „nie zna akcji" — od razu sprawdzamy,
+                // co ten adres w ogole serwuje, bo to jedyne, co rozstrzyga przyczyne.
+                let s2 = '';
+                try { s2 = await shSonda(); } catch (e2){}
+                say('Arkusz: ' + ((e && e.message) || e) + (s2 ? (' — ' + s2) : ''), '#c00');
             }
             shBtn.disabled = false;
         };
@@ -34481,6 +34700,12 @@
                     if (!r.tabs){
                         m.style.color = '#c47f00';
                         m.textContent = '✓ połączone, ale to starsza wersja skryptu — wdróż nową (Manage deployments → New version)';
+                    } else if (!Array.isArray(r.akcje)){
+                        // Zakladki sa, ale pola „akcje" nie ma — czyli wdrozenie zna
+                        // stare akcje, a nie zna „todo" i „todoSet".
+                        m.style.color = '#c47f00';
+                        m.textContent = '✓ połączone, ale wdrożenie nie zna akcji „todo" i „todoSet" — '
+                                      + 'wgraj nowy kod i wdróż NOWĄ wersję (Manage deployments → ołówek → New version)';
                     } else {
                         const need = {};
                         jobList().forEach(function (j){
@@ -34558,6 +34783,63 @@
         // Jedno przejscie po aktualnie ustawionym sklepie. Liste cykli pobieramy RAZ
         // i dopasowujemy do niej wszystkie czekajace referencje — inaczej przy 13 sklepach
         // i 7 zleceniach bylo by 91 zapytan zamiast 13.
+        // Po pobraniu rozliczenia nazwa sklepu jest juz znana — wiec teraz arkusz moze
+        // ja dostac. Wpisujemy WLASNIE NAZWE, nie numer konta: konto potrafi byc wspolne
+        // dla kilku sklepow (Home24 AT, DE i NL siedza na 1147), wiec z niego nie da sie
+        // odczytac, o ktory sklep chodzi. Kolumny konta nie dotykamy — stoi w niej
+        // formula i przeliczy sie sama po zmianie etykiety.
+        async function shDopiszSklep(jobs){
+            const rows = [], czyj = {};        // „zakladka!wiersz" -> klucz zlecenia
+            Object.keys(jobs).forEach(function (k){
+                const j = jobs[k], a = j && j.zArkusza;
+                if (!a || !a.tab || !a.row || a.uzup) return;
+                const shop = (j.data && j.data.shop) || j.shop || '';
+                if (!shop) return;                 // sklepu jeszcze nie znamy
+                // Do arkusza idzie DOKLADNIE ta nazwa, ktora HUB wpisuje, gdy sam
+                // dokłada wiersz (shRow uzywa mkShort) — panel mowi „Beliani NL",
+                // a pozycja w arkuszu nazywa sie „Home24 NL". Bez tego ta sama wplata
+                // nazywalaby sie roznie w zaleznosci od drogi, ktora tam trafila.
+                const nazwa = mkShort(j) || shop;
+                // Etykieta juz wlasciwa — nie ma po co pukac do arkusza. Znacznik
+                // stawiamy tak samo, zeby kazdy kolejny przelot tez to pominal.
+                if (mkNorm(nazwa) === mkNorm(a.market || '')) { a.uzup = nazwa; return; }
+                rows.push({ tab: a.tab, row: a.row, market: nazwa });
+                czyj[a.tab + '!' + a.row] = k;
+            });
+            if (!rows.length){ jobsSave(jobs); return; }
+            const dopisz = function (k, txt){ jobs[k].msg = String(jobs[k].msg || '') + txt; };
+            const zle = {};
+            try {
+                const r = await shTodoSet(rows);
+                const ile = (r && r.updated) || 0;
+                // Kazdy wiersz odpowiada za siebie: „missing" niesie zakladke i numer,
+                // wiec powod trafia do tego zlecenia, ktorego dotyczy.
+                ((r && r.missing) || []).forEach(function (t){
+                    const m = String(t).match(/^(\S+)\s+w\.\s+(\d+)/);
+                    const k = m ? czyj[m[1] + '!' + Number(m[2])] : null;
+                    if (k){ zle[k] = 1; dopisz(k, ' · ARKUSZ: ' + t); }
+                });
+                rows.forEach(function (w){
+                    const k = czyj[w.tab + '!' + w.row];
+                    if (!k || zle[k]) return;
+                    // Zero poprawionych wierszy i zadnego powodu znaczy, ze wdrozone
+                    // Apps Script jeszcze nie zna pola „market" — inaczej odpowiedzialoby
+                    // choc jednym „missing".
+                    if (!ile){ dopisz(k, ' · arkusz nie przyjął nazwy sklepu — wgraj nowszy Apps Script'); return; }
+                    // Dopiero TERAZ sprawa jest zamknieta. Znacznik postawiony wczesniej
+                    // przepadalby przy kazdej nieudanej probie — a to one sa najczestsze
+                    // za pierwszym razem (brak pozycji w liscie marketow).
+                    jobs[k].zArkusza.uzup = w.market;
+                    jobs[k].zArkusza.market = w.market;
+                    dopisz(k, ' · w arkuszu wpisany sklep ' + w.market);
+                });
+            } catch (e){
+                Object.keys(czyj).forEach(function (x){
+                    dopisz(czyj[x], ' · ARKUSZ: ' + ((e && e.message) || e));
+                });
+            }
+            jobsSave(jobs); render();
+        }
         async function mkPass(jobs, shopName, host){
             let cycles;
             try { cycles = await mkCycles(); }
@@ -34571,7 +34853,10 @@
             // Ten sam warunek co w mkLeft — obie strony musza liczyc tak samo.
             const todo = Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
-                if (!mkTodo(j) || !j.ref || (j.kind || 'mirakl') !== 'mirakl') return false;
+                if (!mkTodo(j) || (j.kind || 'mirakl') !== 'mirakl') return false;
+                // Bez numeru cykl dobiera sie po kwocie i dacie — ale wtedy host MUSI
+                // byc znany, inaczej zlecenie trafiloby do instancji domyslnej.
+                if (!j.ref && !j.host) return false;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
             });
             let ok = 0;
@@ -34621,7 +34906,8 @@
                     byRef = !!mkMatchIn([cyc], j.ref);     // czy trafilismy po numerze, czy po dacie
                     byKwote = !byRef && !bezKwoty && eq(cycAmount(cyc), j.amount);
                     cycIds = [cyc.id];
-                    say('Sklep ' + (shopName || '?') + ' — pobieram ' + j.ref + '…');
+                    say('Sklep ' + (shopName || '?') + ' — pobieram '
+                      + (j.ref || ('wpłatę ' + f2(j.amount) + ' ' + (j.cur || '') + ' z ' + j.date)) + '…');
                 }
                 try {
                     // Kilka cykli zlewamy w jedna liste pozycji — dalej wszystko liczy sie
@@ -34678,6 +34964,9 @@
                 } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
             }
+            // Dopiero teraz nazwy sklepow sa znane — wiec teraz arkusz moze je dostac.
+            // Jedno zapytanie na caly przelot, nie po razie na zlecenie.
+            try { await shDopiszSklep(jobs); } catch (e){}
             return ok;
         }
         // Przejscie dla VTEX. Referencja z przelewu rowna sie nazwie raportu, wiec nie ma
@@ -34885,7 +35174,12 @@
         function mkLeft(jobs, host){
             return Object.keys(jobs).filter(function (k){
                 const j = jobs[k];
-                if (!mkTodo(j) || !j.ref) return false;
+                if (!mkTodo(j)) return false;
+                // Zlecenie BEZ referencji — z arkusza albo dopisane recznie — tez ma byc
+                // pobierane: mkMatchCycle dobiera cykl po kwocie i dacie, tak jak przy
+                // Home24 i BRW. Wymagamy za to HOSTA, bo bez jednego i drugiego zlecenie
+                // wpadloby do instancji domyslnej i dostalo cudzy cykl.
+                if (!j.ref && !j.host) return false;
                 const kind = j.kind || 'mirakl';
                 if (kind === 'joy' || kind === 'galx' || kind === 'wayf') return false;
                 const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
@@ -35163,7 +35457,8 @@
             const o = {}, out = [];
             Object.keys(jobs).forEach(function (k){
                 const j = jobs[k];
-                if (!mkTodo(j) || !j.ref) return;
+                if (!mkTodo(j)) return;
+                if (!j.ref && !j.host) return;      // patrz mkLeft — bez numeru musi byc host
                 if ((j.kind || 'mirakl') !== kind) return;
                 const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
                 if (h && !o[h]){ o[h] = 1; out.push(h); }
@@ -35349,7 +35644,7 @@
             }
             b.disabled = false; if (b2) b2.disabled = false;
             render();
-            const dup = fresh.filter(function (x){ const s = mkSheet[x.ref]; return s && s.found; }).length;
+            const dup = fresh.filter(function (x){ const s = mkSheet[mkJobId(x)]; return s && s.found; }).length;
             // „Nieznalezione" musi liczyc tak samo jak okno potwierdzenia — czyli razem
             // z Galaxusem i Wayfairem, ktore mkLeft celowo pomija.
             const jl = jobsLoad();
@@ -36880,11 +37175,11 @@
         let dupSheet = [], dupFile = [], shErr = '';
         // Stare wyniki kasujemy, zeby po nieudanym sprawdzeniu nie zostal na ekranie
         // wynik z poprzedniego przebiegu — czyli zeby „nie wiem" nie udawalo „czysto".
-        sel.forEach(function (j){ delete mkSheet[j.ref]; });
+        sel.forEach(function (j){ delete mkSheet[mkJobId(j)]; });
         try { await shCheckJobs(sel); }
         catch (e){ shErr = (e && e.message) || String(e); say('Arkusz: ' + shErr + ' — sprawdzam dalej bez niego.', '#c47f00'); }
         for (let i = 0; i < sel.length; i++){
-            const s = mkSheet[sel[i].ref];
+            const s = mkSheet[mkJobId(sel[i])];
             if (s && s.found) dupSheet.push(sel[i]);
             const f = await impSameFile(sel[i]);
             if (f) dupFile.push({ j: sel[i], f: f });
@@ -36897,8 +37192,10 @@
             const n = Object.keys(j.data.ord).length;
             const c = sets[setKey(j.mp, j.data.shop)];
             tot = r2(tot + j.data.gross); cnt += n;
-            const s = mkSheet[j.ref];
-            const df = dupFile.filter(function (x){ return x.j.ref === j.ref; })[0];
+            const s = mkSheet[mkJobId(j)];
+            // Ostrzezenie o powtorzonym pliku szlo tym samym bledem: przy pustych
+            // referencjach „x.j.ref === j.ref" bylo prawda dla kazdej pary.
+            const df = dupFile.filter(function (x){ return mkJobId(x.j) === mkJobId(j); })[0];
             let flag = '';
             if (shErr) flag += '   ⚠ arkusz NIESPRAWDZONY';
             else if (s && s.found) flag += '   ⚠ JEST JUŻ W ARKUSZU (wiersz ' + s.row.row + ', ' + s.row.marketplace + ')';
