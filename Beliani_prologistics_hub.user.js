@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.02
+// @version      5.03
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22415,9 +22415,20 @@
                     .some(function (x){ const y = mkNorm(x); return y && y === n; });
             });
             if (scisle.length) return scisle;
-            return cele.filter(function (c){
+            const luzne = cele.filter(function (c){
                 return [c.shop, c.label, c.brand, (c.brand || '') + ' ' + (c.shop || '')]
                     .some(function (x){ const y = mkNorm(x); return y && y.length > 3 && (y.indexOf(n) === 0 || n.indexOf(y) === 0); });
+            });
+            if (luzne.length) return luzne;
+            // Ostatnia droga: nazwa z arkusza niesie kraj („But FR"), a katalog zna sama
+            // marke („But"), bo nazwy sklepu jeszcze nie znamy. Odcinamy koncowy kod kraju
+            // i porownujemy SCISLE, znak w znak — nie przez zawieranie, bo wlasnie po to
+            // stoi wyzej prog dlugosci: trzyliterowy „But" nie moze lapac przez przypadek.
+            const bezKraju = mkNorm(String(tekst || '').trim().replace(/\s+[A-Za-z]{2}$/, ''));
+            if (!bezKraju || bezKraju === n) return [];
+            return cele.filter(function (c){
+                return [c.shop, c.label, c.mp, c.brand, c.short]
+                    .some(function (x){ const y = mkNorm(x); return y && y === bezKraju; });
             });
         };
         // „home 24" albo „Vente" bez kraju: pasuje kilka sklepow, ale WSZYSTKIE stoja
@@ -23824,6 +23835,7 @@
     function mkZlozZlecenie(j, tx, o){
         o = o || {};
         const manor = !!o.manor, bezKwoty = !!o.bezKwoty, byRef = !!o.byRef, byKwote = !!o.byKwote;
+        const reczny = !!o.reczny;        // cykl wskazany z listy kandydatow, nie dobrany
         const cycIds = o.cycIds || [], shopName = o.shopName || '';
         const docs = o.docs || [], docSum = o.docSum;
         let a = mkAggregate(tx.list, j.ref), split = false;
@@ -23854,7 +23866,10 @@
         // i wlasnie to sie stalo: Home24 CH przejal wyplate Beliani AT.
         // Kwota wyplaty rozstrzyga, czyj to cykl. Jesli nie pasuje, zlecenie
         // zostaje nieprzypisane i szukamy dalej, pomijajac juz sprawdzone cykle.
-        if (!byRef && !bezKwoty && a.pay != null && !eq(net, j.amount))
+        // Wskazanego RECZNIE nie odrzucamy: czlowiek wybral to rozliczenie swiadomie,
+        // wlasnie dlatego, ze kwota sie nie zgadza. Zlecenie i tak nie przejdzie dalej —
+        // nizej ta sama niezgodnosc trafia do „bad", czyli na „wymaga sprawdzenia".
+        if (!reczny && !byRef && !bezKwoty && a.pay != null && !eq(net, j.amount))
             return { odrzuc: true };
         // Kontrola spojnosci: skladniki + WSZYSTKIE wyplaty musza dac zero.
         const selfOk = !a.pays.length || eq(r2(a.comp + a.payAll), 0);
@@ -23881,7 +23896,9 @@
         if (!manor && !a.pays.length) bad.push('w pobranych pozycjach nie ma wiersza wypłaty — to nie jest komplet rozliczenia');
         // kasujemy uwage z poprzedniego przebiegu i zaznaczamy, jesli cykl
         // zostal dobrany po dacie, a nie po numerze z przelewu
-        j.note = byRef ? '' : (bezKwoty
+        j.note = reczny
+            ? ('rozliczenie WSKAZANE RĘCZNIE z listy — nie dobrało się samo, bo kwoty się nie zgadzają')
+            : byRef ? '' : (bezKwoty
             ? 'cykl dobrany po dacie zamknięcia — Empik nie podaje numeru cyklu w przelewie'
             : (byKwote
                 ? ('cykl dobrany po kwocie wypłaty ' + f2(j.amount) + ' — rozliczenie nie zawiera numeru z przelewu')
@@ -29256,6 +29273,85 @@
         const hit = (list || []).filter(function (c){ const a = cycAmount(c); return a != null && Math.abs(a - amount) < 0.005; });
         return hit.length === 1 ? hit[0] : null;      // przy dwoch takich samych kwotach nie zgadujemy
     }
+    // Czego szukalismy i co panel ma zamiast tego. Wolane WYLACZNIE wtedy, gdy zaden
+    // cykl nie pasowal — zeby zamiast „nie znalazlem" powiedziec, czego dokladnie
+    // brakuje do zgodnosci. Najczestszy powod to grosz roznicy w kwocie, a przy nim
+    // dotychczasowy komunikat wysylal sprawdzac sesje i panel, czyli nie tam, gdzie
+    // trzeba. Do tekstu ida same daty, kwoty i numery cykli.
+    // Same cyfry kwoty, posortowane. Dwie kwoty o tym samym zestawie cyfr to prawie
+    // zawsze przestawienie — czyli czeski blad przy przepisywaniu.
+    function mkCyfry(v){
+        return String(f2(v)).replace(/[^0-9]/g, '').split('').sort().join('');
+    }
+    // Czy roznica miedzy kwotami wyglada na POMYLKE W ZAPISIE, a nie na inna wyplate.
+    // Odleglosc kwot tego nie rozstrzyga: 4535,31 zamiast 4553,31 to blad jednego
+    // ruchu palcem, a roznica prawie dwustu. Nazywamy wiec powod, a nie tylko dystans.
+    function mkPodobna(a, b){
+        if (a == null || b == null || !isFinite(a) || !isFinite(b)) return '';
+        const r = Math.abs(r2(a - b));
+        if (r < 0.005) return '';
+        if (r < 1) return 'różnica ' + f2(r) + ' — to wygląda na literówkę';
+        const A = String(f2(a)), B = String(f2(b));
+        if (A.length !== B.length) return '';
+        if (mkCyfry(a) === mkCyfry(b)) return 'te same cyfry w innej kolejności — czeski błąd';
+        let ile = 0;
+        for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) ile++;
+        if (ile === 1) return 'różni się JEDNĄ cyfrą';
+        if (ile === 2) return 'różni się dwiema cyframi';
+        return '';
+    }
+    // Co panel ma w okolicy tej daty, uporzadkowane wedlug tego, jak blisko jest kwocie.
+    // Okno jak przy dopasowaniu szerokim: 10 dni wstecz, 3 w przod — tyle wynosi realny
+    // rozjazd miedzy zamknieciem cyklu a ksiegowaniem przelewu w banku.
+    function mkKandydaci(list, j){
+        const d0 = mkDay(j && j.date);
+        if (d0 == null) return [];
+        const dataCyklu = function (c){
+            return mkIso(c && (c.dateCreated || c.creationDate || c.endDate || c.dateEnd ||
+                               (c.period && (c.period.endDate || c.period.end)))) || '';
+        };
+        const out = (list || []).filter(function (c){
+            const x = mkCycDay(c);
+            return x != null && (d0 - x) <= 10 * 86400000 && (x - d0) <= 3 * 86400000;
+        }).map(function (c){
+            const a = cycAmount(c);
+            return { id: String((c && c.id) || ''), data: dataCyklu(c), kwota: a,
+                     dni: Math.abs(mkCycDay(c) - d0) / 86400000,
+                     roz: (a == null) ? null : Math.abs(r2(a - j.amount)),
+                     powod: mkPodobna(a, j.amount) };
+        });
+        // Najpierw te, ktore wygladaja na pomylke w zapisie, potem po roznicy kwoty,
+        // na koncu po odlegloscie daty.
+        out.sort(function (a, b){
+            if (!!a.powod !== !!b.powod) return a.powod ? -1 : 1;
+            if (a.roz == null && b.roz == null) return a.dni - b.dni;
+            if (a.roz == null) return 1;
+            if (b.roz == null) return -1;
+            return (a.roz - b.roz) || (a.dni - b.dni);
+        });
+        return out;
+    }
+    function mkCoWPanelu(list, j){
+        const kand = mkKandydaci(list, j);
+        if (!kand.length)
+            return 'w panelu nie ma żadnego rozliczenia zamkniętego w okolicy ' + j.date
+                 + ' (±10 dni). Sprawdź, czy wypłata jest już widoczna w panelu.';
+        const opis = kand.slice(0, 3).map(function (x){
+            return (x.data || '?')
+                 + (x.kwota == null ? ' (panel nie podaje kwoty)' : (' na ' + f2(x.kwota)))
+                 + (x.roz == null ? '' : (' — różnica ' + f2(x.roz)))
+                 + (x.id ? (' [' + x.id.slice(0, 8) + ']') : '');
+        }).join('; ');
+        // Gdy pierwszy kandydat wyglada na pomylke w zapisie kwoty, zaczynamy od tego —
+        // bo wtedy szukanie w panelu i sprawdzanie sesji jest strata czasu.
+        const p = kand[0].powod;
+        return (p
+                ? ('kwota nie zgadza się: ' + p + '. W panelu jest wypłata '
+                   + f2(kand[0].kwota) + ', a z wyciągu przyszło ' + f2(j.amount)
+                   + ' — sprawdź kwotę wpłaty albo wskaż rozliczenie niżej. ')
+                : ('nie znalazłem rozliczenia na ' + f2(j.amount) + ' ' + (j.cur || '') + '. '))
+             + 'W panelu w okolicy ' + j.date + ': ' + opis + '.';
+    }
     function mkMatchCycle(list, ref, dateStr, amount, tried){
         // Cykle juz sprawdzone i odrzucone (bo kwota nie pasowala) pomijamy, inaczej
         // przelot po sklepach wracalby w kolko do tego samego, blednego kandydata.
@@ -30454,6 +30550,39 @@
     // zamiast numerow (2 przelewy na 47), i gdy suma dokumentow nie schodzi sie z wplata,
     // bo w tytule zabraklo jednego. Wtedy przepisujesz numery z awiza, a modul liczy
     // od nowa. Pokazujemy je TYLKO na prologistics — tam stoi lista zlecen.
+    // Rozliczenia, ktore MOGA byc tym, o co chodzi — do wskazania recznie. Pokazujemy
+    // je tylko przy zleceniu, ktore nie ma jeszcze danych: gdy rozliczenie sie pobralo,
+    // nie ma czego wybierac.
+    function mkKandBox(j){
+        if (!onProlo) return '';
+        const st = j.status || 'new';
+        if (st !== 'new' && st !== 'err') return '';
+        const kand = (j.kand || []).filter(function (x){ return x && x.id; });
+        if (!kand.length) return '';
+        const trop = kand.filter(function (x){ return x.powod; }).length;
+        return '<div style="margin-top:4px;padding:5px 7px;background:#fef2f2;border:1px solid #fecaca;border-radius:5px">'
+             + '<div style="font-size:10px;color:#7f1d1d">'
+             +   '<b>Które to rozliczenie?</b> Żadne nie pasuje do kwoty ' + f2(j.amount) + ' ' + esc(j.cur || '')
+             +   ' z wyciągu' + (j.kandSklep ? (' (sklep ' + esc(j.kandSklep) + ')') : '') + '. '
+             +   (trop ? '<b>Najpierw upewnij się co do kwoty wpłaty</b> — przy przepisywaniu łatwo o czeski błąd. '
+                       : 'Sprawdź kwotę wpłaty, zanim wskażesz. ')
+             +   'Wskazane ręcznie NIE pójdzie do importu — trafi na „wymaga sprawdzenia".'
+             + '</div>'
+             + kand.map(function (x){
+                 return '<div style="margin-top:3px;display:flex;gap:6px;align-items:center">'
+                      + '<button class="mk-kand" data-k="' + esc(j.__k || '') + '" data-cyc="' + esc(x.id) + '" '
+                      +   'style="padding:2px 8px;border:none;border-radius:4px;background:#b91c1c;color:#fff;'
+                      +   'font-size:11px;cursor:pointer;white-space:nowrap">pobierz to</button>'
+                      + '<span style="font-size:11px">' + esc(x.data || '?') + ' · <b>'
+                      +   (x.kwota == null ? 'panel nie podaje kwoty' : f2(x.kwota)) + '</b>'
+                      +   (x.roz == null ? '' : (' · różnica ' + f2(x.roz)))
+                      +   (x.powod ? ('<span style="color:#b91c1c;font-weight:700"> · ' + esc(x.powod) + '</span>') : '')
+                      +   ' <span style="color:#999">[' + esc(String(x.id).slice(0, 8)) + ']</span>'
+                      + '</span></div>';
+               }).join('')
+             + '</div>';
+    }
+
     function manorBox(j){
         if (!onProlo || String(j.mp || '') !== 'Manor') return '';
         const st = j.status || 'new';
@@ -30588,6 +30717,7 @@
             }
             if (!j.data && c24Brak(j)) det += '<div style="color:#c47f00">' + esc(c24Brak(j)) + '</div>';
             if (!j.data && obiChBrak(j)) det += '<div style="color:#c47f00">' + esc(obiChBrak(j)) + '</div>';
+            det += mkKandBox(j);
             h += '<tr style="border-top:1px solid #eee">'
               +  '<td style="padding:3px 5px">' + (onProlo && st === 'ready'
                     ? '<input type="checkbox" class="mk-ck" data-ref="' + esc(j.ref) + '"' + (selOn(j) ? ' checked' : '') + '>'
@@ -30735,6 +30865,34 @@
                 jobsSave(jobs); render();
                 say('Data wpłaty ' + (j.shop || j.mp || '') + ' ' + f2(j.amount) + ' ' + (j.cur || '')
                     + ': ' + stara + ' → ' + v + '. Ta data pójdzie do księgowania.', '#0a7a2f');
+            };
+        });
+        // Wybor rozliczenia z listy kandydatow. Nie pobieramy od razu — zapisujemy wybor
+        // i zlecenie wraca na „czeka na dane", tak jak przy recznych numerach Manora.
+        out.querySelectorAll('.mk-kand').forEach(function (b){
+            b.onclick = function(){
+                const k = b.getAttribute('data-k'), cyc = b.getAttribute('data-cyc');
+                if (!k || !cyc) return;
+                const jobs = jobsLoad(), j = jobs[k];
+                if (!j) return;
+                if (j.status === 'done'){ say('To zlecenie jest już zaksięgowane.', '#c47f00'); return; }
+                const x = (j.kand || []).filter(function (y){ return y && y.id === cyc; })[0] || {};
+                if (!confirm('Pobrać rozliczenie ' + String(cyc).slice(0, 8)
+                    + (x.data ? (' z ' + x.data) : '')
+                    + (x.kwota == null ? '' : (' na ' + f2(x.kwota)))
+                    + ' do wpłaty ' + f2(j.amount) + ' ' + (j.cur || '') + '?\n\n'
+                    + (x.roz == null ? '' : ('Kwoty różnią się o ' + f2(x.roz) + '. '))
+                    + 'Sprawdź najpierw kwotę wpłaty na wyciągu — przy przepisywaniu łatwo o czeski błąd.\n\n'
+                    + 'Zlecenie trafi na „wymaga sprawdzenia" i NIE pójdzie do importu, '
+                    + 'dopóki kwoty się nie zgodzą.')) return;
+                j.wymus = cyc;
+                j.status = 'new';
+                // Odrzucone wczesniej cykle czyscimy: wskazany mogl byc wsrod nich.
+                j.tried = [];
+                j.msg = 'wskazane rozliczenie ' + String(cyc).slice(0, 8)
+                      + ' — kliknij „⬇ Pobierz zestawienia", żeby je ściągnąć';
+                jobsSave(jobs); render();
+                say('Zapisane. Kliknij „⬇ Pobierz zestawienia".', '#0a7a2f');
             };
         });
         out.querySelectorAll('.mk-ck').forEach(function (c){
@@ -34869,6 +35027,7 @@
                 const bezKwoty = mkBezKwoty(j);
                 const nrs = (j.docs || []).filter(Boolean);
                 let cycIds = [], byRef = true, byKwote = false, docs = null, docSum = null;
+                let reczny = false;               // cykl wskazany z listy, nie dobrany
                 // Manor bez numerow w tytule („SIEHE AVIS VOM …"). Nie zgadujemy cyklu po
                 // dacie — przy tym operatorze data przelewu i data cyklu rozjezdzaja sie
                 // o tygodnie. Zlecenie ma powstac i czekac na numery przepisane z awiza.
@@ -34900,14 +35059,46 @@
                 } else {
                     // Empik nie podaje w przelewie zadnego numeru cyklu (w tytule stoi
                     // identyfikator PayPro), a kwota nie pasuje — zostaje sama data.
+                    // Cykl WSKAZANY RECZNIE ma pierwszenstwo przed szukaniem. Jesli nie
+                    // ma go na liscie tego sklepu, idziemy dalej BEZ szukania czegokolwiek
+                    // innego — czlowiek wybral konkretne rozliczenie, wiec podstawienie mu
+                    // innego byloby najgorsza z mozliwych uslug.
+                    if (j.wymus){
+                        const w = (cycles || []).filter(function (c){
+                            return String(c && c.id) === String(j.wymus);
+                        })[0];
+                        if (!w) continue;                  // pewnie inny sklep tej platformy
+                        reczny = true;
+                        cycIds = [w.id];
+                        byRef = false; byKwote = false;
+                        say('Sklep ' + (shopName || '?') + ' — pobieram wskazane rozliczenie '
+                          + String(w.id).slice(0, 8) + '…');
+                    } else {
                     const cyc = bezKwoty ? mkCycleByDate(cycles, j.date, j.tried)
                                          : mkMatchCycle(cycles, j.ref, j.date, j.amount, j.tried);
-                    if (!cyc) continue;
+                    if (!cyc){
+                        // Cisza w tym miejscu byla najgorsza z mozliwych odpowiedzi:
+                        // zlecenie zostawalo na „czeka na dane", a zbiorczy komunikat
+                        // kazal sprawdzac sesje — nawet gdy w panelu stala wyplata
+                        // rozniaca sie o grosz. Wlasny opis ma tu pierwszenstwo:
+                        // mkPowodHost dopisuje swoj TYLKO zleceniom bez opisu.
+                        j.msg = (shopName ? ('Sklep ' + shopName + ': ') : '') + mkCoWPanelu(cycles, j);
+                        // Kandydaci ZOSTAJA przy zleceniu — z nich powstaje lista wyboru
+                        // pod zleceniem. Pieciu wystarczy: dalej to juz nie sa kandydaci.
+                        const kd = mkKandydaci(cycles, j).slice(0, 5);
+                        j.kand = kd.length ? kd.map(function (x){
+                            return { id: x.id, data: x.data, kwota: x.kwota, roz: x.roz, powod: x.powod };
+                        }) : null;
+                        j.kandSklep = shopName || '';
+                        jobsSave(jobs); render();
+                        continue;
+                    }
                     byRef = !!mkMatchIn([cyc], j.ref);     // czy trafilismy po numerze, czy po dacie
                     byKwote = !byRef && !bezKwoty && eq(cycAmount(cyc), j.amount);
                     cycIds = [cyc.id];
                     say('Sklep ' + (shopName || '?') + ' — pobieram '
                       + (j.ref || ('wpłatę ' + f2(j.amount) + ' ' + (j.cur || '') + ' z ' + j.date)) + '…');
+                    }
                 }
                 try {
                     // Kilka cykli zlewamy w jedna liste pozycji — dalej wszystko liczy sie
@@ -34951,7 +35142,8 @@
                     const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: allFull };
                     const wynik = mkZlozZlecenie(j, tx, {
                         manor: manor, bezKwoty: bezKwoty, byRef: byRef, byKwote: byKwote,
-                        cycIds: cycIds, shopName: shopName, docs: docs, docSum: docSum });
+                        cycIds: cycIds, shopName: shopName, docs: docs, docSum: docSum,
+                        reczny: reczny });
                     // Cykl dobrany po dacie, ktorego kwota nie pasuje — nie jest nasz.
                     // Dopisujemy go do sprawdzonych i szukamy dalej, inaczej przelot po
                     // sklepach wracalby w kolko do tego samego, blednego kandydata.
@@ -34960,6 +35152,10 @@
                         jobsSave(jobs);
                         continue;
                     }
+                    // Rozliczenie jest — lista kandydatow i wskazanie zrobily swoje.
+                    // Zostawione zasmiecalyby ekran i przy nastepnym przelocie kazalyby
+                    // pobrac raz jeszcze to samo.
+                    j.wymus = ''; j.kand = null; j.kandSklep = '';
                     ok++;
                 } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
