@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.06
+// @version      5.07
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22613,6 +22613,14 @@
             // po sklepach i tak je odwiedza, a rozstrzyga to samo co zawsze — czy jest
             // tam cykl o zgodnej kwocie i dacie.
             if (!wiele) return null;
+            // Wszyscy kandydaci musza miec TE SAMA MARKE. Przy „NN" wystarczalo, ze
+            // nazwa byla jawnie niepelna; teraz szersze szukanie dziala takze przy samej
+            // nazwie, wiec bez tego warunku dwa niespokrewnione cele moglyby sie skleic.
+            const marka = mkNorm(l[0].brand || l[0].short || l[0].mp);
+            const jedna = l.every(function (c){
+                return mkNorm(c.brand || c.short || c.mp) === marka;
+            });
+            if (!marka || !jedna) return null;
             const hosty = [];
             l.forEach(function (c){
                 const h = String(c.host || '');
@@ -22631,9 +22639,12 @@
         const nn = mkNNRdzen(nazwa);
         const luzno = nn ? szukaj(nn) : szukaj(nazwa);
         const poKoncie = kt ? cele.filter(function (c){ return String(c.acct || '') === kt; }) : [];
-        // Szersze szukanie WYLACZNIE przy „NN" — patrz jedenPanel.
-        const zN = jeden(luzno) || jedenPanel(luzno, !!nn);
-        const zK = jeden(poKoncie) || jedenPanel(poKoncie, !!nn);
+        // Szersze szukanie dziala takze BEZ „NN": kto pisze sama nazwe marketplace'u,
+        // tez nie wie, ktory to panel. Zabezpieczeniem nie jest tu skladnia wpisu, tylko
+        // to, ze panel nie zostaje wybrany na chybil trafil — sprawdzamy wszystkie po
+        // kolei, a rozstrzyga cykl o zgodnej kwocie i dacie (patrz jedenPanel).
+        const zN = jeden(luzno) || jedenPanel(luzno, true);
+        const zK = jeden(poKoncie) || jedenPanel(poKoncie, true);
         // Cel zlozony z kilku sklepow jednego panelu nie ma nazwy sklepu. Konto
         // takiemu celowi NIE PRZECZY — ono go uscisla. Sprzecznoscia jest wylacznie
         // wskazanie dwoch roznych marketplace'ow albo dwoch roznych sklepow.
@@ -24174,7 +24185,9 @@
     // Numer kolumny z kwota, gdy ma stac gdzie indziej niz „Amount" z naglowka.
     // LICZYMY OD ZERA: 13 to czternasta kolumna arkusza, czyli „N" (domyslne „Amount"
     // stoi na 14, czyli w „O"). Tak czyta import po stronie prologistics.
-    const MK_KOL_KWOTA = { 'Manor': 13, 'Mirakl (But)': 13 };
+    // Maxeda: Brico BE i Praxis NL to JEDEN panel i jeden wpis — ustawienie importu
+    // po stronie prologistics czyta kwote z N przy obu sklepach.
+    const MK_KOL_KWOTA = { 'Manor': 13, 'Mirakl (But)': 13, 'Mirakl (Maxeda)': 13 };
     // Nie kazdy Mirakl eksportuje ten sam komplet kolumn. Empik nie ma „Payment reference"
     // ani „Sales channel", wiec jego plik ma 25 kolumn zamiast 27, a „Amount" stoi na 13.
     // Plik do importu budujemy w ukladzie TEGO marketplace'u — ustawienie importu po
@@ -37581,6 +37594,40 @@
     // Referencja z przelewu, gdy jest; przy zleceniach z arkusza jej nie ma, wiec zostaje
     // numer cyklu, skrocony tak samo jak w opisie zlecenia. Numeru paczki TU NIE MA:
     // pojawia sie dopiero przy imporcie, a wpis ma byc staly od chwili dopasowania.
+    // Nazwa, ktora ma trafic do arkusza. Zwykle sklada ja mkShort: marka plus kod kraju
+    // z NAZWY SKLEPU podanej przez panel. Nie kazdy panel ten kraj podaje — Conforama FR
+    // nie podaje — i wtedy wychodzi samo „Conforama", czyli nie etykieta z listy, tylko
+    // zawartosc kolumny obok. Kraj stoi jednak w drugim, pewnym miejscu: w nazwie
+    // marketplace'u („Mirakl (Conforama FR)"). Stamtad go bierzemy.
+    // Zgadywaniem to nie jest: arkusz wpisze wylacznie etykiete, ktora naprawde u siebie
+    // ma — my tylko podajemy lepszego kandydata do sprawdzenia.
+    // Etykieta odczytana z NAZWY KONTA. Plan kont prologistics nazywa konta
+    // „<market> <kraj> <spolka>" — „Praxis NL Beliani (EU) GmbH", „Brico BE Beliani
+    // EU GmbH", „Conforama FR Beliani DE" — a lista _Markety trzyma dokladnie ten
+    // poczatek. Odcinamy czlon ze spolka i zostaje etykieta.
+    // Bierzemy TYLKO nazwy konczace sie kodem kraju, bo taki ksztalt maja etykiety.
+    // Bez tego warunku „Home24 Beliani DE" dalo by „Home24" i weszlo do arkusza
+    // zamiast „Home24 DE" — a takze kazde konto bankowe zaczeloby udawac marketplace.
+    function mkEtykietaZKonta(konto){
+        const kt = String(konto == null ? '' : konto).trim();
+        if (!kt) return '';
+        const nm = (mkAcctLoad().filter(function (a){ return String(a.n) === kt; })[0] || {}).nm || '';
+        if (!nm) return '';
+        const bez = String(nm).replace(/\s*\bBeliani\b.*$/i, '').trim();
+        return mkKrajZ(bez) ? bez : '';
+    }
+    function mkNazwaDoArkusza(j){
+        const n = mkShort(j) || '';
+        if (n && mkKrajZ(n)) return n;                   // kraj juz jest — nie ruszamy
+        const kr = mkKrajZ(String((j && j.mp) || '').replace(/\)\s*$/, ''));
+        const marka = String((j && (j.brand || j.short)) || '').trim();
+        if (kr && marka) return marka + ' ' + kr;
+        // Trzecia droga: konto, na ktorym naprawde ksiegujemy. Przy Maxedzie jedyna,
+        // ktora dziala — marka („Maxeda") nie ma nic wspolnego z etykietami „Brico BE"
+        // i „Praxis NL", a nazwa marketplace'u nie niesie kraju.
+        const c = setLoad()[setKey(j && j.mp, j && j.data && j.data.shop)] || {};
+        return mkEtykietaZKonta(c.acct) || n;
+    }
     function mkNrZestawienia(j){
         if (!j) return '';
         if (j.ref) return String(j.ref);
@@ -37604,7 +37651,7 @@
             // nazywa sie „Home24 NL". Bez tego ta sama wplata nazywalaby sie roznie
             // w zaleznosci od drogi, ktora tam trafila.
             const shop = (j.data && j.data.shop) || j.shop || '';
-            const nazwa = shop ? (mkShort(j) || shop) : '';
+            const nazwa = shop ? (mkNazwaDoArkusza(j) || shop) : '';
             if (nazwa){
                 // Znacznik trzyma NAZWE, ktora do arkusza naprawde poszla. Porownujemy go
                 // z ta, ktora chcemy wpisac — dzieki temu znacznik postawiony starsza
