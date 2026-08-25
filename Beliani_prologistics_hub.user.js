@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.03
+// @version      5.04
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22096,7 +22096,7 @@
     // Adres i klucz siedza w ustawieniach, nie w kodzie: adres jest jak haslo, a klucz
     // ma zostac tylko u Ciebie.
     const MK_SH_KEY = 'mkt_sheet';
-    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycby-XNIPume9BApHqtUzoqdCJsJk0xlWendwkoZjlV1WgMBl4AMTz5pR_1ek-Je_kcrPjw/exec';
+    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycby6aTUAxVPXQcADY5zLlzmT6A9a9eMN85gEk9HLtxFaYmnXo_3Qqdvn9zzIt7NH7mGIsw/exec';
     // Adresy WCZESNIEJSZYCH wdrozen. Trzymamy je po to, zeby przeniesc tych, ktorzy
     // maja ktorys zapisany w ustawieniach — patrz shCfg. Stare wdrozenia serwuja kod
     // bez nowych akcji i nie da sie tego odkrecic: w Apps Script adres jest przypiety
@@ -22105,7 +22105,8 @@
     // dwa razy i powtorzy znowu.
     const MK_SH_STARE = [
         'https://script.google.com/macros/s/AKfycby17PasQqFV7vkVT3_j8oZ0L2QmejC3SSs69YxWVxG57nniiclm19AG1q7FZ6r7R80NZQ/exec',   // sprzed 5.01
-        'https://script.google.com/macros/s/AKfycbyKDrklk31Y48nRxc3gKyDLbkC1sk-CdIKuAFOOBkv62Jywi4XaIaR9HV2GH0e1Qog-dg/exec'    // 5.01, wymienione 25.08.2026
+        'https://script.google.com/macros/s/AKfycbyKDrklk31Y48nRxc3gKyDLbkC1sk-CdIKuAFOOBkv62Jywi4XaIaR9HV2GH0e1Qog-dg/exec',   // 5.01, wymienione 25.08.2026
+        'https://script.google.com/macros/s/AKfycby-XNIPume9BApHqtUzoqdCJsJk0xlWendwkoZjlV1WgMBl4AMTz5pR_1ek-Je_kcrPjw/exec'    // wymienione 25.08.2026 po poludniu
     ];
 
     // ==========================================================================
@@ -22247,10 +22248,10 @@
                         + '<span style="font-family:monospace;font-size:11px">' + esc(z.nr) + '</span>'
                         + '<span style="font-size:11px;color:#666">' + f2(Math.abs(z.netto)) + ' ' + esc(z.waluta)
                         + ' · korekta z ' + esc(z.data || '?') + '</span>'
-                        + '<input class="mk-obiref" data-nr="' + esc(z.nr) + '" data-ref="' + esc(j.ref) + '" '
+                        + '<input class="mk-obiref" data-nr="' + esc(z.nr) + '" data-k="' + esc(mkKlucz(j)) + '" '
                         + 'value="' + esc(ff) + '" placeholder="numer faktury" '
                         + 'style="width:150px;font-size:11px;padding:2px 4px;border:1px solid #fdba74;border-radius:4px">'
-                        + '<button class="mk-obirefb" data-nr="' + esc(z.nr) + '" data-ref="' + esc(j.ref) + '" '
+                        + '<button class="mk-obirefb" data-nr="' + esc(z.nr) + '" data-k="' + esc(mkKlucz(j)) + '" '
                         + 'style="padding:2px 8px;border:none;border-radius:4px;background:#ea580c;color:#fff;'
                         + 'font-size:11px;cursor:pointer">zapisz</button>'
                         + (ff ? '<span style="font-size:11px;color:#0a7a2f">✓ pójdzie dalej jako faktura ' + esc(ff) + '</span>'
@@ -22474,10 +22475,31 @@
         if (poKoncie.length > 1) return { err: 'konto ' + kt + ' ma kilka sklepów w ustawieniach' };
         return { err: 'nie rozpoznaję ani nazwy, ani konta' + (kt ? (' ' + kt) : '') };
     }
+    // Oznaczenie „Refunded" w arkuszu. Dwie drogi, bo dwa rodzaje zlecen:
+    //   * z arkusza — znamy zakladke i numer wiersza, wiec idziemy po WSPOLRZEDNYCH.
+    //     Klucz data+konto+kwota by tu nie trafil: konto w arkuszu bywa inne niz to,
+    //     na ktorym naprawde ksiegujemy, i wlasnie po to modul poprawia etykiete.
+    //   * z wyciagu — wspolrzednych nie ma, wiec zostaje klucz data+konto+kwota.
     async function shMarkRefunded(list){
         const cfg = shCfg();
         if (!cfg.on || !cfg.url || !cfg.secret || !list || !list.length) return null;
-        return shReq('POST', cfg.url, JSON.stringify({ secret: cfg.secret, action: 'refunded', rows: list }));
+        const po = list.filter(function (x){ return x && x.tab && x.row; });
+        const kl = list.filter(function (x){ return !(x && x.tab && x.row); });
+        let updated = 0; const missing = [];
+        if (po.length){
+            const r = await shTodoSet(po.map(function (x){
+                return { tab: x.tab, row: x.row, refunded: 'Tak' };
+            }));
+            updated += (r && r.updated) || 0;
+            ((r && r.missing) || []).forEach(function (m){ missing.push(m); });
+        }
+        if (kl.length){
+            const r = await shReq('POST', cfg.url,
+                JSON.stringify({ secret: cfg.secret, action: 'refunded', rows: kl }));
+            updated += (r && r.updated) || 0;
+            ((r && r.missing) || []).forEach(function (m){ missing.push(m); });
+        }
+        return { ok: true, updated: updated, missing: missing };
     }
     // Czy ta wyplata jest juz w arkuszu. To najwazniejsza z trzech kontroli duplikatow,
     // bo arkusz jest wspolny i czesc wierszy powstaje recznie — o cudzej pracy nie dowiemy
@@ -30540,7 +30562,12 @@
     // WSZYSTKIE kontrole (stan „gotowe do importu") — czyli zgadza sie z wyciagiem,
     // ma komplet pozycji i nie ma nierozpoznanych typow. Reszty nie zaznaczamy sami.
     const mkSel = {};
-    function selOn(j){ const v = mkSel[j.ref]; return (v === undefined) ? (j.status === 'ready') : !!v; }
+    // Klucz zlecenia — po nim, a NIE po referencji, chodza wszystkie akcje przy wierszu.
+    // Magazyn zlecen jest trzymany wlasnie po kluczu; referencja bywa mu rowna, ale przy
+    // zleceniach z arkusza i dopisanych recznie jest PUSTA, wiec wszystkie takie zlecenia
+    // wygladalyby jak jedno. „__k" doklada jobList; obiekt spoza niej ma zapas.
+    function mkKlucz(j){ return String((j && (j.__k || j.ref)) || ''); }
+    function selOn(j){ const v = mkSel[mkKlucz(j)]; return (v === undefined) ? (j.status === 'ready') : !!v; }
     function selList(){ return jobList().filter(function (j){ return j.status === 'ready' && selOn(j); }); }
     // Paczki gotowe do zaksiegowania: zaimportowane, znany numer, jeszcze niezaksiegowane.
     function bookList(){ return jobList().filter(function (j){ return j.status === 'done' && j.impId && !j.booked; }); }
@@ -30589,10 +30616,10 @@
         if (st !== 'partial' && st !== 'err' && st !== 'new') return '';
         return '<div style="margin-top:4px;padding:4px 6px;background:#fff7ed;border:1px solid #fed7aa;border-radius:5px">'
              + '<span style="font-size:10px;color:#7c2d12">numery dokumentów z przelewu (po przecinku):</span> '
-             + '<input class="mk-mdoc" data-ref="' + esc(j.ref) + '" value="' + esc((j.docs || []).join(', ')) + '" '
+             + '<input class="mk-mdoc" data-k="' + esc(mkKlucz(j)) + '" value="' + esc((j.docs || []).join(', ')) + '" '
              + 'placeholder="IN2858A-80, CN2858A-68, 247638" '
              + 'style="width:280px;font-size:11px;padding:2px 4px;border:1px solid #fdba74;border-radius:4px">'
-             + ' <button class="mk-mdocb" data-ref="' + esc(j.ref) + '" '
+             + ' <button class="mk-mdocb" data-k="' + esc(mkKlucz(j)) + '" '
              + 'style="padding:2px 8px;border:none;border-radius:4px;background:#ea580c;color:#fff;'
              + 'font-size:11px;cursor:pointer">zapisz numery</button></div>';
     }
@@ -30720,7 +30747,7 @@
             det += mkKandBox(j);
             h += '<tr style="border-top:1px solid #eee">'
               +  '<td style="padding:3px 5px">' + (onProlo && st === 'ready'
-                    ? '<input type="checkbox" class="mk-ck" data-ref="' + esc(j.ref) + '"' + (selOn(j) ? ' checked' : '') + '>'
+                    ? '<input type="checkbox" class="mk-ck" data-k="' + esc(mkKlucz(j)) + '"' + (selOn(j) ? ' checked' : '') + '>'
                     : '') + '</td>'
               +  '<td style="padding:3px 5px;white-space:nowrap">' + mkDataCell(j) + '</td>'
                  // v3.84: nazwa Z KRAJEM. Dotad stalo tu samo j.mp, wiec przy trzech
@@ -30748,8 +30775,8 @@
                 // Awaryjnie: numer paczki z adresu strony importu, wpisany recznie.
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff;font-size:11px">'
                   +  'Nie znam numeru paczki. Wpisz go z adresu <span style="font-family:monospace">…/import_payments/<b>NUMER</b>/</span>: '
-                  +  '<input class="mk-impid" data-ref="' + esc(j.ref) + '" style="width:90px;font-size:11px" placeholder="np. 2061242"> '
-                  +  '<button class="mk-impset" data-ref="' + esc(j.ref) + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">Zapisz</button>'
+                  +  '<input class="mk-impid" data-k="' + esc(mkKlucz(j)) + '" style="width:90px;font-size:11px" placeholder="np. 2061242"> '
+                  +  '<button class="mk-impset" data-k="' + esc(mkKlucz(j)) + '" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">Zapisz</button>'
                   +  '</td></tr>';
             }
             if (onProlo && st === 'done' && j.impId){
@@ -30760,7 +30787,7 @@
                 // nic nie psuje i czasem chce sie zobaczyc stan prosto z systemu.
                 const zrob = !!j.booked;
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
-                  +  '<button class="mk-chk" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:none;border-radius:6px;background:'
+                  +  '<button class="mk-chk" data-k="' + esc(mkKlucz(j)) + '" style="padding:4px 10px;border:none;border-radius:6px;background:'
                   +  (zrob ? '#9ca3af' : '#5b21b6') + ';color:#fff;font-weight:700;cursor:pointer;font-size:11px">'
                   +  (zrob ? ('✔ Paczka ' + esc(j.impId) + ' zaksięgowana — sprawdź ponownie')
                            : ('🔍 Sprawdź paczkę ' + esc(j.impId) + ' i zaksięguj')) + '</button>'
@@ -30782,36 +30809,36 @@
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  ((j.kind === 'hd' && j.data.hd) ? hdPodsumowanieHtml(j.data.hd) : '')
                   +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">Import zablokowany — najpierw wyjaśnij powyższe. Podgląd i zwroty działają.</span> ' : '')
-                  +  (refIle(j) ? '<button class="mk-cpr" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
+                  +  (refIle(j) ? '<button class="mk-cpr" data-k="' + esc(mkKlucz(j)) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">📋 Kopiuj zwroty do ticketa</button> ' : '')
                   // v3.82: osobnego guzika „Sprawdź typy klienta" juz nie ma. Kontrola
                   // przeniosla sie do widoku PACZKI IMPORTU, gdzie prologistics podaje juz
                   // gotowe przypisanie zamowienie -> auftrag. Nie trzeba niczego szukac,
                   // a przy okazji nie da sie zaksiegowac przed sprawdzeniem typow.
                   +  ((j.kind === 'wayf' && j.data.wayf && j.data.wayf.raw)
-                        ? '<button class="mk-wfraw" data-ref="' + esc(j.ref) + '" title="Rozliczenie dokładnie tak, jak przyszło z Wayfaira — do sprawdzenia, gdy zlecenie zostało zatrzymane" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Rozliczenie z Wayfaira</button>'
+                        ? '<button class="mk-wfraw" data-k="' + esc(mkKlucz(j)) + '" title="Rozliczenie dokładnie tak, jak przyszło z Wayfaira — do sprawdzenia, gdy zlecenie zostało zatrzymane" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Rozliczenie z Wayfaira</button>'
                         : '')
                   +  ((j.kind === 'hd' && j.data.hd && j.data.hd.nPozaNic)
-                        ? '<button class="mk-hdnz" data-ref="' + esc(j.ref) + '" title="Wiersze, których nie księguje nikt — ani w auftragu, ani w tickecie. Ten sam układ co źródło plus kolumna z powodem" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Nieksięgowane (' + j.data.hd.nPozaNic + ')</button>'
+                        ? '<button class="mk-hdnz" data-k="' + esc(mkKlucz(j)) + '" title="Wiersze, których nie księguje nikt — ani w auftragu, ani w tickecie. Ten sam układ co źródło plus kolumna z powodem" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\u2b07 Nieksięgowane (' + j.data.hd.nPozaNic + ')</button>'
                         : '')
                   +  ((j.kind === 'hd' && j.data.hd && hdDoSprawdzenia(j.data.hd).length)
-                        ? '<button class="mk-hdauf" data-ref="' + esc(j.ref) + '" title="Dla zamówień, których nie da się rozstrzygnąć z pliku, sprawdza auftrag: czy jest, czy ma open amount i czy wisi na nim ticket" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udd0d Sprawdź auftragi (' + hdDoSprawdzenia(j.data.hd).length + ')</button>'
+                        ? '<button class="mk-hdauf" data-k="' + esc(mkKlucz(j)) + '" title="Dla zamówień, których nie da się rozstrzygnąć z pliku, sprawdza auftrag: czy jest, czy ma open amount i czy wisi na nim ticket" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udd0d Sprawdź auftragi (' + hdDoSprawdzenia(j.data.hd).length + ')</button>'
                         : '')
                   +  ((j.kind === 'amz' && j.data.amz && j.data.amz.raw)
-                        ? '<button class="mk-amzxls" data-ref="' + esc(j.ref) + '" title="Skoroszyt z trzema zakładkami: plik źródłowy, Order i Refunds — układ jak w dotychczasowej aplikacji" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udcd7 Excel (3 zakładki)</button>'
+                        ? '<button class="mk-amzxls" data-k="' + esc(mkKlucz(j)) + '" title="Skoroszyt z trzema zakładkami: plik źródłowy, Order i Refunds — układ jak w dotychczasowej aplikacji" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udcd7 Excel (3 zakładki)</button>'
                         : '')
                   +  ((j.data.amz && j.data.amz.doWyj && j.data.amz.doWyj.length)
-                        ? '<button class="mk-cpw" data-ref="' + esc(j.ref) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + j.data.amz.doWyj.length + ')</button> '
+                        ? '<button class="mk-cpw" data-k="' + esc(mkKlucz(j)) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + j.data.amz.doWyj.length + ')</button> '
                         : '')
-                  +  '<button class="mk-csv" data-ref="' + esc(j.ref) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz „do prolo" CSV</button>'
+                  +  '<button class="mk-csv" data-k="' + esc(mkKlucz(j)) + '" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">⬇ Zapisz „do prolo" CSV</button>'
                   +  '</td></tr>';
             }
         });
         out.innerHTML = h + '</table><div id="mk-ref"></div><div id="mk-cr"></div><div id="mk-joy"></div>';
-        out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-ref')); }; });
-        out.querySelectorAll('.mk-chk').forEach(function (b){ b.onclick = function(){ impCheck(b.getAttribute('data-ref')); }; });
+        out.querySelectorAll('.mk-csv').forEach(function (b){ b.onclick = function(){ doCsv(b.getAttribute('data-k')); }; });
+        out.querySelectorAll('.mk-chk').forEach(function (b){ b.onclick = function(){ impCheck(b.getAttribute('data-k')); }; });
         out.querySelectorAll('.mk-impset').forEach(function (b){ b.onclick = function(){
-            const ref = b.getAttribute('data-ref');
-            const inp = out.querySelector('.mk-impid[data-ref="' + ref + '"]');
+            const ref = b.getAttribute('data-k');
+            const inp = out.querySelector('.mk-impid[data-k="' + ref + '"]');
             const v = String((inp && inp.value) || '').replace(/\D+/g, '');
             if (!v){ say('Podaj sam numer paczki, np. 2061242.', '#c47f00'); return; }
             const jobs = jobsLoad();
@@ -30820,12 +30847,12 @@
             jobs[ref].msg = String(jobs[ref].msg || '').replace(/ · nie odczytałem numeru paczki[^·]*/, '') + ' · paczka ' + v;
             jobsSave(jobs); render();
         }; });
-        out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-ref')); }; });
-        out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-ref')); }; });
-        out.querySelectorAll('.mk-amzxls').forEach(function (b){ b.onclick = function(){ doAmzXlsx(b.getAttribute('data-ref')); }; });
-        out.querySelectorAll('.mk-wfraw').forEach(function (b){ b.onclick = function(){ doWayfRaw(b.getAttribute('data-ref')); }; });
-        out.querySelectorAll('.mk-hdnz').forEach(function (b){ b.onclick = function(){ doHdNieZaks(b.getAttribute('data-ref')); }; });
-        out.querySelectorAll('.mk-hdauf').forEach(function (b){ b.onclick = function(){ doHdAuftragi(b.getAttribute('data-ref'), b); }; });
+        out.querySelectorAll('.mk-cpr').forEach(function (b){ b.onclick = function(){ doCopyRef(b.getAttribute('data-k')); }; });
+        out.querySelectorAll('.mk-cpw').forEach(function (b){ b.onclick = function(){ doCopyWyj(b.getAttribute('data-k')); }; });
+        out.querySelectorAll('.mk-amzxls').forEach(function (b){ b.onclick = function(){ doAmzXlsx(b.getAttribute('data-k')); }; });
+        out.querySelectorAll('.mk-wfraw').forEach(function (b){ b.onclick = function(){ doWayfRaw(b.getAttribute('data-k')); }; });
+        out.querySelectorAll('.mk-hdnz').forEach(function (b){ b.onclick = function(){ doHdNieZaks(b.getAttribute('data-k')); }; });
+        out.querySelectorAll('.mk-hdauf').forEach(function (b){ b.onclick = function(){ doHdAuftragi(b.getAttribute('data-k'), b); }; });
         out.querySelectorAll('.mk-inv').forEach(function (b){ b.onclick = function(){
             const ref = b.getAttribute('data-ref');
             const span = out.querySelector('.mk-invout[data-ref="' + ref + '"]');
@@ -30896,7 +30923,7 @@
             };
         });
         out.querySelectorAll('.mk-ck').forEach(function (c){
-            c.onchange = function(){ mkSel[c.getAttribute('data-ref')] = c.checked; render(); };
+            c.onchange = function(){ mkSel[c.getAttribute('data-k')] = c.checked; render(); };
         });
         // Zapis recznie wpisanych numerow Manora. Zlecenie wraca na „czeka na dane",
         // wiec podniesie je zwykle „Pobierz zestawienia" — nie robimy osobnej sciezki
@@ -30906,8 +30933,8 @@
         // prologistics naprawde znajdzie auftrag.
         out.querySelectorAll('.mk-obirefb').forEach(function (b){
             b.onclick = function(){
-                const ref = b.getAttribute('data-ref'), nr = b.getAttribute('data-nr');
-                const inp = out.querySelector('.mk-obiref[data-nr="' + nr + '"][data-ref="' + ref + '"]');
+                const ref = b.getAttribute('data-k'), nr = b.getAttribute('data-nr');
+                const inp = out.querySelector('.mk-obiref[data-nr="' + nr + '"][data-k="' + ref + '"]');
                 if (!inp) return;
                 const ff = String(inp.value || '').trim().replace(/\s+/g, '');
                 const mapa = obiRefLoad();
@@ -30932,8 +30959,8 @@
         });
         out.querySelectorAll('.mk-mdocb').forEach(function (b){
             b.onclick = function(){
-                const ref = b.getAttribute('data-ref');
-                const inp = out.querySelector('.mk-mdoc[data-ref="' + ref + '"]');
+                const ref = b.getAttribute('data-k');
+                const inp = out.querySelector('.mk-mdoc[data-k="' + ref + '"]');
                 if (!inp) return;
                 const nrs = String(inp.value || '').split(/[,;\s]+/)
                     .map(function (x){ return x.trim().toUpperCase(); })
@@ -30957,7 +30984,7 @@
         // Zaznaczanie hurtem dotyczy tylko wierszy „gotowe do importu" — reszta i tak
         // nie ma checkboxa, wiec nie ma jej po co ruszac.
         function selAll(v){
-            jobList().forEach(function (j){ if (j.status === 'ready') mkSel[j.ref] = v; });
+            jobList().forEach(function (j){ if (j.status === 'ready') mkSel[mkKlucz(j)] = v; });
             render();
         }
         const sa = out.querySelector('#mk-sel-all'), sn = out.querySelector('#mk-sel-none');
@@ -32194,8 +32221,18 @@
                 g[key] = { key: key, date: j.date, acct: c.acct || '', accNm: a ? a.nm : '', rows: [], shops: {}, sum: 0, keys: [], seen: {} };
             }
             g[key].shops[j.data.shop] = 1;
-            // jedno zestawienie = jeden wiersz w arkuszu, nawet gdy ma kilka zwrotow
-            if (!g[key].seen[j.ref]){ g[key].seen[j.ref] = 1; g[key].keys.push(shKey(j, c.acct)); }
+            // Jedno zestawienie = jeden wiersz w arkuszu, nawet gdy ma kilka zwrotow.
+            // Liczy sie KLUCZ zlecenia, nie referencja: zlecenia z arkusza maja ja pusta,
+            // wiec drugie i kazde nastepne uchodzilo za juz widziane i wypadalo z listy.
+            const kj = mkKlucz(j);
+            if (!g[key].seen[kj]){
+                g[key].seen[kj] = 1;
+                // Wspolrzedne wiersza sa pewniejsze niz klucz data+konto+kwota — patrz
+                // komentarz przy shMarkRefunded.
+                const a = j.zArkusza;
+                g[key].keys.push((a && a.tab && a.row) ? { tab: a.tab, row: a.row }
+                                                       : shKey(j, c.acct));
+            }
             // v3.71: domyslnie na liste idzie WARTOSC BEZWZGLEDNA — parsery zapisuja zwroty
             // raz na plus, raz na minus i lista ma je pokazywac jednolicie. Wyjatkiem sa
             // pozycje oznaczone przez parser jako refSign = −1: SAFE-T Amazona jest w pliku
@@ -32750,6 +32787,22 @@
         const m = t.match(/-?\s*\d[\d'’\s,.]*/);
         return m ? mkNum(m[0]) : null;
     }
+    // Czy auftrag jest SKASOWANY. Trzy sposoby, bo jeden nie wystarczyl: przy auftragu
+    // 15454127 sama klasa nie trafila, a w zrodle strony napis stal jak byk. Pomylka
+    // w te strone jest kosztowna — „nie skasowany" wysyla szukac przyczyny gdzie indziej,
+    // a przy skasowanym trzeba po prostu zaksiegowac mimo delete.
+    function auftUsuniety(d, html){
+        try {
+            if (d && d.querySelector('.auftrag-status--deleted')) return true;
+            const st = d ? d.querySelectorAll('[class*="auftrag-status"]') : [];
+            for (let i = 0; i < st.length; i++){
+                if (/^\s*deleted\s*$/i.test(st[i].textContent || '')) return true;
+            }
+        } catch (e){}
+        // Rozstrzygajace: napis stoi w kodzie strony, wiec auftrag jest skasowany —
+        // niezaleznie od tego, jak wyszlo parsowanie.
+        return /auftrag-status--deleted/i.test(String(html || ''));
+    }
     async function crRead(num){
         let html = '';
         try {
@@ -32757,9 +32810,16 @@
             html = await res.text();
         } catch (e){ return { ok: false, err: 'nie otwarto auftragu ' + num }; }
         const d = new DOMParser().parseFromString(html, 'text/html');
-        if (!d.querySelector('form#book')) return { ok: false, err: 'na stronie auftragu ' + num + ' nie ma formularza płatności' };
+        // Stan „skasowany" ustalamy PRZED sprawdzeniem formularza: skasowany auftrag
+        // zwykle formularza platnosci nie ma, wiec przy dawnej kolejnosci wychodzilismy
+        // stad, zanim ktokolwiek zdazyl o skasowaniu powiedziec.
+        const usun = auftUsuniety(d, html);
+        if (!d.querySelector('form#book'))
+            return { ok: false, deleted: usun,
+                     err: usun ? ('auftrag ' + num + ' jest SKASOWANY (bez formularza płatności)')
+                               : ('na stronie auftragu ' + num + ' nie ma formularza płatności') };
         return { ok: true, open: crOpen(d), nPay: d.querySelectorAll('a[href*="delpay="]').length,
-                 deleted: !!d.querySelector('.auftrag-status--deleted') };
+                 deleted: usun };
     }
     // Formularz #book nie ma tokenu CSRF ani onsubmit, wiec POST z osmioma polami
     // odtwarza dokladnie to, co wysyla przegladarka po kliknieciu „Make payment".
@@ -34941,63 +35001,6 @@
         // Jedno przejscie po aktualnie ustawionym sklepie. Liste cykli pobieramy RAZ
         // i dopasowujemy do niej wszystkie czekajace referencje — inaczej przy 13 sklepach
         // i 7 zleceniach bylo by 91 zapytan zamiast 13.
-        // Po pobraniu rozliczenia nazwa sklepu jest juz znana — wiec teraz arkusz moze
-        // ja dostac. Wpisujemy WLASNIE NAZWE, nie numer konta: konto potrafi byc wspolne
-        // dla kilku sklepow (Home24 AT, DE i NL siedza na 1147), wiec z niego nie da sie
-        // odczytac, o ktory sklep chodzi. Kolumny konta nie dotykamy — stoi w niej
-        // formula i przeliczy sie sama po zmianie etykiety.
-        async function shDopiszSklep(jobs){
-            const rows = [], czyj = {};        // „zakladka!wiersz" -> klucz zlecenia
-            Object.keys(jobs).forEach(function (k){
-                const j = jobs[k], a = j && j.zArkusza;
-                if (!a || !a.tab || !a.row || a.uzup) return;
-                const shop = (j.data && j.data.shop) || j.shop || '';
-                if (!shop) return;                 // sklepu jeszcze nie znamy
-                // Do arkusza idzie DOKLADNIE ta nazwa, ktora HUB wpisuje, gdy sam
-                // dokłada wiersz (shRow uzywa mkShort) — panel mowi „Beliani NL",
-                // a pozycja w arkuszu nazywa sie „Home24 NL". Bez tego ta sama wplata
-                // nazywalaby sie roznie w zaleznosci od drogi, ktora tam trafila.
-                const nazwa = mkShort(j) || shop;
-                // Etykieta juz wlasciwa — nie ma po co pukac do arkusza. Znacznik
-                // stawiamy tak samo, zeby kazdy kolejny przelot tez to pominal.
-                if (mkNorm(nazwa) === mkNorm(a.market || '')) { a.uzup = nazwa; return; }
-                rows.push({ tab: a.tab, row: a.row, market: nazwa });
-                czyj[a.tab + '!' + a.row] = k;
-            });
-            if (!rows.length){ jobsSave(jobs); return; }
-            const dopisz = function (k, txt){ jobs[k].msg = String(jobs[k].msg || '') + txt; };
-            const zle = {};
-            try {
-                const r = await shTodoSet(rows);
-                const ile = (r && r.updated) || 0;
-                // Kazdy wiersz odpowiada za siebie: „missing" niesie zakladke i numer,
-                // wiec powod trafia do tego zlecenia, ktorego dotyczy.
-                ((r && r.missing) || []).forEach(function (t){
-                    const m = String(t).match(/^(\S+)\s+w\.\s+(\d+)/);
-                    const k = m ? czyj[m[1] + '!' + Number(m[2])] : null;
-                    if (k){ zle[k] = 1; dopisz(k, ' · ARKUSZ: ' + t); }
-                });
-                rows.forEach(function (w){
-                    const k = czyj[w.tab + '!' + w.row];
-                    if (!k || zle[k]) return;
-                    // Zero poprawionych wierszy i zadnego powodu znaczy, ze wdrozone
-                    // Apps Script jeszcze nie zna pola „market" — inaczej odpowiedzialoby
-                    // choc jednym „missing".
-                    if (!ile){ dopisz(k, ' · arkusz nie przyjął nazwy sklepu — wgraj nowszy Apps Script'); return; }
-                    // Dopiero TERAZ sprawa jest zamknieta. Znacznik postawiony wczesniej
-                    // przepadalby przy kazdej nieudanej probie — a to one sa najczestsze
-                    // za pierwszym razem (brak pozycji w liscie marketow).
-                    jobs[k].zArkusza.uzup = w.market;
-                    jobs[k].zArkusza.market = w.market;
-                    dopisz(k, ' · w arkuszu wpisany sklep ' + w.market);
-                });
-            } catch (e){
-                Object.keys(czyj).forEach(function (x){
-                    dopisz(czyj[x], ' · ARKUSZ: ' + ((e && e.message) || e));
-                });
-            }
-            jobsSave(jobs); render();
-        }
         async function mkPass(jobs, shopName, host){
             let cycles;
             try { cycles = await mkCycles(); }
@@ -36967,7 +36970,10 @@
             }).join(', ') + ' — zaksięguj ręcznie</span>';
         }
         const c = k[0];
-        if (!c.ok) return '<span style="color:#c00">' + esc(c.err || 'nie odczytałem auftragu') + '</span>';
+        // Skasowanie sprawdzamy PRZED bledem odczytu: skasowany auftrag nie ma formularza
+        // platnosci, wiec dotad konczylo sie to komunikatem o braku formularza — prawdziwym,
+        // ale nie na temat.
+        if (!c.ok && !c.deleted) return '<span style="color:#c00">' + esc(c.err || 'nie odczytałem auftragu') + '</span>';
         if (!c.deleted){
             return '<span style="color:#c47f00">auftrag ' + lnk(c.num)
                  + ' istnieje i NIE jest skasowany — sprawdź, czemu import go nie znalazł</span>';
@@ -37155,7 +37161,7 @@
         // po zaksiegowaniu nadal oddaje te wiersze jako OK, wiec licznik nie odroznia
         // „jest co ksiegowac" od „juz zrobione". Flage czytamy swiezo z dysku, bo
         // impRender bywa wolany z zamknieciem, ktore pamieta starszy stan zlecenia.
-        const jbNow = jobsLoad()[job.ref] || job;
+        const jbNow = jobsLoad()[mkKlucz(job)] || job;
         // v3.82: przy Amazonie ksiegowanie jest ZABLOKOWANE, dopoki nie sprawdzisz typow
         // klienta. Typ decyduje o koncie VAT, a po zaksiegowaniu jego poprawienie jest juz
         // grzebaniem w zaksiegowanych pozycjach — dlatego kontrola stoi PRZED, a nie obok.
@@ -37184,7 +37190,7 @@
         try { box.scrollIntoView({ block: 'nearest' }); } catch (e){}
 
         const re = box.querySelector('#mk-imp-re');
-        if (re) re.onclick = function(){ impCheck(job.ref); };
+        if (re) re.onclick = function(){ impCheck(mkKlucz(job)); };
         const nfb = box.querySelector('#mk-nf-check');
         if (nfb) nfb.onclick = async function(){
             const lista = nf.map(function (x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); })
@@ -37199,7 +37205,7 @@
             };
         });
         const tr = box.querySelector('#mk-typ-run');
-        if (tr) tr.onclick = function(){ amzTypZPaczki(jobsLoad()[job.ref] || job, d, tr); };
+        if (tr) tr.onclick = function(){ amzTypZPaczki(jobsLoad()[mkKlucz(job)] || job, d, tr); };
         const ts = box.querySelector('#mk-tol-set');
         if (ts) ts.onclick = function(){
             const v = Number(String(box.querySelector('#mk-tol').value || '').replace(',', '.'));
@@ -37221,8 +37227,8 @@
                 }
                 m.textContent = 'księguję na subkoncie…';
                 await impBookSub(job.impId, near.map(function (x){ return x.id; }));
-                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję wynik…';
-                await impCheck(job.ref);
+                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
+                await impCheck(mkKlucz(job));
             } catch (e){
                 m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
                 fx.disabled = false;
@@ -37238,20 +37244,114 @@
             try {
                 await impBook(job.impId, ok.map(function (x){ return x.id; }));
                 const jobs = jobsLoad();
-                if (jobs[job.ref]){
-                    jobs[job.ref].booked = true; jobs[job.ref].checked = true;
-                    jobs[job.ref].msg = impMsgPoKsieg(jobs[job.ref].msg);   // v3.88
+                const kj = mkKlucz(job);
+                if (jobs[kj]){
+                    jobs[kj].booked = true; jobs[kj].checked = true;
+                    jobs[kj].msg = impMsgPoKsieg(jobs[kj].msg);   // v3.88
                     jobsSave(jobs);
                 }
-                await shAfterBook(jobs, job.ref);
-                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję wynik…';
+                await shAfterBook(jobs, kj);
+                // „Wynik" to PACZKA odczytana z prologistics jeszcze raz — po to, zeby
+                // stan pozycji brał się z systemu, a nie z tego, co sami wysłaliśmy.
+                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
                 render();
-                await impCheck(job.ref);                 // stan po ksiegowaniu, prosto z systemu
+                await impCheck(kj);                      // stan po ksiegowaniu, prosto z systemu
             } catch (e){
                 m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
                 bb.disabled = false;
             }
         };
+    }
+
+    // Po pobraniu rozliczenia nazwa sklepu jest juz znana — wiec teraz arkusz moze
+    // ja dostac. Wpisujemy WLASNIE NAZWE, nie numer konta: konto potrafi byc wspolne
+    // dla kilku sklepow (Home24 AT, DE i NL siedza na 1147), wiec z niego nie da sie
+    // odczytac, o ktory sklep chodzi. Kolumny konta nie dotykamy — stoi w niej
+    // formula i przeliczy sie sama po zmianie etykiety.
+    // Numer rozliczenia, ktore te wplate zaksiegowalo — do kolumny z komentarzem.
+    // Referencja z przelewu, gdy jest; przy zleceniach z arkusza jej nie ma, wiec zostaje
+    // numer cyklu, skrocony tak samo jak w opisie zlecenia. Numeru paczki TU NIE MA:
+    // pojawia sie dopiero przy imporcie, a wpis ma byc staly od chwili dopasowania.
+    function mkNrZestawienia(j){
+        if (!j) return '';
+        if (j.ref) return String(j.ref);
+        const c = j.data && j.data.cycle;
+        if (!c) return '';
+        return 'cykl ' + String(c).split(',').map(function (x){
+            return String(x).trim().slice(0, 8);
+        }).filter(Boolean).join(', ');
+    }
+    async function shDopiszSklep(jobs){
+        const rows = [], czyj = {};        // „zakladka!wiersz" -> klucz zlecenia
+        Object.keys(jobs).forEach(function (k){
+            const j = jobs[k], a = j && j.zArkusza;
+            if (!a || !a.tab || !a.row) return;
+            const wiersz = { tab: a.tab, row: a.row };
+            let trzeba = false;
+
+            // --- nazwa sklepu ---
+            // Do arkusza idzie DOKLADNIE ta nazwa, ktora HUB wpisuje, gdy sam dokłada
+            // wiersz (shRow uzywa mkShort) — panel mowi „Beliani NL", a pozycja w arkuszu
+            // nazywa sie „Home24 NL". Bez tego ta sama wplata nazywalaby sie roznie
+            // w zaleznosci od drogi, ktora tam trafila.
+            const shop = (j.data && j.data.shop) || j.shop || '';
+            const nazwa = shop ? (mkShort(j) || shop) : '';
+            if (nazwa){
+                // Znacznik trzyma NAZWE, ktora do arkusza naprawde poszla. Porownujemy go
+                // z ta, ktora chcemy wpisac — dzieki temu znacznik postawiony starsza
+                // wersja modulu (trzymal tam NUMER KONTA) nie blokuje poprawki na zawsze.
+                if (mkNorm(a.uzup || '') === mkNorm(nazwa)){ /* juz wpisane */ }
+                else if (mkNorm(nazwa) === mkNorm(a.market || '')) a.uzup = nazwa;   // arkusz juz ma
+                else { wiersz.market = nazwa; trzeba = true; }
+            }
+
+            // --- numer rozliczenia do komentarza ---
+            const kom = mkNrZestawienia(j);
+            if (kom && String(a.uzupKom || '') !== kom){ wiersz.comments = kom; trzeba = true; }
+
+            if (!trzeba) return;
+            rows.push(wiersz);
+            czyj[a.tab + '!' + a.row] = k;
+        });
+        if (!rows.length){ jobsSave(jobs); return; }
+        const dopisz = function (k, txt){ jobs[k].msg = String(jobs[k].msg || '') + txt; };
+        const zle = {};
+        try {
+            const r = await shTodoSet(rows);
+            const ile = (r && r.updated) || 0;
+            // Kazdy wiersz odpowiada za siebie: „missing" niesie zakladke i numer,
+            // wiec powod trafia do tego zlecenia, ktorego dotyczy.
+            ((r && r.missing) || []).forEach(function (t){
+                const m = String(t).match(/^(\S+)\s+w\.\s+(\d+)/);
+                const k = m ? czyj[m[1] + '!' + Number(m[2])] : null;
+                if (k){ zle[k] = 1; dopisz(k, ' · ARKUSZ: ' + t); }
+            });
+            rows.forEach(function (w){
+                const k = czyj[w.tab + '!' + w.row];
+                if (!k || zle[k]) return;
+                // Zero poprawionych wierszy i zadnego powodu znaczy, ze wdrozone
+                // Apps Script jeszcze nie zna pola „market" — inaczej odpowiedzialoby
+                // choc jednym „missing".
+                if (!ile){ dopisz(k, ' · arkusz nie przyjął nazwy sklepu — wgraj nowszy Apps Script'); return; }
+                // Dopiero TERAZ sprawa jest zamknieta. Znacznik postawiony wczesniej
+                // przepadalby przy kazdej nieudanej probie — a to one sa najczestsze
+                // za pierwszym razem (brak pozycji w liscie marketow).
+                // Kazdy znacznik osobno: wpisanie jednego nie moze zamykac drogi drugiemu.
+                if (w.market){
+                    jobs[k].zArkusza.uzup = w.market;
+                    jobs[k].zArkusza.market = w.market;
+                }
+                if (w.comments) jobs[k].zArkusza.uzupKom = w.comments;
+                dopisz(k, ' · w arkuszu ' + [w.market ? ('sklep ' + w.market) : '',
+                                             w.comments ? ('numer ' + w.comments) : '']
+                                            .filter(Boolean).join(' i '));
+            });
+        } catch (e){
+            Object.keys(czyj).forEach(function (x){
+                dopisz(czyj[x], ' · ARKUSZ: ' + ((e && e.message) || e));
+            });
+        }
+        jobsSave(jobs); render();
     }
 
     // Wiersz do arkusza po ZAKSIEGOWANIU. Dotad lecial tylko przy imporcie, czyli
@@ -37264,6 +37364,9 @@
     async function shAfterBook(jobs, ref){
         const j = jobs[ref];
         if (!j) return;
+        // Nazwa sklepu jest tu znana na pewno, a zlecenie juz pobrane nigdy nie wroci
+        // do przelotu — to jedyna druga okazja, zeby poprawic etykiete w arkuszu.
+        try { await shDopiszSklep(jobs); } catch (e){}
         const cfg = shCfg();
         if (!(cfg.on && cfg.url && cfg.secret)){
             j.msg = String(j.msg || '') + ' · ARKUSZ POMINIĘTY: ' + shWhy(cfg) + ' — wiersz dopisz ręcznie';
@@ -37318,12 +37421,13 @@
             try {
                 await impBook(p.j.impId, p.ok.map(function (x){ return x.id; }));
                 const jobs = jobsLoad();
-                if (jobs[p.j.ref]){
-                    jobs[p.j.ref].booked = true;
-                    jobs[p.j.ref].checked = true;
-                    jobs[p.j.ref].msg = impMsgPoKsieg(jobs[p.j.ref].msg) + ' · zaksięgowane ' + p.ok.length + ' poz.';
+                const kj = mkKlucz(p.j);
+                if (jobs[kj]){
+                    jobs[kj].booked = true;
+                    jobs[kj].checked = true;
+                    jobs[kj].msg = impMsgPoKsieg(jobs[kj].msg) + ' · zaksięgowane ' + p.ok.length + ' poz.';
                     jobsSave(jobs);
-                    await shAfterBook(jobs, p.j.ref);
+                    await shAfterBook(jobs, kj);
                 }
                 done++;
             } catch (e){ bad.push(p.j.impId + ': ' + ((e && e.message) || e)); }
@@ -37336,6 +37440,10 @@
     async function impCheck(ref){
         const j = jobsLoad()[ref];
         if (!j || !j.impId){ say('Ta pozycja nie ma numeru paczki — otwórz Import payments ręcznie.', '#c47f00'); return; }
+        // Widok paczki musi wiedziec, KTORE to zlecenie. Referencja do tego nie wystarcza
+        // (przy zleceniach z arkusza jest pusta), wiec niesiemy klucz tak samo, jak robi
+        // to jobList przy rysowaniu listy.
+        j.__k = ref;
         say('Czytam paczkę ' + j.impId + '…');
         try {
             const d = await impRows(j.impId);
@@ -37656,10 +37764,17 @@
             html = await res.text();
         } catch (e){ return { ok: false, err: 'nie otwarto auftraga' }; }
         var d = dom(html);
-        if (!d.querySelector('form#book')) return { ok: false, err: 'na stronie auftraga nie ma formularza płatności' };
+        // Ta sama zasada co przy crRead: skasowanie ustalamy przed formularzem i po
+        // tekscie strony, a nie wylacznie po klasie w drzewie dokumentu.
+        var usun = /auftrag-status--deleted/i.test(String(html || ''))
+                || !!d.querySelector('.auftrag-status--deleted');
+        if (!d.querySelector('form#book'))
+            return { ok: false, deleted: usun,
+                     err: usun ? 'auftrag jest SKASOWANY (bez formularza płatności)'
+                               : 'na stronie auftraga nie ma formularza płatności' };
         var a = accOptions(d);
         return { ok: true, open: openAmt(d), nPay: nPayments(d), accs: a.list, pre: a.pre,
-                 deleted: !!d.querySelector('.auftrag-status--deleted') };
+                 deleted: usun };
     }
 
     // ===== ksiegowanie =====
