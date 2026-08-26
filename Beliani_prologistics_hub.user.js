@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.09
+// @version      5.10
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -22940,6 +22940,19 @@
              + '|' + f2(j.amount) + '|' + String(j.cur || '');
     }
     const mkSheet = {};                    // mkJobId -> { found, row, similar }
+    // Co NAPRAWDE znaczy trafienie w arkuszu. „Jest w arkuszu" i „ktos to zaksiegowal"
+    // to dwie rozne rzeczy, a dotad obie krzyczaly tak samo — na czerwono. Odkad
+    // zlecenia POWSTAJA z wierszy arkusza, trafienie jest normalne: to ten sam wiersz.
+    // Ostrzezeniem jest dopiero cudza PRACA, czyli „Booked: Tak".
+    function shTrafienie(j, s){
+        if (!s || !s.found || !s.row) return null;
+        const r = s.row;
+        const zaks = /^tak$/i.test(String(r.booked == null ? '' : r.booked).trim());
+        const a = j && j.zArkusza;
+        const wlasny = !!(a && a.tab && String(a.tab) === String(s.tab || a.tab)
+                          && Number(a.row) === Number(r.row));
+        return { row: r, zaks: zaks, wlasny: wlasny };
+    }
     async function shCheck(list){
         const cfg = shCfg();
         if (!cfg.on || !cfg.url || !cfg.secret) throw new Error('arkusz nie jest ustawiony (' + shWhy(cfg) + ')');
@@ -31217,7 +31230,20 @@
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
                 const sh = mkSheet[mkJobId(j)];
-                if (sh && sh.found) det += '<div style="color:#c00;font-weight:700">JEST JUŻ W ARKUSZU — wiersz ' + esc(sh.row.row) + ' (' + esc(sh.row.marketplace) + ', ' + esc(sh.row.comments || '') + ')</div>';
+                const tf = shTrafienie(j, sh);
+                if (tf){
+                    const gdzie = 'wiersz ' + esc(tf.row.row) + ' (' + esc(tf.row.marketplace)
+                                + (tf.row.comments ? (', ' + esc(tf.row.comments)) : '') + ')';
+                    if (tf.zaks)
+                        det += '<div style="color:#c00;font-weight:700">'
+                             + (tf.wlasny ? 'TEN WIERSZ JEST JUŻ ZAKSIĘGOWANY — ' : 'JEST JUŻ W ARKUSZU I ZAKSIĘGOWANY — ')
+                             + gdzie + '</div>';
+                    else if (tf.wlasny)
+                        det += '<div style="color:#888">z arkusza: ' + gdzie + ' — jeszcze niezaksięgowany</div>';
+                    else
+                        det += '<div style="color:#c47f00">taka pozycja jest już w arkuszu — ' + gdzie
+                             + ', ale niezaksięgowana</div>';
+                }
                 else if (sh && sh.similar && sh.similar.length) det += '<div style="color:#c47f00">w arkuszu jest podobny wpis: ' + esc(sh.similar.map(function (x){ return x.data + ' ' + x.marketplace + ' ' + f2(x.kwota); }).join('; ')) + '</div>';
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
                 det += manorBox(j);
@@ -33297,6 +33323,18 @@
             const nag = d && d.querySelector('h1.header-title, .header-title');
             const stat = nag ? nag.querySelector('[class*="auftrag-status--"]') : null;
             if (stat) return /auftrag-status--deleted/i.test(String(stat.className || ''));
+            // Drugi odczyt TEGO SAMEGO naglowka, ale wprost ze zrodla — na wypadek,
+            // gdyby drzewo dokumentu sie nie zlozylo (przy auftragu 15454127 juz sie
+            // nie zlozylo). Bez tego schodzilismy do sprawdzianu po CALEJ stronie,
+            // a ta wymienia takze pozostale transakcje tego numeru i wystarczy jedna
+            // skasowana, zeby auftrag ACTIVE wyszedl na DELETED.
+            const bl = String(html || '').match(/<h1[^>]*class="[^"]*header-title[^"]*"[\s\S]{0,600}?<\/h1>/i);
+            if (bl){
+                if (/auftrag-status--deleted/i.test(bl[0])) return true;
+                // „active" w naglowku ROZSTRZYGA i konczy sprawdzanie. Inaczej dalsze
+                // sprawdziany mogly to jeszcze odwrocic.
+                if (/auftrag-status--active/i.test(bl[0])) return false;
+            }
             if (d && d.querySelector('.auftrag-status--deleted')) return true;
             const st = d ? d.querySelectorAll('[class*="auftrag-status"]') : [];
             for (let i = 0; i < st.length; i++){
@@ -38329,7 +38367,10 @@
         catch (e){ shErr = (e && e.message) || String(e); say('Arkusz: ' + shErr + ' — sprawdzam dalej bez niego.', '#c47f00'); }
         for (let i = 0; i < sel.length; i++){
             const s = mkSheet[mkJobId(sel[i])];
-            if (s && s.found) dupSheet.push(sel[i]);
+            // Do ostrzezenia liczy sie WYLACZNIE wiersz zaksiegowany — tylko on znaczy,
+            // ze ktos te prace juz wykonal. Wlasny wiersz z „Nie" to zrodlo zlecenia.
+            const tf0 = shTrafienie(sel[i], s);
+            if (tf0 && tf0.zaks) dupSheet.push(sel[i]);
             const f = await impSameFile(sel[i]);
             if (f) dupFile.push({ j: sel[i], f: f });
         }
@@ -38347,7 +38388,14 @@
             const df = dupFile.filter(function (x){ return mkJobId(x.j) === mkJobId(j); })[0];
             let flag = '';
             if (shErr) flag += '   ⚠ arkusz NIESPRAWDZONY';
-            else if (s && s.found) flag += '   ⚠ JEST JUŻ W ARKUSZU (wiersz ' + s.row.row + ', ' + s.row.marketplace + ')';
+            else if (s && s.found){
+                const tf1 = shTrafienie(j, s);
+                flag += tf1 && tf1.zaks
+                    ? ('   ⚠ JEST JUŻ W ARKUSZU I ZAKSIĘGOWANE (wiersz ' + s.row.row + ', ' + s.row.marketplace + ')')
+                    : ((tf1 && tf1.wlasny)
+                        ? ('   · wiersz z arkusza ' + s.row.row)
+                        : ('   · jest w arkuszu, niezaksięgowane (wiersz ' + s.row.row + ')'));
+            }
             else if (s && s.similar && s.similar.length) flag += '   ⚠ w arkuszu jest podobny wpis: ' + s.similar[0].data + ' ' + s.similar[0].marketplace;
             if (df) flag += df.f.exact
                 ? ('   ⚠ TEN PLIK BYŁ JUŻ IMPORTOWANY (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ')')
@@ -38359,10 +38407,10 @@
                + '\nNie wiem więc, czy ktoś już tego nie zaksięgował. Brak ostrzeżeń NIE znaczy, że jest czysto.')
             : '';
         const warn = brakArk + ((dupSheet.length || dupFile.length)
-            ? ('\n\n⚠ UWAGA: ' + (dupSheet.length ? (dupSheet.length + ' pozycji jest już w arkuszu') : '')
+            ? ('\n\n⚠ UWAGA: ' + (dupSheet.length ? (dupSheet.length + ' pozycji jest w arkuszu ZAKSIĘGOWANYCH') : '')
                + (dupSheet.length && dupFile.length ? ', ' : '')
                + (dupFile.length ? (dupFile.length + ' plików było już importowanych') : '')
-               + '.\nPrawdopodobnie ktoś to już zaksięgował. Sprawdź, zanim potwierdzisz.')
+               + '.\nTo znaczy, że ktoś tę pracę już wykonał. Sprawdź, zanim potwierdzisz.')
             : '');
         if (!confirm('Zaksięgować ' + sel.length + ' zestawień, razem ' + cnt + ' zamówień na ' + f2(tot) + '?\n\n'
             + lines.join('\n') + warn + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
@@ -38620,10 +38668,19 @@
             html = await res.text();
         } catch (e){ return { ok: false, err: 'nie otwarto auftraga' }; }
         var d = dom(html);
-        // Ta sama zasada co przy crRead: skasowanie ustalamy przed formularzem i po
-        // tekscie strony, a nie wylacznie po klasie w drzewie dokumentu.
-        var usun = /auftrag-status--deleted/i.test(String(html || ''))
-                || !!d.querySelector('.auftrag-status--deleted');
+        // Ta sama zasada co przy crRead — i ta sama kolejnosc. Rozstrzyga status WLASNY,
+        // ten z naglowka („Auftrag 15409076 / 3 [Active]"); reszta strony wymienia takze
+        // POZOSTALE transakcje tego numeru i wystarczy jedna skasowana, zeby auftrag
+        // zywy wyszedl na skasowany. Dwa moduly nie moga odpowiadac na to roznie.
+        var usun;
+        var _nag = d && d.querySelector('h1.header-title, .header-title');
+        var _st = _nag ? _nag.querySelector('[class*="auftrag-status--"]') : null;
+        var _bl = String(html || '').match(/<h1[^>]*class="[^"]*header-title[^"]*"[\s\S]{0,600}?<\/h1>/i);
+        if (_st) usun = /auftrag-status--deleted/i.test(String(_st.className || ''));
+        else if (_bl && /auftrag-status--deleted/i.test(_bl[0])) usun = true;
+        else if (_bl && /auftrag-status--active/i.test(_bl[0])) usun = false;
+        else usun = /auftrag-status--deleted/i.test(String(html || ''))
+                 || !!d.querySelector('.auftrag-status--deleted');
         if (!d.querySelector('form#book'))
             return { ok: false, deleted: usun,
                      err: usun ? 'auftrag jest SKASOWANY (bez formularza płatności)'
