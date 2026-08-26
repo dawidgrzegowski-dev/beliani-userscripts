@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.10
+// @version      5.11
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13238,6 +13238,41 @@
         function pcDocBankowy(nazwa){
             return /bank|account|swift|iban|beneficiar|supplier\s*details|dane\s*bankow/i.test(String(nazwa || ''));
         }
+        // Adres dostawcy ROZPISANY NA POLA — prosto z formularza karty dostawcy.
+        // To jedyne miejsce, w ktorym miasto stoi osobno; wszedzie indziej trzeba je
+        // zgadywac z jednego napisu, a przy adresach konczacych sie na „District"
+        // zgadywanie zawodzi i TwnNm zostaje puste.
+        // Kolejnosc blokow: nazwany wprost BENEFICIARY, potem biuro, magazyn, fabryka.
+        // Blok bez MIASTA pomijamy — nie wnosi tego, po co go czytamy.
+        var PC_ADR_GRUPY = ['beneficiary', 'office', 'warehouse', 'factory'];
+        function pcSupAdres(html){
+            var h = String(html == null ? '' : html), pola = {};
+            var re = /name="place_addresses\[([a-z_]+)\]\[(\d+)\]\[([a-z_]+)\]"[^>]*value="([^"]*)"/gi, m;
+            while ((m = re.exec(h)) !== null){
+                var g = String(m[1]).toLowerCase();
+                (pola[g] = pola[g] || {})[String(m[3]).toLowerCase()] = pcTxt(m[4]);
+            }
+            for (var i = 0; i < PC_ADR_GRUPY.length; i++){
+                var p = pola[PC_ADR_GRUPY[i]];
+                if (!p || !String(p.city || '').trim()) continue;
+                // Ulica z numerem, a przed nia strefa/dzielnica — tak samo, jak stoi
+                // to na kopercie. Puste pola po prostu wypadaja.
+                var ulica = [String(p.street || '').trim(), String(p.house_number || '').trim()]
+                            .filter(Boolean).join(' ');
+                var linia = [String(p.zone || '').trim(), ulica,
+                             String(p.county || '').trim(), String(p.state || '').trim()]
+                            .filter(Boolean).join(', ');
+                return { grupa: PC_ADR_GRUPY[i], zone: p.zone || '', street: p.street || '',
+                         nr: p.house_number || '', zip: p.zip || '', city: String(p.city).trim(),
+                         county: p.county || '', state: p.state || '', country: p.country || '',
+                         linia: linia };
+            }
+            return null;
+        }
+        // Adres z karty dostawcy trzymamy na czas sesji — strona i tak jest pobierana
+        // dla konta i potwierdzenia, wiec to nie jest ani jedno zapytanie wiecej.
+        var _adr = {};
+        function pcAdrOf(cid){ return (cid && _adr[cid]) ? _adr[cid] : null; }
         async function fetchCompany(c){
             if (_sup[c] !== undefined) return _sup[c];
             var acc = null, info = '';
@@ -13245,7 +13280,9 @@
             if (h == null) return { acc: null, info: '', conf: null, failed: true };
             var m = h.match(/name="bank_account_number"[^>]*value="([^"]*)"/); acc = m ? m[1].trim() : null;
             var mi = h.match(/name="document_information"[^>]*>([\s\S]*?)<\/textarea>/i); info = mi ? mi[1].trim() : '';
-            _sup[c] = { acc: acc, info: info, conf: pcBankConf(h), docs: pcSupDocs(h) }; return _sup[c];
+            var adr = pcSupAdres(h);
+            if (adr) _adr[c] = adr;
+            _sup[c] = { acc: acc, info: info, conf: pcBankConf(h), docs: pcSupDocs(h), adres: adr }; return _sup[c];
         }
         async function companyToAcc(c){
             if (!c) return null;
@@ -13306,6 +13343,16 @@
             if (/\b(?:information|informations|details|data|dane)\b[\s\S]{0,20}?\b(?:company|firm|supplier|contact|firmy|dostawc[ayi])\b/i.test(s)) return true;
             return false;
         }
+        // Lista kontrolna odhaczona punkt po punkcie:
+        //     SUPPLIER NAME: OK
+        //     BANK ACCOUNT NUMBER: OK
+        // To tez jest potwierdzenie, tylko zapisane inaczej niz zdaniem. Wymagamy, zeby
+        // „OK" stalo przy punkcie O KONCIE — samo „ok" w zdaniu nie moze potwierdzac
+        // przelewu. Miedzy nazwa punktu a „OK" dopuszczamy dwukropek, myslnik albo nic.
+        // Granica po znaczniku nie moze byc „\b": „✓" nie jest znakiem slowa, wiec „\b"
+        // po nim NIGDY nie trafia i odhaczenie ptaszkiem przepadalo.
+        var PC_LISTA_KONTO = /\b(?:bank\s*)?(?:account|acct|a\/c|konto|rachunek)\s*(?:number|no\.?|nr\.?|numer)?\s*[:\-–—=]?\s*(?:OK|TAK|YES|✓|V)(?![A-Za-z0-9])/i;
+        function pcIsBankConfLista(t){ return PC_LISTA_KONTO.test(String(t == null ? '' : t)); }
         function pcIsBankConfText(t){
             var s = String(t == null ? '' : t);
             if (pcIsTomato(s)) return true;
@@ -13402,7 +13449,15 @@
                 // komentarz moze byc jednym i drugim, wiec nie wchodzi do tego samego else-if.
                 var a = pcAcctFromText(c.text);
                 if (a){ var h = rec(c); h.accs = a.accs; h.old = a.old; if (!hint || pcNewer(h.ts, hint.ts)) hint = h; }
-                if (pcIsBankConfText(c.text)) { var r1 = rec(c); if (!conf || pcNewer(r1.ts, conf.ts)) conf = r1; }
+                // Lista kontrolna liczy sie jako potwierdzenie, ale SLABSZE: samo „OK"
+                // nie mowi, jaki numer konta widzial odhaczajacy. Zaznaczamy to przy
+                // potwierdzeniu, a pcConfEval zada drugiego swiadka — zgodnosci P/I
+                // z kontem wpisanym u dostawcy.
+                var lista = !pcIsBankConfText(c.text) && pcIsBankConfLista(c.text);
+                if (pcIsBankConfText(c.text) || lista) {
+                    var r1 = rec(c); r1.lista = lista;
+                    if (!conf || pcNewer(r1.ts, conf.ts)) conf = r1;
+                }
                 else if (pcIsBankChgText(c.text)) { var r2 = rec(c); if (!chg || pcNewer(r2.ts, chg.ts)) chg = r2; }
             });
             return { conf: conf, chg: chg, hint: hint };
@@ -14287,6 +14342,14 @@
                 var G = W.G;
                 var ds = pcSumRows(G.dep), bs = pcBalSum(G.bal);
                 var bk = painBankOfG(G), b = bk.bank || {}, geo = piBankGeo(b), ageo = painAgtGeo(b), st = painGroupOk(G);
+                // Adres z KARTY DOSTAWCY ma pierwszenstwo przed wyprowadzaniem z P/I:
+                // tam miasto stoi w osobnym polu i nie trzeba go zgadywac.
+                var kartaA = pcAdrOf(G.cid);
+                var karta = kartaA ? {
+                    town: kartaA.city,
+                    ctry: pbFindCtry(kartaA.country) || pbFindCtry(kartaA.city) || '',
+                    addr: [kartaA.linia, kartaA.zip].filter(Boolean).join(', ')
+                } : null;
                 var ed = (state.painEdit && state.painEdit[G.key]) || {};
                 function V(k, d){ return (ed[k] != null && String(ed[k]) !== '') ? ed[k] : d; }
                 var amtBase = (ds || 0) + (bs || 0);
@@ -14308,15 +14371,19 @@
                     name: String(V('name', b.name || '')),
                     acc: accV,
                     bic: painNorm(V('bic', b.swift || '')),
-                    town: String(V('town', geo.town || '')),
-                    ctry: String(V('ctry', geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2),
-                    addr: String(V('addr', b.addr || '')),
+                    // Reczna poprawka > karta dostawcy > wyprowadzenie z P/I.
+                    town: String(V('town', (karta && karta.town) || geo.town || '')),
+                    ctry: String(V('ctry', (karta && karta.ctry) || geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2),
+                    addr: String(V('addr', (karta && karta.addr) || b.addr || '')),
+                    adrKarta: karta ? kartaA.grupa : '',
                     bankName: String(V('bankName', b.bankName || '')), bankAddr: b.bankAddr || '',
                     bankTown: String(V('bankTown', ageo.town || '')),
                     bankCtry: String(V('bankCtry', ageo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2),
                     bankGeoSrc: ageo.src || '',
                     accWasWrong: b.accWasWrong || '', accFix: !!b.accFix, accBad: b.accBad || '',
-                    geoSrc: geo.src || '', geoWeak: !!(geo.weak && geo.ctry),
+                    // Kraj z karty dostawcy jest pewny — „slaby" dotyczy tylko wyprowadzania.
+                    geoSrc: karta && karta.ctry ? 'karta' : (geo.src || ''),
+                    geoWeak: !!(geo.weak && geo.ctry && !(karta && karta.ctry)),
                     hasBank: bk.n > 0, bankWhy: bk.why || '', conflict: bk.conflict, nBank: bk.n,
                     verified: st.ok && !hintBad, why: st.why,
                     nDep: (G.dep || []).length, nBal: (G.bal || []).length,
@@ -14325,6 +14392,56 @@
                 });
             });
             return out;
+        }
+        // Uwagi DLA JEDNEGO WIERSZA — jedno zrodlo prawdy dla kontroli przed plikiem
+        // i dla zielonego statusu w tabeli. Gdyby liczyly osobno, rozjechalyby sie,
+        // a „sprawdzone" znow zaczeloby znaczyc co innego niz „bez uwag".
+        // e2e: mapa juz uzytych identyfikatorow — duplikat da sie zobaczyc tylko
+        // w zestawieniu z innymi wierszami, wiec przychodzi z zewnatrz.
+        function painRowUwagi(r, strict, e2e){
+            var errs = [], warns = [];
+            if (!(r.amount > 0)) errs.push('kwota musi być większa od zera.');
+            if (!r.hasBank) errs.push((r.bankWhy || 'brak bloku bankowego w P/I') + ' — uzupełnij dane ręcznie.');
+            if (!painTxt(r.name, 140, strict)) errs.push('brak nazwy beneficjenta.');
+            if (!painNorm(r.acc)) errs.push('brak numeru konta beneficjenta.');
+            // .slice(0, 34) w budowie pliku ucinalby numer PO CICHU. Lepiej zatrzymac
+            // caly plik i kazac skrocic recznie, niz wyslac przelew na obciety numer.
+            var accOut = painIbanOk(r.acc) ? painNorm(r.acc) : painAcctOthr(r.acc);
+            if (accOut.length > 34) errs.push('numer konta ma ' + accOut.length
+                + ' znaków, a do pain.001 wchodzi najwyżej 34 — popraw zapis konta.');
+            if (!painBicOk(r.bic)) errs.push('BIC „' + r.bic + '” niepoprawny.');
+            if (r.acctHintBad) warns.push('⛔ ' + (r.why[0] || 'komentarz wskazuje inne konto') + ' — wiersz jest ODZNACZONY; zaznacz go ręcznie dopiero po sprawdzeniu, na który numer ma iść przelew.');
+            if (!painTxt(r.town, 35, strict)) errs.push('brak miasta beneficjenta — TwnNm obowiązkowe w obu wariantach adresu SPS (strukturalnym i hybrydowym).');
+            if (!/^[A-Z]{2}$/.test(r.ctry)) errs.push('brak kraju beneficjenta — Ctry obowiązkowe w obu wariantach adresu SPS (strukturalnym i hybrydowym).');
+            var t = painChars(r.title, strict);
+            if (!t.txt) errs.push('pusty tytuł przelewu.');
+            if (t.txt.length > PAIN_TITLE_MAX) warns.push('tytuł ma ' + t.txt.length + ' znaków — zostanie przycięty do ' + PAIN_TITLE_MAX + '.');
+            if (t.bad.length) warns.push('w tytule zamieniono/usunięto znaki: ' + t.bad.join(' '));
+            var n = painChars(r.name, strict);
+            if (n.bad.length) warns.push('w nazwie beneficjenta zamieniono/usunięto znaki: ' + n.bad.join(' '));
+            if (!r.verified) warns.push('nie wszystko sprawdzone — ' + (r.why[0] || '') + (r.why.length > 1 ? (' (+' + (r.why.length - 1) + ')') : ''));
+            if (r.geoWeak) warns.push('kraj ustalony ' + (r.geoSrc === 'bic' ? 'z BIC banku — bank bywa w innym kraju niż firma, sprawdź' : 'z nazwy firmy — sprawdź') + '.');
+            if (r.conflict) warns.push('P/I wskazują ' + r.nBank + ' różne konta beneficjenta — użyto pierwszego.');
+            // Od 1.84 nazwa i adres banku beneficjenta NIE ida do pliku, gdy jest BIC
+            // (SPS: „When using a BIC, the specification of 'Name'/'Postal Address' is not
+            // permitted."). BIC jest bledem blokujacym powyzej, wiec kazdy wiersz w pliku
+            // ma BIC — nie ostrzegamy juz o braku nazwy/miasta/kraju banku.
+            if (r.accWasWrong) warns.push('w bloku bankowym P/I pod etykietą konta stało „' + String(r.accWasWrong).slice(0, 60) + '” — użyto numeru potwierdzonego przy kontroli P/I (etykiety w pliku są przesunięte).');
+            else if (r.accFix) warns.push('numer konta odczytany spod innej etykiety w P/I (etykiety przesunięte' + (r.accBad ? ', pod „konto” stało: „' + String(r.accBad).slice(0, 60) + '”' : '') + ') — sprawdź.');
+            if (r.amountEdited) warns.push('kwota zmieniona ręcznie: ' + r.amountBase.toFixed(2) + ' → ' + r.amount.toFixed(2) + '.');
+            if (/^[A-Z]{2}\d{2}/.test(painNorm(r.acc)) && !painIbanOk(r.acc)) warns.push('konto wygląda jak IBAN, ale suma kontrolna się nie zgadza — wysyłamy jako „Othr”.');
+            if (e2e){
+                var id = painE2E(r);
+                if (e2e[id]) errs.push('zduplikowany EndToEndId „' + id + '”.');
+                e2e[id] = 1;
+            }
+            return { errs: errs, warns: warns };
+        }
+        // Czy wiersz da sie wyslac BEZ ZASTANOWIENIA: zero bledow i zero ostrzezen.
+        // Tylko taki dostaje zielone „sprawdzone".
+        function painRowGotowy(r, strict){
+            var u = painRowUwagi(r, strict, null);
+            return !u.errs.length && !u.warns.length;
         }
         function painValidate(cfg, rows, strict){
             var errs = [], warns = [];
@@ -14340,40 +14457,13 @@
             if (cfg.flatAdr) warns.push('Włączony tryb testowy „adres tylko w AdrLine” — plik pójdzie bez TwnNm, PstCd i Ctry, czyli NIEZGODNIE ze Swiss Payment Standards (TwnNm i Ctry są wymagane w obu dopuszczonych wariantach adresu). Bank może go odrzucić. Używaj wyłącznie do porównania w e-finance i zaraz potem wyłącz.');
             var e2e = {};
             rows.forEach(function(r){
+                // Uwagi liczy painRowUwagi — TA SAMA funkcja, ktora koloruje status
+                // w tabeli. Jedno zrodlo prawdy: „sprawdzone" nie moze znaczyc czego
+                // innego niz „bez uwag".
                 var p = '„' + r.sup + '”: ';
-                if (!(r.amount > 0)) errs.push(p + 'kwota musi być większa od zera.');
-                if (!r.hasBank) errs.push(p + (r.bankWhy || 'brak bloku bankowego w P/I') + ' — uzupełnij dane ręcznie.');
-                if (!painTxt(r.name, 140, strict)) errs.push(p + 'brak nazwy beneficjenta.');
-                if (!painNorm(r.acc)) errs.push(p + 'brak numeru konta beneficjenta.');
-                // .slice(0, 34) w budowie pliku ucinalby numer PO CICHU. Lepiej zatrzymac
-                // caly plik i kazac skrocic recznie, niz wyslac przelew na obciety numer.
-                var accOut = painIbanOk(r.acc) ? painNorm(r.acc) : painAcctOthr(r.acc);
-                if (accOut.length > 34) errs.push(p + 'numer konta ma ' + accOut.length
-                    + ' znaków, a do pain.001 wchodzi najwyżej 34 — popraw zapis konta.');
-                if (!painBicOk(r.bic)) errs.push(p + 'BIC „' + r.bic + '” niepoprawny.');
-                if (r.acctHintBad) warns.push(p + '⛔ ' + (r.why[0] || 'komentarz wskazuje inne konto') + ' — wiersz jest ODZNACZONY; zaznacz go ręcznie dopiero po sprawdzeniu, na który numer ma iść przelew.');
-                if (!painTxt(r.town, 35, strict)) errs.push(p + 'brak miasta beneficjenta — TwnNm obowiązkowe w obu wariantach adresu SPS (strukturalnym i hybrydowym).');
-                if (!/^[A-Z]{2}$/.test(r.ctry)) errs.push(p + 'brak kraju beneficjenta — Ctry obowiązkowe w obu wariantach adresu SPS (strukturalnym i hybrydowym).');
-                var t = painChars(r.title, strict);
-                if (!t.txt) errs.push(p + 'pusty tytuł przelewu.');
-                if (t.txt.length > PAIN_TITLE_MAX) warns.push(p + 'tytuł ma ' + t.txt.length + ' znaków — zostanie przycięty do ' + PAIN_TITLE_MAX + '.');
-                if (t.bad.length) warns.push(p + 'w tytule zamieniono/usunięto znaki: ' + t.bad.join(' '));
-                var n = painChars(r.name, strict);
-                if (n.bad.length) warns.push(p + 'w nazwie beneficjenta zamieniono/usunięto znaki: ' + n.bad.join(' '));
-                if (!r.verified) warns.push(p + 'nie wszystko sprawdzone — ' + (r.why[0] || '') + (r.why.length > 1 ? (' (+' + (r.why.length - 1) + ')') : ''));
-                if (r.geoWeak) warns.push(p + 'kraj ustalony ' + (r.geoSrc === 'bic' ? 'z BIC banku — bank bywa w innym kraju niż firma, sprawdź' : 'z nazwy firmy — sprawdź') + '.');
-                if (r.conflict) warns.push(p + 'P/I wskazują ' + r.nBank + ' różne konta beneficjenta — użyto pierwszego.');
-                // Od 1.84 nazwa i adres banku beneficjenta NIE ida do pliku, gdy jest BIC
-                // (SPS: „When using a BIC, the specification of 'Name'/'Postal Address' is not
-                // permitted."). BIC jest bledem blokujacym powyzej, wiec kazdy wiersz w pliku
-                // ma BIC — nie ostrzegamy juz o braku nazwy/miasta/kraju banku.
-                if (r.accWasWrong) warns.push(p + 'w bloku bankowym P/I pod etykietą konta stało „' + String(r.accWasWrong).slice(0, 60) + '” — użyto numeru potwierdzonego przy kontroli P/I (etykiety w pliku są przesunięte).');
-                else if (r.accFix) warns.push(p + 'numer konta odczytany spod innej etykiety w P/I (etykiety przesunięte' + (r.accBad ? ', pod „konto” stało: „' + String(r.accBad).slice(0, 60) + '”' : '') + ') — sprawdź.');
-                if (r.amountEdited) warns.push(p + 'kwota zmieniona ręcznie: ' + r.amountBase.toFixed(2) + ' → ' + r.amount.toFixed(2) + '.');
-                if (/^[A-Z]{2}\d{2}/.test(painNorm(r.acc)) && !painIbanOk(r.acc)) warns.push(p + 'konto wygląda jak IBAN, ale suma kontrolna się nie zgadza — wysyłamy jako „Othr”.');
-                var id = painE2E(r);
-                if (e2e[id]) errs.push(p + 'zduplikowany EndToEndId „' + id + '”.');
-                e2e[id] = 1;
+                var u = painRowUwagi(r, strict, e2e);
+                u.errs.forEach(function(x){ errs.push(p + x); });
+                u.warns.forEach(function(x){ warns.push(p + x); });
             });
             return { errs: errs, warns: warns };
         }
@@ -17229,15 +17319,25 @@
                        + '</span></td></tr>';
                 }
                 if (r.acctHintBad) bg = on ? '#FDECEC' : '#FFF5F5';
-                var st = r.verified
+                // Zielone znaczy: BEZ ZADNEJ UWAGI, mozna isc do przelewu. Samo
+                // „dostawca sprawdzony" nie wystarcza — wiersz z pustym miastem
+                // beneficjenta stal na zielono, a pliku z niego nie da sie zlozyc.
+                var uw = painRowUwagi(r, strict, null);
+                var ileUw = uw.errs.length + uw.warns.length;
+                var st = ileUw === 0
                     ? '<span style="color:#0a0;font-weight:700">✓ sprawdzone</span>'
-                    : '<span style="color:#c47f00;font-weight:700" title="' + pcAttr(r.why.join('\n')) + '">⚠ ' + esc(r.why.length) + ' uwag</span>';
+                    : '<span style="color:' + (uw.errs.length ? '#c00' : '#c47f00') + ';font-weight:700" title="'
+                      + pcAttr(uw.errs.concat(uw.warns).join('\n')) + '">⚠ ' + ileUw + ' uwag'
+                      + (uw.errs.length ? (' (' + uw.errs.length + ' blokuje plik)') : '') + '</span>';
                 if (!r.hasBank) st = '<span style="color:#c00;font-weight:700">✗ brak danych bankowych w P/I</span>';
                 else if (r.conflict) st += ' <span style="color:#c00;font-weight:700" title="P/I wskazują różne konta">✗ konflikt kont</span>';
                 // Rozjazd z komentarzem stoi NAD reszta statusu — to jedyna uwaga, ktora moze
                 // skonczyc sie wyslaniem pieniedzy pod zly numer.
                 if (r.acctHintBad) st = '<span style="color:#a10000;font-weight:700" title="' + pcAttr(r.why[0] || '') + '">⛔ komentarz: konto ' + esc(r.acctHint.accs.join(' / ')) + (r.acctHint.old ? ' (STARE)' : '') + '</span><br>' + st;
                 if (r.geoWeak) st += ' <span style="color:#c47f00" title="Kraj wyprowadzony ' + (r.geoSrc === 'bic' ? 'z BIC banku' : 'z nazwy firmy') + ', nie z adresu">(kraj: ' + esc(r.geoSrc) + ')</span>';
+                // Skad wziety adres — zeby nie trzeba bylo zgadywac, czemu miasto jest
+                // takie, a nie inne. „karta" znaczy: rozpisane pola z karty dostawcy.
+                if (r.adrKarta) st += ' <span style="color:#0a7a2f" title="Miasto i adres wzięte z karty dostawcy (blok „' + pcAttr(r.adrKarta) + '”) — pola rozpisane, bez zgadywania">(adres: karta)</span>';
                 var tl = painChars(r.title, strict).txt.length;
                 h += '<tr style="background:' + bg + '">'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top"><input type="checkbox" class="pain-chk" data-key="' + pcAttr(r.key) + '"' + (on ? ' checked' : '') + '></td>'
@@ -17282,7 +17382,8 @@
             h += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
                + '<button id="pain-dl" class="chn-btn ' + (v.errs.length ? 'ghost' : 'red') + '"' + (v.errs.length ? ' disabled title="Najpierw popraw błędy"' : ' title="Zapisz plik XML do wczytania w banku"') + '>⬇ Pobierz pain.001 (XML)</button>'
                + '<button id="pain-copy" class="chn-btn ghost" title="Skopiuj XML do schowka">📋 Kopiuj XML</button>'
-               + '<button id="pain-all" class="chn-btn ghost">☑ Zaznacz / odznacz wszystkie</button>'
+               + '<button id="pain-all" class="chn-btn ghost" title="Zaznacz wszystkich dostawców do pliku">☑ Zaznacz wszystkie</button>'
+               + '<button id="pain-none" class="chn-btn ghost" title="Odznacz wszystkich — zacznij wybierać od zera">☐ Odznacz wszystkie</button>'
                + '<button id="pain-onlyok" class="chn-btn ghost" title="Zostaw zaznaczone tylko wiersze w pełni sprawdzone">✓ Tylko sprawdzone</button>'
                + '<button id="pain-reset" class="chn-btn ghost" title="Cofnij ręczne poprawki w tabeli">↺ Cofnij poprawki</button>'
                + '<span id="pain-status" style="font-size:11px;color:#666"></span></div>';
@@ -17320,6 +17421,25 @@
             // sprawdzone w praktyce. Przy samym balance patrzymy WYLACZNIE na to, czy numer
             // konta w miedzyczasie sie nie zmienil.
             out.needConf = (G.dep || []).length > 0;
+            // Potwierdzenie w formie LISTY KONTROLNEJ potrzebuje drugiego swiadka:
+            // konto z P/I musi zgadzac sie z kontem wpisanym u dostawcy. „BANK ACCOUNT
+            // NUMBER: OK" mowi, ze ktos punkt odhaczyl — nie mowi, jaki numer wtedy widzial.
+            if (conf && conf.lista){
+                var kontoSup = G.cid ? String(_acc[G.cid] || '') : '';
+                var zPI = [];
+                (G.dep || []).forEach(function(r){ if (r && r.pi && r.pi.piAcc) zPI.push(r.pi.piAcc); });
+                (G.bal || []).forEach(function(r){ if (r && r.bpi && r.bpi.piAcc) zPI.push(r.bpi.piAcc); });
+                var zgodne = !!kontoSup && zPI.length > 0 && zPI.every(function(x){ return accTenSam(x, kontoSup); });
+                out.lista = zgodne ? 'ok' : (!kontoSup ? 'brakKonta' : (zPI.length ? 'rozjazd' : 'brakPI'));
+                if (!zgodne){
+                    out.listaWhy = 'komentarz odhaczył „BANK ACCOUNT NUMBER: OK", ale '
+                        + (!kontoSup ? 'nie znam konta wpisanego u dostawcy'
+                           : (zPI.length ? 'konto z P/I nie zgadza się z kontem u dostawcy'
+                                         : 'nie mam konta z P/I do porównania'))
+                        + ' — sama lista nie mówi, jaki numer widział odhaczający';
+                    conf = null;
+                }
+            }
             if (!conf){
                 if (out.needConf) return out;             // st = 'none' — czerwone ✗
                 out.st = isFinite(chTs) ? 'chg' : 'nochg';
@@ -19982,12 +20102,13 @@
                 var t = ev.target; if (!t || t.tagName !== 'BUTTON') return;
                 var st = wp.querySelector('#pain-status'), rows = painRows(), cfg = painCfg(), strict = !!cfg.strict;
                 function say(m, col){ if (st) { st.textContent = m; st.style.color = col || '#666'; } }
-                if (t.id === 'pain-all'){
-                    var anyOff = rows.some(function(r){ return !state.painSel[r.key]; });
-                    rows.forEach(function(r){ state.painSel[r.key] = anyOff; });
-                    renderPain(); return;
-                }
-                if (t.id === 'pain-onlyok'){ rows.forEach(function(r){ state.painSel[r.key] = !!(r.verified && r.hasBank && !r.conflict); }); renderPain(); return; }
+                // Dwa osobne polecenia zamiast jednego przelacznika: przy przelaczniku
+                // trzeba bylo najpierw zgadnac, w ktorym jest stanie.
+                if (t.id === 'pain-all'){ rows.forEach(function(r){ state.painSel[r.key] = true; }); renderPain(); return; }
+                if (t.id === 'pain-none'){ rows.forEach(function(r){ state.painSel[r.key] = false; }); renderPain(); return; }
+                // „Tylko sprawdzone" ma znaczyc TO SAMO co zielony status — inaczej guzik
+                // zostawialby zaznaczone wiersze, ktore w tabeli maja uwagi.
+                if (t.id === 'pain-onlyok'){ rows.forEach(function(r){ state.painSel[r.key] = painRowGotowy(r, strict); }); renderPain(); return; }
                 if (t.id === 'pain-reset'){ state.painEdit = {}; renderPain(); return; }
                 if (t.id === 'pain-dl' || t.id === 'pain-copy'){
                     var sel = painSelected(rows), v = painValidate(cfg, sel, strict);
