@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.07
+// @version      5.08
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -6735,7 +6735,8 @@
             🔍 Refund Checker
         </div>
         <div style="font-size:11px; color:#666; margin-bottom:8px;">
-            Wklej całą tabelę ze strony — skrypt sam wyciągnie numery z "Refund_ XXXXXXX". Sprawdza tylko refundy ze statusem "Refund approved".
+            Wklej całą tabelę ze strony — skrypt sam wyciągnie numery z "Refund_ XXXXXXX". Sprawdza tylko refundy ze statusem "Refund approved".<br>
+            Przy wpłacie z Klarny zielone dostaje wyłącznie zwrot równy <b>całej</b> jej wpłacie.
         </div>
         <textarea id="tm-refund-input" placeholder="false&#9;1901240&#9;Refund_ 14548371&#9;Refund&#9;..." style="
             width: 100%; height: 120px; padding: 8px;
@@ -7113,6 +7114,99 @@
         return false;
     }
 
+    // Konta Klarny z planu kont prologistics — po nich poznajemy jej wplaty w tabeli
+    // Payments. „Klarna AT" wystepuje w planie dwa razy (1440 i 2106); wlasciwe jest
+    // 1440 i tylko ono tu stoi.
+    const REFUND_KLARNA_KONTA = [
+        '1081',  // Klarna Beliani PL
+        '1157',  // Klarna EUR BE Beliani (EU)
+        '1160',  // Klarna RO Beliani (EU) GmbH
+        '1275',  // Klarna EUR NL
+        '1343',  // Klarna Beliani NL
+        '1402',  // Klarna Beliani Switzerland
+        '1412',  // Klarna SE Beliani DE
+        '1427',  // Klarna DE Beliani DE
+        '1428',  // Klarna FI Beliani DE
+        '1429',  // Klarna DKK Beliani DE
+        '1430',  // Klarna IT Beliani DE
+        '1433',  // Klarna UK Beliani UK
+        '1439',  // Klarna NOK
+        '1440',  // Klarna AT
+        '1441',  // Klarna ES Beliani DE
+        '1502',  // Klarna CZ Beliani DE
+        '1503',  // Klarna FR Beliani DE
+        '1504',  // Klarna PT Beliani DE
+        '1509',  // Klarna HU Beliani DE
+        '1510'   // Klarna SK Beliani DE
+    ];
+
+    // Wplaty Klarny z tabeli Payments, ZE ZNAKIEM. parseMoney oddaje wartosc bezwzgledna,
+    // wiec minus zdejmujemy z tekstu — tak samo jak paymentsHasRefundBookingOnDate.
+    // Wiersze naglowka i podsumowania odpadaja same: maja mniej niz trzy komorki.
+    function getKlarnaPayments(doc) {
+        let table = null;
+        const anchor = doc.querySelector('#payments');
+        if (anchor) table = anchor.closest('table');
+        if (!table) table = doc.querySelector('table[data-simple-nav="Payments under billing information"]');
+        if (!table) return [];
+        const out = [];
+        table.querySelectorAll('tr').forEach(function (row) {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 3) return;
+            const konto = (cells[1].textContent || '').trim();
+            if (REFUND_KLARNA_KONTA.indexOf(konto) < 0) return;
+            const raw = (cells[2].textContent || '').trim();
+            const amt = parseMoney(raw);
+            if (amt === null) return;
+            out.push({ konto: konto, amount: raw.charAt(0) === '-' ? -amt : amt });
+        });
+        return out;
+    }
+
+    // Zwrot przez Klarne musi byc rowny DOKLADNIE JEDNEJ jej wplacie.
+    // Zwraca { dotyczy, ok, msg } — „dotyczy: false" znaczy, ze na auftragu nie ma
+    // zadnego wiersza na koncie Klarny i zostaje kontrola dotychczasowa.
+    function klarnaSprawdz(doc, approvedPairs, refundAmount) {
+        const wplaty = getKlarnaPayments(doc);
+        if (!wplaty.length) return { dotyczy: false };
+
+        const dodatnie = wplaty.filter(function (p) { return p.amount > 0; });
+        const saldo = wplaty.reduce(function (s, p) { return s + p.amount; }, 0);
+
+        // Ktora czesc zwrotu idzie przez Klarne. Nazwa banku stoi przy wierszu refundu
+        // („Klarna automatic booking"). Gdyby jej zabraklo, bierzemy cala sume approved
+        // — przy jednym wierszu to i tak to samo, a przy kilku wyjdzie czerwone,
+        // czyli w strone bezpieczna.
+        const zKlarny = approvedPairs.filter(function (p) { return /klarna/i.test(p.bankName || ''); });
+        const zwrot = zKlarny.length
+            ? zKlarny.reduce(function (s, p) { return s + p.amount; }, 0)
+            : refundAmount;
+
+        const opis = dodatnie.map(function (p) { return p.amount.toFixed(2); }).join(' + ') || '—';
+
+        if (!dodatnie.length)
+            return { dotyczy: true, ok: false,
+                     msg: `Klarna: w Payments sa tylko wiersze ujemne (saldo ${saldo.toFixed(2)}) — nie ma czego zwracac` };
+
+        const pasuje = dodatnie.some(function (p) { return Math.abs(p.amount - zwrot) < 0.02; });
+        if (!pasuje) {
+            const suma = dodatnie.reduce(function (s, p) { return s + p.amount; }, 0);
+            // Osobno nazwana pulapka: zwrot rowny SUMIE kilku wplat. Po stronie Klarny
+            // to nie jest jedna operacja, wiec zielonego nie ma — ale powod ma byc jasny.
+            const toSuma = dodatnie.length > 1 && Math.abs(suma - zwrot) < 0.02;
+            return { dotyczy: true, ok: false,
+                     msg: `Klarna: zwrot ${zwrot.toFixed(2)} ≠ wpłata Klarny (${opis})`
+                        + (toSuma ? ' — to suma kilku wpłat, a Klarna oddaje po jednej' : '')
+                        + ' — Zwrot na Klarnie tylko całościowy' };
+        }
+
+        if (saldo + 0.02 < zwrot)
+            return { dotyczy: true, ok: false,
+                     msg: `Klarna: ta wpłata jest już zwrócona — saldo kont Klarny na auftragu ${saldo.toFixed(2)}, zwrot ${zwrot.toFixed(2)}` };
+
+        return { dotyczy: true, ok: true };
+    }
+
     async function checkRefund(auftragNumber) {
         try {
             const resp = await fetch(`/auction.php?number=${auftragNumber}&txnid=3`);
@@ -7189,14 +7283,21 @@
             const amountGroups = {};
 
             approvedPairs.forEach(pr => {
-                const key = pr.amount.toFixed(2);
-                (amountGroups[key] = amountGroups[key] || []).push({ logId: pr.logId, bankName: pr.bankName || '' });
+                // Klucz to KWOTA I BANK. Dwa zwroty tej samej kwoty na ROZNE banki nie sa
+                // duplikatem, tylko poprawnie rozbita wyplata — przy wplacie 100 Klarna
+                // + 100 bank maja powstac wlasnie dwa requesty po 100. Po samej kwocie
+                // modul stawial tam czerwone „Duplikat statusu approved".
+                // Ta sama kwota na TYM SAMYM banku to nadal duplikat. A gdyby to jednak
+                // byl ten sam zwrot zatwierdzony dwa razy, suma approved rozjedzie sie
+                // z Open i zatrzyma go kontrola kwoty.
+                const key = pr.amount.toFixed(2) + '|' + String(pr.bankName || '').trim().toLowerCase();
+                (amountGroups[key] = amountGroups[key] || []).push({ logId: pr.logId, bankName: pr.bankName || '', amount: pr.amount });
             });
 
             const internalDuplicates = Object.entries(amountGroups)
                 .filter(([, arr]) => arr.length > 1)
-                .map(([amt, arr]) => ({
-                    amount: parseFloat(amt),
+                .map(([, arr]) => ({
+                    amount: arr[0].amount,
                     count: arr.length,
                     logIds: arr.map(x => x.logId).filter(Boolean),
                     items: arr.filter(x => x.logId)
@@ -7254,21 +7355,33 @@
 
             const isMatch = Math.abs(openAmount - refundAmount) < 0.02;
 
+            // Klarna umie zwrocic wylacznie CALA wplate, wiec zgodnosc z Open jej nie
+            // wystarcza — to wlasnie ona robila z requestu na 39,99 przy wplacie 479,92
+            // zielony wynik. Kontrola milczy, gdy na auftragu nie ma wplaty Klarny.
+            const kl = klarnaSprawdz(doc, approvedPairs, refundAmount);
+            const klZle = !!(kl.dotyczy && !kl.ok);
+
             let error = null;
 
             if (internalDuplicates.length > 0) {
                 error = `Duplikat statusu approved: ${internalDuplicates.map(d => `${formatAmount(d.amount)} ×${d.count}`).join(', ')}`;
             } else if (!isMatch) {
                 error = `Open: ${formatAmount(openAmount)} ≠ Refund (suma approved): ${refundAmount.toFixed(2)}`;
+                // Gdy nie zgadza sie i jedno, i drugie, mowimy o obu: same kwoty nie
+                // pokazuja, ze problem jest po stronie Klarny.
+                if (klZle) error += ` · ${kl.msg}`;
+            } else if (klZle) {
+                error = kl.msg;
             }
 
             return {
-                ok: isMatch && internalDuplicates.length === 0,
+                ok: isMatch && internalDuplicates.length === 0 && !klZle,
                 auftragNumber,
                 openAmount,
                 refundAmount,
                 approvedAmounts,
                 internalDuplicates,
+                klarna: kl,
                 suspiciousHufBug: false,
                 error
             };
